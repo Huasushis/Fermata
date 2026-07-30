@@ -1,0 +1,18 @@
+{
+  "provisional": true,
+  "note": "这是手工写的种子数据，只有 2 条经过合理确认的锚点（社区里被广泛引用的两道经典难度参照题），不是 experiments/calibrate-anchors.ts 要求的 6-8 条完整锚点集，也没有真的跑过校准脚本核实。上线前必须配置好 CODEFORCES_KEY/CODEFORCES_SECRET，然后运行 `npm run experiment:calibrate-anchors` 从真实数据重新生成覆盖本文件，并把 provisional 改成 false。",
+  "anchors": [
+    {
+      "contestId": 4,
+      "index": "A",
+      "rating": 800,
+      "summary": "给定一个整数 w，判断能否把它拆成两个正偶数之和；只需要几个分支判断，是社区里经常被引用的 Codeforces 800 难度典型代表。"
+    },
+    {
+      "contestId": 1,
+      "index": "A",
+      "rating": 1000,
+      "summary": "用边长为 a 的正方形砖块铺满一个 n×m 的矩形广场，求最少需要多少块砖；对两个方向分别向上取整再相乘即可，是 Codeforces 历史上第一道题，常被引用为 1000 难度的典型代表。"
+    }
+  ]
+}

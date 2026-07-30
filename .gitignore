@@ -1,0 +1,32 @@
+# 依赖与构建产物
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 运行期状态（含 settings.json 持久化文件，不入库）
+/data/
+
+# 环境变量与密钥
+.env
+.env.*
+!.env.example
+# 部署环境里密钥文件是 private/urmotiv.env（不叫 .env，.env.* 这两条规则不会
+# 匹配到它），额外排除任何 *.env 文件和整个 private/ 目录，双重保险。
+*.env
+private/
+
+# 实验数据集：抓取自 Codeforces 的完整题面/题解，属于公开数据但不入库，
+# 报告只应引用题号。原始单题快照与未脱敏的评测明细同样不入库。
+# 用 /* + !.gitkeep 而不是整目录排除，这样空目录能在 clone 后就存在。
+experiments/data/*
+!experiments/data/.gitkeep
+experiments/results/raw/*
+!experiments/results/raw/.gitkeep
+
+# 汇总报告（不含题面全文）允许入库，因此不要在这里排除 experiments/results/*.md
+# 或 experiments/results/*-summary.json —— 具体规则见 AGENTS.md。
+
+# 日志与系统文件
+*.log
+.DS_Store
+Thumbs.db

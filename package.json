@@ -1,0 +1,33 @@
+{
+  "name": "@fermata/service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Fermata：USTC 算法竞赛协会的独立 AI 审题服务，轮询 Urmotiv 待审题目并提交结构化审核意见。",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "experiment:fetch-cf-dataset": "tsx experiments/fetch-cf-dataset.ts",
+    "experiment:eval-difficulty": "tsx experiments/eval-difficulty.ts",
+    "experiment:calibrate-anchors": "tsx experiments/calibrate-anchors.ts",
+    "experiment:fetch-hf-dataset": "tsx experiments/fetch-hf-dataset.ts",
+    "experiment:calibrate-levels": "tsx experiments/calibrate-levels.ts",
+    "experiment:eval-verdict": "tsx experiments/eval-verdict.ts"
+  },
+  "dependencies": {
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "hyparquet": "latest",
+    "tsx": "latest",
+    "typescript": "latest",
+    "vitest": "latest"
+  }
+}
