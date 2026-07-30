@@ -1,0 +1,552 @@
+import {
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { sep } from "node:path";
+import { pathToFileURL } from "node:url";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  LevelsCalibrationStateError,
+  acquireLevelsLabelLock,
+  assessCalibrationCompleteness,
+  assertCalibrationLabelUnused,
+  buildLevelsExperimentFingerprint,
+  buildLevelsReportRunConfiguration,
+  buildLevelsRunConfiguration,
+  checkpointUrl,
+  loadCalibrationCheckpoint,
+  preflightCalibrationDocuments,
+  writeCalibrationCheckpoint,
+  writeJsonAtomically,
+  type CalibrationDatasetItem,
+  type CalibrationRow
+} from "../experiments/lib/levels-calibration-state";
+
+const temporaryDirectories: string[] = [];
+
+afterEach(() => {
+  for (const directory of temporaryDirectories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+function makeDirectoryUrl(): URL {
+  const directory = mkdtempSync(`${tmpdir()}${sep}fermata-levels-`);
+  temporaryDirectories.push(directory);
+  return pathToFileURL(`${directory}${sep}`);
+}
+
+function item(
+  overrides: Partial<CalibrationDatasetItem> = {}
+): CalibrationDatasetItem {
+  return {
+    contestId: 1000,
+    index: "A",
+    rating: 1200,
+    statement: "题面正文",
+    editorial: "标准题解",
+    ...overrides
+  };
+}
+
+function row(
+  source: CalibrationDatasetItem,
+  overrides: Partial<CalibrationRow> = {}
+): CalibrationRow {
+  return {
+    contestId: source.contestId,
+    index: source.index,
+    rating: source.rating,
+    thinkingLevel: 2,
+    thinkingSignals: {
+      solved: true,
+      approachSimilarity: 0.8,
+      selfCorrections: 0,
+      keyInsightCount: 1
+    },
+    codingLevel: 2,
+    codingSignals: {
+      effectiveLineCount: 30,
+      maxNestingDepth: 2,
+      detectedDataStructures: [],
+      maxDataStructureWeight: 0
+    },
+    ...overrides
+  };
+}
+
+function fingerprint(
+  dataset: readonly CalibrationDatasetItem[],
+  currentRunConfiguration = runConfiguration()
+) {
+  return buildLevelsExperimentFingerprint({
+    dataset,
+    experimentVersion: "experiment-test",
+    profileName: "review-balanced",
+    profile: {
+      thinking: { solver: { model: "solver-a" }, analyst: { model: "analyst-a" } },
+      coding: { model: "coding-a" }
+    },
+    runConfiguration: currentRunConfiguration,
+    pipelineSources: {
+      thinking: "thinking-source-v1",
+      coding: "coding-source-v1",
+      shared: "shared-source-v1"
+    },
+    calibrationProtocol: { bandBoundaries: [1400, 2200] }
+  });
+}
+
+type TestRunConfiguration = ReturnType<typeof buildLevelsRunConfiguration>;
+type TestRunConfigurationOverrides =
+  Partial<Omit<TestRunConfiguration, "providerBaseUrls">> & {
+    readonly providerBaseUrls?: Partial<TestRunConfiguration["providerBaseUrls"]>;
+  };
+
+function runConfiguration(overrides: TestRunConfigurationOverrides = {}) {
+  const base = buildLevelsRunConfiguration({
+    solverBaseUrl: "https://solver.example/v1/",
+    analystBaseUrl: "https://analyst.example/v1/",
+    codingBaseUrl: "https://coding.example/v1/",
+    requestTimeoutMs: 600_000,
+    maxAttempts: 3,
+    baseDelayMs: 1_000,
+    concurrency: 4
+  });
+  return {
+    ...base,
+    ...overrides,
+    providerBaseUrls: {
+      ...base.providerBaseUrls,
+      ...overrides.providerBaseUrls
+    }
+  };
+}
+
+function captureStateError(action: () => unknown): LevelsCalibrationStateError {
+  try {
+    action();
+  } catch (error) {
+    expect(error).toBeInstanceOf(LevelsCalibrationStateError);
+    return error as LevelsCalibrationStateError;
+  }
+  throw new Error("预期操作失败，但操作成功了。");
+}
+
+describe("标定集预检", () => {
+  it("JSON 损坏、必需字段缺失和题解缺失都会让整批输入失败", () => {
+    const error = captureStateError(() =>
+      preflightCalibrationDocuments([
+        "{not-json",
+        JSON.stringify({ contestId: 1, index: "A", rating: 1200, editorial: "题解" }),
+        JSON.stringify({ ...item({ contestId: 2 }), editorial: null })
+      ])
+    );
+    expect(error.code).toBe("LEVELS_DATA_PRECHECK_FAILED");
+    expect(error.message).toBe("标定集预检失败。");
+    expect(error.message).not.toContain("not-json");
+    expect(error.issues).toEqual([
+      { code: "LEVELS_DATA_EDITORIAL_MISSING", count: 1 },
+      { code: "LEVELS_DATA_FIELDS_INVALID", count: 1 },
+      { code: "LEVELS_DATA_JSON_INVALID", count: 1 }
+    ]);
+  });
+
+  it("重复题号会让整批输入失败", () => {
+    const duplicate = item();
+    const error = captureStateError(() =>
+      preflightCalibrationDocuments([
+        JSON.stringify(duplicate),
+        JSON.stringify({ ...duplicate, statement: "另一份题面" })
+      ])
+    );
+    expect(error.code).toBe("LEVELS_DATA_PRECHECK_FAILED");
+    expect(error.issues).toEqual([{ code: "LEVELS_DATA_DUPLICATE", count: 1 }]);
+  });
+
+  it("题号只接受一个大写字母及其后的数字，不接受空白、换行或 Markdown", () => {
+    const invalidIndexes = [" A", "A ", "A\n", "[A]", "A|B", "a", "AA", "A12345678"];
+    const documents = invalidIndexes.map((index, offset) =>
+      JSON.stringify(item({ contestId: 100 + offset, index }))
+    );
+    documents.push(
+      JSON.stringify(item({ contestId: 201, index: "A1", rating: 1200 })),
+      JSON.stringify(item({ contestId: 202, index: "B2", rating: 1800 })),
+      JSON.stringify(item({ contestId: 203, index: "C3", rating: 2400 }))
+    );
+    const error = captureStateError(() => preflightCalibrationDocuments(documents));
+    expect(error.issues).toEqual([
+      { code: "LEVELS_DATA_FIELDS_INVALID", count: invalidIndexes.length }
+    ]);
+  });
+
+  it("比赛编号和官方 rating 必须是正整数", () => {
+    const error = captureStateError(() =>
+      preflightCalibrationDocuments([
+        JSON.stringify(item({ contestId: 0 })),
+        JSON.stringify(item({ contestId: 2, rating: -100 })),
+        JSON.stringify(item({ contestId: 3, index: "B", rating: 1800 })),
+        JSON.stringify(item({ contestId: 4, index: "C", rating: 2400 }))
+      ])
+    );
+    expect(error.issues).toEqual([
+      { code: "LEVELS_DATA_FIELDS_INVALID", count: 2 }
+    ]);
+  });
+
+  it("缺少低、中、高任一分段时在模型调用前的预检阶段失败", () => {
+    const error = captureStateError(() =>
+      preflightCalibrationDocuments([
+        JSON.stringify(item({ contestId: 1, index: "A", rating: 1000 })),
+        JSON.stringify(item({ contestId: 2, index: "B", rating: 1800 }))
+      ])
+    );
+    expect(error.code).toBe("LEVELS_DATA_PRECHECK_FAILED");
+    expect(error.issues).toEqual([{ code: "LEVELS_DATA_BAND_MISSING", count: 1 }]);
+  });
+
+  it("没有任何输入时明确失败", () => {
+    expect(captureStateError(() => preflightCalibrationDocuments([])).code).toBe(
+      "LEVELS_DATASET_EMPTY"
+    );
+  });
+
+  it("全部合法时返回稳定排序后的完整集合", () => {
+    const high = item({ contestId: 3, index: "C", rating: 2400 });
+    const low = item({ contestId: 1, index: "A", rating: 1000 });
+    const middle = item({ contestId: 2, index: "B", rating: 1800 });
+    expect(
+      preflightCalibrationDocuments(
+        [high, low, middle].map((value) => JSON.stringify(value))
+      ).map((value) => value.contestId)
+    ).toEqual([1, 2, 3]);
+  });
+});
+
+describe("实验校验摘要与续跑", () => {
+  it("题面、题解、rating、模型配置和流水线来源变化都会改变摘要", () => {
+    const dataset = [item()];
+    const base = fingerprint(dataset);
+    expect(fingerprint(dataset)).toEqual(base);
+    expect(fingerprint([item({ statement: "新题面" })]).combinedHash).not.toBe(
+      base.combinedHash
+    );
+    expect(fingerprint([item({ editorial: "新题解" })]).combinedHash).not.toBe(
+      base.combinedHash
+    );
+    expect(fingerprint([item({ rating: 1300 })]).combinedHash).not.toBe(
+      base.combinedHash
+    );
+
+    const modelChanged = buildLevelsExperimentFingerprint({
+      dataset,
+      experimentVersion: "experiment-test",
+      profileName: "review-balanced",
+      profile: { coding: { model: "coding-b" } },
+      runConfiguration: runConfiguration(),
+      pipelineSources: {
+        thinking: "thinking-source-v1",
+        coding: "coding-source-v1",
+        shared: "shared-source-v1"
+      },
+      calibrationProtocol: { bandBoundaries: [1400, 2200] }
+    });
+    expect(modelChanged.combinedHash).not.toBe(base.combinedHash);
+
+    const pipelineChanged = buildLevelsExperimentFingerprint({
+      dataset,
+      experimentVersion: "experiment-test",
+      profileName: "review-balanced",
+      profile: {
+        thinking: { solver: { model: "solver-a" }, analyst: { model: "analyst-a" } },
+        coding: { model: "coding-a" }
+      },
+      runConfiguration: runConfiguration(),
+      pipelineSources: {
+        thinking: "thinking-source-v2",
+        coding: "coding-source-v1",
+        shared: "shared-source-v1"
+      },
+      calibrationProtocol: { bandBoundaries: [1400, 2200] }
+    });
+    expect(pipelineChanged.combinedHash).not.toBe(base.combinedHash);
+  });
+
+  it("实际服务地址、等待、重试和并发参数变化都会改变摘要", () => {
+    const dataset = [item()];
+    const base = fingerprint(dataset);
+    const changedConfigurations = [
+      runConfiguration({
+        providerBaseUrls: { solver: "https://solver-2.example/v1/" }
+      }),
+      runConfiguration({ requestTimeoutMs: 599_999 }),
+      runConfiguration({ maxAttempts: 2 }),
+      runConfiguration({ baseDelayMs: 2_000 }),
+      runConfiguration({ concurrency: 2 })
+    ];
+    for (const changed of changedConfigurations) {
+      expect(fingerprint(dataset, changed).combinedHash).not.toBe(base.combinedHash);
+    }
+  });
+
+  it("公开运行参数只保留服务名称、地址校验值和数值，不输出完整地址或 API key", () => {
+    const secret = "never-write-this-api-key";
+    const sensitiveBaseUrl =
+      `https://user:password@private.example/internal/gateway?api_key=${secret}`;
+    const privateConfiguration = buildLevelsRunConfiguration({
+      solverBaseUrl: sensitiveBaseUrl,
+      analystBaseUrl: sensitiveBaseUrl,
+      codingBaseUrl: sensitiveBaseUrl,
+      requestTimeoutMs: 600_000,
+      maxAttempts: 3,
+      baseDelayMs: 1_000,
+      concurrency: 4
+    });
+    const reportConfiguration = buildLevelsReportRunConfiguration({
+      runConfiguration: privateConfiguration,
+      providerNames: {
+        solver: "aether",
+        analyst: "aether",
+        coding: "dashscope"
+      }
+    });
+    const serialized = JSON.stringify(reportConfiguration);
+    expect(serialized).not.toContain(secret);
+    expect(serialized).not.toContain("password");
+    expect(serialized).not.toContain("/internal/gateway");
+    expect(serialized).not.toContain("private.example");
+    expect(serialized).toContain("aether");
+    expect(reportConfiguration.providers.solver.addressCheck).toMatch(
+      /^[a-f0-9]{16}$/
+    );
+  });
+
+  it("只读取明确指定的 checkpoint，不扫描或合并历史快照", () => {
+    const directory = makeDirectoryUrl();
+    const dataset = [item()];
+    const currentFingerprint = fingerprint(dataset);
+    writeCalibrationCheckpoint({
+      target: new URL("levels-source-2026-01-01.json", directory),
+      label: "source",
+      profileName: "review-balanced",
+      fingerprint: currentFingerprint,
+      rows: [row(dataset[0]!)]
+    });
+
+    const error = captureStateError(() =>
+      loadCalibrationCheckpoint({
+        source: checkpointUrl(directory, "source"),
+        expectedLabel: "source",
+        expectedProfileName: "review-balanced",
+        expectedFingerprint: currentFingerprint,
+        expectedItems: dataset
+      })
+    );
+    expect(error.code).toBe("LEVELS_CHECKPOINT_MISSING");
+  });
+
+  it("摘要不一致时拒绝复用检查点", () => {
+    const directory = makeDirectoryUrl();
+    const dataset = [item()];
+    const oldFingerprint = fingerprint(dataset);
+    writeCalibrationCheckpoint({
+      target: checkpointUrl(directory, "source"),
+      label: "source",
+      profileName: "review-balanced",
+      fingerprint: oldFingerprint,
+      rows: [row(dataset[0]!)]
+    });
+
+    const changedDataset = [item({ editorial: "修改后的题解" })];
+    const error = captureStateError(() =>
+      loadCalibrationCheckpoint({
+        source: checkpointUrl(directory, "source"),
+        expectedLabel: "source",
+        expectedProfileName: "review-balanced",
+        expectedFingerprint: fingerprint(changedDataset),
+        expectedItems: changedDataset
+      })
+    );
+    expect(error.code).toBe("LEVELS_FINGERPRINT_MISMATCH");
+  });
+
+  it("没有实验校验摘要的旧格式检查点会被拒绝", () => {
+    const directory = makeDirectoryUrl();
+    const dataset = [item()];
+    const target = checkpointUrl(directory, "legacy");
+    writeFileSync(
+      target,
+      JSON.stringify({
+        label: "legacy",
+        profileName: "review-balanced",
+        rows: [row(dataset[0]!)]
+      }),
+      "utf8"
+    );
+    const error = captureStateError(() =>
+      loadCalibrationCheckpoint({
+        source: target,
+        expectedLabel: "legacy",
+        expectedProfileName: "review-balanced",
+        expectedFingerprint: fingerprint(dataset),
+        expectedItems: dataset
+      })
+    );
+    expect(error.code).toBe("LEVELS_CHECKPOINT_INVALID");
+  });
+
+  it("新实验不能覆盖同标签的检查点、快照、报告、汇总或残留临时文件", () => {
+    const artifacts = [
+      ["checkpoint", "raw", "levels-checkpoint-checkpoint.json"],
+      ["snapshot", "raw", "levels-snapshot-2026-07-31T12-34-56-789Z.json"],
+      ["report", "results", "levels-report-report.md"],
+      ["summary", "results", "levels-summary-summary.json"],
+      ["temporary", "results", "levels-temporary-summary.json.tmp-123-abc-def"],
+      ["legacy-temp", "results", "levels-legacy-temp-report.md.tmp"]
+    ] as const;
+    for (const [label, location, fileName] of artifacts) {
+      const rawDirectory = makeDirectoryUrl();
+      const resultsDirectory = makeDirectoryUrl();
+      const targetDirectory =
+        location === "raw" ? rawDirectory : resultsDirectory;
+      writeFileSync(new URL(fileName, targetDirectory), "occupied", "utf8");
+      const error = captureStateError(() =>
+        assertCalibrationLabelUnused({
+          label,
+          rawDirectory,
+          resultsDirectory
+        })
+      );
+      expect(error.code).toBe("LEVELS_LABEL_ALREADY_USED");
+    }
+  });
+
+  it("标签检查使用完整文件名，不把带点标签或更长标签误判成当前标签", () => {
+    const rawDirectory = makeDirectoryUrl();
+    const resultsDirectory = makeDirectoryUrl();
+    writeFileSync(
+      new URL("levels-v1.2-next-summary.json", resultsDirectory),
+      "other label",
+      "utf8"
+    );
+    writeFileSync(new URL("levels-v1.2.lock", rawDirectory), "current lock", "utf8");
+    expect(() =>
+      assertCalibrationLabelUnused({
+        label: "v1.2",
+        rawDirectory,
+        resultsDirectory
+      })
+    ).not.toThrow();
+    writeFileSync(
+      new URL("levels-v1.2-report.md", resultsDirectory),
+      "occupied",
+      "utf8"
+    );
+    expect(
+      captureStateError(() =>
+        assertCalibrationLabelUnused({
+          label: "v1.2",
+          rawDirectory,
+          resultsDirectory
+        })
+      ).code
+    ).toBe("LEVELS_LABEL_ALREADY_USED");
+  });
+
+  it("检查点中的未知题目、重复题目或不同 rating 会被拒绝", () => {
+    const directory = makeDirectoryUrl();
+    const dataset = [item()];
+    const currentFingerprint = fingerprint(dataset);
+    writeCalibrationCheckpoint({
+      target: checkpointUrl(directory, "source"),
+      label: "source",
+      profileName: "review-balanced",
+      fingerprint: currentFingerprint,
+      rows: [row(dataset[0]!, { rating: 1300 })]
+    });
+    const error = captureStateError(() =>
+      loadCalibrationCheckpoint({
+        source: checkpointUrl(directory, "source"),
+        expectedLabel: "source",
+        expectedProfileName: "review-balanced",
+        expectedFingerprint: currentFingerprint,
+        expectedItems: dataset
+      })
+    );
+    expect(error.code).toBe("LEVELS_CHECKPOINT_INVALID");
+  });
+});
+
+describe("完整性、原子写和同标签互斥", () => {
+  it("缺少任一低、中、高分段时 complete 为 false", () => {
+    const result = assessCalibrationCompleteness(
+      [{ rating: 1000 }, { rating: 1800 }],
+      2
+    );
+    expect(result).toEqual({
+      allProblemsCompleted: true,
+      allBandsPresent: false,
+      missingBands: ["高"],
+      complete: false
+    });
+  });
+
+  it("只有题目全部完成且三个分段都有样本时才完整", () => {
+    expect(
+      assessCalibrationCompleteness(
+        [{ rating: 1000 }, { rating: 1800 }, { rating: 2400 }],
+        3
+      )
+    ).toEqual({
+      allProblemsCompleted: true,
+      allBandsPresent: true,
+      missingBands: [],
+      complete: true
+    });
+  });
+
+  it("原子写可以覆盖目标且不会留下固定或随机临时文件", () => {
+    const directory = makeDirectoryUrl();
+    const target = new URL("summary.json", directory);
+    writeJsonAtomically(target, { version: 1 });
+    writeJsonAtomically(target, { version: 2 });
+    expect(JSON.parse(readFileSync(target, "utf8"))).toEqual({ version: 2 });
+    expect(readdirSync(directory).filter((name) => name.includes(".tmp-"))).toEqual([]);
+  });
+
+  it("同一标签只能由一个进程持有运行锁", () => {
+    const directory = makeDirectoryUrl();
+    const first = acquireLevelsLabelLock(directory, "same-label");
+    const lockFile = new URL("levels-same-label.lock", directory);
+    const firstMarker = readFileSync(lockFile, "utf8");
+    try {
+      expect(
+        captureStateError(() => acquireLevelsLabelLock(directory, "same-label")).code
+      ).toBe("LEVELS_LABEL_LOCKED");
+    } finally {
+      expect(first.release()).toBe(true);
+    }
+    const second = acquireLevelsLabelLock(directory, "same-label");
+    const secondMarker = readFileSync(lockFile, "utf8");
+    expect(secondMarker).not.toBe(firstMarker);
+    expect(second.release()).toBe(true);
+  });
+
+  it("旧任务不会删除已被替换的新锁，重复 release 也保持失败结果", () => {
+    const directory = makeDirectoryUrl();
+    const lock = acquireLevelsLabelLock(directory, "replaced");
+    const lockFile = new URL("levels-replaced.lock", directory);
+    unlinkSync(lockFile);
+    writeFileSync(lockFile, "another-process:new-random-owner\n", "utf8");
+    expect(lock.release()).toBe(false);
+    expect(lock.release()).toBe(false);
+    expect(readFileSync(lockFile, "utf8")).toBe(
+      "another-process:new-random-owner\n"
+    );
+  });
+});

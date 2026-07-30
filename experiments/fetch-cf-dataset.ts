@@ -20,7 +20,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { z } from "zod";
 import { CodeforcesClient, type CodeforcesCredentials } from "../src/codeforces";
-import { logError, logInfo, logWarn } from "../src/logger";
+import { describeError, logError, logInfo, logWarn } from "../src/logger";
 
 const RATING_MIN = 800;
 const RATING_MAX = 3500;
@@ -143,10 +143,6 @@ async function main(): Promise<void> {
   }
 
   logInfo("抓取完成", { fetched, failed, outputDir: OUTPUT_DIR.pathname });
-}
-
-function describeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 main().catch((error: unknown) => {

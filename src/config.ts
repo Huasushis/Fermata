@@ -12,6 +12,8 @@ import { z } from "zod";
 import { parseYamlLite } from "./yaml-lite";
 
 export class ConfigError extends Error {
+  public readonly code = "CONFIG_INVALID";
+
   public constructor(message: string) {
     super(message);
     this.name = "ConfigError";

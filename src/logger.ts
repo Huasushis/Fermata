@@ -11,6 +11,32 @@ import { timingSafeEqual as nodeTimingSafeEqual } from "node:crypto";
 
 export type LogFields = Readonly<Record<string, string | number | boolean | null | undefined>>;
 
+const allowedErrorCodes = new Set([
+  "CONFIG_INVALID",
+  "LLM_HTTP_ERROR",
+  "LLM_REQUEST_FAILED",
+  "LLM_RESPONSE_BODY_TOO_LARGE",
+  "LLM_RESPONSE_FORMAT_INVALID",
+  "LLM_JSON_OUTPUT_INVALID",
+  "LEVELS_DATA_DIRECTORY_UNREADABLE",
+  "LEVELS_DATA_READ_FAILED",
+  "LEVELS_DATASET_EMPTY",
+  "LEVELS_DATA_PRECHECK_FAILED",
+  "LEVELS_FINGERPRINT_BUILD_FAILED",
+  "LEVELS_PIPELINE_SOURCE_READ_FAILED",
+  "LEVELS_CHECKPOINT_MISSING",
+  "LEVELS_CHECKPOINT_READ_FAILED",
+  "LEVELS_CHECKPOINT_INVALID",
+  "LEVELS_CHECKPOINT_METADATA_MISMATCH",
+  "LEVELS_FINGERPRINT_MISMATCH",
+  "LEVELS_LABEL_ALREADY_USED",
+  "LEVELS_LABEL_CHECK_FAILED",
+  "LEVELS_OUTPUT_DIRECTORY_FAILED",
+  "LEVELS_ATOMIC_WRITE_FAILED",
+  "LEVELS_LABEL_LOCKED",
+  "LEVELS_LOCK_FAILED"
+]);
+
 function write(stream: NodeJS.WriteStream, level: string, message: string, fields?: LogFields): void {
   const timestamp = new Date().toISOString();
   const suffix = fields === undefined ? "" : " " + formatFields(fields);
@@ -33,8 +59,9 @@ export function logWarn(message: string, fields?: LogFields): void {
 }
 
 export function logError(message: string, error?: unknown, fields?: LogFields): void {
-  const errorFields: LogFields = error === undefined ? {} : { error: describeError(error) };
-  write(process.stderr, "ERROR", message, { ...errorFields, ...fields });
+  const errorFields: LogFields =
+    error === undefined ? {} : { errorCode: describeError(error) };
+  write(process.stderr, "ERROR", message, { ...fields, ...errorFields });
 }
 
 /**
@@ -46,15 +73,26 @@ export function describeText(text: string): { length: number } {
 }
 
 /**
- * 把 Error 转成安全的字符串：只取 name + message，不取 stack（stack 有时会
- * 意外包含请求参数），调用方如果需要 stack 用于内部排查，应自己决定是否打印，
- * 本函数的默认行为偏保守。
+ * 把未知错误转成固定错误码。Error.message 可能来自模型服务、损坏的 JSON 或
+ * 文件系统，其中可能夹带题面、题解、模型输出或路径，因此日志一律不记录 message。
  */
 export function describeError(error: unknown): string {
-  if (error instanceof Error) {
-    return `${error.name}: ${error.message}`;
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = (error as { readonly code?: unknown }).code;
+    if (typeof code === "string" && allowedErrorCodes.has(code)) {
+      return code;
+    }
   }
-  return String(error);
+  if (error instanceof SyntaxError) {
+    return "PARSE_ERROR";
+  }
+  if (error instanceof Error && error.name === "ZodError") {
+    return "VALIDATION_ERROR";
+  }
+  if (error instanceof Error && error.name === "AbortError") {
+    return "REQUEST_ABORTED";
+  }
+  return "UNEXPECTED_ERROR";
 }
 
 /**

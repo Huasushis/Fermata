@@ -120,7 +120,9 @@ DATA_SUBDIR=levels ANCHOR_COUNT=8 node scripts/run-with-env.mjs "$FERMATA_ENV_FI
 EVAL_CONCURRENCY=6 node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:eval-difficulty -- --label=calibrated
 
 # 4. 思维/代码难度标定：检验 rating 越高等级是否单调上升。
-# 中断后用相同 label 加 --resume，只补跑没有完成的题。
+# 首次运行不加 --resume。
+EVAL_CONCURRENCY=2 node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:calibrate-levels -- --label=v1
+# 中断后保持原参数不变，并用相同 label 加 --resume，只补跑没有完成的题。
 EVAL_CONCURRENCY=2 node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:calibrate-levels -- --label=v1 --resume
 
 # 5. 综合评审判定：正常题不误拦 + 构造原题触发强制不通过
@@ -131,11 +133,44 @@ node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:eval-verdic
 shell 的 `source` 或 `.`。
 
 思维和代码难度标定中的深度推理可能明显超过 90 秒。正式服务和该实验现在默认允许单次请求等待
-600 秒，避免请求方过早断开后让模型服务记录 `499`。实验可用 `LEVELS_LLM_TIMEOUT_MS` 单独覆盖
-等待时间，用 `LEVELS_LLM_MAX_ATTEMPTS` 调整总尝试次数；两者都只接受有范围限制的整数。脚本会在
-每题完成后把不含题面原文的中间结果写入 `experiments/results/raw/`，以相同 `--label` 加
-`--resume` 时会复用这些结果，不会重复调用已经完成的题。需要保留旧的公开报告时，请换一个新
-`--label`，再用 `--resume-from=<旧标签>` 复用旧标签下已经完成的题；这样旧报告不会被覆盖。
+600 秒，等待范围覆盖响应头和完整响应正文，避免请求方过早断开后让模型服务记录 `499`。实验可用
+`LEVELS_LLM_TIMEOUT_MS` 单独覆盖等待时间，用 `LEVELS_LLM_MAX_ATTEMPTS` 调整总尝试次数；两者都
+只接受有范围限制的整数。`EVAL_CONCURRENCY` 决定同时处理几道题，只接受 1 到 32 的整数。模型
+响应正文按 UTF-8 原始字节计算，固定最多读取 4 MiB（约 4 MB）；超过后立即停止读取，并且错误和
+日志都不会包含响应正文。
+
+脚本会在发出任何模型请求前检查标定集里的全部 JSON 文件。损坏的 JSON、缺少必需字段、空题解、
+不符合 Codeforces 题号格式的 index（如小写 `a`、`AA` 或含空白的值）、非正数比赛编号或
+rating（官方难度分）、
+重复题号和空目录都会让整次实验立即失败，不会先跳过这些文件再把较小的数据集误写成“完整”。
+标定集还必须同时包含低、中、高三个 rating 段；缺任一段时会在付费模型调用前直接失败，不生成
+可用于调整算法的报告。实验结束时仍会再次检查题数和三个分段，不能用不完整结果调整提示词、
+工作流或数值映射。
+
+每题完成后，脚本会把不含题面原文的进度保存到唯一的
+`experiments/results/raw/levels-<标签>-checkpoint.json`。以相同 `--label` 加 `--resume`
+时只读取这一个检查点，不扫描或合并同标签的其它历史快照；检查点不存在或损坏会明确失败。
+需要保留旧的公开报告时，可以换一个新 `--label`，再用 `--resume-from=<旧标签>` 读取旧标签的
+唯一检查点。
+
+标签一旦已有检查点、带时间的原始快照、汇总、报告或写到一半的临时文件，就不能再作为新实验的
+标签；请使用 `--resume` 续跑同一标签，或者换一个新标签重新开始。使用 `--resume-from=<旧标签>`
+时，参数里填写的是读取来源，当前 `--label` 必须是尚未使用的新标签，两者不能相同。这样既不会
+覆盖旧报告，也能保留调整前后的两份报告做对比。
+
+检查点带有“实验校验摘要”：它把完整标定集内容、实际模型档位配置、思维/代码流水线源文件以及
+辅助代码、分段标准、实际模型服务地址、等待时间、重试设置和同时处理题数压成校验值，用来确认
+续跑前后是否完全一致。题面、题解、rating、模型配置、提示词、数值映射代码或这些运行参数有任何
+变化，续跑都会被拒绝；这时必须使用新标签从头运行，不能把不同实验的结果拼在一起。汇总和报告
+会列出这些不含密钥的运行参数；服务地址只显示“地址校验值”，也就是用来比较两次地址是否相同的
+短字符串，不会写出完整地址、私有路径、查询参数或 API key。旧格式检查点没有这些校验值，也会被拒绝。
+修改提示词、权重、映射或运行参数后的对比实验必须使用新标签从头运行，不能加 `--resume-from`；
+这个参数只用于数据、代码、模型和运行参数完全相同、但需要把旧检查点复制到新标签继续保存的情况。
+相同标签同时只能运行一个进程；锁文件带有每次随机生成的所有权标记，旧进程不会删除后来进程的
+锁。如果进程异常终止留下 `.lock` 文件，应先确认服务器上没有对应标定进程，再人工移除该锁文件。
+
+检查点和报告都会先写入随机命名的临时文件，写完后一次替换目标文件，避免中途终止留下半份
+JSON；日志只记录固定错误码、题号和汇总数字，不记录服务商错误原文、题面、题解或模型原始输出。
 
 产出的 `experiments/results/*.json` 和 `*.md` 是不含题面原文的汇总统计，会
 入库；`experiments/data/` 和 `experiments/results/raw/` 里含有较完整的题面/

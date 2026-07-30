@@ -25,6 +25,9 @@ experiments/results/raw/*
 
 # 汇总报告（不含题面全文）允许入库，因此不要在这里排除 experiments/results/*.md
 # 或 experiments/results/*-summary.json —— 具体规则见 AGENTS.md。
+# 原子写入中途产生的随机临时文件不能入库；正常结束时也会自动清理。
+experiments/results/*.tmp-*
+experiments/results/*.tmp
 
 # 日志与系统文件
 *.log

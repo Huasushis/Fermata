@@ -8,21 +8,37 @@ export async function mapWithConcurrency<TInput, TOutput>(
   concurrency: number,
   worker: (item: TInput, index: number) => Promise<TOutput>
 ): Promise<TOutput[]> {
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 32) {
+    throw new RangeError("同时处理任务数必须是 1 到 32 之间的整数。");
+  }
   const results = new Array<TOutput>(items.length);
   const limit = Math.max(1, Math.min(concurrency, items.length || 1));
   let cursor = 0;
+  let stopped = false;
+  let firstError: unknown;
 
   async function run(): Promise<void> {
-    while (true) {
+    while (!stopped) {
       const index = cursor;
       cursor += 1;
       if (index >= items.length) {
         return;
       }
-      results[index] = await worker(items[index]!, index);
+      try {
+        results[index] = await worker(items[index]!, index);
+      } catch (error) {
+        if (!stopped) {
+          stopped = true;
+          firstError = error;
+        }
+        return;
+      }
     }
   }
 
-  await Promise.all(Array.from({ length: limit }, () => run()));
+  await Promise.allSettled(Array.from({ length: limit }, () => run()));
+  if (stopped) {
+    throw firstError;
+  }
   return results;
 }

@@ -59,7 +59,7 @@ function loadDataset(): DatasetItem[] {
         items.push(parsed);
       }
     } catch (error) {
-      logWarn("跳过无法解析的数据文件", { fileName, reason: String(error).slice(0, 120) });
+      logError("跳过无法解析的数据文件", error);
     }
   }
   return items.sort((left, right) => left.rating - right.rating);
@@ -168,7 +168,11 @@ async function main(): Promise<void> {
 
   const concurrency = Number.parseInt(process.env.EVAL_CONCURRENCY ?? "4", 10);
   const results: CaseResult[] = [];
-  const runCase = async (item: DatasetItem, caseKind: CaseResult["caseKind"]): Promise<void> => {
+  const runCase = async (
+    item: DatasetItem,
+    caseKind: CaseResult["caseKind"],
+    caseNumber: number
+  ): Promise<void> => {
     const problem = toProblem(item);
     const reviewItems = caseKind === "fabricated_duplicate" ? [fabricatedSimilarityItem(problem)] : [];
     try {
@@ -214,19 +218,21 @@ async function main(): Promise<void> {
       });
       logInfo("完成一例", {
         caseKind,
-        problem: problem.title,
+        caseNumber,
         verdict: output.review.verdict,
         forcedDuplicateReject: output.forcedDuplicateReject,
         expectationMet
       });
     } catch (error) {
-      logError("这一例判定失败，跳过", error, { caseKind, problem: problem.title });
+      logError("这一例判定失败，跳过", error, { caseKind, caseNumber });
     }
   };
 
-  await mapWithConcurrency(normalCases, concurrency, (item) => runCase(item, "normal"));
-  await mapWithConcurrency(duplicateCases, concurrency, (item) =>
-    runCase(item, "fabricated_duplicate")
+  await mapWithConcurrency(normalCases, concurrency, (item, index) =>
+    runCase(item, "normal", index + 1)
+  );
+  await mapWithConcurrency(duplicateCases, concurrency, (item, index) =>
+    runCase(item, "fabricated_duplicate", index + 1)
   );
 
   const byKind = (kind: CaseResult["caseKind"]) => results.filter((row) => row.caseKind === kind);

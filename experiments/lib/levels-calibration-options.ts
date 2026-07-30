@@ -1,10 +1,12 @@
 export const defaultLevelsRequestTimeoutMs = 600_000;
+export const defaultLevelsConcurrency = 4;
 
 export interface LevelsCalibrationOptions {
   readonly label: string;
   readonly resumeFromLabel: string | null;
   readonly requestTimeoutMs: number;
   readonly maxAttempts: number;
+  readonly concurrency: number;
 }
 
 interface ResolveLevelsCalibrationOptionsInput {
@@ -41,6 +43,9 @@ export function resolveLevelsCalibrationOptions(
   ) {
     throw new Error("--resume-from 只能填写已有报告的安全标签。");
   }
+  if (resumeFromArgument === rawLabel) {
+    throw new Error("--resume-from 不能和 --label 相同；续跑当前标签请使用 --resume。");
+  }
 
   return {
     label: rawLabel,
@@ -58,6 +63,13 @@ export function resolveLevelsCalibrationOptions(
       1,
       10,
       "LEVELS_LLM_MAX_ATTEMPTS"
+    ),
+    concurrency: parseBoundedInteger(
+      input.env.EVAL_CONCURRENCY,
+      defaultLevelsConcurrency,
+      1,
+      32,
+      "EVAL_CONCURRENCY"
     )
   };
 }

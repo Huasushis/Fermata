@@ -69,7 +69,7 @@ function loadDataset(): Array<z.infer<typeof datasetItemSchema>> {
       const raw = JSON.parse(readFileSync(new URL(fileName, DATA_DIR), "utf8")) as unknown;
       items.push(datasetItemSchema.parse(raw));
     } catch (error) {
-      logError("跳过一个无法解析的数据集文件", error, { fileName });
+      logError("跳过一个无法解析的数据集文件", error);
     }
   }
   return items;

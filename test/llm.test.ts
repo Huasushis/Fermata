@@ -5,8 +5,11 @@ import {
   chatCompleteJson,
   LlmJsonOutputError,
   LlmRequestError,
-  LlmResponseFormatError
+  LlmResponseBodyTooLargeError,
+  LlmResponseFormatError,
+  maximumLlmResponseBodyBytes
 } from "../src/llm";
+import { logError } from "../src/logger";
 
 const provider = { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" };
 const spec = { model: "test-model", temperature: 0.2, thinking: false };
@@ -59,6 +62,106 @@ describe("chatComplete：正常路径", () => {
   });
 });
 
+describe("chatComplete：响应正文大小限制", () => {
+  it("UTF-8 多字节字符跨数据块时仍能正确解析", async () => {
+    const encoded = new TextEncoder().encode(
+      JSON.stringify({
+        choices: [{ message: { content: "分块中文回答" } }]
+      })
+    );
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const byte of encoded) {
+          controller.enqueue(Uint8Array.of(byte));
+        }
+        controller.close();
+      }
+    });
+    const fetchMock = vi.fn(async () => new Response(body, { status: 200 }));
+    await expect(
+      chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock })
+    ).resolves.toMatchObject({ content: "分块中文回答" });
+  });
+
+  it("正文恰好等于固定字节上限时允许读取", async () => {
+    const prefix = '{"choices":[{"message":{"content":"';
+    const suffix = '"}}]}';
+    const fixedBytes = new TextEncoder().encode(prefix + suffix).byteLength;
+    const content = "a".repeat(maximumLlmResponseBodyBytes - fixedBytes);
+    const responseBody = prefix + content + suffix;
+    expect(new TextEncoder().encode(responseBody).byteLength).toBe(
+      maximumLlmResponseBodyBytes
+    );
+    const fetchMock = vi.fn(async () => new Response(responseBody, { status: 200 }));
+    const result = await chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    });
+    expect(result.content.length).toBe(content.length);
+  });
+
+  it("按 UTF-8 字节拒绝超限正文，取消流且不重试或泄露内容", async () => {
+    const sensitiveBody = "不应进入异常或日志的正文";
+    const sensitiveCancelError = "不应进入异常或日志的取消错误";
+    const oversizedText =
+      sensitiveBody +
+      "题".repeat(Math.floor(maximumLlmResponseBodyBytes / 3) + 1);
+    expect(oversizedText.length).toBeLessThan(maximumLlmResponseBodyBytes);
+    const oversizedBytes = new TextEncoder().encode(oversizedText);
+    expect(oversizedBytes.byteLength).toBeGreaterThan(maximumLlmResponseBodyBytes);
+    const splitAt = Math.floor(oversizedBytes.byteLength / 2);
+    const firstChunk = oversizedBytes.slice(0, splitAt);
+    const secondChunk = oversizedBytes.slice(splitAt);
+    expect(firstChunk.byteLength).toBeLessThan(maximumLlmResponseBodyBytes);
+    expect(secondChunk.byteLength).toBeLessThan(maximumLlmResponseBodyBytes);
+
+    let cancelled = false;
+    let requestSignal: AbortSignal | undefined;
+    const fetchMock = vi.fn(
+      async (_url: string | URL | Request, init?: RequestInit) => {
+        requestSignal = init?.signal ?? undefined;
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(firstChunk);
+            controller.enqueue(secondChunk);
+          },
+          cancel() {
+            cancelled = true;
+            return Promise.reject(new Error(sensitiveCancelError));
+          }
+        });
+        return new Response(body, {
+          status: 503,
+          headers: { "Content-Length": "1" }
+        });
+      }
+    );
+    const error = await chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(LlmResponseBodyTooLargeError);
+    expect(error).toMatchObject({ code: "LLM_RESPONSE_BODY_TOO_LARGE" });
+    expect((error as Error).message).not.toContain(sensitiveBody);
+    expect((error as Error).message).not.toContain(sensitiveCancelError);
+    expect(cancelled).toBe(true);
+    expect(requestSignal?.aborted).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const write = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      logError("模型响应过大", error);
+      const output = write.mock.calls.map(([value]) => String(value)).join("");
+      expect(output).toContain('errorCode="LLM_RESPONSE_BODY_TOO_LARGE"');
+      expect(output).not.toContain(sensitiveBody);
+      expect(output).not.toContain(sensitiveCancelError);
+    } finally {
+      write.mockRestore();
+    }
+  });
+});
+
 describe("chatComplete：429/5xx 指数退避重试", () => {
   it("在 maxAttempts 次内成功就返回结果，且确实按顺序重试了", async () => {
     let calls = 0;
@@ -87,10 +190,21 @@ describe("chatComplete：429/5xx 指数退避重试", () => {
   });
 
   it("非 429/5xx 的错误状态码（比如 400）不重试，直接失败", async () => {
-    const fetchMock = vi.fn(async () => new Response("bad request", { status: 400 }));
-    await expect(chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock })).rejects.toBeInstanceOf(
-      LlmRequestError
+    const sensitiveProviderMessage = "不应进入异常的题面或模型原文";
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ error: { message: sensitiveProviderMessage } }),
+          { status: 400 }
+        )
     );
+    const error = await chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(LlmRequestError);
+    expect(error).toMatchObject({ code: "LLM_HTTP_ERROR", status: 400 });
+    expect((error as Error).message).not.toContain(sensitiveProviderMessage);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -106,6 +220,62 @@ describe("chatComplete：429/5xx 指数退避重试", () => {
     const result = await chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock });
     expect(result.content).toBe("恢复了");
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("重试耗尽时不把底层网络错误原文放进异常", async () => {
+    const sensitiveNetworkMessage = "不应进入日志的外部错误正文";
+    const fetchMock = vi.fn(async () => {
+      throw new Error(sensitiveNetworkMessage);
+    });
+    const error = await chatComplete(provider, spec, [], {
+      timeoutMs: 5_000,
+      maxAttempts: 1,
+      baseDelayMs: 1,
+      fetch: fetchMock
+    }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "LLM_REQUEST_FAILED" });
+    expect((error as Error).message).not.toContain(sensitiveNetworkMessage);
+  });
+
+  it("等待时间覆盖响应正文读取，而不只覆盖响应头", async () => {
+    vi.useFakeTimers();
+    try {
+      const sensitiveBodyError = "不应进入日志的响应正文片段";
+      const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        let streamController!: ReadableStreamDefaultController<Uint8Array>;
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            streamController = controller;
+          }
+        });
+        init?.signal?.addEventListener(
+          "abort",
+          () => {
+            streamController.error(new DOMException(sensitiveBodyError, "AbortError"));
+          },
+          { once: true }
+        );
+        return new Response(body, {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      });
+      const resultPromise = chatComplete(provider, spec, [], {
+        timeoutMs: 1_000,
+        maxAttempts: 1,
+        baseDelayMs: 1,
+        fetch: fetchMock
+      });
+      const rejection = expect(resultPromise).rejects.toMatchObject({
+        code: "LLM_REQUEST_FAILED"
+      });
+      await vi.advanceTimersByTimeAsync(1_001);
+      await rejection;
+      const error = await resultPromise.catch((caught: unknown) => caught);
+      expect((error as Error).message).not.toContain(sensitiveBodyError);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -161,9 +331,12 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
 
   it("两次都不合法时抛出 LlmJsonOutputError", async () => {
     const fetchMock = vi.fn(async () => completionResponse("完全不是 JSON"));
-    await expect(
-      chatCompleteJson(provider, spec, [], resultSchema, { ...runtime, fetch: fetchMock })
-    ).rejects.toBeInstanceOf(LlmJsonOutputError);
+    const error = await chatCompleteJson(provider, spec, [], resultSchema, {
+      ...runtime,
+      fetch: fetchMock
+    }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(LlmJsonOutputError);
+    expect((error as Error).message).not.toContain("完全不是 JSON");
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 

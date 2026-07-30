@@ -48,29 +48,55 @@ export interface LlmRuntimeOptions {
   readonly fetch?: FetchLike;
 }
 
+/** 模型响应正文的固定上限，按 UTF-8 原始字节计算。 */
+export const maximumLlmResponseBodyBytes = 4 * 1024 * 1024;
+
 /** 发出请求但没能拿到成功响应：网络错误、超时、或者重试耗尽后仍然是错误状态码。 */
 export class LlmRequestError extends Error {
+  public readonly code: "LLM_HTTP_ERROR" | "LLM_REQUEST_FAILED";
   public readonly status: number | undefined;
 
-  public constructor(message: string, status?: number) {
-    super(message);
+  public constructor(
+    code: "LLM_HTTP_ERROR" | "LLM_REQUEST_FAILED",
+    status?: number
+  ) {
+    super(
+      code === "LLM_HTTP_ERROR"
+        ? "模型服务返回了错误状态。"
+        : "模型服务请求未能完成。"
+    );
     this.name = "LlmRequestError";
+    this.code = code;
     this.status = status;
+  }
+}
+
+/** 响应正文超过固定上限。异常只带固定说明，不保留任何正文片段。 */
+export class LlmResponseBodyTooLargeError extends Error {
+  public readonly code = "LLM_RESPONSE_BODY_TOO_LARGE";
+
+  public constructor() {
+    super("模型服务响应正文超过大小限制。");
+    this.name = "LlmResponseBodyTooLargeError";
   }
 }
 
 /** 拿到了 2xx 响应，但结构不符合 OpenAI 兼容格式的基本假设（choices/message/content）。 */
 export class LlmResponseFormatError extends Error {
-  public constructor(message: string) {
-    super(message);
+  public readonly code = "LLM_RESPONSE_FORMAT_INVALID";
+
+  public constructor() {
+    super("模型服务响应格式不正确。");
     this.name = "LlmResponseFormatError";
   }
 }
 
 /** 请求 JSON 结构化输出，模型给了内容，但两次尝试后仍然不是满足 schema 的 JSON。 */
 export class LlmJsonOutputError extends Error {
-  public constructor(message: string) {
-    super(message);
+  public readonly code = "LLM_JSON_OUTPUT_INVALID";
+
+  public constructor() {
+    super("模型两次输出都不符合要求。");
     this.name = "LlmJsonOutputError";
   }
 }
@@ -108,14 +134,12 @@ export async function chatComplete(
     runtime
   );
 
-  const raw = await parseJsonBodyLeniently(response);
-
   if (!response.ok) {
-    const message = extractProviderErrorMessage(raw) ?? `模型服务返回状态码 ${response.status}`;
-    throw new LlmRequestError(message, response.status);
+    // 服务商的 error.message 可能回显请求内容，不能放进异常或日志。
+    throw new LlmRequestError("LLM_HTTP_ERROR", response.status);
   }
 
-  return extractChatCompletion(raw);
+  return extractChatCompletion(response.raw);
 }
 
 /**
@@ -167,9 +191,7 @@ export async function chatCompleteJson<T>(
     return { data: secondAttempt.data, reasoning: second.reasoning ?? first.reasoning };
   }
 
-  throw new LlmJsonOutputError(
-    `模型两次输出都不满足 schema。第一次：${firstAttempt.error}；重试一次后：${secondAttempt.error}`
-  );
+  throw new LlmJsonOutputError();
 }
 
 // ---------------------------------------------------------------------------
@@ -186,8 +208,8 @@ function tryParseAndValidate<T>(content: string, schema: z.ZodType<T>): ParseRes
   let raw: unknown;
   try {
     raw = JSON.parse(extracted);
-  } catch (error) {
-    return { success: false, error: `JSON.parse 失败：${describeErrorMessage(error)}` };
+  } catch {
+    return { success: false, error: "JSON 解析失败" };
   }
   const parsed = schema.safeParse(raw);
   if (!parsed.success) {
@@ -220,20 +242,26 @@ async function requestWithRetry(
   url: URL,
   init: RequestInit,
   runtime: LlmRuntimeOptions
-): Promise<Response> {
+): Promise<{ readonly ok: boolean; readonly status: number; readonly raw: unknown }> {
   let attempt = 1;
   for (;;) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), runtime.timeoutMs);
     try {
       const response = await fetchImpl(url, { ...init, signal: controller.signal });
+      // 必须在清除计时器前读完正文。fetch 在只收到响应头时就可能返回；如果在
+      // 这里之前清除计时器，卡住的响应正文会绕过 timeoutMs 永久等待。
+      const raw = await parseJsonBodyLeniently(response, controller);
       const isRetryableStatus = response.status === 429 || response.status >= 500;
       if (!isRetryableStatus || attempt >= runtime.maxAttempts) {
-        return response;
+        return { ok: response.ok, status: response.status, raw };
       }
     } catch (error) {
+      if (error instanceof LlmResponseBodyTooLargeError) {
+        throw error;
+      }
       if (attempt >= runtime.maxAttempts) {
-        throw new LlmRequestError(`请求模型服务失败（已尝试 ${attempt} 次）：${describeErrorMessage(error)}`);
+        throw new LlmRequestError("LLM_REQUEST_FAILED");
       }
     } finally {
       clearTimeout(timeout);
@@ -253,8 +281,11 @@ function delay(ms: number): Promise<void> {
   });
 }
 
-async function parseJsonBodyLeniently(response: Response): Promise<unknown> {
-  const text = await response.text();
+async function parseJsonBodyLeniently(
+  response: Response,
+  requestController: AbortController
+): Promise<unknown> {
+  const text = await readResponseTextWithLimit(response, requestController);
   if (text.length === 0) {
     return undefined;
   }
@@ -265,50 +296,78 @@ async function parseJsonBodyLeniently(response: Response): Promise<unknown> {
   }
 }
 
+async function readResponseTextWithLimit(
+  response: Response,
+  requestController: AbortController
+): Promise<string> {
+  if (response.body === null) {
+    return "";
+  }
+
+  const reader = response.body.getReader();
+  let bytes = new Uint8Array(0);
+  let totalBytes = 0;
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) {
+        return new TextDecoder().decode(bytes.subarray(0, totalBytes));
+      }
+      if (chunk.value.byteLength > maximumLlmResponseBodyBytes - totalBytes) {
+        try {
+          const cancellation = reader.cancel();
+          void cancellation.catch(() => undefined);
+        } catch {
+          // 取消失败不能替换固定异常，也不能把底层错误原文带出去。
+        }
+        requestController.abort();
+        throw new LlmResponseBodyTooLargeError();
+      }
+      const requiredBytes = totalBytes + chunk.value.byteLength;
+      if (requiredBytes > bytes.byteLength) {
+        const nextCapacity = Math.min(
+          maximumLlmResponseBodyBytes,
+          Math.max(requiredBytes, Math.max(64 * 1024, bytes.byteLength * 2))
+        );
+        const expanded = new Uint8Array(nextCapacity);
+        expanded.set(bytes.subarray(0, totalBytes));
+        bytes = expanded;
+      }
+      bytes.set(chunk.value, totalBytes);
+      totalBytes += chunk.value.byteLength;
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // 读取结果或固定错误已经确定，不再用流清理错误覆盖它。
+    }
+  }
+}
+
 function extractChatCompletion(raw: unknown): ChatCompletionResult {
   if (typeof raw !== "object" || raw === null) {
-    throw new LlmResponseFormatError("模型服务响应不是一个 JSON 对象。");
+    throw new LlmResponseFormatError();
   }
   const choices = (raw as Record<string, unknown>).choices;
   if (!Array.isArray(choices) || choices.length === 0) {
-    throw new LlmResponseFormatError("模型服务响应里没有 choices。");
+    throw new LlmResponseFormatError();
   }
   const first: unknown = choices[0];
   if (typeof first !== "object" || first === null) {
-    throw new LlmResponseFormatError("模型服务响应的 choices[0] 不是对象。");
+    throw new LlmResponseFormatError();
   }
   const message = (first as Record<string, unknown>).message;
   if (typeof message !== "object" || message === null) {
-    throw new LlmResponseFormatError("模型服务响应缺少 choices[0].message。");
+    throw new LlmResponseFormatError();
   }
   const content = (message as Record<string, unknown>).content;
   if (typeof content !== "string") {
-    throw new LlmResponseFormatError("模型服务响应的 message.content 不是字符串。");
+    throw new LlmResponseFormatError();
   }
   const reasoningRaw = (message as Record<string, unknown>).reasoning_content;
   const reasoning = typeof reasoningRaw === "string" ? reasoningRaw : null;
   return { content, reasoning };
-}
-
-function extractProviderErrorMessage(raw: unknown): string | undefined {
-  if (typeof raw !== "object" || raw === null || !("error" in raw)) {
-    return undefined;
-  }
-  const errorValue = (raw as { error: unknown }).error;
-  if (typeof errorValue === "string") {
-    return errorValue;
-  }
-  if (typeof errorValue === "object" && errorValue !== null) {
-    const message = (errorValue as Record<string, unknown>).message;
-    if (typeof message === "string") {
-      return message;
-    }
-  }
-  return undefined;
-}
-
-function describeErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function ensureTrailingSlash(value: string): string {
