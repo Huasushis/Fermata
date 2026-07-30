@@ -11,6 +11,10 @@ import { sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  DATA_STRUCTURE_SIGNATURES,
+  mapCodingSignalsToLevel
+} from "../src/pipelines/coding";
+import {
   LevelsCalibrationStateError,
   acquireLevelsLabelLock,
   assessCalibrationCompleteness,
@@ -19,12 +23,14 @@ import {
   buildLevelsReportRunConfiguration,
   buildLevelsRunConfiguration,
   checkpointUrl,
+  completeCalibrationRows,
   loadCalibrationCheckpoint,
   preflightCalibrationDocuments,
   writeCalibrationCheckpoint,
   writeJsonAtomically,
   type CalibrationDatasetItem,
-  type CalibrationRow
+  type CalibrationFailureCount,
+  type CalibrationProgress
 } from "../experiments/lib/levels-calibration-state";
 
 const temporaryDirectories: string[] = [];
@@ -54,31 +60,37 @@ function item(
   };
 }
 
-function row(
+function progress(
   source: CalibrationDatasetItem,
-  overrides: Partial<CalibrationRow> = {}
-): CalibrationRow {
+  overrides: Partial<CalibrationProgress> = {}
+): CalibrationProgress {
   return {
     contestId: source.contestId,
     index: source.index,
     rating: source.rating,
-    thinkingLevel: 2,
-    thinkingSignals: {
-      solved: true,
-      approachSimilarity: 0.8,
-      selfCorrections: 0,
-      keyInsightCount: 1
+    thinking: {
+      level: 2,
+      signals: {
+        solved: true,
+        approachSimilarity: 0.8,
+        selfCorrections: 0,
+        keyInsightCount: 1
+      }
     },
-    codingLevel: 2,
-    codingSignals: {
-      effectiveLineCount: 30,
-      maxNestingDepth: 2,
-      detectedDataStructures: [],
-      maxDataStructureWeight: 0
+    coding: {
+      level: 2,
+      signals: {
+        effectiveLineCount: 30,
+        maxNestingDepth: 2,
+        detectedDataStructures: [],
+        maxDataStructureWeight: 0
+      }
     },
     ...overrides
   };
 }
+
+const noFailures: readonly CalibrationFailureCount[] = [];
 
 function fingerprint(
   dataset: readonly CalibrationDatasetItem[],
@@ -294,14 +306,44 @@ describe("实验校验摘要与续跑", () => {
     }
   });
 
-  it("公开运行参数只保留服务名称、地址校验值和数值，不输出完整地址或 API key", () => {
-    const secret = "never-write-this-api-key";
-    const sensitiveBaseUrl =
-      `https://user:password@private.example/internal/gateway?api_key=${secret}`;
+  it("模型服务地址拒绝账号、密码、查询参数和片段", () => {
+    const unsafeAddresses = [
+      "https://user:password@private.example/v1",
+      "https://private.example/v1?api_key=secret",
+      "https://private.example/v1#secret"
+    ];
+    for (const solverBaseUrl of unsafeAddresses) {
+      expect(
+        captureStateError(() =>
+          buildLevelsRunConfiguration({
+            solverBaseUrl,
+            analystBaseUrl: "https://analyst.example/v1/",
+            codingBaseUrl: "https://coding.example/v1/",
+            requestTimeoutMs: 600_000,
+            maxAttempts: 3,
+            baseDelayMs: 1_000,
+            concurrency: 4
+          })
+        ).code
+      ).toBe("LEVELS_FINGERPRINT_BUILD_FAILED");
+      expect(
+        captureStateError(() =>
+          fingerprint(
+            [item()],
+            runConfiguration({
+              providerBaseUrls: { solver: solverBaseUrl }
+            })
+          )
+        ).code
+      ).toBe("LEVELS_FINGERPRINT_BUILD_FAILED");
+    }
+  });
+
+  it("公开运行参数只保留服务名称、地址校验值和数值，不输出完整地址", () => {
     const privateConfiguration = buildLevelsRunConfiguration({
-      solverBaseUrl: sensitiveBaseUrl,
-      analystBaseUrl: sensitiveBaseUrl,
-      codingBaseUrl: sensitiveBaseUrl,
+      solverBaseUrl: "https://solver.private.example/internal/gateway",
+      analystBaseUrl: "https://analyst.private.example/internal/gateway",
+      codingBaseUrl: "https://coding.private.example/internal/gateway",
       requestTimeoutMs: 600_000,
       maxAttempts: 3,
       baseDelayMs: 1_000,
@@ -316,8 +358,6 @@ describe("实验校验摘要与续跑", () => {
       }
     });
     const serialized = JSON.stringify(reportConfiguration);
-    expect(serialized).not.toContain(secret);
-    expect(serialized).not.toContain("password");
     expect(serialized).not.toContain("/internal/gateway");
     expect(serialized).not.toContain("private.example");
     expect(serialized).toContain("aether");
@@ -335,7 +375,8 @@ describe("实验校验摘要与续跑", () => {
       label: "source",
       profileName: "review-balanced",
       fingerprint: currentFingerprint,
-      rows: [row(dataset[0]!)]
+      progress: [progress(dataset[0]!)],
+      failureCounts: noFailures
     });
 
     const error = captureStateError(() =>
@@ -350,6 +391,123 @@ describe("实验校验摘要与续跑", () => {
     expect(error.code).toBe("LEVELS_CHECKPOINT_MISSING");
   });
 
+  it("第 3 版检查点可以只保存思维阶段，并在恢复后继续保留严格信号", () => {
+    const directory = makeDirectoryUrl();
+    const dataset = [item()];
+    const currentFingerprint = fingerprint(dataset);
+    const complete = progress(dataset[0]!);
+    const thinkingOnly: CalibrationProgress = {
+      contestId: complete.contestId,
+      index: complete.index,
+      rating: complete.rating,
+      thinking: complete.thinking
+    };
+    const target = checkpointUrl(directory, "source");
+    writeCalibrationCheckpoint({
+      target,
+      label: "source",
+      profileName: "review-balanced",
+      fingerprint: currentFingerprint,
+      progress: [thinkingOnly],
+      failureCounts: [
+        {
+          stage: "coding",
+          errorCode: "LLM_HTTP_ERROR",
+          status: 499,
+          count: 2
+        }
+      ]
+    });
+
+    const checkpointText = readFileSync(target, "utf8");
+    expect(checkpointText).not.toContain(dataset[0]!.statement);
+    expect(checkpointText).not.toContain(dataset[0]!.editorial);
+    const serialized = JSON.parse(checkpointText) as {
+      readonly schemaVersion: unknown;
+    };
+    expect(serialized.schemaVersion).toBe(3);
+    const restored = loadCalibrationCheckpoint({
+      source: target,
+      expectedLabel: "source",
+      expectedProfileName: "review-balanced",
+      expectedFingerprint: currentFingerprint,
+      expectedItems: dataset
+    });
+    expect(restored).toEqual({
+      progress: [thinkingOnly],
+      failureCounts: [
+        {
+          stage: "coding",
+          errorCode: "LLM_HTTP_ERROR",
+          status: 499,
+          count: 2
+        }
+      ]
+    });
+    expect(completeCalibrationRows(restored.progress)).toEqual([]);
+  });
+
+  it("第 2 版和其它数字版本都明确拒绝续跑，缺失版本仍按格式错误处理", () => {
+    const directory = makeDirectoryUrl();
+    const dataset = [item()];
+    const currentFingerprint = fingerprint(dataset);
+    const target = checkpointUrl(directory, "legacy");
+    const load = () =>
+      loadCalibrationCheckpoint({
+        source: target,
+        expectedLabel: "legacy",
+        expectedProfileName: "review-balanced",
+        expectedFingerprint: currentFingerprint,
+        expectedItems: dataset
+      });
+    for (const schemaVersion of [2, 4]) {
+      writeFileSync(
+        target,
+        JSON.stringify({
+          schemaVersion,
+          label: "legacy",
+          profileName: "review-balanced",
+          fingerprint: currentFingerprint,
+          progress: [],
+          failureCounts: []
+        }),
+        "utf8"
+      );
+      expect(captureStateError(load).code).toBe(
+        "LEVELS_CHECKPOINT_VERSION_UNSUPPORTED"
+      );
+    }
+    writeFileSync(
+      target,
+      JSON.stringify({
+        schemaVersion: "3",
+        label: "legacy",
+        profileName: "review-balanced",
+        fingerprint: currentFingerprint,
+        progress: [],
+        failureCounts: []
+      }),
+      "utf8"
+    );
+    expect(captureStateError(load).code).toBe(
+      "LEVELS_CHECKPOINT_INVALID"
+    );
+    writeFileSync(
+      target,
+      JSON.stringify({
+        label: "legacy",
+        profileName: "review-balanced",
+        fingerprint: currentFingerprint,
+        progress: [],
+        failureCounts: []
+      }),
+      "utf8"
+    );
+    expect(captureStateError(load).code).toBe(
+      "LEVELS_CHECKPOINT_INVALID"
+    );
+  });
+
   it("摘要不一致时拒绝复用检查点", () => {
     const directory = makeDirectoryUrl();
     const dataset = [item()];
@@ -359,7 +517,8 @@ describe("实验校验摘要与续跑", () => {
       label: "source",
       profileName: "review-balanced",
       fingerprint: oldFingerprint,
-      rows: [row(dataset[0]!)]
+      progress: [progress(dataset[0]!)],
+      failureCounts: noFailures
     });
 
     const changedDataset = [item({ editorial: "修改后的题解" })];
@@ -384,7 +543,7 @@ describe("实验校验摘要与续跑", () => {
       JSON.stringify({
         label: "legacy",
         profileName: "review-balanced",
-        rows: [row(dataset[0]!)]
+        rows: []
       }),
       "utf8"
     );
@@ -398,6 +557,244 @@ describe("实验校验摘要与续跑", () => {
       })
     );
     expect(error.code).toBe("LEVELS_CHECKPOINT_INVALID");
+  });
+
+  it("写入前拒绝空进度、脱离思维的代码结果和任何未知信号字段", () => {
+    const directory = makeDirectoryUrl();
+    const dataset = [item()];
+    const currentFingerprint = fingerprint(dataset);
+    const write = (candidate: CalibrationProgress) =>
+      writeCalibrationCheckpoint({
+        target: checkpointUrl(directory, "invalid"),
+        label: "invalid",
+        profileName: "review-balanced",
+        fingerprint: currentFingerprint,
+        progress: [candidate],
+        failureCounts: noFailures
+      });
+    expect(
+      captureStateError(() =>
+        write({
+          contestId: dataset[0]!.contestId,
+          index: dataset[0]!.index,
+          rating: dataset[0]!.rating
+        })
+      ).code
+    ).toBe("LEVELS_CHECKPOINT_INVALID");
+    const complete = progress(dataset[0]!);
+    expect(
+      captureStateError(() =>
+        write({
+          contestId: complete.contestId,
+          index: complete.index,
+          rating: complete.rating,
+          coding: complete.coding
+        })
+      ).code
+    ).toBe("LEVELS_CHECKPOINT_INVALID");
+    expect(
+      captureStateError(() =>
+        write({
+          ...complete,
+          thinking: {
+            ...complete.thinking!,
+            signals: {
+              ...complete.thinking!.signals,
+              leakedText: "不能保存"
+            }
+          }
+        } as unknown as CalibrationProgress)
+      ).code
+    ).toBe("LEVELS_CHECKPOINT_INVALID");
+  });
+
+  it("写入和读取时都拒绝与信号计算结果不一致的等级", () => {
+    const directory = makeDirectoryUrl();
+    const dataset = [item()];
+    const currentFingerprint = fingerprint(dataset);
+    const target = checkpointUrl(directory, "levels");
+    const complete = progress(dataset[0]!);
+    expect(
+      captureStateError(() =>
+        writeCalibrationCheckpoint({
+          target,
+          label: "levels",
+          profileName: "review-balanced",
+          fingerprint: currentFingerprint,
+          progress: [
+            {
+              ...complete,
+              thinking: {
+                ...complete.thinking!,
+                level: 5
+              }
+            }
+          ],
+          failureCounts: noFailures
+        })
+      ).code
+    ).toBe("LEVELS_CHECKPOINT_INVALID");
+    expect(
+      captureStateError(() =>
+        writeCalibrationCheckpoint({
+          target,
+          label: "levels",
+          profileName: "review-balanced",
+          fingerprint: currentFingerprint,
+          progress: [
+            {
+              ...complete,
+              coding: {
+                ...complete.coding!,
+                level: 5
+              }
+            }
+          ],
+          failureCounts: noFailures
+        })
+      ).code
+    ).toBe("LEVELS_CHECKPOINT_INVALID");
+
+    writeCalibrationCheckpoint({
+      target,
+      label: "levels",
+      profileName: "review-balanced",
+      fingerprint: currentFingerprint,
+      progress: [complete],
+      failureCounts: noFailures
+    });
+    const saved = JSON.parse(readFileSync(target, "utf8")) as {
+      progress: Array<{
+        thinking: { level: number };
+      }>;
+    };
+    saved.progress[0]!.thinking.level = 5;
+    writeFileSync(target, JSON.stringify(saved), "utf8");
+    expect(
+      captureStateError(() =>
+        loadCalibrationCheckpoint({
+          source: target,
+          expectedLabel: "levels",
+          expectedProfileName: "review-balanced",
+          expectedFingerprint: currentFingerprint,
+          expectedItems: dataset
+        })
+      ).code
+    ).toBe("LEVELS_CHECKPOINT_INVALID");
+  });
+
+  it("代码信号拒绝未知、重复或与最高权重不一致的数据结构名称", () => {
+    const directory = makeDirectoryUrl();
+    const dataset = [item()];
+    const currentFingerprint = fingerprint(dataset);
+    const writeSignals = (signals: unknown, level = 2) =>
+      writeCalibrationCheckpoint({
+        target: checkpointUrl(directory, "signals"),
+        label: "signals",
+        profileName: "review-balanced",
+        fingerprint: currentFingerprint,
+        progress: [
+          {
+            ...progress(dataset[0]!),
+            coding: { level, signals }
+          } as unknown as CalibrationProgress
+        ],
+        failureCounts: noFailures
+      });
+    const allSignals = {
+      effectiveLineCount: 10,
+      maxNestingDepth: 1,
+      detectedDataStructures: DATA_STRUCTURE_SIGNATURES.map(
+        (signature) => signature.label
+      ),
+      maxDataStructureWeight: Math.max(
+        ...DATA_STRUCTURE_SIGNATURES.map((signature) => signature.weight)
+      )
+    };
+    expect(() =>
+      writeSignals(allSignals, mapCodingSignalsToLevel(allSignals))
+    ).not.toThrow();
+    for (const signature of DATA_STRUCTURE_SIGNATURES) {
+      const signals = {
+        effectiveLineCount: 10,
+        maxNestingDepth: 1,
+        detectedDataStructures: [signature.label],
+        maxDataStructureWeight: signature.weight
+      };
+      expect(() =>
+        writeSignals(signals, mapCodingSignalsToLevel(signals))
+      ).not.toThrow();
+    }
+    for (const signals of [
+      {
+        effectiveLineCount: 10,
+        maxNestingDepth: 1,
+        detectedDataStructures: ["模型返回的任意文字"],
+        maxDataStructureWeight: 0
+      },
+      {
+        effectiveLineCount: 10,
+        maxNestingDepth: 1,
+        detectedDataStructures: ["网络流", "网络流"],
+        maxDataStructureWeight: 2.5
+      },
+      {
+        effectiveLineCount: 10,
+        maxNestingDepth: 1,
+        detectedDataStructures: ["网络流"],
+        maxDataStructureWeight: 1
+      }
+    ]) {
+      expect(captureStateError(() => writeSignals(signals)).code).toBe(
+        "LEVELS_CHECKPOINT_INVALID"
+      );
+    }
+  });
+
+  it("失败统计只接受固定阶段、固定错误码和安全状态码，并拒绝重复项", () => {
+    const directory = makeDirectoryUrl();
+    const dataset = [item()];
+    const currentFingerprint = fingerprint(dataset);
+    const writeFailures = (failureCounts: readonly CalibrationFailureCount[]) =>
+      writeCalibrationCheckpoint({
+        target: checkpointUrl(directory, "failures"),
+        label: "failures",
+        profileName: "review-balanced",
+        fingerprint: currentFingerprint,
+        progress: [],
+        failureCounts
+      });
+    const httpFailure = {
+      stage: "coding",
+      errorCode: "LLM_HTTP_ERROR",
+      status: 429,
+      count: 1
+    } as const;
+    expect(() => writeFailures([httpFailure])).not.toThrow();
+    for (const failureCounts of [
+      [{ ...httpFailure, status: 99 }],
+      [{ ...httpFailure, status: 200 }],
+      [{ ...httpFailure, status: 204 }],
+      [{ ...httpFailure, status: 600 }],
+      [{ ...httpFailure, count: 0 }],
+      [
+        {
+          stage: "thinking",
+          errorCode: "LLM_REQUEST_FAILED",
+          status: 503,
+          count: 1
+        }
+      ],
+      [httpFailure, httpFailure]
+    ]) {
+      expect(
+        captureStateError(() =>
+          writeFailures(
+            failureCounts as readonly CalibrationFailureCount[]
+          )
+        ).code
+      ).toBe("LEVELS_CHECKPOINT_INVALID");
+    }
   });
 
   it("新实验不能覆盖同标签的检查点、快照、报告、汇总或残留临时文件", () => {
@@ -462,23 +859,45 @@ describe("实验校验摘要与续跑", () => {
     const directory = makeDirectoryUrl();
     const dataset = [item()];
     const currentFingerprint = fingerprint(dataset);
+    const target = checkpointUrl(directory, "source");
     writeCalibrationCheckpoint({
-      target: checkpointUrl(directory, "source"),
+      target,
       label: "source",
       profileName: "review-balanced",
       fingerprint: currentFingerprint,
-      rows: [row(dataset[0]!, { rating: 1300 })]
+      progress: [progress(dataset[0]!)],
+      failureCounts: noFailures
     });
-    const error = captureStateError(() =>
-      loadCalibrationCheckpoint({
-        source: checkpointUrl(directory, "source"),
-        expectedLabel: "source",
-        expectedProfileName: "review-balanced",
-        expectedFingerprint: currentFingerprint,
-        expectedItems: dataset
-      })
-    );
-    expect(error.code).toBe("LEVELS_CHECKPOINT_INVALID");
+    const saved = JSON.parse(readFileSync(target, "utf8")) as Record<
+      string,
+      unknown
+    > & {
+      progress: CalibrationProgress[];
+    };
+    const validProgress = saved.progress[0]!;
+    const invalidProgressSets: readonly CalibrationProgress[][] = [
+      [{ ...validProgress, contestId: validProgress.contestId + 1 }],
+      [validProgress, validProgress],
+      [{ ...validProgress, rating: validProgress.rating + 100 }]
+    ];
+    for (const invalidProgress of invalidProgressSets) {
+      writeFileSync(
+        target,
+        JSON.stringify({ ...saved, progress: invalidProgress }),
+        "utf8"
+      );
+      expect(
+        captureStateError(() =>
+          loadCalibrationCheckpoint({
+            source: target,
+            expectedLabel: "source",
+            expectedProfileName: "review-balanced",
+            expectedFingerprint: currentFingerprint,
+            expectedItems: dataset
+          })
+        ).code
+      ).toBe("LEVELS_CHECKPOINT_INVALID");
+    }
   });
 });
 

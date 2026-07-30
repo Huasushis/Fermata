@@ -109,6 +109,20 @@ describe("loadConfig：必需项缺失或格式错误时快速失败", () => {
     expect(() => loadConfig({ env, modelsYamlSource: validYaml })).toThrow(ConfigError);
   });
 
+  it("模型服务地址带查询参数或片段时抛出 ConfigError", () => {
+    for (const AETHER_BASE_URL of [
+      "https://aether.example.test/v1?api_key=secret",
+      "https://aether.example.test/v1#secret"
+    ]) {
+      expect(() =>
+        loadConfig({
+          env: { ...validEnv, AETHER_BASE_URL },
+          modelsYamlSource: validYaml
+        })
+      ).toThrow(ConfigError);
+    }
+  });
+
   it("FERMATA_MANAGEMENT_TOKEN 太短时抛出 ConfigError", () => {
     const env = { ...validEnv, FERMATA_MANAGEMENT_TOKEN: "short" };
     expect(() => loadConfig({ env, modelsYamlSource: validYaml })).toThrow(ConfigError);

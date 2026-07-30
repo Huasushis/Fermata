@@ -19,6 +19,12 @@ describe("安全错误码", () => {
     expect(describeError({ code: "UNTRUSTED_EXTERNAL_CODE", message: "外部原文" })).toBe(
       "UNEXPECTED_ERROR"
     );
+    expect(
+      describeError({
+        code: "LEVELS_CHECKPOINT_VERSION_UNSUPPORTED",
+        message: "旧检查点内容"
+      })
+    ).toBe("LEVELS_CHECKPOINT_VERSION_UNSUPPORTED");
   });
 
   it("把解析、校验和取消请求映射为固定错误码", () => {

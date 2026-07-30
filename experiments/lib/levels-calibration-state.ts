@@ -13,6 +13,11 @@ import {
 } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import {
+  DATA_STRUCTURE_SIGNATURES,
+  mapCodingSignalsToLevel
+} from "../../src/pipelines/coding";
+import { mapThinkingSignalsToLevel } from "../../src/pipelines/thinking";
 
 export const LEVEL_BAND_BOUNDARIES = [1400, 2200] as const;
 export type LevelBand = "低" | "中" | "高";
@@ -21,6 +26,12 @@ const digestSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const codeforcesProblemIndexSchema = z
   .string()
   .regex(/^[A-Z][0-9]{0,7}$/);
+const calibrationLabelSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/);
+const calibrationProfileNameSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/);
 
 export const calibrationDatasetItemSchema = z
   .object({
@@ -43,18 +54,220 @@ const calibrationDatasetCandidateSchema = z
   })
   .strict();
 
+export const calibrationThinkingSignalsSchema = z
+  .object({
+    solved: z.boolean(),
+    approachSimilarity: z.number().finite().min(0).max(1),
+    selfCorrections: z.number().int().nonnegative().max(50),
+    keyInsightCount: z.number().int().nonnegative().max(50)
+  })
+  .strict();
+export type CalibrationThinkingSignals = z.infer<
+  typeof calibrationThinkingSignalsSchema
+>;
+
+const codingSignalWeights = new Map(
+  DATA_STRUCTURE_SIGNATURES.map(
+    (signature) => [signature.label, signature.weight] as const
+  )
+);
+
+export const calibrationCodingSignalsSchema = z
+  .object({
+    effectiveLineCount: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(Number.MAX_SAFE_INTEGER),
+    maxNestingDepth: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(Number.MAX_SAFE_INTEGER),
+    detectedDataStructures: z
+      .array(z.string().trim().min(1).max(100))
+      .max(DATA_STRUCTURE_SIGNATURES.length),
+    maxDataStructureWeight: z.number().finite().nonnegative().max(100)
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (
+      new Set(value.detectedDataStructures).size !==
+      value.detectedDataStructures.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "代码信号中的数据结构名称不能重复。"
+      });
+    }
+    const expectedMaximum = value.detectedDataStructures.reduce(
+      (maximum, label) => {
+        const weight = codingSignalWeights.get(label);
+        if (weight === undefined) {
+          context.addIssue({
+            code: "custom",
+            message: "代码信号中包含未知的数据结构名称。"
+          });
+          return maximum;
+        }
+        return Math.max(maximum, weight);
+      },
+      0
+    );
+    if (value.maxDataStructureWeight !== expectedMaximum) {
+      context.addIssue({
+        code: "custom",
+        message: "代码信号中的最高权重与数据结构列表不一致。"
+      });
+    }
+  });
+export type CalibrationCodingSignals = z.infer<
+  typeof calibrationCodingSignalsSchema
+>;
+
+export const calibrationThinkingResultSchema = z
+  .object({
+    level: z.number().int().min(1).max(5),
+    signals: calibrationThinkingSignalsSchema
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (mapThinkingSignalsToLevel(value.signals) !== value.level) {
+      context.addIssue({
+        code: "custom",
+        message: "思维等级与结构化信号不一致。"
+      });
+    }
+  });
+export type CalibrationThinkingResult = z.infer<
+  typeof calibrationThinkingResultSchema
+>;
+
+export const calibrationCodingResultSchema = z
+  .object({
+    level: z.number().int().min(1).max(5),
+    signals: calibrationCodingSignalsSchema
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (mapCodingSignalsToLevel(value.signals) !== value.level) {
+      context.addIssue({
+        code: "custom",
+        message: "代码等级与结构化信号不一致。"
+      });
+    }
+  });
+export type CalibrationCodingResult = z.infer<
+  typeof calibrationCodingResultSchema
+>;
+
+export const calibrationProgressSchema = z
+  .object({
+    contestId: z.number().int().positive(),
+    index: codeforcesProblemIndexSchema,
+    rating: z.number().int().positive(),
+    thinking: calibrationThinkingResultSchema.optional(),
+    coding: calibrationCodingResultSchema.optional()
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.thinking === undefined && value.coding === undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "检查点只保存至少完成一个阶段的题目。"
+      });
+    }
+    if (value.coding !== undefined && value.thinking === undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "代码阶段结果不能脱离思维阶段结果保存。"
+      });
+    }
+  });
+export type CalibrationProgress = z.infer<typeof calibrationProgressSchema>;
+
 export const calibrationRowSchema = z
   .object({
     contestId: z.number().int().positive(),
     index: codeforcesProblemIndexSchema,
     rating: z.number().int().positive(),
     thinkingLevel: z.number().int().min(1).max(5),
-    thinkingSignals: z.record(z.string(), z.unknown()),
+    thinkingSignals: calibrationThinkingSignalsSchema,
     codingLevel: z.number().int().min(1).max(5),
-    codingSignals: z.record(z.string(), z.unknown())
+    codingSignals: calibrationCodingSignalsSchema
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (mapThinkingSignalsToLevel(value.thinkingSignals) !== value.thinkingLevel) {
+      context.addIssue({
+        code: "custom",
+        message: "思维等级与结构化信号不一致。"
+      });
+    }
+    if (mapCodingSignalsToLevel(value.codingSignals) !== value.codingLevel) {
+      context.addIssue({
+        code: "custom",
+        message: "代码等级与结构化信号不一致。"
+      });
+    }
+  });
 export type CalibrationRow = z.infer<typeof calibrationRowSchema>;
+
+export const calibrationFailureStageSchema = z.enum(["thinking", "coding"]);
+export type CalibrationFailureStage = z.infer<
+  typeof calibrationFailureStageSchema
+>;
+
+export const calibrationFailureCodeSchema = z.enum([
+  "LLM_HTTP_ERROR",
+  "LLM_REQUEST_FAILED",
+  "LLM_RESPONSE_BODY_TOO_LARGE",
+  "LLM_RESPONSE_FORMAT_INVALID",
+  "LLM_JSON_OUTPUT_INVALID",
+  "PARSE_ERROR",
+  "VALIDATION_ERROR",
+  "REQUEST_ABORTED",
+  "UNEXPECTED_ERROR"
+]);
+export type CalibrationFailureCode = z.infer<
+  typeof calibrationFailureCodeSchema
+>;
+
+export const calibrationFailureCountSchema = z
+  .object({
+    stage: calibrationFailureStageSchema,
+    errorCode: calibrationFailureCodeSchema,
+    status: z.number().int().min(100).max(599).nullable(),
+    count: z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (
+      value.errorCode === "LLM_HTTP_ERROR" &&
+      value.status !== null &&
+      value.status >= 200 &&
+      value.status <= 299
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "模型服务的 HTTP 错误不能使用成功状态码。"
+      });
+    }
+    if (value.errorCode !== "LLM_HTTP_ERROR" && value.status !== null) {
+      context.addIssue({
+        code: "custom",
+        message: "只有模型服务的 HTTP 错误可以保存状态码。"
+      });
+    }
+  });
+export type CalibrationFailureCount = z.infer<
+  typeof calibrationFailureCountSchema
+>;
+
+export interface CalibrationCheckpointState {
+  readonly progress: readonly CalibrationProgress[];
+  readonly failureCounts: readonly CalibrationFailureCount[];
+}
 
 export const levelsExperimentFingerprintSchema = z
   .object({
@@ -100,13 +313,14 @@ export interface LevelsReportRunConfiguration {
   readonly concurrency: number;
 }
 
-const savedRowsSchema = z
+const savedCheckpointSchema = z
   .object({
-    schemaVersion: z.literal(2),
-    label: z.string().min(1),
-    profileName: z.string().min(1),
+    schemaVersion: z.literal(3),
+    label: calibrationLabelSchema,
+    profileName: calibrationProfileNameSchema,
     fingerprint: levelsExperimentFingerprintSchema,
-    rows: z.array(calibrationRowSchema)
+    progress: z.array(calibrationProgressSchema),
+    failureCounts: z.array(calibrationFailureCountSchema)
   })
   .strict();
 
@@ -132,6 +346,7 @@ export type LevelsCalibrationStateErrorCode =
   | "LEVELS_CHECKPOINT_MISSING"
   | "LEVELS_CHECKPOINT_READ_FAILED"
   | "LEVELS_CHECKPOINT_INVALID"
+  | "LEVELS_CHECKPOINT_VERSION_UNSUPPORTED"
   | "LEVELS_CHECKPOINT_METADATA_MISMATCH"
   | "LEVELS_FINGERPRINT_MISMATCH"
   | "LEVELS_LABEL_ALREADY_USED"
@@ -151,6 +366,7 @@ const safeErrorMessages: Readonly<Record<LevelsCalibrationStateErrorCode, string
   LEVELS_CHECKPOINT_MISSING: "没有找到指定的标定检查点。",
   LEVELS_CHECKPOINT_READ_FAILED: "无法读取指定的标定检查点。",
   LEVELS_CHECKPOINT_INVALID: "指定的标定检查点格式不正确。",
+  LEVELS_CHECKPOINT_VERSION_UNSUPPORTED: "指定的标定检查点版本不再支持续跑。",
   LEVELS_CHECKPOINT_METADATA_MISMATCH: "指定的标定检查点不属于当前标签或模型档位。",
   LEVELS_FINGERPRINT_MISMATCH: "检查点与当前数据、模型配置、运行参数或代码不一致。",
   LEVELS_LABEL_ALREADY_USED: "当前实验标签已经有结果或中间文件。",
@@ -267,7 +483,7 @@ export function buildLevelsRunConfiguration(input: {
   readonly baseDelayMs: number;
   readonly concurrency: number;
 }): LevelsRunConfiguration {
-  return {
+  const configuration = {
     providerBaseUrls: {
       solver: input.solverBaseUrl,
       analyst: input.analystBaseUrl,
@@ -278,6 +494,8 @@ export function buildLevelsRunConfiguration(input: {
     baseDelayMs: input.baseDelayMs,
     concurrency: input.concurrency
   };
+  assertSafeLevelsRunConfiguration(configuration);
+  return configuration;
 }
 
 export function buildLevelsReportRunConfiguration(input: {
@@ -288,6 +506,7 @@ export function buildLevelsReportRunConfiguration(input: {
     readonly coding: string;
   };
 }): LevelsReportRunConfiguration {
+  assertSafeLevelsRunConfiguration(input.runConfiguration);
   const provider = (
     name: string,
     baseUrl: string
@@ -330,6 +549,7 @@ export function buildLevelsExperimentFingerprint(input: {
   readonly calibrationProtocol: unknown;
 }): LevelsExperimentFingerprint {
   try {
+    assertSafeLevelsRunConfiguration(input.runConfiguration);
     const datasetHash = hashCanonicalValue(input.dataset);
     const modelConfigurationHash = hashCanonicalValue({
       experimentVersion: input.experimentVersion,
@@ -360,9 +580,15 @@ export function buildLevelsExperimentFingerprint(input: {
 }
 
 export function calibrationRowKey(
-  value: Pick<CalibrationRow, "contestId" | "index">
+  value: { readonly contestId: number; readonly index: string }
 ): string {
   return `${value.contestId}:${value.index}`;
+}
+
+export function calibrationFailureCountKey(
+  value: Pick<CalibrationFailureCount, "stage" | "errorCode" | "status">
+): string {
+  return `${value.stage}:${value.errorCode}:${value.status ?? "none"}`;
 }
 
 export function checkpointUrl(directory: URL, label: string): URL {
@@ -407,7 +633,7 @@ export function loadCalibrationCheckpoint(input: {
   readonly expectedProfileName: string;
   readonly expectedFingerprint: LevelsExperimentFingerprint;
   readonly expectedItems: readonly CalibrationDatasetItem[];
-}): CalibrationRow[] {
+}): CalibrationCheckpointState {
   let sourceText: string;
   try {
     sourceText = readFileSync(input.source, "utf8");
@@ -425,7 +651,22 @@ export function loadCalibrationCheckpoint(input: {
   } catch {
     throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
   }
-  const parsed = savedRowsSchema.safeParse(parsedJson);
+  const parsedSchemaVersion =
+    typeof parsedJson === "object" &&
+    parsedJson !== null &&
+    "schemaVersion" in parsedJson
+      ? (parsedJson as { readonly schemaVersion?: unknown }).schemaVersion
+      : undefined;
+  if (
+    typeof parsedSchemaVersion === "number" &&
+    Number.isInteger(parsedSchemaVersion) &&
+    parsedSchemaVersion !== 3
+  ) {
+    throw new LevelsCalibrationStateError(
+      "LEVELS_CHECKPOINT_VERSION_UNSUPPORTED"
+    );
+  }
+  const parsed = savedCheckpointSchema.safeParse(parsedJson);
   if (!parsed.success) {
     throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
   }
@@ -444,18 +685,25 @@ export function loadCalibrationCheckpoint(input: {
       (item) => [calibrationRowKey(item), item.rating] as const
     )
   );
+  if (expectedRatings.size !== input.expectedItems.length) {
+    throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
+  }
   const seenKeys = new Set<string>();
-  for (const row of parsed.data.rows) {
-    const key = calibrationRowKey(row);
+  for (const progress of parsed.data.progress) {
+    const key = calibrationRowKey(progress);
     if (
       seenKeys.has(key) ||
-      expectedRatings.get(key) !== row.rating
+      expectedRatings.get(key) !== progress.rating
     ) {
       throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
     }
     seenKeys.add(key);
   }
-  return parsed.data.rows;
+  assertUniqueFailureCounts(parsed.data.failureCounts);
+  return {
+    progress: parsed.data.progress,
+    failureCounts: parsed.data.failureCounts
+  };
 }
 
 export function writeCalibrationCheckpoint(input: {
@@ -463,15 +711,47 @@ export function writeCalibrationCheckpoint(input: {
   readonly label: string;
   readonly profileName: string;
   readonly fingerprint: LevelsExperimentFingerprint;
-  readonly rows: readonly CalibrationRow[];
+  readonly progress: readonly CalibrationProgress[];
+  readonly failureCounts: readonly CalibrationFailureCount[];
 }): void {
-  writeJsonAtomically(input.target, {
-    schemaVersion: 2,
+  const candidate = {
+    schemaVersion: 3,
     label: input.label,
     profileName: input.profileName,
     fingerprint: input.fingerprint,
-    rows: input.rows
-  });
+    progress: input.progress,
+    failureCounts: input.failureCounts
+  } as const;
+  const parsed = savedCheckpointSchema.safeParse(candidate);
+  if (!parsed.success) {
+    throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
+  }
+  assertUniqueProgress(parsed.data.progress);
+  assertUniqueFailureCounts(parsed.data.failureCounts);
+  writeJsonAtomically(input.target, parsed.data);
+}
+
+export function completeCalibrationRows(
+  progressEntries: readonly CalibrationProgress[]
+): CalibrationRow[] {
+  const rows: CalibrationRow[] = [];
+  for (const entry of progressEntries) {
+    if (entry.thinking === undefined || entry.coding === undefined) {
+      continue;
+    }
+    rows.push(
+      calibrationRowSchema.parse({
+        contestId: entry.contestId,
+        index: entry.index,
+        rating: entry.rating,
+        thinkingLevel: entry.thinking.level,
+        thinkingSignals: entry.thinking.signals,
+        codingLevel: entry.coding.level,
+        codingSignals: entry.coding.signals
+      })
+    );
+  }
+  return rows;
 }
 
 export function writeJsonAtomically(target: URL, value: unknown): void {
@@ -616,6 +896,71 @@ export function assessCalibrationCompleteness(
     missingBands,
     complete: allProblemsCompleted && allBandsPresent
   };
+}
+
+function assertUniqueProgress(
+  progressEntries: readonly CalibrationProgress[]
+): void {
+  const seenKeys = new Set<string>();
+  for (const progress of progressEntries) {
+    const key = calibrationRowKey(progress);
+    if (seenKeys.has(key)) {
+      throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
+    }
+    seenKeys.add(key);
+  }
+}
+
+function assertUniqueFailureCounts(
+  failureCounts: readonly CalibrationFailureCount[]
+): void {
+  const seenKeys = new Set<string>();
+  for (const failure of failureCounts) {
+    const key = calibrationFailureCountKey(failure);
+    if (seenKeys.has(key)) {
+      throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
+    }
+    seenKeys.add(key);
+  }
+}
+
+function assertSafeLevelsRunConfiguration(
+  configuration: LevelsRunConfiguration
+): void {
+  const baseUrls = Object.values(configuration.providerBaseUrls);
+  const addressesAreSafe = baseUrls.every((value) => {
+    try {
+      const parsed = new URL(value);
+      return (
+        (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+        parsed.username.length === 0 &&
+        parsed.password.length === 0 &&
+        parsed.search.length === 0 &&
+        parsed.hash.length === 0
+      );
+    } catch {
+      return false;
+    }
+  });
+  if (
+    !addressesAreSafe ||
+    !Number.isSafeInteger(configuration.requestTimeoutMs) ||
+    configuration.requestTimeoutMs < 1_000 ||
+    configuration.requestTimeoutMs > 600_000 ||
+    !Number.isSafeInteger(configuration.maxAttempts) ||
+    configuration.maxAttempts < 1 ||
+    configuration.maxAttempts > 10 ||
+    !Number.isSafeInteger(configuration.baseDelayMs) ||
+    configuration.baseDelayMs < 1 ||
+    configuration.baseDelayMs > 60_000 ||
+    !Number.isSafeInteger(configuration.concurrency) ||
+    configuration.concurrency < 1 ||
+    configuration.concurrency > 32
+  ) {
+    throw new LevelsCalibrationStateError(
+      "LEVELS_FINGERPRINT_BUILD_FAILED"
+    );
+  }
 }
 
 function fingerprintsEqual(

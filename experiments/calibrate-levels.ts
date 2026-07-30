@@ -21,27 +21,33 @@ import { logError, logInfo, logWarn } from "../src/logger";
 import { runCodingPipeline } from "../src/pipelines/coding";
 import { runThinkingPipeline } from "../src/pipelines/thinking";
 import type { PipelineModelConfig, ReviewTaskProblem } from "../src/pipelines/types";
-import { mapWithConcurrency } from "./lib/concurrency";
 import { resolveLevelsCalibrationOptions } from "./lib/levels-calibration-options";
+import {
+  buildLevelsCalibrationReport,
+  levelAnchorDefinitions
+} from "./lib/levels-calibration-report";
+import {
+  runLevelsCalibrationStages,
+  selectCodingCalibrationResult,
+  selectThinkingCalibrationResult
+} from "./lib/levels-calibration-runner";
 import {
   LEVEL_BAND_BOUNDARIES,
   LevelsCalibrationStateError,
   acquireLevelsLabelLock,
   assertCalibrationLabelUnused,
-  assessCalibrationCompleteness,
   buildLevelsExperimentFingerprint,
   buildLevelsReportRunConfiguration,
   buildLevelsRunConfiguration,
-  calibrationRowKey,
   checkpointUrl,
-  levelBandOf,
+  completeCalibrationRows,
   loadCalibrationCheckpoint,
   preflightCalibrationDocuments,
   writeCalibrationCheckpoint,
   writeJsonAtomically,
   writeTextAtomically,
+  type CalibrationCheckpointState,
   type CalibrationDatasetItem,
-  type CalibrationRow,
   type LevelsExperimentFingerprint
 } from "./lib/levels-calibration-state";
 
@@ -49,32 +55,25 @@ const DATA_DIR = new URL("./data/levels/", import.meta.url);
 const RESULTS_DIR = new URL("./results/", import.meta.url);
 const RAW_DIR = new URL("./results/raw/", import.meta.url);
 const PIPELINE_SOURCE_FILES = {
-  calibrationRunner: new URL("./calibrate-levels.ts", import.meta.url),
+  calibrationEntry: new URL("./calibrate-levels.ts", import.meta.url),
+  configLoader: new URL("../src/config.ts", import.meta.url),
+  yamlParser: new URL("../src/yaml-lite.ts", import.meta.url),
   thinking: new URL("../src/pipelines/thinking.ts", import.meta.url),
   coding: new URL("../src/pipelines/coding.ts", import.meta.url),
   sharedTypes: new URL("../src/pipelines/types.ts", import.meta.url),
   llmClient: new URL("../src/llm.ts", import.meta.url),
+  logger: new URL("../src/logger.ts", import.meta.url),
   concurrency: new URL("./lib/concurrency.ts", import.meta.url),
   calibrationOptions: new URL("./lib/levels-calibration-options.ts", import.meta.url),
-  calibrationState: new URL("./lib/levels-calibration-state.ts", import.meta.url)
-} as const;
-
-/** 各等级的文字锚点。修改这里必须同步修改 README 的“数值标准”一节并重跑本实验。 */
-const levelAnchorDefinitions = {
-  thinking: [
-    "1：看到题面即可直接写出做法，没有需要发现的性质。",
-    "2：需要一次简单观察或套用一个标准结论。",
-    "3：需要组合两个以上常见想法，或发现一条不显然的性质。",
-    "4：关键洞察隐藏较深，多数熟练选手需要多次尝试与自我否定。",
-    "5：需要罕见的构造或多层推理链，赛场上仅极少数人能想出。"
-  ],
-  coding: [
-    "1：三十行以内的直接实现，无边界陷阱。",
-    "2：常规模拟或标准算法模板，少量边界处理。",
-    "3：需要仔细组织的中等实现，或一个板子数据结构的正确使用。",
-    "4：多组件配合、复杂数据结构定制（如线段树节点设计）或大量分类讨论。",
-    "5：实现本身就是主要难点，容错空间极小。"
-  ]
+  calibrationState: new URL("./lib/levels-calibration-state.ts", import.meta.url),
+  calibrationRunner: new URL(
+    "./lib/levels-calibration-runner.ts",
+    import.meta.url
+  ),
+  calibrationReport: new URL(
+    "./lib/levels-calibration-report.ts",
+    import.meta.url
+  )
 } as const;
 
 function loadCalibrationSet(): CalibrationDatasetItem[] {
@@ -111,22 +110,19 @@ function toProblem(item: CalibrationDatasetItem): ReviewTaskProblem {
   };
 }
 
-function average(values: readonly number[]): number {
-  return values.length === 0 ? 0 : values.reduce((sum, value) => sum + value, 0) / values.length;
-}
-
 function writeCheckpoint(
   label: string,
   profileName: string,
   fingerprint: LevelsExperimentFingerprint,
-  rows: readonly CalibrationRow[]
+  state: CalibrationCheckpointState
 ): void {
   writeCalibrationCheckpoint({
     target: checkpointUrl(RAW_DIR, label),
     label,
     profileName,
     fingerprint,
-    rows
+    progress: state.progress,
+    failureCounts: state.failureCounts
   });
 }
 
@@ -231,9 +227,9 @@ async function main(): Promise<void> {
         resultsDirectory: RESULTS_DIR
       });
     }
-    const resumedRows =
+    const resumedState: CalibrationCheckpointState =
       options.resumeFromLabel === null
-        ? []
+        ? { progress: [], failureCounts: [] }
         : loadCalibrationCheckpoint({
             source: checkpointUrl(RAW_DIR, options.resumeFromLabel),
             expectedLabel: options.resumeFromLabel,
@@ -241,19 +237,20 @@ async function main(): Promise<void> {
             expectedFingerprint: fingerprint,
             expectedItems: calibrationSet
           });
-    const rowsByKey = new Map<string, CalibrationRow>(
-      resumedRows.map((row) => [calibrationRowKey(row), row] as const)
-    );
-    const pendingItems = calibrationSet.filter(
-      (item) => !rowsByKey.has(calibrationRowKey(item))
-    );
-    writeCheckpoint(label, profileName, fingerprint, [...rowsByKey.values()]);
+    const resumedRows = completeCalibrationRows(resumedState.progress);
+    const resumedThinkingProblemCount = resumedState.progress.filter(
+      (progress) => progress.thinking !== undefined
+    ).length;
+    const pendingProblemCount =
+      calibrationSet.length - resumedRows.length;
+    writeCheckpoint(label, profileName, fingerprint, resumedState);
 
     logInfo("开始标定", {
       label,
       problems: calibrationSet.length,
       reusedProblems: resumedRows.length,
-      pendingProblems: pendingItems.length,
+      reusedThinkingProblems: resumedThinkingProblemCount,
+      pendingProblems: pendingProblemCount,
       profileName,
       requestTimeoutMs: runConfiguration.requestTimeoutMs,
       maxAttempts: runConfiguration.maxAttempts,
@@ -261,88 +258,52 @@ async function main(): Promise<void> {
       concurrency: runConfiguration.concurrency
     });
 
-    let done = resumedRows.length;
-    const settled = await mapWithConcurrency(
-      pendingItems,
-      runConfiguration.concurrency,
-      async (item) => {
+    const runResult = await runLevelsCalibrationStages({
+      items: calibrationSet,
+      concurrency: runConfiguration.concurrency,
+      initialState: resumedState,
+      runThinking: async (item) => {
         const problem = toProblem(item);
-        try {
-          const thinking = await runThinkingPipeline({ problem, solverModel, analystModel });
-          const coding = await runCodingPipeline({ problem, model: codingModel });
-          const row = {
-            contestId: item.contestId,
-            index: item.index,
-            rating: item.rating,
-            thinkingLevel: thinking.level,
-            thinkingSignals: thinking.signals as unknown as Record<string, unknown>,
-            codingLevel: coding.level,
-            codingSignals: coding.signals as unknown as Record<string, unknown>
-          } satisfies CalibrationRow;
-          rowsByKey.set(calibrationRowKey(row), row);
-          writeCheckpoint(label, profileName, fingerprint, [...rowsByKey.values()]);
-          done += 1;
-          logInfo("已完成一题", {
-            contestId: item.contestId,
-            index: item.index,
-            rating: item.rating,
-            thinkingLevel: thinking.level,
-            codingLevel: coding.level,
-            progress: `${done}/${calibrationSet.length}`
-          });
-          return row;
-        } catch (error) {
-          if (error instanceof LevelsCalibrationStateError) {
-            throw error;
-          }
-          done += 1;
-          logError("这一题标定失败，跳过", error, {
-            contestId: item.contestId,
-            index: item.index,
-            progress: `${done}/${calibrationSet.length}`
-          });
-          return null;
-        }
+        const thinking = await runThinkingPipeline({
+          problem,
+          solverModel,
+          analystModel
+        });
+        return selectThinkingCalibrationResult(thinking);
+      },
+      runCoding: async (item) => {
+        const problem = toProblem(item);
+        const coding = await runCodingPipeline({
+          problem,
+          model: codingModel
+        });
+        return selectCodingCalibrationResult(coding);
+      },
+      saveCheckpoint: (state) => {
+        writeCheckpoint(label, profileName, fingerprint, state);
+      },
+      onStageCompleted: (event) => {
+        logInfo("标定阶段完成", {
+          contestId: event.contestId,
+          index: event.index,
+          rating: event.rating,
+          stage: event.stage,
+          level: event.level,
+          progress: `${event.fullyCompletedProblemCount}/${event.expectedProblemCount}`
+        });
+      },
+      onStageFailed: (event) => {
+        logWarn("标定阶段失败，稍后可续跑", {
+          contestId: event.contestId,
+          index: event.index,
+          rating: event.rating,
+          stage: event.stage,
+          errorCode: event.errorCode,
+          status: event.status,
+          progress: `${event.fullyCompletedProblemCount}/${event.expectedProblemCount}`
+        });
       }
-    );
-    const completedThisRun = settled.filter(
-      (value): value is CalibrationRow => value !== null
-    );
-    const rows = [...rowsByKey.values()].sort(
-      (left, right) =>
-        left.rating - right.rating ||
-        left.contestId - right.contestId ||
-        left.index.localeCompare(right.index)
-    );
-
-    if (rows.length === 0) {
-      logError("没有任何题目完成标定。", undefined);
-      process.exitCode = 1;
-      return;
-    }
-
-    const bands = new Map<string, CalibrationRow[]>();
-    for (const row of rows) {
-      const band = levelBandOf(row.rating);
-      bands.set(band, [...(bands.get(band) ?? []), row]);
-    }
-    const bandSummaries = ["低", "中", "高"].map((band) => {
-      const bandRows = bands.get(band) ?? [];
-      return {
-        band,
-        count: bandRows.length,
-        averageThinking: Number(average(bandRows.map((row) => row.thinkingLevel)).toFixed(2)),
-        averageCoding: Number(average(bandRows.map((row) => row.codingLevel)).toFixed(2))
-      };
     });
-    const completeness = assessCalibrationCompleteness(rows, calibrationSet.length);
-    const monotonicThinking =
-      completeness.allBandsPresent &&
-      isNonDecreasing(bandSummaries.map((summary) => summary.averageThinking));
-    const monotonicCoding =
-      completeness.allBandsPresent &&
-      isNonDecreasing(bandSummaries.map((summary) => summary.averageCoding));
-    const incompleteProblemCount = calibrationSet.length - rows.length;
 
     const generatedAt = new Date().toISOString();
     const stamp = generatedAt.replace(/[:.]/g, "-");
@@ -351,108 +312,48 @@ async function main(): Promise<void> {
       label,
       profileName,
       fingerprint,
-      rows
+      progress: runResult.progress,
+      failureCounts: runResult.failureCounts
     });
-
-    const summary = {
+    const report = buildLevelsCalibrationReport({
       label,
       profileName,
-      experimentFingerprint: fingerprint,
+      fingerprint,
       runConfiguration: reportRunConfiguration,
-      problemCount: rows.length,
+      progress: runResult.progress,
+      failureCounts: runResult.failureCounts,
       expectedProblemCount: calibrationSet.length,
-      resumedProblemCount: resumedRows.length,
-      completedThisRun: completedThisRun.length,
-      incompleteProblemCount,
-      allProblemsCompleted: completeness.allProblemsCompleted,
-      allBandsPresent: completeness.allBandsPresent,
-      missingBands: completeness.missingBands,
-      complete: completeness.complete,
-      bandSummaries,
-      monotonicThinking,
-      monotonicCoding,
+      resumedThinkingProblemCount,
+      resumedCompleteProblemCount: resumedRows.length,
+      completedProblemsThisRun: runResult.completedProblemsThisRun,
       generatedAt
-    };
+    });
+    writeTextAtomically(
+      new URL(`levels-${label}-report.md`, RESULTS_DIR),
+      report.markdown
+    );
+    writeJsonAtomically(
+      new URL(`levels-${label}-summary.json`, RESULTS_DIR),
+      report.summary
+    );
 
-    const markdown = [
-      `# 思维/代码难度标定报告（${label}）`,
-      "",
-      `- 模型档位：${profileName}`,
-      `- 实验校验摘要：${fingerprint.combinedHash}`,
-      `- 已完成题数：${rows.length} / ${calibrationSet.length}（按官方 rating 升序）`,
-      `- 从已有中间结果复用：${resumedRows.length}`,
-      `- 本次仍未完成：${incompleteProblemCount}`,
-      `- 缺少的 rating 段：${completeness.missingBands.length === 0 ? "无" : completeness.missingBands.join("、")}`,
-      `- 生成时间：${summary.generatedAt}`,
-      "",
-      "## 本次运行参数",
-      "",
-      "- 地址校验值用于判断两次实验是否连接到同一地址；它不显示完整地址、路径或查询参数。",
-      `- 解题模型服务：${reportRunConfiguration.providers.solver.name}（地址校验值 ${reportRunConfiguration.providers.solver.addressCheck}）`,
-      `- 分析模型服务：${reportRunConfiguration.providers.analyst.name}（地址校验值 ${reportRunConfiguration.providers.analyst.addressCheck}）`,
-      `- 代码模型服务：${reportRunConfiguration.providers.coding.name}（地址校验值 ${reportRunConfiguration.providers.coding.addressCheck}）`,
-      `- 单次请求等待上限：${reportRunConfiguration.requestTimeoutMs} 毫秒`,
-      `- 最多尝试次数：${reportRunConfiguration.maxAttempts}`,
-      `- 首次重试前等待：${reportRunConfiguration.baseDelayMs} 毫秒`,
-      `- 同时处理题数：${reportRunConfiguration.concurrency}`,
-      "",
-      "## 等级锚点定义",
-      "",
-      "### 思维难度",
-      ...levelAnchorDefinitions.thinking.map((line) => `- ${line}`),
-      "",
-      "### 代码难度",
-      ...levelAnchorDefinitions.coding.map((line) => `- ${line}`),
-      "",
-      "## 分段趋势",
-      "",
-      "| rating 段 | 题数 | 思维难度均值 | 代码难度均值 |",
-      "| --- | --- | --- | --- |",
-      ...bandSummaries.map(
-        (band) => `| ${band.band} | ${band.count} | ${band.averageThinking} | ${band.averageCoding} |`
-      ),
-      "",
-      `- 思维难度随 rating 分段单调不降：${completeness.complete ? (monotonicThinking ? "是" : "否") : "结果不完整，不能判断"}`,
-      `- 代码难度随 rating 分段单调不降：${completeness.complete ? (monotonicCoding ? "是" : "否") : "结果不完整，不能判断"}`,
-      "",
-      "## 逐题结果",
-      "",
-      "| 题目 | rating | 思维 | 代码 |",
-      "| --- | --- | --- | --- |",
-      ...rows.map(
-        (row) => `| CF${row.contestId}${row.index} | ${row.rating} | ${row.thinkingLevel} | ${row.codingLevel} |`
-      ),
-      "",
-      "## 结论与后续",
-      "",
-      !completeness.allProblemsCompleted
-        ? "- 本次有题目尚未完成，不能据此调整提示词、工作流或数值映射；请用 --resume 继续补齐。"
-        : !completeness.allBandsPresent
-          ? "- 标定集没有同时覆盖低、中、高三个 rating 段，不能判断趋势，也不能据此调整提示词、工作流或数值映射。"
-          : monotonicThinking && monotonicCoding
-            ? "- 当前映射表在标定集上呈单调趋势，可作为初始标准启用；扩大样本后再复核。"
-            : "- 当前映射表在完整标定集上出现非单调段，需要先分析逐题误差，再调整对应流水线并重跑实验。",
-      "- 修改任何映射常量后，必须以新的 --label 重跑本脚本并保留两份报告做对比。"
-    ].join("\n");
-    writeTextAtomically(new URL(`levels-${label}-report.md`, RESULTS_DIR), markdown);
-    writeJsonAtomically(new URL(`levels-${label}-summary.json`, RESULTS_DIR), summary);
-
-    if (!completeness.complete) {
+    if (!report.summary.complete) {
       logWarn("标定结果不完整，报告仅供续跑定位，不能用于调整算法", {
         label,
-        problems: rows.length,
+        problems: report.summary.problemCount,
+        thinkingProblems: report.summary.thinkingCompletedProblemCount,
         expectedProblems: calibrationSet.length,
-        incompleteProblemCount,
-        missingBands: completeness.missingBands.join(",")
+        incompleteProblemCount: report.summary.incompleteProblemCount,
+        missingBands: report.summary.missingBands.join(",")
       });
       process.exitCode = 1;
       return;
     }
     logInfo("标定完成", {
       label,
-      problems: rows.length,
-      monotonicThinking,
-      monotonicCoding
+      problems: report.summary.problemCount,
+      monotonicThinking: report.summary.monotonicThinking,
+      monotonicCoding: report.summary.monotonicCoding
     });
   } finally {
     if (!labelLock.release()) {
@@ -462,16 +363,6 @@ async function main(): Promise<void> {
       process.exitCode = 1;
     }
   }
-}
-
-function isNonDecreasing(values: readonly number[]): boolean {
-  const present = values.filter((value) => value > 0);
-  for (let index = 1; index < present.length; index += 1) {
-    if (present[index]! < present[index - 1]!) {
-      return false;
-    }
-  }
-  return true;
 }
 
 main().catch((error) => {

@@ -33,12 +33,14 @@ const httpUrlSchema = z
       return (
         (url.protocol === "http:" || url.protocol === "https:") &&
         url.username.length === 0 &&
-        url.password.length === 0
+        url.password.length === 0 &&
+        url.search.length === 0 &&
+        url.hash.length === 0
       );
     } catch {
       return false;
     }
-  }, "必须是不含账号密码的 http/https 地址");
+  }, "必须是不含账号、密码、查询参数或片段的 http/https 地址");
 
 const envSchema = z
   .object({
