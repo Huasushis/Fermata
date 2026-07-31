@@ -43,14 +43,14 @@ export interface ReviewerWorkerOptions {
   readonly leaseSeconds?: number;
   /** 传给所有流水线的 LLM 请求用的 fetch，默认全局 fetch；测试用来注入假实现。 */
   readonly fetch?: FetchLike;
-  /** 停机时最多等待正在处理的任务多久（毫秒），默认 30 秒。 */
-  readonly shutdownTimeoutMs?: number;
 }
 
 interface InFlightTask {
   readonly assignmentId: string;
+  readonly abortController: AbortController;
   leaseExpiresAt: string;
   renewalTimer: NodeJS.Timeout | null;
+  renewalPromise: Promise<void> | null;
   /** 续租发现任务已经不属于我们时置为 true，处理逻辑会尽快放弃、不再提交。 */
   abandoned: boolean;
 }
@@ -62,11 +62,11 @@ export class ReviewerWorker {
   readonly #anchors: readonly DifficultyAnchor[];
   readonly #leaseSeconds: number;
   readonly #fetch: FetchLike | undefined;
-  readonly #shutdownTimeoutMs: number;
 
   #running = false;
   #stopping = false;
   #pollTimer: NodeJS.Timeout | null = null;
+  #pollPromise: Promise<void> | null = null;
   readonly #inFlight = new Map<string, InFlightTask>();
   readonly #taskPromises = new Map<string, Promise<void>>();
 
@@ -77,11 +77,10 @@ export class ReviewerWorker {
     this.#anchors = options.anchors;
     this.#leaseSeconds = options.leaseSeconds ?? 300;
     this.#fetch = options.fetch;
-    this.#shutdownTimeoutMs = options.shutdownTimeoutMs ?? 30_000;
   }
 
   public start(): void {
-    if (this.#running) {
+    if (this.#running || this.#stopping) {
       return;
     }
     this.#running = true;
@@ -96,23 +95,33 @@ export class ReviewerWorker {
       clearTimeout(this.#pollTimer);
       this.#pollTimer = null;
     }
+
+    // 已经发出的 claim 无法安全取消；先等这一轮收束，确保它领取到的任务也进入
+    // #taskPromises，再等待所有在途任务自然完成。等待期间不清续租计时器，避免
+    // 长时间的模型请求在停机过程中丢失租约。
+    if (this.#pollPromise !== null) {
+      await this.#pollPromise;
+    }
     const pending = [...this.#taskPromises.values()];
     if (pending.length > 0) {
-      await Promise.race([
-        Promise.allSettled(pending),
-        new Promise<void>((resolve) => setTimeout(resolve, this.#shutdownTimeoutMs))
-      ]);
+      await Promise.allSettled(pending);
     }
-    // 不管任务是自己跑完了，还是等到超时放弃等待了，都把还没清理的续租定时器清掉，
-    // 避免残留定时器（测试场景下尤其重要，vitest 不会因为业务逻辑结束就退出进程）。
+
+    // 正常情况下 processTask 的 finally 已经清理完毕；这里兜底清除残留计时器，
+    // 避免异常路径留下会阻止进程退出的定时器。
     for (const inFlight of this.#inFlight.values()) {
       this.clearRenewal(inFlight);
     }
+    this.#stopping = false;
   }
 
   /** 跳过当前的等待，立即触发一轮轮询；如果已经停机则什么都不做。 */
   public wake(): void {
     if (!this.#running || this.#stopping) {
+      return;
+    }
+    // 已经在轮询时无需再并发发起一轮；当前轮询结束后仍会按设置安排下一次。
+    if (this.#pollPromise !== null) {
       return;
     }
     if (this.#pollTimer !== null) {
@@ -128,17 +137,25 @@ export class ReviewerWorker {
   private schedulePoll(delayMs: number): void {
     this.#pollTimer = setTimeout(() => {
       this.#pollTimer = null;
-      this.pollOnce()
-        .catch((error: unknown) => {
-          logError("轮询过程出现未捕获异常", error);
-        })
-        .finally(() => {
-          if (this.#running && !this.#stopping) {
-            const { pollingIntervalSeconds } = this.#settingsStore.get().settings;
-            this.schedulePoll(pollingIntervalSeconds * 1_000);
-          }
-        });
+      if (!this.#running || this.#stopping) {
+        return;
+      }
+      this.#pollPromise = this.runPoll();
     }, delayMs);
+  }
+
+  private async runPoll(): Promise<void> {
+    try {
+      await this.pollOnce();
+    } catch (error) {
+      logError("轮询过程出现未捕获异常", error);
+    } finally {
+      this.#pollPromise = null;
+      if (this.#running && !this.#stopping) {
+        const { pollingIntervalSeconds } = this.#settingsStore.get().settings;
+        this.schedulePoll(pollingIntervalSeconds * 1_000);
+      }
+    }
   }
 
   private async pollOnce(): Promise<void> {
@@ -199,8 +216,10 @@ export class ReviewerWorker {
   ): Promise<void> {
     const inFlight: InFlightTask = {
       assignmentId: task.assignmentId,
+      abortController: new AbortController(),
       leaseExpiresAt: task.leaseExpiresAt,
       renewalTimer: null,
+      renewalPromise: null,
       abandoned: false
     };
     this.#inFlight.set(task.assignmentId, inFlight);
@@ -209,22 +228,50 @@ export class ReviewerWorker {
     try {
       logInfo("开始处理审题任务", { problemId: task.problem.id, revision: task.problem.revision });
 
-      const [difficulty, thinking, coding] = await Promise.all([
-        runDifficultyPipeline({
-          problem: task.problem,
-          anchors: this.#anchors,
-          model: this.resolveModelConfig(profile.difficulty)
-        }),
-        runThinkingPipeline({
-          problem: task.problem,
-          solverModel: this.resolveModelConfig(profile.thinking.solver),
-          analystModel: this.resolveModelConfig(profile.thinking.analyst)
-        }),
-        runCodingPipeline({
-          problem: task.problem,
-          model: this.resolveModelConfig(profile.coding)
-        })
-      ]);
+      const [difficultyResult, thinkingResult, codingResult] =
+        await Promise.allSettled([
+          runDifficultyPipeline({
+            problem: task.problem,
+            anchors: this.#anchors,
+            model: this.resolveModelConfig(
+              profile.difficulty,
+              inFlight.abortController.signal
+            )
+          }),
+          runThinkingPipeline({
+            problem: task.problem,
+            solverModel: this.resolveModelConfig(
+              profile.thinking.solver,
+              inFlight.abortController.signal
+            ),
+            analystModel: this.resolveModelConfig(
+              profile.thinking.analyst,
+              inFlight.abortController.signal
+            )
+          }),
+          runCodingPipeline({
+            problem: task.problem,
+            model: this.resolveModelConfig(
+              profile.coding,
+              inFlight.abortController.signal
+            )
+          })
+        ]);
+
+      // 三条付费请求会并发运行。一条先失败时，另外两条不会因此自动停止；
+      // 必须等它们都落地后再清理续租，避免任务被重新领取后重复付费。
+      if (difficultyResult.status === "rejected") {
+        throw difficultyResult.reason;
+      }
+      if (thinkingResult.status === "rejected") {
+        throw thinkingResult.reason;
+      }
+      if (codingResult.status === "rejected") {
+        throw codingResult.reason;
+      }
+      const difficulty = difficultyResult.value;
+      const thinking = thinkingResult.value;
+      const coding = codingResult.value;
 
       if (inFlight.abandoned) {
         logWarn("三条难度流水线跑完时任务已经被判定放弃，不再提交", { problemId: task.problem.id });
@@ -238,11 +285,22 @@ export class ReviewerWorker {
         thinking,
         coding,
         expectedRound: task.problem.reviewRound,
-        model: this.resolveModelConfig(profile.verdict)
+        model: this.resolveModelConfig(
+          profile.verdict,
+          inFlight.abortController.signal
+        )
       });
 
       if (inFlight.abandoned) {
         logWarn("综合流水线跑完时任务已经被判定放弃，不再提交", { problemId: task.problem.id });
+        return;
+      }
+
+      await this.finishRenewalBeforeCompletion(inFlight);
+      if (inFlight.abandoned) {
+        logWarn("提交前续租确认任务已经不属于我们，不再提交", {
+          problemId: task.problem.id
+        });
         return;
       }
 
@@ -260,7 +318,9 @@ export class ReviewerWorker {
         forcedDuplicateReject
       });
     } catch (error) {
-      this.logTaskFailure(task, error);
+      if (!inFlight.abandoned) {
+        this.logTaskFailure(task, error);
+      }
     } finally {
       this.clearRenewal(inFlight);
       this.#inFlight.delete(task.assignmentId);
@@ -286,7 +346,10 @@ export class ReviewerWorker {
     logError("处理审题任务失败", error, { problemId: task.problem.id });
   }
 
-  private resolveModelConfig(spec: ModelSpec): PipelineModelConfig {
+  private resolveModelConfig(
+    spec: ModelSpec,
+    signal: AbortSignal
+  ): PipelineModelConfig {
     const credentials = getProviderCredentials(this.#appConfig, spec.provider);
     if (credentials === undefined) {
       // pollOnce 已经用 missingProvidersForProfile 提前检查过，正常不会走到这里；
@@ -297,22 +360,76 @@ export class ReviewerWorker {
       spec,
       credentials,
       runtime: {
-        timeoutMs: this.#appConfig.models.timeouts.llmRequestMs,
+        firstOutputTimeoutMs: this.#appConfig.models.timeouts.llmFirstOutputMs,
+        outputIdleTimeoutMs: this.#appConfig.models.timeouts.llmOutputIdleMs,
+        maximumDurationMs: this.#appConfig.models.timeouts.llmMaximumDurationMs,
         maxAttempts: this.#appConfig.models.retry.maxAttempts,
         baseDelayMs: this.#appConfig.models.retry.baseDelayMs,
-        fetch: this.#fetch
+        fetch: this.#fetch,
+        signal
       }
     };
   }
 
   private scheduleRenewal(inFlight: InFlightTask): void {
-    // 租期过半左右续一次，且不少于 5 秒，避免 leaseSeconds 很小时续租过于频繁。
-    const renewIntervalMs = Math.max(5_000, this.#leaseSeconds * 500);
+    // 在租期约三分之一处续租，给网络失败后的短间隔重试留出充分余量。
+    const renewIntervalMs = Math.max(
+      5_000,
+      Math.floor((this.#leaseSeconds * 1_000) / 3)
+    );
+    this.scheduleRenewalAfter(inFlight, renewIntervalMs);
+  }
+
+  private scheduleRenewalRetry(inFlight: InFlightTask): void {
+    const normalRetryMs = Math.max(
+      1_000,
+      Math.min(30_000, Math.floor((this.#leaseSeconds * 1_000) / 10))
+    );
+    const leaseExpiresAtMs = Date.parse(inFlight.leaseExpiresAt);
+    const remainingLeaseMs = leaseExpiresAtMs - Date.now();
+    const retryMs =
+      Number.isFinite(remainingLeaseMs) && remainingLeaseMs > 0
+        ? Math.max(
+            1_000,
+            Math.min(normalRetryMs, Math.floor(remainingLeaseMs / 4))
+          )
+        : normalRetryMs;
+    this.scheduleRenewalAfter(inFlight, retryMs);
+  }
+
+  private scheduleRenewalAfter(
+    inFlight: InFlightTask,
+    delayMs: number
+  ): void {
     inFlight.renewalTimer = setTimeout(() => {
-      this.renewTask(inFlight).catch((error: unknown) => {
-        logError("续租时出现未捕获异常", error, { assignmentId: inFlight.assignmentId });
-      });
-    }, renewIntervalMs);
+      inFlight.renewalTimer = null;
+      const renewalPromise = this.renewTask(inFlight)
+        .catch((error: unknown) => {
+          logError("续租时出现未捕获异常", error, {
+            assignmentId: inFlight.assignmentId
+          });
+        })
+        .finally(() => {
+          if (inFlight.renewalPromise === renewalPromise) {
+            inFlight.renewalPromise = null;
+          }
+        });
+      inFlight.renewalPromise = renewalPromise;
+    }, delayMs);
+  }
+
+  private async finishRenewalBeforeCompletion(
+    inFlight: InFlightTask
+  ): Promise<void> {
+    // 不再安排新的续租；如果已有续租请求在途，必须先等响应并采用最新租约时间，
+    // 否则 complete 可能携带旧值，被服务端当成过期任务拒绝。
+    this.clearRenewal(inFlight);
+    const renewalPromise = inFlight.renewalPromise;
+    if (renewalPromise !== null) {
+      await renewalPromise;
+    }
+    // 在途续租成功或普通失败时可能刚安排了下一次定时器，提交前一并清掉。
+    this.clearRenewal(inFlight);
   }
 
   private async renewTask(inFlight: InFlightTask): Promise<void> {
@@ -335,12 +452,26 @@ export class ReviewerWorker {
     } catch (error) {
       if (isTaskConflictError(error)) {
         logWarn("续租失败：任务已经不属于我们，标记放弃", { assignmentId: inFlight.assignmentId });
-        inFlight.abandoned = true;
+        this.abandonTask(inFlight);
         return;
       }
-      logError("续租失败，按原计划下次再试", error, { assignmentId: inFlight.assignmentId });
+      if (isForbiddenError(error)) {
+        logWarn("续租失败：没有继续处理这个任务的权限，标记放弃", {
+          assignmentId: inFlight.assignmentId
+        });
+        this.abandonTask(inFlight);
+        return;
+      }
+      if (isAuthenticationError(error)) {
+        logError("续租失败：机器人令牌认证失败，停止当前任务", error, {
+          assignmentId: inFlight.assignmentId
+        });
+        this.abandonTask(inFlight);
+        return;
+      }
+      logError("续租失败，将在租约到期前尽快再试", error, { assignmentId: inFlight.assignmentId });
       if (!inFlight.abandoned && this.#inFlight.has(inFlight.assignmentId)) {
-        this.scheduleRenewal(inFlight);
+        this.scheduleRenewalRetry(inFlight);
       }
     }
   }
@@ -350,5 +481,13 @@ export class ReviewerWorker {
       clearTimeout(inFlight.renewalTimer);
       inFlight.renewalTimer = null;
     }
+  }
+
+  private abandonTask(inFlight: InFlightTask): void {
+    if (inFlight.abandoned) {
+      return;
+    }
+    inFlight.abandoned = true;
+    inFlight.abortController.abort();
   }
 }

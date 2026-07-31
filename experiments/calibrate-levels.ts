@@ -131,7 +131,12 @@ async function main(): Promise<void> {
   const options = resolveLevelsCalibrationOptions({
     argv: process.argv.slice(2),
     env: process.env,
-    configuredTimeoutMs: config.models.timeouts.llmRequestMs,
+    configuredOutputIdleTimeoutMs:
+      config.models.timeouts.llmOutputIdleMs,
+    configuredFirstOutputTimeoutMs:
+      config.models.timeouts.llmFirstOutputMs,
+    configuredMaximumDurationMs:
+      config.models.timeouts.llmMaximumDurationMs,
     configuredMaxAttempts: config.models.retry.maxAttempts
   });
   const label = options.label;
@@ -156,7 +161,9 @@ async function main(): Promise<void> {
       spec,
       credentials,
       runtime: {
-        timeoutMs: options.requestTimeoutMs,
+        outputIdleTimeoutMs: options.outputIdleTimeoutMs,
+        firstOutputTimeoutMs: options.firstOutputTimeoutMs,
+        maximumDurationMs: options.maximumDurationMs,
         maxAttempts: options.maxAttempts,
         baseDelayMs: config.models.retry.baseDelayMs
       }
@@ -173,7 +180,9 @@ async function main(): Promise<void> {
     solverBaseUrl: solverModel.credentials.baseUrl,
     analystBaseUrl: analystModel.credentials.baseUrl,
     codingBaseUrl: codingModel.credentials.baseUrl,
-    requestTimeoutMs: options.requestTimeoutMs,
+    outputIdleTimeoutMs: options.outputIdleTimeoutMs,
+    firstOutputTimeoutMs: options.firstOutputTimeoutMs,
+    maximumDurationMs: options.maximumDurationMs,
     maxAttempts: options.maxAttempts,
     baseDelayMs: config.models.retry.baseDelayMs,
     concurrency: options.concurrency
@@ -252,7 +261,9 @@ async function main(): Promise<void> {
       reusedThinkingProblems: resumedThinkingProblemCount,
       pendingProblems: pendingProblemCount,
       profileName,
-      requestTimeoutMs: runConfiguration.requestTimeoutMs,
+      outputIdleTimeoutMs: runConfiguration.outputIdleTimeoutMs,
+      firstOutputTimeoutMs: runConfiguration.firstOutputTimeoutMs,
+      maximumDurationMs: runConfiguration.maximumDurationMs,
       maxAttempts: runConfiguration.maxAttempts,
       baseDelayMs: runConfiguration.baseDelayMs,
       concurrency: runConfiguration.concurrency

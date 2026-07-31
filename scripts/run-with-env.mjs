@@ -8,47 +8,38 @@
  */
 import { readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { mergeEnvFile } from "./env-file.mjs";
 
 const [, , envPath, ...command] = process.argv;
 if (envPath === undefined || command.length === 0) {
   process.stderr.write("用法：node scripts/run-with-env.mjs <env文件> <命令> [参数...]\n");
   process.exit(2);
 }
+if (hasNodeDebugEnabled(process.env)) {
+  process.stderr.write(
+    "启动前必须清除 NODE_DEBUG 和 NODE_DEBUG_NATIVE，防止 Node 把子进程环境写到终端。\n"
+  );
+  process.exit(2);
+}
 
-let content;
+let childEnvironment;
 try {
-  content = readFileSync(envPath, "utf8");
+  childEnvironment = mergeEnvFile(readFileSync(envPath, "utf8"), process.env);
 } catch {
   process.stderr.write("无法读取指定的 env 文件。\n");
   process.exit(2);
 }
-
-for (const line of content.split(/\r?\n/)) {
-  const trimmed = line.trim();
-  if (trimmed === "" || trimmed.startsWith("#")) {
-    continue;
-  }
-  const eq = trimmed.indexOf("=");
-  if (eq <= 0) {
-    continue;
-  }
-  const key = trimmed.slice(0, eq).trim();
-  if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) {
-    continue;
-  }
-  let value = trimmed.slice(eq + 1);
-  if (
-    (value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
-    (value.startsWith("'") && value.endsWith("'") && value.length >= 2)
-  ) {
-    value = value.slice(1, -1);
-  }
-  if (!(key in process.env)) {
-    process.env[key] = value;
-  }
+if (hasNodeDebugEnabled(childEnvironment)) {
+  process.stderr.write(
+    "env 文件不能设置 NODE_DEBUG 或 NODE_DEBUG_NATIVE，防止 Node 把子进程环境写到终端。\n"
+  );
+  process.exit(2);
 }
 
-const child = spawn(command[0], command.slice(1), { stdio: "inherit", env: process.env });
+const child = spawn(command[0], command.slice(1), {
+  stdio: "inherit",
+  env: childEnvironment
+});
 child.on("error", () => {
   process.stderr.write("子进程启动失败。\n");
   process.exit(1);
@@ -56,3 +47,10 @@ child.on("error", () => {
 child.on("exit", (code, signal) => {
   process.exit(code ?? (signal === null ? 1 : 1));
 });
+
+function hasNodeDebugEnabled(environment) {
+  return (
+    environment.NODE_DEBUG?.trim() ||
+    environment.NODE_DEBUG_NATIVE?.trim()
+  );
+}

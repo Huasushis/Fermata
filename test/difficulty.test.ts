@@ -51,7 +51,7 @@ describe("runDifficultyPipeline：整体接线", () => {
       model: {
         spec: { provider: "aether" as const, model: "test-model", temperature: 0.2, thinking: false },
         credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
-        runtime: { timeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
+        runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
       }
     });
     expect(result.rating).toBe(1700);
@@ -72,7 +72,7 @@ describe("runDifficultyPipeline：整体接线", () => {
       model: {
         spec: { provider: "aether" as const, model: "test-model", temperature: 0.2, thinking: false },
         credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
-        runtime: { timeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
+        runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
       }
     });
     expect(result.rating).toBe(900);

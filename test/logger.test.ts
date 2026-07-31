@@ -16,6 +16,16 @@ describe("安全错误码", () => {
     expect(describeError({ code: "LLM_HTTP_ERROR", message: "外部原文" })).toBe(
       "LLM_HTTP_ERROR"
     );
+    for (const code of [
+      "LLM_NETWORK_FAILED",
+      "LLM_FIRST_OUTPUT_TIMEOUT",
+      "LLM_OUTPUT_IDLE_TIMEOUT",
+      "LLM_TOTAL_TIMEOUT",
+      "LLM_STREAM_INTERRUPTED",
+      "LLM_CANCELLED"
+    ]) {
+      expect(describeError({ code, message: "外部原文" })).toBe(code);
+    }
     expect(describeError({ code: "UNTRUSTED_EXTERNAL_CODE", message: "外部原文" })).toBe(
       "UNEXPECTED_ERROR"
     );

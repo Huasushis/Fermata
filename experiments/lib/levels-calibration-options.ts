@@ -1,10 +1,14 @@
-export const defaultLevelsRequestTimeoutMs = 600_000;
+export const defaultLevelsOutputIdleTimeoutMs = 10 * 60 * 1_000;
+export const defaultLevelsFirstOutputTimeoutMs = 30 * 60 * 1_000;
+export const defaultLevelsMaximumDurationMs = 4 * 60 * 60 * 1_000;
 export const defaultLevelsConcurrency = 4;
 
 export interface LevelsCalibrationOptions {
   readonly label: string;
   readonly resumeFromLabel: string | null;
-  readonly requestTimeoutMs: number;
+  readonly outputIdleTimeoutMs: number;
+  readonly firstOutputTimeoutMs: number;
+  readonly maximumDurationMs: number;
   readonly maxAttempts: number;
   readonly concurrency: number;
 }
@@ -12,7 +16,9 @@ export interface LevelsCalibrationOptions {
 interface ResolveLevelsCalibrationOptionsInput {
   readonly argv: readonly string[];
   readonly env: NodeJS.ProcessEnv;
-  readonly configuredTimeoutMs: number;
+  readonly configuredOutputIdleTimeoutMs: number;
+  readonly configuredFirstOutputTimeoutMs: number;
+  readonly configuredMaximumDurationMs: number;
   readonly configuredMaxAttempts: number;
 }
 
@@ -23,20 +29,23 @@ interface ResolveLevelsCalibrationOptionsInput {
 export function resolveLevelsCalibrationOptions(
   input: ResolveLevelsCalibrationOptionsInput
 ): LevelsCalibrationOptions {
-  const rawLabel =
-    input.argv.find((value) => value.startsWith("--label="))?.slice("--label=".length) ??
-    "v1";
+  if (input.env.LEVELS_LLM_TIMEOUT_MS !== undefined) {
+    throw new Error(
+      "LEVELS_LLM_TIMEOUT_MS 已不再支持；请分别使用 LEVELS_LLM_OUTPUT_IDLE_MS、LEVELS_LLM_FIRST_OUTPUT_MS 和 LEVELS_LLM_MAX_DURATION_MS。"
+    );
+  }
+  const argumentsResult = parseCalibrationArguments(input.argv);
+  const rawLabel = argumentsResult.label ?? "v1";
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(rawLabel)) {
     throw new Error("--label 只能包含字母、数字、点、下划线和短横线，且不能超过 80 个字符。");
   }
 
-  const resumeFromArgument = input.argv
-    .find((value) => value.startsWith("--resume-from="))
-    ?.slice("--resume-from=".length);
-  if (input.argv.includes("--resume") && resumeFromArgument !== undefined) {
+  const resumeFromArgument = argumentsResult.resumeFrom;
+  if (argumentsResult.resume && resumeFromArgument !== undefined) {
     throw new Error("--resume 和 --resume-from 不能同时使用。");
   }
-  const resumeFromLabel = resumeFromArgument ?? (input.argv.includes("--resume") ? rawLabel : null);
+  const resumeFromLabel =
+    resumeFromArgument ?? (argumentsResult.resume ? rawLabel : null);
   if (
     resumeFromLabel !== null &&
     !/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(resumeFromLabel)
@@ -47,16 +56,51 @@ export function resolveLevelsCalibrationOptions(
     throw new Error("--resume-from 不能和 --label 相同；续跑当前标签请使用 --resume。");
   }
 
+  const outputIdleTimeoutMs = parseBoundedInteger(
+    input.env.LEVELS_LLM_OUTPUT_IDLE_MS,
+    Math.max(
+      input.configuredOutputIdleTimeoutMs,
+      defaultLevelsOutputIdleTimeoutMs
+    ),
+    defaultLevelsOutputIdleTimeoutMs,
+    24 * 60 * 60 * 1_000,
+    "LEVELS_LLM_OUTPUT_IDLE_MS"
+  );
+  const firstOutputTimeoutMs = parseBoundedInteger(
+    input.env.LEVELS_LLM_FIRST_OUTPUT_MS,
+    Math.max(
+      input.configuredFirstOutputTimeoutMs,
+      defaultLevelsFirstOutputTimeoutMs
+    ),
+    defaultLevelsFirstOutputTimeoutMs,
+    24 * 60 * 60 * 1_000,
+    "LEVELS_LLM_FIRST_OUTPUT_MS"
+  );
+  const maximumDurationMs = parseBoundedInteger(
+    input.env.LEVELS_LLM_MAX_DURATION_MS,
+    Math.max(
+      input.configuredMaximumDurationMs,
+      defaultLevelsMaximumDurationMs
+    ),
+    defaultLevelsMaximumDurationMs,
+    24 * 60 * 60 * 1_000,
+    "LEVELS_LLM_MAX_DURATION_MS"
+  );
+  if (
+    maximumDurationMs < outputIdleTimeoutMs ||
+    maximumDurationMs < firstOutputTimeoutMs
+  ) {
+    throw new Error(
+      "LEVELS_LLM_MAX_DURATION_MS 不能小于 LEVELS_LLM_OUTPUT_IDLE_MS 或 LEVELS_LLM_FIRST_OUTPUT_MS。"
+    );
+  }
+
   return {
     label: rawLabel,
     resumeFromLabel,
-    requestTimeoutMs: parseBoundedInteger(
-      input.env.LEVELS_LLM_TIMEOUT_MS,
-      Math.max(input.configuredTimeoutMs, defaultLevelsRequestTimeoutMs),
-      1_000,
-      600_000,
-      "LEVELS_LLM_TIMEOUT_MS"
-    ),
+    outputIdleTimeoutMs,
+    firstOutputTimeoutMs,
+    maximumDurationMs,
     maxAttempts: parseBoundedInteger(
       input.env.LEVELS_LLM_MAX_ATTEMPTS,
       input.configuredMaxAttempts,
@@ -74,6 +118,41 @@ export function resolveLevelsCalibrationOptions(
   };
 }
 
+function parseCalibrationArguments(argv: readonly string[]): {
+  readonly label: string | undefined;
+  readonly resume: boolean;
+  readonly resumeFrom: string | undefined;
+} {
+  let label: string | undefined;
+  let resume = false;
+  let resumeFrom: string | undefined;
+  for (const argument of argv) {
+    if (argument === "--resume") {
+      if (resume) {
+        throw new Error("--resume 不能重复填写。");
+      }
+      resume = true;
+      continue;
+    }
+    if (argument.startsWith("--label=")) {
+      if (label !== undefined) {
+        throw new Error("--label 不能重复填写。");
+      }
+      label = argument.slice("--label=".length);
+      continue;
+    }
+    if (argument.startsWith("--resume-from=")) {
+      if (resumeFrom !== undefined) {
+        throw new Error("--resume-from 不能重复填写。");
+      }
+      resumeFrom = argument.slice("--resume-from=".length);
+      continue;
+    }
+    throw new Error("存在不支持的标定参数。");
+  }
+  return { label, resume, resumeFrom };
+}
+
 function parseBoundedInteger(
   raw: string | undefined,
   fallback: number,
@@ -81,13 +160,16 @@ function parseBoundedInteger(
   maximum: number,
   name: string
 ): number {
-  if (raw === undefined || raw.trim() === "") {
-    return fallback;
-  }
-  if (!/^\d+$/.test(raw.trim())) {
+  const trimmed = raw?.trim();
+  if (
+    trimmed !== undefined &&
+    trimmed !== "" &&
+    !/^\d+$/.test(trimmed)
+  ) {
     throw new Error(`${name} 必须是 ${minimum} 到 ${maximum} 之间的整数。`);
   }
-  const value = Number(raw);
+  const value =
+    trimmed === undefined || trimmed === "" ? fallback : Number(trimmed);
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
     throw new Error(`${name} 必须是 ${minimum} 到 ${maximum} 之间的整数。`);
   }

@@ -87,7 +87,7 @@ describe("runThinkingPipeline：整体接线", () => {
     const modelConfig = {
       spec: { provider: "aether" as const, model: "test-model", temperature: 0.2, thinking: true },
       credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
-      runtime: { timeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
+      runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
     };
 
     const result = await runThinkingPipeline({
@@ -121,7 +121,7 @@ describe("runThinkingPipeline：整体接线", () => {
     const modelConfig = {
       spec: { provider: "aether" as const, model: "test-model", temperature: 0.2, thinking: true },
       credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
-      runtime: { timeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
+      runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
     };
     await runThinkingPipeline({ problem, solverModel: modelConfig, analystModel: modelConfig });
   });

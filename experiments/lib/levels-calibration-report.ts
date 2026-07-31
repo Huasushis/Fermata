@@ -43,12 +43,37 @@ const reportRunConfigurationSchema = z
         coding: providerReportSchema()
       })
       .strict(),
-    requestTimeoutMs: z.number().int().min(1_000).max(600_000),
+    outputIdleTimeoutMs: z
+      .number()
+      .int()
+      .min(10 * 60 * 1_000)
+      .max(24 * 60 * 60 * 1_000),
+    firstOutputTimeoutMs: z
+      .number()
+      .int()
+      .min(30 * 60 * 1_000)
+      .max(24 * 60 * 60 * 1_000),
+    maximumDurationMs: z
+      .number()
+      .int()
+      .min(4 * 60 * 60 * 1_000)
+      .max(24 * 60 * 60 * 1_000),
     maxAttempts: z.number().int().min(1).max(10),
     baseDelayMs: z.number().int().min(1).max(60_000),
     concurrency: z.number().int().min(1).max(32)
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (
+      value.maximumDurationMs < value.outputIdleTimeoutMs ||
+      value.maximumDurationMs < value.firstOutputTimeoutMs
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "每次向模型服务发出请求的最长时间不能小于另外两项等待时间。"
+      });
+    }
+  });
 
 export interface LevelsCalibrationReportInput {
   readonly label: string;
@@ -232,8 +257,10 @@ function buildMarkdown(
     `- 解题模型服务：${summary.runConfiguration.providers.solver.name}（地址校验值 ${summary.runConfiguration.providers.solver.addressCheck}）`,
     `- 分析模型服务：${summary.runConfiguration.providers.analyst.name}（地址校验值 ${summary.runConfiguration.providers.analyst.addressCheck}）`,
     `- 代码模型服务：${summary.runConfiguration.providers.coding.name}（地址校验值 ${summary.runConfiguration.providers.coding.addressCheck}）`,
-    `- 单次请求等待上限：${summary.runConfiguration.requestTimeoutMs} 毫秒`,
-    `- 最多尝试次数：${summary.runConfiguration.maxAttempts}`,
+    `- 收到第一段输出后，连续没有新数据的等待上限：${summary.runConfiguration.outputIdleTimeoutMs} 毫秒`,
+    `- 等待第一段输出的上限：${summary.runConfiguration.firstOutputTimeoutMs} 毫秒`,
+    `- 每次向模型服务发出请求的最长时间：${summary.runConfiguration.maximumDurationMs} 毫秒`,
+    `- 最多尝试次数：${summary.runConfiguration.maxAttempts}（只有模型服务明确返回请求过多时才会再次尝试）`,
     `- 首次重试前等待：${summary.runConfiguration.baseDelayMs} 毫秒`,
     `- 同时处理题数：${summary.runConfiguration.concurrency}`,
     "",

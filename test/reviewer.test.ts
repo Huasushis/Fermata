@@ -41,7 +41,12 @@ const appConfig: AppConfig = {
       }
     },
     retry: { maxAttempts: 1, baseDelayMs: 1 },
-    timeouts: { llmRequestMs: 5_000, codeforcesRequestMs: 5_000 },
+    timeouts: {
+      llmFirstOutputMs: 120_000,
+      llmOutputIdleMs: 120_000,
+      llmMaximumDurationMs: 300_000,
+      codeforcesRequestMs: 5_000
+    },
     codeforces: { minimumRequestIntervalMs: 0 },
     thresholds: { duplicateSimilarityReject: 0.9 }
   }
@@ -147,8 +152,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   // 每个测试结束前都应该已经让所有任务 promise 落地（settings/complete 或者
-  // 主动 flush 过），这样 #taskPromises 为空，stop() 会走"没有待处理任务"的
-  // 快速路径直接返回，不依赖它内部那个 30 秒 setTimeout 在假时钟下会不会触发。
+  // 主动 flush 过），避免 afterEach 永久等待测试自己遗留的在途任务。
   if (worker !== null) {
     await worker.stop();
     worker = null;
@@ -283,6 +287,63 @@ describe("ReviewerWorker：基本轮询与处理", () => {
 });
 
 describe("ReviewerWorker：续租", () => {
+  it("一条付费流水线先失败时仍等待其余请求并继续续租", async () => {
+    const client = createFakeUrmotivClient();
+    const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
+    client.claimMock.mockResolvedValueOnce({
+      items: [sampleTask(assignmentId)]
+    });
+    const remainingRequests = createDeferred<Response>();
+    let requestNumber = 0;
+    const fetchMock = vi.fn(async () => {
+      requestNumber += 1;
+      if (requestNumber === 1) {
+        return new Response("", { status: 503 });
+      }
+      await remainingRequests.promise;
+      return llmSuccessResponse();
+    });
+    const settingsStore = createFakeSettingsStore({
+      enabled: true,
+      pollingIntervalSeconds: 30,
+      maximumConcurrentTasks: 2,
+      modelProfileName: "test-profile",
+      experimentVersion: "exp-test"
+    });
+    worker = new ReviewerWorker({
+      urmotivClient: client,
+      settingsStore,
+      appConfig,
+      anchors: [],
+      leaseSeconds: 10,
+      fetch: fetchMock
+    });
+    worker.start();
+    await flushAsync();
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(worker.getStatus().activeTasks).toBe(1);
+    let stopFinished = false;
+    const stopPromise = worker.stop().then(() => {
+      stopFinished = true;
+    });
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushAsync();
+    expect(client.renewMock).toHaveBeenCalled();
+    expect(stopFinished).toBe(false);
+    expect(worker.getStatus().activeTasks).toBe(1);
+
+    remainingRequests.resolve(llmSuccessResponse());
+    await flushAsync(100);
+    await stopPromise;
+
+    expect(stopFinished).toBe(true);
+    expect(client.completeMock).not.toHaveBeenCalled();
+    expect(worker.getStatus().activeTasks).toBe(0);
+    worker = null;
+  });
+
   it("租约过半后自动续租，用续租时任务当时的 leaseExpiresAt 作为 expectedLeaseExpiresAt", async () => {
     const client = createFakeUrmotivClient();
     const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
@@ -304,7 +365,7 @@ describe("ReviewerWorker：续租", () => {
       settingsStore,
       appConfig,
       anchors: [],
-      leaseSeconds: 10, // 续租间隔 = max(5000, 10*500) = 5000ms
+      leaseSeconds: 10, // 续租间隔 = max(5000, 10000/3) = 5000ms
       fetch: vi.fn(async () => {
         // 每次调用都要返回一个新的 Response：同一个 Response 的正文只能读一次，
         // 流水线会发起多次 LLM 请求，复用同一实例会在第二次 json() 时失败。
@@ -323,11 +384,65 @@ describe("ReviewerWorker：续租", () => {
       expect.objectContaining({ expectedLeaseExpiresAt: "2026-07-26T00:05:00.000Z" })
     );
 
-    // 放开卡住的 fetch，让任务能正常结束，这样测试结束时 #taskPromises 是空的，
-    // afterEach 里的 stop() 才不会去依赖那个 30 秒兜底超时。
+    // 放开卡住的 fetch，让任务能正常结束，避免 afterEach 永久等待测试自己
+    // 遗留的在途任务。
     deferred.resolve(llmSuccessResponse());
     await flushAsync();
     expect(client.completeMock).toHaveBeenCalledTimes(1);
+    expect(worker.getStatus().activeTasks).toBe(0);
+  });
+
+  it("流水线完成时若续租仍在途，等待续租响应后用最新租约提交", async () => {
+    const client = createFakeUrmotivClient();
+    const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
+    const nextLeaseExpiresAt = "2026-07-26T00:20:00.000Z";
+    client.claimMock.mockResolvedValueOnce({
+      items: [sampleTask(assignmentId)]
+    });
+    const renewal = createDeferred<{
+      assignmentId: string;
+      leaseExpiresAt: string;
+    }>();
+    client.renewMock.mockImplementationOnce(async () => renewal.promise);
+    const modelRequests = createDeferred<Response>();
+    const settingsStore = createFakeSettingsStore({
+      enabled: true,
+      pollingIntervalSeconds: 30,
+      maximumConcurrentTasks: 2,
+      modelProfileName: "test-profile",
+      experimentVersion: "exp-test"
+    });
+    worker = new ReviewerWorker({
+      urmotivClient: client,
+      settingsStore,
+      appConfig,
+      anchors: [],
+      leaseSeconds: 10,
+      fetch: vi.fn(async () => {
+        await modelRequests.promise;
+        return llmSuccessResponse();
+      })
+    });
+    worker.start();
+    await flushAsync();
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(client.renewMock).toHaveBeenCalledTimes(1);
+
+    modelRequests.resolve(llmSuccessResponse());
+    await flushAsync(100);
+    expect(client.completeMock).not.toHaveBeenCalled();
+    expect(worker.getStatus().activeTasks).toBe(1);
+
+    renewal.resolve({ assignmentId, leaseExpiresAt: nextLeaseExpiresAt });
+    await flushAsync(100);
+
+    expect(client.completeMock).toHaveBeenCalledWith(
+      assignmentId,
+      expect.objectContaining({
+        expectedLeaseExpiresAt: nextLeaseExpiresAt
+      })
+    );
     expect(worker.getStatus().activeTasks).toBe(0);
   });
 
@@ -362,16 +477,170 @@ describe("ReviewerWorker：续租", () => {
     await flushAsync();
     await vi.advanceTimersByTimeAsync(5_000);
     expect(client.renewMock).toHaveBeenCalledTimes(1);
+    await flushAsync();
 
+    expect(worker.getStatus().activeTasks).toBe(0);
+    expect(client.completeMock).not.toHaveBeenCalled();
+    // 清理测试里故意不理会 AbortSignal 的假 fetch；真实 fetch 会被请求信号停止。
     deferred.resolve(llmSuccessResponse());
     await flushAsync();
 
     expect(worker.getStatus().activeTasks).toBe(0);
     expect(client.completeMock).not.toHaveBeenCalled();
   });
+
+  it.each([401, 403])(
+    "续租收到 %i 时停止当前付费请求且不按网络故障重试",
+    async (status) => {
+      const client = createFakeUrmotivClient();
+      const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
+      client.claimMock.mockResolvedValueOnce({
+        items: [sampleTask(assignmentId)]
+      });
+      client.renewMock.mockRejectedValueOnce(
+        new UrmotivApiError(status, "固定拒绝")
+      );
+
+      const deferred = createDeferred<Response>();
+      const settingsStore = createFakeSettingsStore({
+        enabled: true,
+        pollingIntervalSeconds: 30,
+        maximumConcurrentTasks: 2,
+        modelProfileName: "test-profile",
+        experimentVersion: "exp-test"
+      });
+      worker = new ReviewerWorker({
+        urmotivClient: client,
+        settingsStore,
+        appConfig,
+        anchors: [],
+        leaseSeconds: 10,
+        fetch: vi.fn(async () => {
+          await deferred.promise;
+          return llmSuccessResponse();
+        })
+      });
+      worker.start();
+      await flushAsync();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+      expect(worker.getStatus().activeTasks).toBe(0);
+      expect(client.completeMock).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(client.renewMock).toHaveBeenCalledTimes(1);
+      deferred.resolve(llmSuccessResponse());
+    }
+  );
+
+  it("续租遇到普通网络失败后用短间隔重试，不再等待完整续租周期", async () => {
+    const client = createFakeUrmotivClient();
+    const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
+    client.claimMock.mockResolvedValueOnce({ items: [sampleTask(assignmentId)] });
+    client.renewMock
+      .mockRejectedValueOnce(new Error("临时网络故障"))
+      .mockResolvedValueOnce({
+        assignmentId,
+        leaseExpiresAt: "2026-07-26T00:20:00.000Z"
+      });
+
+    const deferred = createDeferred<Response>();
+    const settingsStore = createFakeSettingsStore({
+      enabled: true,
+      pollingIntervalSeconds: 30,
+      maximumConcurrentTasks: 2,
+      modelProfileName: "test-profile",
+      experimentVersion: "exp-test"
+    });
+    worker = new ReviewerWorker({
+      urmotivClient: client,
+      settingsStore,
+      appConfig,
+      anchors: [],
+      leaseSeconds: 10,
+      fetch: vi.fn(async () => {
+        await deferred.promise;
+        return llmSuccessResponse();
+      })
+    });
+    worker.start();
+    await flushAsync();
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushAsync();
+    expect(client.renewMock).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await flushAsync();
+    expect(client.renewMock).toHaveBeenCalledTimes(2);
+
+    deferred.resolve(llmSuccessResponse());
+    await flushAsync();
+    expect(client.completeMock).toHaveBeenCalledTimes(1);
+    expect(worker.getStatus().activeTasks).toBe(0);
+  });
 });
 
 describe("ReviewerWorker：停机", () => {
+  it("stop() 在任务未完成时持续等待，任务完成后才结束", async () => {
+    const client = createFakeUrmotivClient();
+    const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
+    client.claimMock.mockResolvedValueOnce({ items: [sampleTask(assignmentId)] });
+
+    const deferred = createDeferred<Response>();
+    const settingsStore = createFakeSettingsStore({
+      enabled: true,
+      pollingIntervalSeconds: 30,
+      maximumConcurrentTasks: 2,
+      modelProfileName: "test-profile",
+      experimentVersion: "exp-test"
+    });
+    worker = new ReviewerWorker({
+      urmotivClient: client,
+      settingsStore,
+      appConfig,
+      anchors: [],
+      leaseSeconds: 10,
+      fetch: vi.fn(async () => {
+        await deferred.promise;
+        return llmSuccessResponse();
+      })
+    });
+    worker.start();
+    await flushAsync();
+    expect(worker.getStatus().activeTasks).toBe(1);
+
+    let stopFinished = false;
+    const stopPromise = worker.stop().then(() => {
+      stopFinished = true;
+    });
+    // 停机尚未完成时调用 start() 必须被忽略，不能启动一代新的轮询和续租。
+    worker.start();
+
+    // 跨过旧实现的 30 秒停机时限；任务还没完成时 stop 仍不能返回，而且续租
+    // 必须继续，不能因为进入停机流程就让昂贵的模型请求失去租约。
+    await vi.advanceTimersByTimeAsync(30_001);
+    expect(stopFinished).toBe(false);
+    expect(client.completeMock).not.toHaveBeenCalled();
+    expect(client.renewMock).toHaveBeenCalled();
+    expect(client.claimMock).toHaveBeenCalledTimes(1);
+
+    deferred.resolve(llmSuccessResponse());
+    await flushAsync();
+    await stopPromise;
+
+    expect(stopFinished).toBe(true);
+    expect(client.completeMock).toHaveBeenCalledTimes(1);
+    expect(worker.getStatus().activeTasks).toBe(0);
+
+    const renewalCountAfterStop = client.renewMock.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(client.renewMock).toHaveBeenCalledTimes(renewalCountAfterStop);
+
+    worker = null; // 已经手动 stop 过了，避免 afterEach 重复调用
+  });
+
   it("stop() 之后不会再触发新的轮询", async () => {
     const client = createFakeUrmotivClient();
     const settingsStore = createFakeSettingsStore({

@@ -45,7 +45,9 @@ retry:
   maxAttempts: 3
   baseDelayMs: 500
 timeouts:
-  llmRequestMs: 60000
+  llmFirstOutputMs: 1800000
+  llmOutputIdleMs: 600000
+  llmMaximumDurationMs: 14400000
   codeforcesRequestMs: 15000
 codeforces:
   minimumRequestIntervalMs: 2100
@@ -160,6 +162,26 @@ profiles:
     expect(() => loadConfig({ env: validEnv, modelsYamlSource: brokenYaml })).toThrow(ConfigError);
   });
 
+  it("拒绝把模型输出停顿时间降回 120 秒", () => {
+    const brokenYaml = validYaml.replace(
+      "llmOutputIdleMs: 600000",
+      "llmOutputIdleMs: 120000"
+    );
+    expect(() =>
+      loadConfig({ env: validEnv, modelsYamlSource: brokenYaml })
+    ).toThrow(ConfigError);
+  });
+
+  it("最终保护时长不能短于等待第一段输出的时间", () => {
+    const brokenYaml = validYaml.replace(
+      "llmFirstOutputMs: 1800000",
+      "llmFirstOutputMs: 20000000"
+    );
+    expect(() =>
+      loadConfig({ env: validEnv, modelsYamlSource: brokenYaml })
+    ).toThrow(ConfigError);
+  });
+
   it("YAML 解析本身失败（比如 Tab 缩进）时抛出 ConfigError", () => {
     expect(() => loadConfig({ env: validEnv, modelsYamlSource: "a:\n\tb: 1" })).toThrow(ConfigError);
   });
@@ -257,7 +279,9 @@ retry:
   maxAttempts: 3
   baseDelayMs: 500
 timeouts:
-  llmRequestMs: 60000
+  llmFirstOutputMs: 1800000
+  llmOutputIdleMs: 600000
+  llmMaximumDurationMs: 14400000
   codeforcesRequestMs: 15000
 codeforces:
   minimumRequestIntervalMs: 2100

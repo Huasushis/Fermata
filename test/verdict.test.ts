@@ -93,7 +93,7 @@ const problem: ReviewTaskProblem = {
 const modelConfig = (fetchMock: (input: string | URL | Request, init?: RequestInit) => Promise<Response>) => ({
   spec: { provider: "aether" as const, model: "test-model", temperature: 0.1, thinking: false },
   credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
-  runtime: { timeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
+  runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
 });
 
 function jsonResponse(payload: unknown): Response {

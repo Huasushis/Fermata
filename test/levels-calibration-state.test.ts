@@ -125,7 +125,9 @@ function runConfiguration(overrides: TestRunConfigurationOverrides = {}) {
     solverBaseUrl: "https://solver.example/v1/",
     analystBaseUrl: "https://analyst.example/v1/",
     codingBaseUrl: "https://coding.example/v1/",
-    requestTimeoutMs: 600_000,
+    outputIdleTimeoutMs: 600_000,
+    firstOutputTimeoutMs: 1_800_000,
+    maximumDurationMs: 14_400_000,
     maxAttempts: 3,
     baseDelayMs: 1_000,
     concurrency: 4
@@ -289,14 +291,16 @@ describe("实验校验摘要与续跑", () => {
     expect(pipelineChanged.combinedHash).not.toBe(base.combinedHash);
   });
 
-  it("实际服务地址、等待、重试和并发参数变化都会改变摘要", () => {
+  it("实际服务地址、三项等待时间、重试和并发参数变化都会改变摘要", () => {
     const dataset = [item()];
     const base = fingerprint(dataset);
     const changedConfigurations = [
       runConfiguration({
         providerBaseUrls: { solver: "https://solver-2.example/v1/" }
       }),
-      runConfiguration({ requestTimeoutMs: 599_999 }),
+      runConfiguration({ outputIdleTimeoutMs: 600_001 }),
+      runConfiguration({ firstOutputTimeoutMs: 1_800_001 }),
+      runConfiguration({ maximumDurationMs: 14_400_001 }),
       runConfiguration({ maxAttempts: 2 }),
       runConfiguration({ baseDelayMs: 2_000 }),
       runConfiguration({ concurrency: 2 })
@@ -319,7 +323,9 @@ describe("实验校验摘要与续跑", () => {
             solverBaseUrl,
             analystBaseUrl: "https://analyst.example/v1/",
             codingBaseUrl: "https://coding.example/v1/",
-            requestTimeoutMs: 600_000,
+            outputIdleTimeoutMs: 600_000,
+            firstOutputTimeoutMs: 1_800_000,
+            maximumDurationMs: 14_400_000,
             maxAttempts: 3,
             baseDelayMs: 1_000,
             concurrency: 4
@@ -339,12 +345,52 @@ describe("实验校验摘要与续跑", () => {
     }
   });
 
+  it("三项等待时间都使用安全范围，且最长时间不能短于另外两项", () => {
+    const safeInput = {
+      solverBaseUrl: "https://solver.example/v1/",
+      analystBaseUrl: "https://analyst.example/v1/",
+      codingBaseUrl: "https://coding.example/v1/",
+      outputIdleTimeoutMs: 600_000,
+      firstOutputTimeoutMs: 1_800_000,
+      maximumDurationMs: 14_400_000,
+      maxAttempts: 3,
+      baseDelayMs: 1_000,
+      concurrency: 4
+    };
+    const invalidChanges = [
+      { outputIdleTimeoutMs: 599_999 },
+      { outputIdleTimeoutMs: 86_400_001 },
+      { outputIdleTimeoutMs: 600_000.5 },
+      { firstOutputTimeoutMs: 1_799_999 },
+      { firstOutputTimeoutMs: 86_400_001 },
+      { maximumDurationMs: 14_399_999 },
+      { maximumDurationMs: 86_400_001 },
+      {
+        outputIdleTimeoutMs: 18_000_000,
+        maximumDurationMs: 14_400_000
+      },
+      {
+        firstOutputTimeoutMs: 18_000_000,
+        maximumDurationMs: 14_400_000
+      }
+    ];
+    for (const change of invalidChanges) {
+      expect(
+        captureStateError(() =>
+          buildLevelsRunConfiguration({ ...safeInput, ...change })
+        ).code
+      ).toBe("LEVELS_FINGERPRINT_BUILD_FAILED");
+    }
+  });
+
   it("公开运行参数只保留服务名称、地址校验值和数值，不输出完整地址", () => {
     const privateConfiguration = buildLevelsRunConfiguration({
       solverBaseUrl: "https://solver.private.example/internal/gateway",
       analystBaseUrl: "https://analyst.private.example/internal/gateway",
       codingBaseUrl: "https://coding.private.example/internal/gateway",
-      requestTimeoutMs: 600_000,
+      outputIdleTimeoutMs: 600_000,
+      firstOutputTimeoutMs: 1_800_000,
+      maximumDurationMs: 14_400_000,
       maxAttempts: 3,
       baseDelayMs: 1_000,
       concurrency: 4
@@ -361,6 +407,11 @@ describe("实验校验摘要与续跑", () => {
     expect(serialized).not.toContain("/internal/gateway");
     expect(serialized).not.toContain("private.example");
     expect(serialized).toContain("aether");
+    expect(reportConfiguration).toMatchObject({
+      outputIdleTimeoutMs: 600_000,
+      firstOutputTimeoutMs: 1_800_000,
+      maximumDurationMs: 14_400_000
+    });
     expect(reportConfiguration.providers.solver.addressCheck).toMatch(
       /^[a-f0-9]{16}$/
     );
@@ -445,6 +496,68 @@ describe("实验校验摘要与续跑", () => {
       ]
     });
     expect(completeCalibrationRows(restored.progress)).toEqual([]);
+  });
+
+  it("旧检查点的笼统模型错误码只在读取时兼容，并归入未知错误", () => {
+    const directory = makeDirectoryUrl();
+    const dataset = [item()];
+    const currentFingerprint = fingerprint(dataset);
+    const target = checkpointUrl(directory, "legacy-errors");
+    writeCalibrationCheckpoint({
+      target,
+      label: "legacy-errors",
+      profileName: "review-balanced",
+      fingerprint: currentFingerprint,
+      progress: [],
+      failureCounts: []
+    });
+    const saved = JSON.parse(readFileSync(target, "utf8")) as {
+      failureCounts: unknown[];
+    };
+    saved.failureCounts = [
+      {
+        stage: "coding",
+        errorCode: "LLM_REQUEST_FAILED",
+        status: null,
+        count: 2
+      },
+      {
+        stage: "coding",
+        errorCode: "UNEXPECTED_ERROR",
+        status: null,
+        count: 3
+      }
+    ];
+    writeFileSync(target, JSON.stringify(saved), "utf8");
+
+    const restored = loadCalibrationCheckpoint({
+      source: target,
+      expectedLabel: "legacy-errors",
+      expectedProfileName: "review-balanced",
+      expectedFingerprint: currentFingerprint,
+      expectedItems: dataset
+    });
+    expect(restored.failureCounts).toEqual([
+      {
+        stage: "coding",
+        errorCode: "UNEXPECTED_ERROR",
+        status: null,
+        count: 5
+      }
+    ]);
+
+    const rewritten = new URL("levels-rewritten-checkpoint.json", directory);
+    writeCalibrationCheckpoint({
+      target: rewritten,
+      label: "legacy-errors",
+      profileName: "review-balanced",
+      fingerprint: currentFingerprint,
+      progress: restored.progress,
+      failureCounts: restored.failureCounts
+    });
+    expect(readFileSync(rewritten, "utf8")).not.toContain(
+      "LLM_REQUEST_FAILED"
+    );
   });
 
   it("第 2 版和其它数字版本都明确拒绝续跑，缺失版本仍按格式错误处理", () => {
@@ -532,6 +645,37 @@ describe("实验校验摘要与续跑", () => {
       })
     );
     expect(error.code).toBe("LEVELS_FINGERPRINT_MISMATCH");
+  });
+
+  it("任一等待时间变化后都不能复用旧检查点", () => {
+    const directory = makeDirectoryUrl();
+    const dataset = [item()];
+    const target = checkpointUrl(directory, "source");
+    writeCalibrationCheckpoint({
+      target,
+      label: "source",
+      profileName: "review-balanced",
+      fingerprint: fingerprint(dataset),
+      progress: [progress(dataset[0]!)],
+      failureCounts: noFailures
+    });
+    const changedConfigurations = [
+      runConfiguration({ outputIdleTimeoutMs: 600_001 }),
+      runConfiguration({ firstOutputTimeoutMs: 1_800_001 }),
+      runConfiguration({ maximumDurationMs: 14_400_001 })
+    ];
+    for (const changedConfiguration of changedConfigurations) {
+      const error = captureStateError(() =>
+        loadCalibrationCheckpoint({
+          source: target,
+          expectedLabel: "source",
+          expectedProfileName: "review-balanced",
+          expectedFingerprint: fingerprint(dataset, changedConfiguration),
+          expectedItems: dataset
+        })
+      );
+      expect(error.code).toBe("LEVELS_FINGERPRINT_MISMATCH");
+    }
   });
 
   it("没有实验校验摘要的旧格式检查点会被拒绝", () => {
@@ -770,7 +914,24 @@ describe("实验校验摘要与续跑", () => {
       status: 429,
       count: 1
     } as const;
-    expect(() => writeFailures([httpFailure])).not.toThrow();
+    const currentLlmFailures = [
+      "LLM_NETWORK_FAILED",
+      "LLM_FIRST_OUTPUT_TIMEOUT",
+      "LLM_OUTPUT_IDLE_TIMEOUT",
+      "LLM_TOTAL_TIMEOUT",
+      "LLM_STREAM_INTERRUPTED"
+    ].map(
+      (errorCode) =>
+        ({
+          stage: "thinking",
+          errorCode,
+          status: null,
+          count: 1
+        }) as CalibrationFailureCount
+    );
+    expect(() =>
+      writeFailures([httpFailure, ...currentLlmFailures])
+    ).not.toThrow();
     for (const failureCounts of [
       [{ ...httpFailure, status: 99 }],
       [{ ...httpFailure, status: 200 }],
@@ -780,9 +941,26 @@ describe("实验校验摘要与续跑", () => {
       [
         {
           stage: "thinking",
-          errorCode: "LLM_REQUEST_FAILED",
+          errorCode: "LLM_NETWORK_FAILED",
           status: 503,
           count: 1
+        }
+      ],
+      [
+        {
+          stage: "thinking",
+          errorCode: "LLM_REQUEST_FAILED",
+          status: null,
+          count: 1
+        }
+      ],
+      [
+        {
+          stage: "thinking",
+          errorCode: "LLM_NETWORK_FAILED",
+          status: null,
+          count: 1,
+          message: "不能写入检查点的外部错误正文"
         }
       ],
       [httpFailure, httpFailure]

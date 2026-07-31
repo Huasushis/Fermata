@@ -142,7 +142,9 @@ async function main(): Promise<void> {
     spec: profile.verdict,
     credentials,
     runtime: {
-      timeoutMs: config.models.timeouts.llmRequestMs,
+      firstOutputTimeoutMs: config.models.timeouts.llmFirstOutputMs,
+      outputIdleTimeoutMs: config.models.timeouts.llmOutputIdleMs,
+      maximumDurationMs: config.models.timeouts.llmMaximumDurationMs,
       maxAttempts: config.models.retry.maxAttempts,
       baseDelayMs: config.models.retry.baseDelayMs
     }

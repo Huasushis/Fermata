@@ -14,7 +14,12 @@ export type LogFields = Readonly<Record<string, string | number | boolean | null
 const allowedErrorCodes = new Set([
   "CONFIG_INVALID",
   "LLM_HTTP_ERROR",
-  "LLM_REQUEST_FAILED",
+  "LLM_NETWORK_FAILED",
+  "LLM_FIRST_OUTPUT_TIMEOUT",
+  "LLM_OUTPUT_IDLE_TIMEOUT",
+  "LLM_TOTAL_TIMEOUT",
+  "LLM_STREAM_INTERRUPTED",
+  "LLM_CANCELLED",
   "LLM_RESPONSE_BODY_TOO_LARGE",
   "LLM_RESPONSE_FORMAT_INVALID",
   "LLM_JSON_OUTPUT_INVALID",

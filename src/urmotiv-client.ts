@@ -173,33 +173,50 @@ export class UrmotivClient implements UrmotivClientLike {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.#timeoutMs);
 
-    let response: Response;
+    let response: Response | undefined;
+    let rawBody: unknown;
     try {
-      response = await this.#fetch(new URL(relativePath, this.#baseUrl), {
-        method: "POST",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.#robotToken}`,
-          "X-Urmotiv-API-Version": "1"
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal
-      });
+      response = await waitForOrAbort(
+        this.#fetch(new URL(relativePath, this.#baseUrl), {
+          method: "POST",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${this.#robotToken}`,
+            "X-Urmotiv-API-Version": "1"
+          },
+          body: JSON.stringify(body),
+          signal: controller.signal
+        }),
+        controller.signal
+      );
+      if (response.ok) {
+        rawBody = await parseJsonBodyLeniently(response, controller.signal);
+      } else {
+        cancelResponseBodyWithoutReading(response);
+      }
     } catch (error) {
+      controller.abort();
+      if (response?.body !== null && response?.body !== undefined) {
+        try {
+          const cancellation = response.body.cancel();
+          void cancellation.catch(() => undefined);
+        } catch {
+          // 取消失败不能替换固定的网络错误。
+        }
+      }
       throw new UrmotivNetworkError(`请求 Urmotiv 机器人 API 失败：${relativePath}`, error);
     } finally {
       clearTimeout(timeout);
     }
 
-    const rawBody = await parseJsonBodyLeniently(response);
-
+    if (response === undefined) {
+      throw new UrmotivNetworkError(`请求 Urmotiv 机器人 API 失败：${relativePath}`);
+    }
     if (!response.ok) {
-      const envelope = extractErrorEnvelope(rawBody);
       throw new UrmotivApiError(
         response.status,
-        envelope?.message ?? `Urmotiv 返回状态码 ${response.status}：${relativePath}`,
-        { code: envelope?.code, requestId: envelope?.requestId, fieldErrors: envelope?.fieldErrors }
+        `Urmotiv 返回状态码 ${response.status}：${relativePath}`
       );
     }
 
@@ -213,8 +230,23 @@ export class UrmotivClient implements UrmotivClientLike {
   }
 }
 
-async function parseJsonBodyLeniently(response: Response): Promise<unknown> {
-  const text = await response.text();
+function cancelResponseBodyWithoutReading(response: Response): void {
+  if (response.body === null) {
+    return;
+  }
+  try {
+    const cancellation = response.body.cancel();
+    void cancellation.catch(() => undefined);
+  } catch {
+    // 状态码已经足够分类；取消正文失败不能把它改成网络错误。
+  }
+}
+
+async function parseJsonBodyLeniently(
+  response: Response,
+  signal: AbortSignal
+): Promise<unknown> {
+  const text = await waitForOrAbort(response.text(), signal);
   if (text.length === 0) {
     return undefined;
   }
@@ -225,46 +257,30 @@ async function parseJsonBodyLeniently(response: Response): Promise<unknown> {
   }
 }
 
-interface ErrorEnvelope {
-  readonly code?: string;
-  readonly message?: string;
-  readonly requestId?: string;
-  readonly fieldErrors?: Record<string, string[]>;
-}
-
-/**
- * 尽力而为地解析 Urmotiv 的错误响应体（`{ error: { code, message, requestId,
- * fieldErrors? } }`）。这不是契约的一部分，只是观察到的应用层约定，解析失败时
- * 静默返回 undefined，调用方会退化成用 HTTP 状态码拼一句默认错误信息。
- */
-function extractErrorEnvelope(rawBody: unknown): ErrorEnvelope | undefined {
-  if (typeof rawBody !== "object" || rawBody === null || !("error" in rawBody)) {
-    return undefined;
+function waitForOrAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal
+): Promise<T> {
+  if (signal.aborted) {
+    return Promise.reject(new DOMException("请求已结束。", "AbortError"));
   }
-  const errorValue = (rawBody as { error: unknown }).error;
-  if (typeof errorValue !== "object" || errorValue === null) {
-    return undefined;
-  }
-  const record = errorValue as Record<string, unknown>;
-  const result: {
-    code?: string;
-    message?: string;
-    requestId?: string;
-    fieldErrors?: Record<string, string[]>;
-  } = {};
-  if (typeof record.code === "string") {
-    result.code = record.code;
-  }
-  if (typeof record.message === "string") {
-    result.message = record.message;
-  }
-  if (typeof record.requestId === "string") {
-    result.requestId = record.requestId;
-  }
-  if (typeof record.fieldErrors === "object" && record.fieldErrors !== null) {
-    result.fieldErrors = record.fieldErrors as Record<string, string[]>;
-  }
-  return result;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener("abort", onAbort);
+      reject(new DOMException("请求已结束。", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
 }
 
 function ensureTrailingSlash(value: string): string {

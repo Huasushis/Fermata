@@ -9,6 +9,7 @@ import {
   type CalibrationCheckpointState,
   type CalibrationCodingResult,
   type CalibrationDatasetItem,
+  type CalibrationFailureCode,
   type CalibrationProgress,
   type CalibrationThinkingResult
 } from "../experiments/lib/levels-calibration-state";
@@ -190,6 +191,61 @@ describe("思维和代码标定的分阶段执行", () => {
     expect(JSON.stringify({ snapshots, failedEvents })).not.toContain(secret);
   });
 
+  it.each(
+    [
+      "LLM_NETWORK_FAILED",
+      "LLM_FIRST_OUTPUT_TIMEOUT",
+      "LLM_OUTPUT_IDLE_TIMEOUT",
+      "LLM_TOTAL_TIMEOUT",
+      "LLM_STREAM_INTERRUPTED"
+    ] satisfies readonly CalibrationFailureCode[]
+  )("保留当前模型错误码 %s，且不保存外部错误正文", async (errorCode) => {
+    const secret = "MODEL_PROVIDER_ERROR_BODY_MUST_NOT_PERSIST";
+    const result = await runLevelsCalibrationStages({
+      items: [item(1)],
+      concurrency: 1,
+      runThinking: async () => {
+        throw Object.assign(new Error(secret), {
+          code: errorCode,
+          responseBody: secret
+        });
+      },
+      runCoding: async () => codingResult(),
+      saveCheckpoint: () => undefined
+    });
+    expect(result.failureCounts).toEqual([
+      {
+        stage: "thinking",
+        errorCode,
+        status: null,
+        count: 1
+      }
+    ]);
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it("当前运行不会继续产生旧的笼统模型错误码", async () => {
+    const result = await runLevelsCalibrationStages({
+      items: [item(1)],
+      concurrency: 1,
+      runThinking: async () => {
+        throw Object.assign(new Error("不能保存的异常说明"), {
+          code: "LLM_REQUEST_FAILED"
+        });
+      },
+      runCoding: async () => codingResult(),
+      saveCheckpoint: () => undefined
+    });
+    expect(result.failureCounts).toEqual([
+      {
+        stage: "thinking",
+        errorCode: "UNEXPECTED_ERROR",
+        status: null,
+        count: 1
+      }
+    ]);
+  });
+
   it("代码失败后保留思维结果，续跑时跳过思维并只补代码", async () => {
     const source = item(1);
     const firstThinking = vi.fn(async () => thinkingResult(3));
@@ -199,7 +255,7 @@ describe("思维和代码标定的分阶段执行", () => {
       runThinking: firstThinking,
       runCoding: async () => {
         throw Object.assign(new Error("不能保存的异常说明"), {
-          code: "LLM_REQUEST_FAILED",
+          code: "LLM_OUTPUT_IDLE_TIMEOUT",
           status: 503
         });
       },
@@ -211,7 +267,7 @@ describe("思维和代码标定的分阶段执行", () => {
     expect(first.failureCounts).toEqual([
       {
         stage: "coding",
-        errorCode: "LLM_REQUEST_FAILED",
+        errorCode: "LLM_OUTPUT_IDLE_TIMEOUT",
         status: null,
         count: 1
       }
@@ -225,7 +281,7 @@ describe("思维和代码标定的分阶段执行", () => {
       runThinking: failedAgainThinking,
       runCoding: async () => {
         throw Object.assign(new Error("仍然不能保存的异常说明"), {
-          code: "LLM_REQUEST_FAILED"
+          code: "LLM_OUTPUT_IDLE_TIMEOUT"
         });
       },
       saveCheckpoint: () => undefined

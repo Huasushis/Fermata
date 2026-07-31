@@ -65,7 +65,9 @@ function reportInput(
     solverBaseUrl: "https://solver.private.example/internal/gateway",
     analystBaseUrl: "https://analyst.private.example/internal/gateway",
     codingBaseUrl: "https://coding.private.example/internal/gateway",
-    requestTimeoutMs: 600_000,
+    outputIdleTimeoutMs: 600_000,
+    firstOutputTimeoutMs: 1_800_000,
+    maximumDurationMs: 14_400_000,
     maxAttempts: 3,
     baseDelayMs: 1_000,
     concurrency: 2
@@ -111,7 +113,7 @@ function reportInput(
         },
         {
           stage: "coding" as const,
-          errorCode: "LLM_REQUEST_FAILED" as const,
+          errorCode: "LLM_OUTPUT_IDLE_TIMEOUT" as const,
           status: null,
           count: 2
         }
@@ -154,6 +156,20 @@ describe("标定汇总与报告", () => {
     expect(serialized).not.toContain("Infinity");
     expect(output.markdown).toContain("暂无完整结果");
     expect(output.markdown).toContain("结果不完整，不能判断");
+    expect(output.summary.runConfiguration).toMatchObject({
+      outputIdleTimeoutMs: 600_000,
+      firstOutputTimeoutMs: 1_800_000,
+      maximumDurationMs: 14_400_000
+    });
+    expect(output.markdown).toContain(
+      "连续没有新数据的等待上限：600000 毫秒"
+    );
+    expect(output.markdown).toContain(
+      "等待第一段输出的上限：1800000 毫秒"
+    );
+    expect(output.markdown).toContain(
+      "每次向模型服务发出请求的最长时间：14400000 毫秒"
+    );
   });
 
   it("仅保存思维结果时显示阶段进度，但完整题数仍为零", () => {
@@ -223,5 +239,51 @@ describe("标定汇总与报告", () => {
       3
     );
     expect(() => buildLevelsCalibrationReport(input)).toThrow();
+  });
+
+  it("报告层拒绝旧等待字段和彼此矛盾的等待时间", () => {
+    const { input } = reportInput([], 3);
+    expect(() =>
+      buildLevelsCalibrationReport({
+        ...input,
+        runConfiguration: {
+          ...input.runConfiguration,
+          requestTimeoutMs: 600_000
+        } as unknown as typeof input.runConfiguration
+      })
+    ).toThrow();
+    expect(() =>
+      buildLevelsCalibrationReport({
+        ...input,
+        runConfiguration: {
+          ...input.runConfiguration,
+          outputIdleTimeoutMs: 18_000_000,
+          maximumDurationMs: 14_400_000
+        }
+      })
+    ).toThrow();
+  });
+
+  it("报告拒绝失败统计中的旧错误码和外部错误正文", () => {
+    const { input, secret } = reportInput([], 3);
+    let caught: unknown;
+    try {
+      buildLevelsCalibrationReport({
+        ...input,
+        failureCounts: [
+          {
+            stage: "coding",
+            errorCode: "LLM_REQUEST_FAILED",
+            status: null,
+            count: 1,
+            message: secret
+          }
+        ] as unknown as typeof input.failureCounts
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeDefined();
+    expect(String(caught)).not.toContain(secret);
   });
 });

@@ -95,7 +95,13 @@ async function summarize(
   statement: string,
   profile: ProfileConfig,
   credentials: ProviderCredentials,
-  runtime: { timeoutMs: number; maxAttempts: number; baseDelayMs: number }
+  runtime: {
+    firstOutputTimeoutMs: number;
+    outputIdleTimeoutMs: number;
+    maximumDurationMs: number;
+    maxAttempts: number;
+    baseDelayMs: number;
+  }
 ): Promise<string> {
   const messages: ChatMessage[] = [
     {
@@ -140,7 +146,9 @@ async function main(): Promise<void> {
   const candidates = selectAnchorCandidates(dataset, targetRatings);
 
   const runtime = {
-    timeoutMs: config.models.timeouts.llmRequestMs,
+    firstOutputTimeoutMs: config.models.timeouts.llmFirstOutputMs,
+    outputIdleTimeoutMs: config.models.timeouts.llmOutputIdleMs,
+    maximumDurationMs: config.models.timeouts.llmMaximumDurationMs,
     maxAttempts: config.models.retry.maxAttempts,
     baseDelayMs: config.models.retry.baseDelayMs
   };

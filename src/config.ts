@@ -135,10 +135,24 @@ export const modelsYamlSchema = z
       .strict(),
     timeouts: z
       .object({
-        llmRequestMs: z.number().int().min(1_000).max(600_000),
+        llmFirstOutputMs: z.number().int().min(1_800_000).max(86_400_000),
+        llmOutputIdleMs: z.number().int().min(600_000).max(86_400_000),
+        llmMaximumDurationMs: z.number().int().min(14_400_000).max(86_400_000),
         codeforcesRequestMs: z.number().int().min(1_000).max(600_000)
       })
-      .strict(),
+      .strict()
+      .superRefine((timeouts, context) => {
+        if (
+          timeouts.llmMaximumDurationMs < timeouts.llmFirstOutputMs ||
+          timeouts.llmMaximumDurationMs < timeouts.llmOutputIdleMs
+        ) {
+          context.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["llmMaximumDurationMs"],
+            message: "模型请求的最终保护时长不能小于等待第一段输出或输出停顿的时长。"
+          });
+        }
+      }),
     codeforces: z
       .object({
         minimumRequestIntervalMs: z.number().int().min(0).max(60_000)

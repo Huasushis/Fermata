@@ -18,6 +18,7 @@
     "experiment:calibrate-anchors": "tsx experiments/calibrate-anchors.ts",
     "experiment:fetch-hf-dataset": "tsx experiments/fetch-hf-dataset.ts",
     "experiment:calibrate-levels": "tsx experiments/calibrate-levels.ts",
+    "experiment:calibrate-levels:detached": "node scripts/start-detached-calibration.mjs",
     "experiment:eval-verdict": "tsx experiments/eval-verdict.ts"
   },
   "dependencies": {

@@ -5,13 +5,13 @@
  *     调用方负责传对应的 baseUrl/apiKey，这个模块本身不知道"provider"这个
  *     概念）；
  *   - 读取思考模型的 reasoning_content（如果响应里有的话）；
- *   - 结构化 JSON 输出：优先用 response_format，同时在提示词里也要求只输出
- *     JSON；解析或校验失败时重新带着错误信息请求一次（只重试这一次，和网络层
- *     的重试是两回事）；
- *   - 网络超时与 429/5xx 的指数退避重试。
+ *   - 结构化 JSON 输出：用提示词要求只输出 JSON；解析或校验失败时重新带着
+ *     固定校验说明请求一次（这会产生第二次模型调用，和 429 重试是两回事）；
+ *   - 只对服务端明确返回的 429 做退避重试；连接中断和超时不自动重发，
+ *     避免同一道题在模型已经开始生成后被重复计费。
  *
- * 不支持流式响应（stream 恒为 false），这是有意简化：审题任务不需要边生成边
- * 展示，等完整结果一次性返回即可，省掉手写 SSE 解析的复杂度和风险。
+ * 使用流式响应持续接收推理与最终答案。这里的流式不是为了边生成边展示，
+ * 而是为了确认模型仍在工作：只有长时间没有收到任何新数据时才中断请求。
  */
 import { z } from "zod";
 
@@ -33,38 +33,61 @@ export interface ProviderCredentialsLike {
 export interface ModelCallSpec {
   readonly model: string;
   readonly temperature: number;
-  /** 目前只影响调用方怎么使用 reasoning，请求本身不需要因为这个字段变化。 */
+  /**
+   * 是否保留响应里的思考过程。具体怎样开启思考由所选模型和网关约定，
+   * 这里不猜测或发送服务商专有参数。
+   */
   readonly thinking: boolean;
 }
 
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 export interface LlmRuntimeOptions {
-  /** 单次 HTTP 请求（含每次重试）的超时时间。 */
-  readonly timeoutMs: number;
-  /** 总尝试次数，包含第一次，即"最多重试 maxAttempts-1 次"。 */
+  /** 已经收到首段输出后，连续多久没有新数据才认为连接停住。 */
+  readonly outputIdleTimeoutMs: number;
+  /** 等待第一段输出的时间；深度推理通常需要明显长于普通请求。 */
+  readonly firstOutputTimeoutMs?: number;
+  /** 防止异常连接永久占用任务的最终保护时长。 */
+  readonly maximumDurationMs?: number;
+  /** 总尝试次数；只有收到 429 时才会使用后续尝试。 */
   readonly maxAttempts: number;
   readonly baseDelayMs: number;
   readonly fetch?: FetchLike;
+  /** 任务已经丢失或被明确拒绝时，由上层用它停止仍在运行的付费请求。 */
+  readonly signal?: AbortSignal;
 }
 
 /** 模型响应正文的固定上限，按 UTF-8 原始字节计算。 */
 export const maximumLlmResponseBodyBytes = 4 * 1024 * 1024;
+export const defaultLlmFirstOutputTimeoutMs = 30 * 60 * 1_000;
+export const defaultLlmMaximumDurationMs = 4 * 60 * 60 * 1_000;
 
-/** 发出请求但没能拿到成功响应：网络错误、超时、或者重试耗尽后仍然是错误状态码。 */
+/** 模型请求未完成；只包含固定分类和状态码，不带服务商错误正文。 */
 export class LlmRequestError extends Error {
-  public readonly code: "LLM_HTTP_ERROR" | "LLM_REQUEST_FAILED";
+  public readonly code:
+    | "LLM_HTTP_ERROR"
+    | "LLM_NETWORK_FAILED"
+    | "LLM_FIRST_OUTPUT_TIMEOUT"
+    | "LLM_OUTPUT_IDLE_TIMEOUT"
+    | "LLM_TOTAL_TIMEOUT"
+    | "LLM_STREAM_INTERRUPTED"
+    | "LLM_CANCELLED";
   public readonly status: number | undefined;
 
   public constructor(
-    code: "LLM_HTTP_ERROR" | "LLM_REQUEST_FAILED",
+    code: LlmRequestError["code"],
     status?: number
   ) {
-    super(
-      code === "LLM_HTTP_ERROR"
-        ? "模型服务返回了错误状态。"
-        : "模型服务请求未能完成。"
-    );
+    const messages: Record<LlmRequestError["code"], string> = {
+      LLM_HTTP_ERROR: "模型服务返回了错误状态。",
+      LLM_NETWORK_FAILED: "模型服务连接未能完成。",
+      LLM_FIRST_OUTPUT_TIMEOUT: "模型服务长时间没有返回第一段输出。",
+      LLM_OUTPUT_IDLE_TIMEOUT: "模型服务的输出长时间没有继续。",
+      LLM_TOTAL_TIMEOUT: "模型服务请求超过最终保护时长。",
+      LLM_STREAM_INTERRUPTED: "模型服务的输出在完成前中断。",
+      LLM_CANCELLED: "模型请求已按任务状态停止。"
+    };
+    super(messages[code]);
     this.name = "LlmRequestError";
     this.code = code;
     this.status = status;
@@ -113,7 +136,7 @@ export async function chatComplete(
   const body: Record<string, unknown> = {
     model: spec.model,
     temperature: spec.temperature,
-    stream: false,
+    stream: true,
     messages
   };
   if (options.requestJson === true) {
@@ -127,6 +150,7 @@ export async function chatComplete(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        Accept: "text/event-stream, application/json",
         Authorization: `Bearer ${provider.apiKey}`
       },
       body: JSON.stringify(body)
@@ -139,7 +163,10 @@ export async function chatComplete(
     throw new LlmRequestError("LLM_HTTP_ERROR", response.status);
   }
 
-  return extractChatCompletion(response.raw);
+  const result = extractChatCompletion(response.raw);
+  return spec.thinking
+    ? result
+    : { content: result.content, reasoning: null };
 }
 
 /**
@@ -160,17 +187,11 @@ export async function chatCompleteJson<T>(
     content: "只输出一个满足要求的 JSON 对象本身，不要输出任何解释、前后缀文字，也不要用 Markdown 代码块包裹。"
   };
   const firstMessages: ChatMessage[] = [jsonInstruction, ...messages];
-  let first: ChatCompletionResult;
-  try {
-    first = await chatComplete(provider, spec, firstMessages, runtime, { requestJson: true });
-  } catch (error) {
-    if (!(error instanceof LlmResponseFormatError)) {
-      throw error;
-    }
-    // 部分网关在 response_format=json_object 时会把 message.content 置空
-    // （实测 aether 网关的 deepseek 系列如此）。降级成纯提示词方式再试一次。
-    first = await chatComplete(provider, spec, firstMessages, runtime, { requestJson: false });
-  }
+  // 当前接入的网关并不都正确支持 response_format。直接用提示词约束 JSON，
+  // 避免先付费生成一次空 content，再为了探测兼容性重复发送完整题目。
+  const first = await chatComplete(provider, spec, firstMessages, runtime, {
+    requestJson: false
+  });
   const firstAttempt = tryParseAndValidate(first.content, schema);
   if (firstAttempt.success) {
     return { data: firstAttempt.data, reasoning: first.reasoning };
@@ -243,32 +264,232 @@ async function requestWithRetry(
   init: RequestInit,
   runtime: LlmRuntimeOptions
 ): Promise<{ readonly ok: boolean; readonly status: number; readonly raw: unknown }> {
+  const durations = resolveLlmRequestDurations(runtime);
+  const deadline = Date.now() + durations.maximumDurationMs;
   let attempt = 1;
   for (;;) {
+    if (runtime.signal?.aborted) {
+      throw new LlmRequestError("LLM_CANCELLED");
+    }
+    const remainingDurationMs = deadline - Date.now();
+    if (remainingDurationMs <= 0) {
+      throw new LlmRequestError("LLM_TOTAL_TIMEOUT");
+    }
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), runtime.timeoutMs);
+    const watchdog = new LlmRequestWatchdog(
+      controller,
+      durations,
+      remainingDurationMs
+    );
+    const cancelForTaskState = (): void => {
+      controller.abort();
+    };
+    runtime.signal?.addEventListener("abort", cancelForTaskState, {
+      once: true
+    });
+    let responseReceived = false;
     try {
-      const response = await fetchImpl(url, { ...init, signal: controller.signal });
-      // 必须在清除计时器前读完正文。fetch 在只收到响应头时就可能返回；如果在
-      // 这里之前清除计时器，卡住的响应正文会绕过 timeoutMs 永久等待。
-      const raw = await parseJsonBodyLeniently(response, controller);
-      const isRetryableStatus = response.status === 429 || response.status >= 500;
-      if (!isRetryableStatus || attempt >= runtime.maxAttempts) {
-        return { ok: response.ok, status: response.status, raw };
+      const response = await waitForOrAbort(
+        fetchImpl(url, { ...init, signal: controller.signal }),
+        controller.signal
+      );
+      responseReceived = true;
+      if (!response.ok) {
+        cancelResponseBodyWithoutReading(response, controller);
+        const timeoutError = watchdog.error();
+        if (timeoutError !== undefined) {
+          throw timeoutError;
+        }
+        if (Date.now() >= deadline) {
+          throw new LlmRequestError("LLM_TOTAL_TIMEOUT");
+        }
+        if (response.status !== 429 || attempt >= runtime.maxAttempts) {
+          return { ok: false, status: response.status, raw: undefined };
+        }
+      } else {
+        const raw = await parseResponseBody(response, controller, () => {
+          watchdog.receivedOutput();
+        });
+        const timeoutError = watchdog.error();
+        if (timeoutError !== undefined) {
+          throw timeoutError;
+        }
+        if (Date.now() >= deadline) {
+          throw new LlmRequestError("LLM_TOTAL_TIMEOUT");
+        }
+        return { ok: true, status: response.status, raw };
       }
     } catch (error) {
-      if (error instanceof LlmResponseBodyTooLargeError) {
+      const timeoutError = watchdog.error();
+      if (timeoutError !== undefined) {
+        throw timeoutError;
+      }
+      if (runtime.signal?.aborted) {
+        throw new LlmRequestError("LLM_CANCELLED");
+      }
+      if (
+        error instanceof LlmResponseBodyTooLargeError ||
+        error instanceof LlmResponseFormatError ||
+        error instanceof LlmRequestError
+      ) {
         throw error;
       }
-      if (attempt >= runtime.maxAttempts) {
-        throw new LlmRequestError("LLM_REQUEST_FAILED");
-      }
+      // fetch 无法证明请求是否已经到达模型服务。自动重发可能让同一题重复计费，
+      // 因此只有服务端明确返回“请求过多”(429)时才自动重试。
+      throw new LlmRequestError(
+        responseReceived ? "LLM_STREAM_INTERRUPTED" : "LLM_NETWORK_FAILED"
+      );
     } finally {
-      clearTimeout(timeout);
+      runtime.signal?.removeEventListener("abort", cancelForTaskState);
+      watchdog.close();
     }
-    await delay(backoffMs(runtime.baseDelayMs, attempt));
+    await delayBeforeRetry(
+      backoffMs(runtime.baseDelayMs, attempt),
+      deadline,
+      runtime.signal
+    );
     attempt += 1;
   }
+}
+
+function cancelResponseBodyWithoutReading(
+  response: Response,
+  fallbackController: AbortController
+): void {
+  if (response.body === null) return;
+  try {
+    const cancellation = response.body.cancel();
+    void cancellation.catch(() => {
+      fallbackController.abort();
+    });
+  } catch {
+    fallbackController.abort();
+  }
+}
+
+type LlmTimeoutCode =
+  | "LLM_FIRST_OUTPUT_TIMEOUT"
+  | "LLM_OUTPUT_IDLE_TIMEOUT"
+  | "LLM_TOTAL_TIMEOUT";
+
+interface LlmRequestDurations {
+  readonly firstOutputTimeoutMs: number;
+  readonly outputIdleTimeoutMs: number;
+  readonly maximumDurationMs: number;
+}
+
+class LlmRequestWatchdog {
+  readonly #controller: AbortController;
+  readonly #firstOutputTimeoutMs: number;
+  readonly #outputIdleTimeoutMs: number;
+  readonly #maximumDurationMs: number;
+  #firstOutputTimer: NodeJS.Timeout | null = null;
+  #outputIdleTimer: NodeJS.Timeout | null = null;
+  #maximumDurationTimer: NodeJS.Timeout | null = null;
+  #timeoutCode: LlmTimeoutCode | null = null;
+  #receivedOutput = false;
+
+  public constructor(
+    controller: AbortController,
+    durations: LlmRequestDurations,
+    remainingDurationMs: number
+  ) {
+    this.#controller = controller;
+    this.#outputIdleTimeoutMs = durations.outputIdleTimeoutMs;
+    this.#firstOutputTimeoutMs = durations.firstOutputTimeoutMs;
+    this.#maximumDurationMs = remainingDurationMs;
+    this.#firstOutputTimer = setTimeout(() => {
+      this.#abort("LLM_FIRST_OUTPUT_TIMEOUT");
+    }, this.#firstOutputTimeoutMs);
+    this.#maximumDurationTimer = setTimeout(() => {
+      this.#abort("LLM_TOTAL_TIMEOUT");
+    }, this.#maximumDurationMs);
+  }
+
+  public receivedOutput(): void {
+    if (this.#timeoutCode !== null) return;
+    if (!this.#receivedOutput) {
+      this.#receivedOutput = true;
+      if (this.#firstOutputTimer !== null) {
+        clearTimeout(this.#firstOutputTimer);
+        this.#firstOutputTimer = null;
+      }
+    }
+    if (this.#outputIdleTimer !== null) {
+      clearTimeout(this.#outputIdleTimer);
+    }
+    this.#outputIdleTimer = setTimeout(() => {
+      this.#abort("LLM_OUTPUT_IDLE_TIMEOUT");
+    }, this.#outputIdleTimeoutMs);
+  }
+
+  public error(): LlmRequestError | undefined {
+    return this.#timeoutCode === null
+      ? undefined
+      : new LlmRequestError(this.#timeoutCode);
+  }
+
+  public close(): void {
+    for (const timer of [
+      this.#firstOutputTimer,
+      this.#outputIdleTimer,
+      this.#maximumDurationTimer
+    ]) {
+      if (timer !== null) clearTimeout(timer);
+    }
+    this.#firstOutputTimer = null;
+    this.#outputIdleTimer = null;
+    this.#maximumDurationTimer = null;
+  }
+
+  #abort(code: LlmTimeoutCode): void {
+    if (this.#timeoutCode !== null) return;
+    this.#timeoutCode = code;
+    this.#controller.abort();
+  }
+}
+
+function resolveLlmRequestDurations(
+  runtime: LlmRuntimeOptions
+): LlmRequestDurations {
+  const outputIdleTimeoutMs = positiveDuration(
+    runtime.outputIdleTimeoutMs,
+    "outputIdleTimeoutMs"
+  );
+  const firstOutputTimeoutMs = positiveDuration(
+    runtime.firstOutputTimeoutMs ??
+      Math.max(defaultLlmFirstOutputTimeoutMs, outputIdleTimeoutMs),
+    "firstOutputTimeoutMs"
+  );
+  const maximumDurationMs = positiveDuration(
+    runtime.maximumDurationMs ??
+      Math.max(
+        defaultLlmMaximumDurationMs,
+        firstOutputTimeoutMs,
+        outputIdleTimeoutMs
+      ),
+    "maximumDurationMs"
+  );
+  if (
+    maximumDurationMs < firstOutputTimeoutMs ||
+    maximumDurationMs < outputIdleTimeoutMs
+  ) {
+    throw new TypeError(
+      "maximumDurationMs 不能小于第一段输出或输出停顿的等待时间。"
+    );
+  }
+  return {
+    firstOutputTimeoutMs,
+    outputIdleTimeoutMs,
+    maximumDurationMs
+  };
+}
+
+function positiveDuration(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 24 * 60 * 60 * 1_000) {
+    throw new TypeError(`${name} 必须是 1 到 86400000 之间的整数。`);
+  }
+  return value;
 }
 
 function backoffMs(baseDelayMs: number, attempt: number): number {
@@ -281,11 +502,87 @@ function delay(ms: number): Promise<void> {
   });
 }
 
-async function parseJsonBodyLeniently(
+function waitForOrAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal
+): Promise<T> {
+  if (signal.aborted) {
+    return Promise.reject(new DOMException("请求已结束。", "AbortError"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener("abort", onAbort);
+      reject(new DOMException("请求已结束。", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
+}
+
+async function delayBeforeRetry(
+  ms: number,
+  deadline: number,
+  signal?: AbortSignal
+): Promise<void> {
+  if (signal?.aborted) {
+    throw new LlmRequestError("LLM_CANCELLED");
+  }
+  const remainingDurationMs = deadline - Date.now();
+  if (remainingDurationMs <= 0) {
+    throw new LlmRequestError("LLM_TOTAL_TIMEOUT");
+  }
+  if (ms >= remainingDurationMs) {
+    try {
+      await (signal === undefined
+        ? delay(remainingDurationMs)
+        : waitForOrAbort(delay(remainingDurationMs), signal));
+    } catch {
+      if (signal?.aborted) {
+        throw new LlmRequestError("LLM_CANCELLED");
+      }
+      throw new LlmRequestError("LLM_TOTAL_TIMEOUT");
+    }
+    throw new LlmRequestError("LLM_TOTAL_TIMEOUT");
+  }
+  try {
+    await (signal === undefined
+      ? delay(ms)
+      : waitForOrAbort(delay(ms), signal));
+  } catch {
+    if (signal?.aborted) {
+      throw new LlmRequestError("LLM_CANCELLED");
+    }
+    throw new LlmRequestError("LLM_NETWORK_FAILED");
+  }
+}
+
+async function parseResponseBody(
   response: Response,
-  requestController: AbortController
+  requestController: AbortController,
+  onOutput: () => void
 ): Promise<unknown> {
-  const text = await readResponseTextWithLimit(response, requestController);
+  const mediaType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  if (response.ok && mediaType.includes("text/event-stream")) {
+    return readChatCompletionEventStream(
+      response,
+      requestController,
+      onOutput
+    );
+  }
+  const text = await readResponseTextWithLimit(
+    response,
+    requestController,
+    onOutput
+  );
   if (text.length === 0) {
     return undefined;
   }
@@ -298,7 +595,8 @@ async function parseJsonBodyLeniently(
 
 async function readResponseTextWithLimit(
   response: Response,
-  requestController: AbortController
+  requestController: AbortController,
+  onOutput: () => void
 ): Promise<string> {
   if (response.body === null) {
     return "";
@@ -307,11 +605,25 @@ async function readResponseTextWithLimit(
   const reader = response.body.getReader();
   let bytes = new Uint8Array(0);
   let totalBytes = 0;
+  let readerFinished = false;
   try {
     for (;;) {
-      const chunk = await reader.read();
+      const chunk = await waitForOrAbort(
+        reader.read(),
+        requestController.signal
+      );
       if (chunk.done) {
-        return new TextDecoder().decode(bytes.subarray(0, totalBytes));
+        readerFinished = true;
+        try {
+          return new TextDecoder("utf-8", { fatal: true }).decode(
+            bytes.subarray(0, totalBytes)
+          );
+        } catch {
+          throw new LlmResponseFormatError();
+        }
+      }
+      if (chunk.value.byteLength > 0) {
+        onOutput();
       }
       if (chunk.value.byteLength > maximumLlmResponseBodyBytes - totalBytes) {
         try {
@@ -337,11 +649,276 @@ async function readResponseTextWithLimit(
       totalBytes += chunk.value.byteLength;
     }
   } finally {
+    if (!readerFinished) {
+      cancelReaderWithoutReplacingResult(reader);
+      requestController.abort();
+    }
     try {
       reader.releaseLock();
     } catch {
       // 读取结果或固定错误已经确定，不再用流清理错误覆盖它。
     }
+  }
+}
+
+interface ChatCompletionStreamState {
+  content: string;
+  reasoning: string;
+  sawChoice: boolean;
+  sawStop: boolean;
+  sawDone: boolean;
+}
+
+async function readChatCompletionEventStream(
+  response: Response,
+  requestController: AbortController,
+  onOutput: () => void
+): Promise<unknown> {
+  if (response.body === null) {
+    throw new LlmRequestError("LLM_STREAM_INTERRUPTED");
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const state: ChatCompletionStreamState = {
+    content: "",
+    reasoning: "",
+    sawChoice: false,
+    sawStop: false,
+    sawDone: false
+  };
+  let pending = "";
+  let trailingCarriageReturn = false;
+  let totalBytes = 0;
+  let readerFinished = false;
+
+  try {
+    for (;;) {
+      const chunk = await waitForOrAbort(
+        reader.read(),
+        requestController.signal
+      );
+      if (chunk.done) {
+        readerFinished = true;
+        ({ pending, trailingCarriageReturn } = appendEventStreamText(
+          pending,
+          trailingCarriageReturn,
+          decodeEventStreamText(decoder),
+          true
+        ));
+        for (;;) {
+          const boundary = pending.indexOf("\n\n");
+          if (boundary < 0) break;
+          const event = pending.slice(0, boundary);
+          pending = pending.slice(boundary + 2);
+          consumeChatCompletionEvent(event, state);
+        }
+        if (pending.trim().length > 0) {
+          consumeChatCompletionEvent(pending, state);
+        }
+        if (!state.sawChoice || (!state.sawStop && !state.sawDone)) {
+          throw new LlmRequestError("LLM_STREAM_INTERRUPTED");
+        }
+        return chatCompletionStreamResult(state);
+      }
+      totalBytes = addResponseChunkSize(
+        totalBytes,
+        chunk.value.byteLength,
+        reader,
+        requestController
+      );
+      if (chunk.value.byteLength === 0) continue;
+      onOutput();
+      ({ pending, trailingCarriageReturn } = appendEventStreamText(
+        pending,
+        trailingCarriageReturn,
+        decodeEventStreamText(decoder, chunk.value),
+        false
+      ));
+
+      for (;;) {
+        const boundary = pending.indexOf("\n\n");
+        if (boundary < 0) break;
+        const event = pending.slice(0, boundary);
+        pending = pending.slice(boundary + 2);
+        consumeChatCompletionEvent(event, state);
+      }
+    }
+  } finally {
+    if (!readerFinished) {
+      cancelReaderWithoutReplacingResult(reader);
+      requestController.abort();
+    }
+    try {
+      reader.releaseLock();
+    } catch {
+      // 读取结果或固定错误已经确定，不再用流清理错误覆盖它。
+    }
+  }
+}
+
+function decodeEventStreamText(
+  decoder: TextDecoder,
+  bytes?: Uint8Array
+): string {
+  try {
+    return bytes === undefined
+      ? decoder.decode()
+      : decoder.decode(bytes, { stream: true });
+  } catch {
+    throw new LlmResponseFormatError();
+  }
+}
+
+function appendEventStreamText(
+  pending: string,
+  trailingCarriageReturn: boolean,
+  next: string,
+  final: boolean
+): { readonly pending: string; readonly trailingCarriageReturn: boolean } {
+  let text = next;
+  let carried = trailingCarriageReturn;
+  if (carried && text.length > 0) {
+    pending += "\n";
+    if (text.startsWith("\n")) {
+      text = text.slice(1);
+    }
+    carried = false;
+  }
+  if (!final && text.endsWith("\r")) {
+    text = text.slice(0, -1);
+    carried = true;
+  }
+  pending += text.replace(/\r\n/gu, "\n").replace(/\r/gu, "\n");
+  if (final && carried) {
+    pending += "\n";
+    carried = false;
+  }
+  return { pending, trailingCarriageReturn: carried };
+}
+
+function consumeChatCompletionEvent(
+  event: string,
+  state: ChatCompletionStreamState
+): void {
+  const data = event
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice("data:".length).trimStart())
+    .join("\n")
+    .trim();
+  if (data.length === 0) return;
+  if (state.sawDone) {
+    // [DONE] 后只能是 HTTP 正常收尾；继续出现非空事件说明响应次序损坏。
+    throw new LlmResponseFormatError();
+  }
+  if (data === "[DONE]") {
+    state.sawDone = true;
+    return;
+  }
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(data) as unknown;
+  } catch {
+    throw new LlmResponseFormatError();
+  }
+  if (typeof raw !== "object" || raw === null) {
+    throw new LlmResponseFormatError();
+  }
+  const rawRecord = raw as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(rawRecord, "error")) {
+    throw new LlmResponseFormatError();
+  }
+  const choices = rawRecord.choices;
+  if (!Array.isArray(choices)) {
+    throw new LlmResponseFormatError();
+  }
+  if (choices.length === 0) {
+    // 部分服务商会在答案后发送只含用量的事件。
+    return;
+  }
+  if (state.sawStop) {
+    // finish_reason=stop 之后只允许用量事件或 [DONE]。继续出现答案片段说明
+    // 服务端的流不完整或次序异常，不能把前半段误当成完整结果。
+    throw new LlmResponseFormatError();
+  }
+  const choice = choices[0];
+  if (typeof choice !== "object" || choice === null) {
+    throw new LlmResponseFormatError();
+  }
+  state.sawChoice = true;
+  const choiceRecord = choice as Record<string, unknown>;
+  const deltaOrMessage =
+    typeof choiceRecord.delta === "object" && choiceRecord.delta !== null
+      ? choiceRecord.delta
+      : choiceRecord.message;
+  if (typeof deltaOrMessage !== "object" || deltaOrMessage === null) {
+    throw new LlmResponseFormatError();
+  }
+  const part = deltaOrMessage as Record<string, unknown>;
+  for (const field of ["reasoning_content", "reasoning", "content"] as const) {
+    const value = part[field];
+    if (value !== undefined && value !== null && typeof value !== "string") {
+      throw new LlmResponseFormatError();
+    }
+  }
+  if (typeof part.reasoning_content === "string") {
+    state.reasoning += part.reasoning_content;
+  } else if (typeof part.reasoning === "string") {
+    state.reasoning += part.reasoning;
+  }
+  if (typeof part.content === "string") {
+    state.content += part.content;
+  }
+  if (choiceRecord.finish_reason !== undefined && choiceRecord.finish_reason !== null) {
+    if (choiceRecord.finish_reason !== "stop") {
+      throw new LlmResponseFormatError();
+    }
+    state.sawStop = true;
+  }
+}
+
+function chatCompletionStreamResult(state: ChatCompletionStreamState): unknown {
+  return {
+    choices: [
+      {
+        message: {
+          content: state.content,
+          ...(state.reasoning.length === 0
+            ? {}
+            : { reasoning_content: state.reasoning })
+        }
+      }
+    ]
+  };
+}
+
+function addResponseChunkSize(
+  totalBytes: number,
+  nextBytes: number,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  requestController: AbortController
+): number {
+  if (nextBytes > maximumLlmResponseBodyBytes - totalBytes) {
+    cancelReaderWithoutReplacingResult(reader);
+    requestController.abort();
+    throw new LlmResponseBodyTooLargeError();
+  }
+  return totalBytes + nextBytes;
+}
+
+function cancelReaderWithoutReplacingResult(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  fallbackController?: AbortController
+): void {
+  try {
+    const cancellation = reader.cancel();
+    void cancellation.catch(() => {
+      fallbackController?.abort();
+    });
+  } catch {
+    // 取消失败不能替换已经确定的结果或固定异常。
+    fallbackController?.abort();
   }
 }
 

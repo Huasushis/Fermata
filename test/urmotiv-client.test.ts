@@ -140,8 +140,6 @@ describe("UrmotivClient：按状态码分类错误", () => {
       expect(isAuthenticationError(error)).toBe(true);
       expect(isForbiddenError(error)).toBe(false);
       expect(isTaskConflictError(error)).toBe(false);
-      expect((error as UrmotivApiError).code).toBe("UNAUTHENTICATED");
-      expect((error as UrmotivApiError).requestId).toBe("req-1");
       return true;
     });
   });
@@ -180,6 +178,41 @@ describe("UrmotivClient：按状态码分类错误", () => {
       return true;
     });
   });
+
+  it("已收到错误状态时不等待永不结束的正文，并立即取消正文", async () => {
+    for (const status of [401, 403, 409]) {
+      let cancelled = false;
+      const fetchMock = vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              cancel() {
+                cancelled = true;
+              }
+            }),
+            {
+              status,
+              headers: { "Content-Type": "application/json" }
+            }
+          )
+      );
+      const client = new UrmotivClient({
+        baseUrl,
+        robotToken,
+        fetch: fetchMock
+      });
+      const error = await client
+        .renew(assignmentId, {
+          expectedLeaseExpiresAt: "2026-07-26T00:05:00.000Z",
+          leaseSeconds: 300
+        })
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(UrmotivApiError);
+      expect((error as UrmotivApiError).status).toBe(status);
+      expect(cancelled).toBe(true);
+    }
+  });
 });
 
 describe("UrmotivClient：网络与契约错误", () => {
@@ -195,5 +228,33 @@ describe("UrmotivClient：网络与契约错误", () => {
     const fetchMock = vi.fn(async () => jsonResponse({ items: [{ notATask: true }] }));
     const client = new UrmotivClient({ baseUrl, robotToken, fetch: fetchMock });
     await expect(client.claim({})).rejects.toBeInstanceOf(UrmotivContractError);
+  });
+
+  it("等待时限覆盖完整响应正文，正文不结束时按网络失败返回", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn(
+        async () =>
+          new Response(new ReadableStream<Uint8Array>(), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          })
+      );
+      const client = new UrmotivClient({
+        baseUrl,
+        robotToken,
+        timeoutMs: 1_000,
+        fetch: fetchMock
+      });
+      const resultPromise = client.claim({});
+      const rejection = expect(resultPromise).rejects.toBeInstanceOf(
+        UrmotivNetworkError
+      );
+      await vi.advanceTimersByTimeAsync(1_001);
+      await rejection;
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

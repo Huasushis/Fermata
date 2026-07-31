@@ -220,7 +220,11 @@ export type CalibrationFailureStage = z.infer<
 
 export const calibrationFailureCodeSchema = z.enum([
   "LLM_HTTP_ERROR",
-  "LLM_REQUEST_FAILED",
+  "LLM_NETWORK_FAILED",
+  "LLM_FIRST_OUTPUT_TIMEOUT",
+  "LLM_OUTPUT_IDLE_TIMEOUT",
+  "LLM_TOTAL_TIMEOUT",
+  "LLM_STREAM_INTERRUPTED",
   "LLM_RESPONSE_BODY_TOO_LARGE",
   "LLM_RESPONSE_FORMAT_INVALID",
   "LLM_JSON_OUTPUT_INVALID",
@@ -264,6 +268,18 @@ export type CalibrationFailureCount = z.infer<
   typeof calibrationFailureCountSchema
 >;
 
+const legacyCalibrationFailureCountSchema = z
+  .object({
+    stage: calibrationFailureStageSchema,
+    errorCode: z.literal("LLM_REQUEST_FAILED"),
+    status: z.null(),
+    count: z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+  })
+  .strict();
+type LegacyCalibrationFailureCount = z.infer<
+  typeof legacyCalibrationFailureCountSchema
+>;
+
 export interface CalibrationCheckpointState {
   readonly progress: readonly CalibrationProgress[];
   readonly failureCounts: readonly CalibrationFailureCount[];
@@ -286,7 +302,9 @@ export interface LevelsRunConfiguration {
     readonly analyst: string;
     readonly coding: string;
   };
-  readonly requestTimeoutMs: number;
+  readonly outputIdleTimeoutMs: number;
+  readonly firstOutputTimeoutMs: number;
+  readonly maximumDurationMs: number;
   readonly maxAttempts: number;
   readonly baseDelayMs: number;
   readonly concurrency: number;
@@ -307,7 +325,9 @@ export interface LevelsReportRunConfiguration {
       readonly addressCheck: string;
     };
   };
-  readonly requestTimeoutMs: number;
+  readonly outputIdleTimeoutMs: number;
+  readonly firstOutputTimeoutMs: number;
+  readonly maximumDurationMs: number;
   readonly maxAttempts: number;
   readonly baseDelayMs: number;
   readonly concurrency: number;
@@ -321,6 +341,22 @@ const savedCheckpointSchema = z
     fingerprint: levelsExperimentFingerprintSchema,
     progress: z.array(calibrationProgressSchema),
     failureCounts: z.array(calibrationFailureCountSchema)
+  })
+  .strict();
+
+const savedCheckpointReadSchema = z
+  .object({
+    schemaVersion: z.literal(3),
+    label: calibrationLabelSchema,
+    profileName: calibrationProfileNameSchema,
+    fingerprint: levelsExperimentFingerprintSchema,
+    progress: z.array(calibrationProgressSchema),
+    failureCounts: z.array(
+      z.union([
+        calibrationFailureCountSchema,
+        legacyCalibrationFailureCountSchema
+      ])
+    )
   })
   .strict();
 
@@ -478,7 +514,9 @@ export function buildLevelsRunConfiguration(input: {
   readonly solverBaseUrl: string;
   readonly analystBaseUrl: string;
   readonly codingBaseUrl: string;
-  readonly requestTimeoutMs: number;
+  readonly outputIdleTimeoutMs: number;
+  readonly firstOutputTimeoutMs: number;
+  readonly maximumDurationMs: number;
   readonly maxAttempts: number;
   readonly baseDelayMs: number;
   readonly concurrency: number;
@@ -489,7 +527,9 @@ export function buildLevelsRunConfiguration(input: {
       analyst: input.analystBaseUrl,
       coding: input.codingBaseUrl
     },
-    requestTimeoutMs: input.requestTimeoutMs,
+    outputIdleTimeoutMs: input.outputIdleTimeoutMs,
+    firstOutputTimeoutMs: input.firstOutputTimeoutMs,
+    maximumDurationMs: input.maximumDurationMs,
     maxAttempts: input.maxAttempts,
     baseDelayMs: input.baseDelayMs,
     concurrency: input.concurrency
@@ -532,7 +572,9 @@ export function buildLevelsReportRunConfiguration(input: {
         input.runConfiguration.providerBaseUrls.coding
       )
     },
-    requestTimeoutMs: input.runConfiguration.requestTimeoutMs,
+    outputIdleTimeoutMs: input.runConfiguration.outputIdleTimeoutMs,
+    firstOutputTimeoutMs: input.runConfiguration.firstOutputTimeoutMs,
+    maximumDurationMs: input.runConfiguration.maximumDurationMs,
     maxAttempts: input.runConfiguration.maxAttempts,
     baseDelayMs: input.runConfiguration.baseDelayMs,
     concurrency: input.runConfiguration.concurrency
@@ -586,7 +628,11 @@ export function calibrationRowKey(
 }
 
 export function calibrationFailureCountKey(
-  value: Pick<CalibrationFailureCount, "stage" | "errorCode" | "status">
+  value: {
+    readonly stage: CalibrationFailureStage;
+    readonly errorCode: string;
+    readonly status: number | null;
+  }
 ): string {
   return `${value.stage}:${value.errorCode}:${value.status ?? "none"}`;
 }
@@ -666,7 +712,7 @@ export function loadCalibrationCheckpoint(input: {
       "LEVELS_CHECKPOINT_VERSION_UNSUPPORTED"
     );
   }
-  const parsed = savedCheckpointSchema.safeParse(parsedJson);
+  const parsed = savedCheckpointReadSchema.safeParse(parsedJson);
   if (!parsed.success) {
     throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
   }
@@ -699,10 +745,13 @@ export function loadCalibrationCheckpoint(input: {
     }
     seenKeys.add(key);
   }
-  assertUniqueFailureCounts(parsed.data.failureCounts);
+  assertUniqueLoadedFailureCounts(parsed.data.failureCounts);
+  const failureCounts = normalizeLoadedFailureCounts(
+    parsed.data.failureCounts
+  );
   return {
     progress: parsed.data.progress,
-    failureCounts: parsed.data.failureCounts
+    failureCounts
   };
 }
 
@@ -924,6 +973,58 @@ function assertUniqueFailureCounts(
   }
 }
 
+function assertUniqueLoadedFailureCounts(
+  failureCounts: readonly (
+    | CalibrationFailureCount
+    | LegacyCalibrationFailureCount
+  )[]
+): void {
+  const keys = failureCounts.map(calibrationFailureCountKey);
+  if (new Set(keys).size !== keys.length) {
+    throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
+  }
+}
+
+/**
+ * 旧检查点的笼统错误码无法可靠区分网络失败和各类等待超时。读取时将它归入
+ * 未知错误并合并计数；新检查点和报告不再允许写回旧码。
+ */
+function normalizeLoadedFailureCounts(
+  failureCounts: readonly (
+    | CalibrationFailureCount
+    | LegacyCalibrationFailureCount
+  )[]
+): CalibrationFailureCount[] {
+  const normalizedByKey = new Map<string, CalibrationFailureCount>();
+  for (const failure of failureCounts) {
+    const normalized = calibrationFailureCountSchema.safeParse({
+      ...failure,
+      errorCode:
+        failure.errorCode === "LLM_REQUEST_FAILED"
+          ? "UNEXPECTED_ERROR"
+          : failure.errorCode
+    });
+    if (!normalized.success) {
+      throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
+    }
+    const key = calibrationFailureCountKey(normalized.data);
+    const count = (normalizedByKey.get(key)?.count ?? 0) + normalized.data.count;
+    const merged = calibrationFailureCountSchema.safeParse({
+      ...normalized.data,
+      count
+    });
+    if (!merged.success) {
+      throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
+    }
+    normalizedByKey.set(key, merged.data);
+  }
+  return [...normalizedByKey.values()].sort((left, right) =>
+    calibrationFailureCountKey(left).localeCompare(
+      calibrationFailureCountKey(right)
+    )
+  );
+}
+
 function assertSafeLevelsRunConfiguration(
   configuration: LevelsRunConfiguration
 ): void {
@@ -944,9 +1045,17 @@ function assertSafeLevelsRunConfiguration(
   });
   if (
     !addressesAreSafe ||
-    !Number.isSafeInteger(configuration.requestTimeoutMs) ||
-    configuration.requestTimeoutMs < 1_000 ||
-    configuration.requestTimeoutMs > 600_000 ||
+    !Number.isSafeInteger(configuration.outputIdleTimeoutMs) ||
+    configuration.outputIdleTimeoutMs < 10 * 60 * 1_000 ||
+    configuration.outputIdleTimeoutMs > 24 * 60 * 60 * 1_000 ||
+    !Number.isSafeInteger(configuration.firstOutputTimeoutMs) ||
+    configuration.firstOutputTimeoutMs < 30 * 60 * 1_000 ||
+    configuration.firstOutputTimeoutMs > 24 * 60 * 60 * 1_000 ||
+    !Number.isSafeInteger(configuration.maximumDurationMs) ||
+    configuration.maximumDurationMs < 4 * 60 * 60 * 1_000 ||
+    configuration.maximumDurationMs > 24 * 60 * 60 * 1_000 ||
+    configuration.maximumDurationMs < configuration.outputIdleTimeoutMs ||
+    configuration.maximumDurationMs < configuration.firstOutputTimeoutMs ||
     !Number.isSafeInteger(configuration.maxAttempts) ||
     configuration.maxAttempts < 1 ||
     configuration.maxAttempts > 10 ||

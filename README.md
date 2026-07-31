@@ -74,7 +74,10 @@ npm test            # vitest run
 
 Fermata 本身不解析 `.env` 文件，只读取进程已经收到的环境变量。上面的
 `run-with-env.mjs` 会逐行读取指定文件，再直接启动命令；它不会让 shell 解释密钥中的
-特殊字符，也不会在出错时打印密钥内容。不要用 shell 的 `source` 或 `.` 加载密钥文件，
+特殊字符，也不会在出错时打印密钥内容。如果当前终端设置了 `NODE_DEBUG` 或
+`NODE_DEBUG_NATIVE`，它会在读取密钥前拒绝启动；env 文件本身包含这两个设置时也会
+拒绝启动，避免 Node 把子进程环境写到终端。
+不要用 shell 的 `source` 或 `.` 加载密钥文件，
 因为特殊字符可能导致命令失败并把密钥回显到终端。生产环境也可以由部署平台直接把变量
 传给进程，不需要改 Fermata 的代码。
 
@@ -132,12 +135,82 @@ node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:eval-verdic
 完整用法是 `node scripts/run-with-env.mjs <env文件> <命令> [参数...]`。不要改回
 shell 的 `source` 或 `.`。
 
-思维和代码难度标定中的深度推理可能明显超过 90 秒。正式服务和该实验现在默认允许单次请求等待
-600 秒，等待范围覆盖响应头和完整响应正文，避免请求方过早断开后让模型服务记录 `499`。实验可用
-`LEVELS_LLM_TIMEOUT_MS` 单独覆盖等待时间，用 `LEVELS_LLM_MAX_ATTEMPTS` 调整总尝试次数；两者都
-只接受有范围限制的整数。`EVAL_CONCURRENCY` 决定同时处理几道题，只接受 1 到 32 的整数。模型
-响应正文按 UTF-8 原始字节计算，固定最多读取 4 MiB（约 4 MB）；超过后立即停止读取，并且错误和
-日志都不会包含响应正文。
+### 让长时间标定留在服务器运行
+
+思维/代码难度标定的一次模型请求可能持续数分钟。通过 SSH 在服务器上启动时，可以
+使用下面的专用后台命令。它会创建独立于当前终端的进程；在服务器没有配置“用户退出
+时清理全部登录会话进程”的常规环境下，关闭 SSH，或者发起 SSH 的本地电脑关机、重启，
+不会仅因为终端断开而切断正在等待的模型请求。若服务器启用了登录会话进程清理，应改用
+该服务器的 systemd 服务或其它长期任务管理方式。
+
+```bash
+FERMATA_ENV_FILE=/home/ubuntu/urmotiv-codex/private/fermata.env
+FERMATA_CALIBRATION_RUN_DIR=/home/ubuntu/urmotiv-codex/private/fermata-calibration-runs
+
+# 新实验
+npm run experiment:calibrate-levels:detached -- \
+  --environment-file="$FERMATA_ENV_FILE" \
+  --private-dir="$FERMATA_CALIBRATION_RUN_DIR" \
+  --label=v1
+
+# 同一标签中断后的续跑
+npm run experiment:calibrate-levels:detached -- \
+  --environment-file="$FERMATA_ENV_FILE" \
+  --private-dir="$FERMATA_CALIBRATION_RUN_DIR" \
+  --label=v1 \
+  --resume
+
+# 从旧标签的检查点复制到尚未使用的新标签
+npm run experiment:calibrate-levels:detached -- \
+  --environment-file="$FERMATA_ENV_FILE" \
+  --private-dir="$FERMATA_CALIBRATION_RUN_DIR" \
+  --label=v2 \
+  --resume-from=v1
+```
+
+这个后台入口只支持 Linux 服务器。`--environment-file` 和 `--private-dir` 都必须是服务器
+绝对路径，并且都必须位于 Fermata 仓库之外。env 文件不能是符号链接，必须属于启动
+标定的当前用户，而且不能给同组用户或其他用户任何权限；通常应使用 `0600`。后台
+入口和 `run-with-env.mjs` 共用同一套 env 解析规则，但只从文件接收 Fermata 配置、
+模型服务配置和本标定支持的有界运行参数，忽略 `NODE_OPTIONS` 等能改变 Node 启动
+行为的变量。如果启动终端设置了 `NODE_DEBUG` 或 `NODE_DEBUG_NATIVE`，入口会在读取
+密钥和创建子进程前拒绝启动，避免 Node 的调试输出把子进程环境写到终端。
+
+请给每个部署使用一个专用私有运行目录；它的父目录必须预先存在，最后一级目录不存在时
+启动器会按 `0700` 创建。已存在的目录必须属于当前用户并且已经是 `0700`，启动器不会
+改动一个权限过宽的既有目录。
+每次启动会写一个唯一的 `0600` 日志和一个通过临时文件原子替换的 `0600` JSON 元数据
+文件。元数据只含固定格式版本、任务类型、任务编号、实际标定进程及进程组 ID、标签、
+续跑方式、启动时间、启动状态和日志文件名，不保存环境变量、env 文件路径、完整命令
+或模型服务地址。命令启动后会打印任务编号、进程及进程组 ID 和两个文件名；“已脱离”
+只表示后台进程已经创建，最终是否成功仍应以日志和标定报告为准。
+
+这个入口固定运行 `calibrate-levels`，启动器自身使用参数数组和 `shell: false` 创建
+后台进程，不把用户输入拼成 shell 命令，也不接受任意命令。除两个路径参数外，只允许
+标定本身支持的 `--label`、`--resume` 和 `--resume-from`；未知、重复、冲突或格式
+不安全的参数会在创建进程前被拒绝。并发、等待时间和重试次数仍通过受原标定脚本范围
+检查的环境变量设置。
+
+这里的“电脑重启”只指发起 SSH 的本地电脑。Fermata 所在服务器重启、进程被系统
+终止或服务器网络中断，仍会终止当前模型请求。确认旧进程已停止后，保持数据、代码、
+模型和运行参数不变，用同一 `--label` 加 `--resume` 继续；已经写入检查点的阶段不会
+重跑。
+
+思维和代码难度标定中的深度推理可能明显超过 90 秒。模型开始输出后，每收到一段新数据都会重新
+计算等待时间；默认连续 10 分钟没有新数据才停止。等待第一段输出默认最多 30 分钟，每次向模型
+服务发出请求另有 4 小时的最终保护。实验可分别用 `LEVELS_LLM_OUTPUT_IDLE_MS`、
+`LEVELS_LLM_FIRST_OUTPUT_MS` 和 `LEVELS_LLM_MAX_DURATION_MS` 覆盖这三项。它们只接受整数，
+安全下限依次是 600000、1800000 和 14400000 毫秒，上限都是 86400000 毫秒；最长时间不能小于
+另外两项等待时间。旧的 `LEVELS_LLM_TIMEOUT_MS` 已不再支持，设置后会明确报错。
+`LEVELS_LLM_MAX_ATTEMPTS` 调整最多尝试次数，但只有模型服务明确返回请求过多时才会再次尝试。
+`EVAL_CONCURRENCY` 决定同时处理几道题，只接受 1 到 32 的整数。模型响应正文按 UTF-8 原始字节
+计算，固定最多读取 4 MiB（约 4 MB）；超过后立即停止读取，并且错误和日志都不会包含响应正文。
+
+正式服务已有的 `settings.json` 会保留上次保存的 `experimentVersion`，不会因为替换
+`models.yaml` 自动改变。部署这次流式请求改动后，应在没有在途任务时，通过 Urmotiv 的
+Fermata 设置页或管理接口把 `experimentVersion` 明确更新为
+`experiment-2026-07-stream-v1`，再恢复领取任务；这样提交的审核结果才能准确说明使用了哪一版
+请求与等待规则。
 
 脚本会在发出任何模型请求前检查标定集里的全部 JSON 文件。损坏的 JSON、缺少必需字段、空题解、
 不符合 Codeforces 题号格式的 index（如小写 `a`、`AA` 或含空白的值）、非正数比赛编号或
@@ -235,6 +308,13 @@ JSON；日志只记录固定错误码、题号、标签、模型档位、阶段�
 config/
   models.yaml              模型档位配置（每条流水线用什么模型/温度/是否思考，见文件内注释）
   anchors/difficulty.json  CF 难度评估的参照题（当前发布的是 2 条临时数据，见"当前校准状态"）
+scripts/
+  env-file.mjs             run-with-env 和后台启动器共用的简单 env 解析规则
+  run-with-env.mjs         从仓库外安全读取 env 文件后，不经 shell 运行参数数组
+  detached-calibration-worker.mjs
+                           等 PID 元数据写盘后，在同一进程载入标定入口
+  start-detached-calibration.mjs
+                           脱离 SSH 启动长期标定，日志和启动记录只写服务器私有目录
 src/
   config.ts                读 env + models.yaml，启动即校验
   yaml-lite.ts             一个只支持很小子集的 YAML 解析器（避免引入额外依赖）

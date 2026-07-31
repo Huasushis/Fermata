@@ -138,6 +138,10 @@ describe("parseYamlLite：解析真实的 config/models.yaml", () => {
     });
     expect(defaultProfile.coding).toBeTruthy();
     expect(defaultProfile.verdict).toBeTruthy();
-    expect(parsed.timeouts).toMatchObject({ llmRequestMs: 600_000 });
+    expect(parsed.timeouts).toMatchObject({
+      llmFirstOutputMs: 1_800_000,
+      llmOutputIdleMs: 600_000,
+      llmMaximumDurationMs: 14_400_000
+    });
   });
 });
