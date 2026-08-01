@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "kind": "evaluation-report-completion",
+  "executionRunId": "public83-after-rubric-v1-20260801-2026-08-01T08-44-41-601Z-d47bd7d0d618",
+  "chainRunId": "a422cc30-a1fd-48ee-9259-24b699eab1d1",
+  "experimentComplete": false,
+  "artifacts": {
+    "raw": {
+      "fileName": "difficulty-public83-after-rubric-v1-20260801-2026-08-01T08-44-41-601Z-d47bd7d0d618-raw.json",
+      "sha256": "44b14a0d58d204c80b6c4cfa196562c41fb5c5d7be2fcaf4a599f0070e21e1a7"
+    },
+    "summary": {
+      "fileName": "difficulty-public83-after-rubric-v1-20260801-2026-08-01T08-44-41-601Z-d47bd7d0d618-summary.json",
+      "sha256": "8ffb847a7a22608e067266917f8eaeddad33f818c9210b9c292b64b60e387b81"
+    },
+    "markdown": {
+      "fileName": "difficulty-public83-after-rubric-v1-20260801-2026-08-01T08-44-41-601Z-d47bd7d0d618.md",
+      "sha256": "7f90a4ab5c7b636dc0de7d3c79e8a4fa4450fa6f1fec095f54914f2f56e2268c"
+    }
+  }
+}

@@ -1,0 +1,594 @@
+{
+  "schemaVersion": 2,
+  "runId": "public83-after-rubric-v1-20260801-2026-08-01T08-44-41-601Z-d47bd7d0d618",
+  "label": "public83-after-rubric-v1-20260801",
+  "generatedAt": "2026-08-01T08:44:41.601Z",
+  "codeVersion": "16b2449ed3d635610ef7b77db74049b22bf967fe",
+  "configurationFingerprint": "a2844eb84059c8ff8c7c292a26157ea61a07621a3f4dd294135c5da84be38ca9",
+  "chain": {
+    "chainRunId": "a422cc30-a1fd-48ee-9259-24b699eab1d1",
+    "originalReportRunId": "public83-after-rubric-v1-20260801-2026-08-01T08-44-41-601Z-d47bd7d0d618",
+    "createdAt": "2026-08-01T08:44:41.640Z",
+    "executionKind": "new"
+  },
+  "dataset": {
+    "discoveredFiles": 83,
+    "excludedAnchors": 0,
+    "manifest": {
+      "enabled": true,
+      "expectedFiles": 83,
+      "fingerprint": "509473b84d457c91c25cdae65037e0931d1bd0d7a4c34a344e7334ebee233cfe",
+      "verified": true
+    }
+  },
+  "integrity": {
+    "expected": 83,
+    "succeeded": 19,
+    "failed": 65,
+    "complete": false,
+    "failures": [
+      {
+        "sampleId": "difficulty-evaluation-orchestration",
+        "phase": "setup",
+        "code": "DIFFICULTY_EVALUATION_STOPPED"
+      },
+      {
+        "sampleId": "source-01038421eb237ab7",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-018eb664eba914e3",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-0254f9e1b6169321",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-06a0dee06fb32258",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-0943df5663d9d5b1",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-0f59580653f6ae87",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-18b008f75214e919",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-1c638717d54732f7",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-1d9d71b0155bcc59",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-22e2d926b4f63e34",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-233621fc3ef1e590",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-2382398fda3146c6",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-267eba36901226d1",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-2aff8242bc3b3b66",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-32d6dcabd7dfda28",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-38bc4b21b53dd13d",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-3a12aa0e484ccea4",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-3e83f436c91f380e",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-41a975135961dbd3",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-470cb63b74f876dc",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-48a454436c524fe8",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-48fd26d676f0a7fc",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-4db03982ce1cb301",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-556dafc6511916e4",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-55822a49d7f4730c",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-598000ffd3ec34a5",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-5a3c546da6c1d93b",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-5be0834f214f145f",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-64a2967b7c227ccb",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-6a79f6ca5d41a57b",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-6aab44f068e02974",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-6bc8e95b26d2a391",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-6d3f25faaf77ae8c",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-6fe03d3f09d87229",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-7125a230ded04a1f",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-721f2e95ce5c9b5b",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-7523eb246f9dfc51",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-80fa31f680e1fe1f",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-8283080751ef9dc5",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-8490806d419a4ab3",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-8548c066255a5948",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-8a0b98dcb7fd0e28",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-8c5756417b6fb750",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-90d072c13bfd98df",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-91cc7a0c113e8c4c",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-953e97f5a3d63830",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-97aaaa23f0ebb042",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-9db95f206fca4670",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-a9ed7a0c72746762",
+        "phase": "execution",
+        "code": "LLM_RESPONSE_FORMAT_INVALID"
+      },
+      {
+        "sampleId": "source-aa76ab46932c82e3",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-abb5fa9a4f124544",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-b06f9160ff4e5ba4",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-c4167f9c735be52b",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-c799481e6a615a24",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-ce7e518f70ed87f2",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-d01feb50e06ed6e9",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-d1184a77e9c4e195",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-d9f87d9e1e989b98",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-dc4bd5ae5d3c58b4",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-de3a521fbab13132",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-dfc5f298bcf79263",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-e18c1659b987dcc7",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-e2a068f48d7941c5",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      },
+      {
+        "sampleId": "source-e3f2425746c5d31f",
+        "phase": "reconciliation",
+        "code": "EVALUATION_SAMPLE_MISSING"
+      }
+    ]
+  },
+  "summary": {
+    "count": 19,
+    "meanAbsoluteError": 231.57894736842104,
+    "hitRateWithin200": 0.6842105263157895,
+    "byBucket": {
+      "800": {
+        "count": 1,
+        "meanAbsoluteError": 0
+      },
+      "900": {
+        "count": 1,
+        "meanAbsoluteError": 0
+      },
+      "1100": {
+        "count": 1,
+        "meanAbsoluteError": 200
+      },
+      "1400": {
+        "count": 1,
+        "meanAbsoluteError": 0
+      },
+      "1600": {
+        "count": 1,
+        "meanAbsoluteError": 0
+      },
+      "1700": {
+        "count": 1,
+        "meanAbsoluteError": 100
+      },
+      "2000": {
+        "count": 1,
+        "meanAbsoluteError": 400
+      },
+      "2100": {
+        "count": 1,
+        "meanAbsoluteError": 500
+      },
+      "2200": {
+        "count": 1,
+        "meanAbsoluteError": 0
+      },
+      "2400": {
+        "count": 1,
+        "meanAbsoluteError": 0
+      },
+      "2500": {
+        "count": 1,
+        "meanAbsoluteError": 100
+      },
+      "2600": {
+        "count": 1,
+        "meanAbsoluteError": 200
+      },
+      "2700": {
+        "count": 1,
+        "meanAbsoluteError": 100
+      },
+      "2800": {
+        "count": 1,
+        "meanAbsoluteError": 200
+      },
+      "2900": {
+        "count": 1,
+        "meanAbsoluteError": 500
+      },
+      "3000": {
+        "count": 1,
+        "meanAbsoluteError": 0
+      },
+      "3100": {
+        "count": 1,
+        "meanAbsoluteError": 500
+      },
+      "3300": {
+        "count": 1,
+        "meanAbsoluteError": 700
+      },
+      "3500": {
+        "count": 1,
+        "meanAbsoluteError": 900
+      }
+    }
+  },
+  "rows": [
+    {
+      "contestId": 1776,
+      "index": "J",
+      "actualRating": 2500,
+      "predictedRating": 2400,
+      "error": -100,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1783,
+      "index": "C",
+      "actualRating": 1700,
+      "predictedRating": 1600,
+      "error": -100,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1829,
+      "index": "E",
+      "actualRating": 1100,
+      "predictedRating": 1300,
+      "error": 200,
+      "confidence": 0.8
+    },
+    {
+      "contestId": 1862,
+      "index": "A",
+      "actualRating": 800,
+      "predictedRating": 800,
+      "error": 0,
+      "confidence": 0.9
+    },
+    {
+      "contestId": 1862,
+      "index": "E",
+      "actualRating": 1600,
+      "predictedRating": 1600,
+      "error": 0,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1866,
+      "index": "E",
+      "actualRating": 2700,
+      "predictedRating": 2600,
+      "error": -100,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1866,
+      "index": "F",
+      "actualRating": 3100,
+      "predictedRating": 2600,
+      "error": -500,
+      "confidence": 0.6
+    },
+    {
+      "contestId": 1866,
+      "index": "H",
+      "actualRating": 2100,
+      "predictedRating": 2600,
+      "error": 500,
+      "confidence": 0.6
+    },
+    {
+      "contestId": 1866,
+      "index": "M",
+      "actualRating": 2400,
+      "predictedRating": 2400,
+      "error": 0,
+      "confidence": 0.6
+    },
+    {
+      "contestId": 1893,
+      "index": "C",
+      "actualRating": 2000,
+      "predictedRating": 2400,
+      "error": 400,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1893,
+      "index": "E",
+      "actualRating": 3500,
+      "predictedRating": 2600,
+      "error": -900,
+      "confidence": 0.6
+    },
+    {
+      "contestId": 1906,
+      "index": "C",
+      "actualRating": 3000,
+      "predictedRating": 3000,
+      "error": 0,
+      "confidence": 0.6
+    },
+    {
+      "contestId": 1906,
+      "index": "D",
+      "actualRating": 2800,
+      "predictedRating": 2600,
+      "error": -200,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1906,
+      "index": "I",
+      "actualRating": 2900,
+      "predictedRating": 2400,
+      "error": -500,
+      "confidence": 0.6
+    },
+    {
+      "contestId": 1949,
+      "index": "A",
+      "actualRating": 3300,
+      "predictedRating": 2600,
+      "error": -700,
+      "confidence": 0.55
+    },
+    {
+      "contestId": 1949,
+      "index": "D",
+      "actualRating": 2600,
+      "predictedRating": 2400,
+      "error": -200,
+      "confidence": 0.6
+    },
+    {
+      "contestId": 1949,
+      "index": "F",
+      "actualRating": 2200,
+      "predictedRating": 2200,
+      "error": 0,
+      "confidence": 0.6
+    },
+    {
+      "contestId": 1951,
+      "index": "A",
+      "actualRating": 900,
+      "predictedRating": 900,
+      "error": 0,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 1951,
+      "index": "C",
+      "actualRating": 1400,
+      "predictedRating": 1400,
+      "error": 0,
+      "confidence": 0.75
+    }
+  ]
+}
