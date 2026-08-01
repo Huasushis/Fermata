@@ -13,7 +13,7 @@
 # 分别对应 .env 里的 AETHER_* 和 DASHSCOPE_* 变量，具体 baseUrl/apiKey 从环境
 # 变量读取，不写在这个文件里。
 
-experimentVersion: "experiment-2026-08-difficulty-rubric-thinking-low-v1"
+experimentVersion: "experiment-2026-08-difficulty-rubric-thinking-low-cap4096-v1"
 
 defaults:
   modelProfileName: review-balanced

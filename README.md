@@ -227,7 +227,7 @@ npm run experiment:calibrate-levels:detached -- \
 正式服务已有的 `settings.json` 会保留上次保存的 `experimentVersion`，不会因为替换
 `models.yaml` 自动改变。部署当前版本后，应在没有在途任务时，通过 Urmotiv 的 Fermata 设置页
 或管理接口把 `experimentVersion` 明确更新为
-`experiment-2026-08-difficulty-rubric-thinking-low-v1`，再恢复领取任务；这样提交的审核结果才能准确说明使用了
+`experiment-2026-08-difficulty-rubric-thinking-low-cap4096-v1`，再恢复领取任务；这样提交的审核结果才能准确说明使用了
 哪一版请求规则和难度量尺。这个 Candidate B 版本号只标识实现版本，尚未进行
 准确性标定，不表示难度准确性已经通过标定门槛。
 
@@ -239,6 +239,11 @@ npm run experiment:calibrate-levels:detached -- \
 不保存题面、题解、难度预测或模型原文。运行时还会核对当前 Git 提交、探针源文件、已登记公开材料
 和当前模型服务身份的安全指纹；其中“安全指纹”是配置内容的 SHA-256 摘要，用于确认仍是同一份
 配置，而不把服务地址或密钥写入报告。
+
+2048 输出上限的第一轮探针在第一道公开高难题上明确得到
+`LLM_OUTPUT_LENGTH_LIMIT`，所以完整性为假，也没有启动 83 题实验。当前 4096 上限只依据这项预先
+登记的升级条件设置；它不是准确性提升结论。必须先用新标签把同一组四题全部跑完且零失败，才允许
+启动正式实验；4096 探针再出现长度上限或任何其它失败时，不继续自动提高上限。
 
 思维/代码标定必须先在 `experiments/data/levels/manifest.private.json` 登记私有数据集清单。
 清单逐项绑定安全编号、文件名和文件原始字节的 SHA-256 校验值；目录里漏文件、多文件、改后缀、

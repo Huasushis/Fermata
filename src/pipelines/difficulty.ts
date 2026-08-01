@@ -79,7 +79,7 @@ const rawDifficultyOutputSchema = z.object({
   rationale: z.string().trim().min(1).max(2_000)
 });
 
-const difficultyMaxOutputTokens = 2_048;
+const difficultyMaxOutputTokens = 4_096;
 
 export async function runDifficultyPipeline(input: DifficultyPipelineInput): Promise<DifficultyResult> {
   const messages = buildDifficultyMessages(input.problem, input.anchors);

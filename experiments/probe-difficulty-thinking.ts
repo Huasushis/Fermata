@@ -35,14 +35,14 @@ import {
 } from "../scripts/private-runtime.mjs";
 
 const experimentVersion =
-  "experiment-2026-08-difficulty-rubric-thinking-low-v1";
+  "experiment-2026-08-difficulty-rubric-thinking-low-cap4096-v1";
 const sourceManifestSha256 =
   "edd286b5511ea7887e685c1cf7ee2b8aba75bf58f2ef5c914617807c3d6dc68e";
 const providerIdentityFingerprint =
   "6e913442f0833b7950c9ae934e46f437dad6ffd72bf847fbe3acee058256050c";
 const maximumProbeFileBytes = 1024 * 1024;
 const repositoryDirectory = fileURLToPath(new URL("../", import.meta.url));
-const reportLabel = "difficulty-thinking-low-probe-2048-20260801-a";
+const reportLabel = "difficulty-thinking-low-probe-4096-20260801-b";
 const checkpointFileName = `${reportLabel}.checkpoint.private.json`;
 const reportFileName = `${reportLabel}.private.json`;
 
@@ -85,7 +85,7 @@ const thinkingRequestBodySchema = z
     messages: z.array(z.unknown()).min(1),
     thinking: z.object({ type: z.literal("enabled") }).strict(),
     reasoning_effort: z.literal("low"),
-    max_tokens: z.literal(2048)
+    max_tokens: z.literal(4096)
   })
   .strict();
 
@@ -470,7 +470,7 @@ async function main(): Promise<void> {
     sourceManifestSha256,
     providerIdentityFingerprint,
     anchorsFingerprint: strictAnchors.fingerprint,
-    maxOutputTokens: 2048,
+    maxOutputTokens: 4096,
     expected: samples.length,
     revision: checkpointRevision,
     state,
@@ -649,7 +649,7 @@ async function main(): Promise<void> {
     sourceManifestSha256,
     providerIdentityFingerprint,
     anchorsFingerprint: strictAnchors.fingerprint,
-    maxOutputTokens: 2048,
+    maxOutputTokens: 4096,
     expected: samples.length,
     succeeded,
     failed: samples.length - succeeded,

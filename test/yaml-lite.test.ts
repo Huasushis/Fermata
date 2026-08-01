@@ -148,7 +148,7 @@ describe("parseYamlLite：解析真实的 config/models.yaml", () => {
       llmMaximumDurationMs: 14_400_000
     });
     expect(parsed.experimentVersion).toBe(
-      "experiment-2026-08-difficulty-rubric-thinking-low-v1"
+      "experiment-2026-08-difficulty-rubric-thinking-low-cap4096-v1"
     );
   });
 });
