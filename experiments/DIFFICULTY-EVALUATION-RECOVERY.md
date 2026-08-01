@@ -18,8 +18,10 @@ PID 名称猜测并自动删除，以免 PID 已复用或旧模型请求其实�
    没有仍属于本项目的对应评测进程时，才可认定锁已遗留。不能只凭进程名称判断。
 3. 只删除核验过的那一个精确锁文件。不得删除或修改
    `difficulty-<标签>.checkpoint.private.json`，不得批量删除 `evaluation-state`。
-4. 使用完全相同的数据 manifest、配置和标签重新运行。检查点中的 `succeeded` 不会重跑；
-   崩溃时的 `active` 会永久计为不完整且不会重跑；只有 `pending` 会继续发起请求。
+4. 使用完全相同的数据 manifest、配置和标签重新运行，只用于收束这条失败链。检查点中的
+   `succeeded` 会进入不完整报告，`active`/`failed` 会保留为终止证据，所有 `pending` 会显式记为
+   `EVALUATION_SAMPLE_MISSING`；恢复进程不会再把任何 pending 改成 active，也不会发起模型请求。
+   若之后要重新取得完整结果，必须保留本次不完整报告，并用新标签从 clean checkpoint 开始新链。
 
 若不能证明旧 PID/启动时钟对应的进程已经退出，就保留锁并停止恢复。任何 active、499、取消、
 显式失败或缺失样本都会让整个链永久 `complete=false`；人工删除锁不能清除这些证据。

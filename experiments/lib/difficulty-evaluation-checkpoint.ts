@@ -35,7 +35,11 @@ import {
   workspaceRoot,
   type PrivateDirectoryHandle
 } from "../../scripts/private-runtime.mjs";
-import type { EvaluationFailure } from "./evaluation-integrity";
+import {
+  reconcileEvaluation,
+  type EvaluationCompleteness,
+  type EvaluationFailure
+} from "./evaluation-integrity";
 
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/);
 const labelSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
@@ -154,6 +158,51 @@ export interface DifficultyCheckpointOptions {
   readonly privateRoot?: string;
   readonly containingWorkspace?: string;
   readonly now?: () => Date;
+}
+
+export interface ContaminatedDifficultyResume {
+  readonly kind: "contaminated";
+  readonly persistedRows: readonly (DifficultyCheckpointRow & { readonly sampleId: string })[];
+  readonly terminalFailures: readonly EvaluationFailure[];
+  readonly integrity: EvaluationCompleteness;
+}
+
+export interface ContinuedDifficultyEvaluation<T> {
+  readonly kind: "continued";
+  readonly value: T;
+}
+
+/**
+ * 既有链一旦留下 active/failed，完整性已经不可恢复。这个门必须包住所有
+ * markActive 与模型调用：污染链只用已持久结果对账，pending 会被明确记为缺失，
+ * 不会为了一个永远不可能 complete 的报告继续付费。
+ */
+export async function continueDifficultyEvaluationUnlessContaminated<T>(input: {
+  readonly checkpoint: Pick<
+    DifficultyEvaluationCheckpoint,
+    "openedExistingCheckpoint" | "terminalFailures" | "succeededRows"
+  >;
+  readonly expectedSampleIds: readonly string[];
+  readonly continueClean: () => Promise<T>;
+}): Promise<ContaminatedDifficultyResume | ContinuedDifficultyEvaluation<T>> {
+  if (input.checkpoint.openedExistingCheckpoint()) {
+    const terminalFailures = input.checkpoint.terminalFailures();
+    if (terminalFailures.length > 0) {
+      const persistedRows = input.checkpoint.succeededRows();
+      return {
+        kind: "contaminated",
+        persistedRows,
+        terminalFailures,
+        integrity: reconcileEvaluation({
+          expectedSampleIds: input.expectedSampleIds,
+          succeededSampleIds: persistedRows.map((row) => row.sampleId),
+          failures: terminalFailures
+        })
+      };
+    }
+  }
+
+  return { kind: "continued", value: await input.continueClean() };
 }
 
 export class DifficultyEvaluationCheckpoint {

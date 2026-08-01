@@ -25,6 +25,7 @@ import {
   verifyKnownPublicDifficultyArchiveProfile
 } from "./lib/difficulty-dataset-manifest";
 import {
+  continueDifficultyEvaluationUnlessContaminated,
   DifficultyEvaluationCheckpoint,
   type DifficultyCheckpointRow
 } from "./lib/difficulty-evaluation-checkpoint";
@@ -729,81 +730,92 @@ async function main(): Promise<void> {
       return;
     }
 
-    const priorTerminalFailures = checkpoint.terminalFailures();
-    if (priorTerminalFailures.length > 0) {
-      // active/failed 永久污染该链且永不重试；人工核验遗留锁后，只续真正 pending。
-      logInfo("续跑链含永久失败证据，只继续 pending 样本", {
-        terminalFailures: priorTerminalFailures.length,
-        pending: checkpoint.pendingSampleIds().length
-      });
-    }
-
-    const pendingIds = new Set(checkpoint.pendingSampleIds());
-    const pendingDataset = dataset.filter((source) => pendingIds.has(source.sourceId));
-    let done = dataset.length - pendingDataset.length;
-    let orchestrationFailure: EvaluationFailure | null = null;
-    try {
-      await mapWithConcurrency(pendingDataset, concurrency, async (source): Promise<void> => {
-        const item = source.item;
-        const problem = toReviewTaskProblem(item);
-
-        // 这是付费调用的提交点。只有 active 已经 fsync 并原子替换成功后，
-        // 才允许进入 runDifficultyPipeline。
-        checkpoint.markActive(source.sourceId);
-
-        let row: DifficultyCheckpointRow;
-        try {
-          const result = await runDifficultyPipeline({ problem, anchors, model });
-          const predictedRating = clampAndRoundDifficultyRating(result.rating);
-          row = {
-            contestId: item.contestId,
-            index: item.index,
-            actualRating: item.rating,
-            predictedRating,
-            error: predictedRating - item.rating,
-            confidence: result.confidence
-          };
-        } catch (error) {
-          done += 1;
-          const failure = executionFailure(source.sourceId, error);
-          checkpoint.markFailed(source.sourceId, failure);
-          logError("这一题的难度评定失败，停止发起后续请求", error, {
-            contestId: item.contestId,
-            index: item.index,
-            progress: `${done}/${dataset.length}`
-          });
-          throw new Error("DIFFICULTY_EVALUATION_SAMPLE_FAILED");
-        }
-
-        // 不保存模型理由；成功数值先原子持久化，之后才计入进度与报告。
-        checkpoint.markSucceeded(source.sourceId, row);
-        done += 1;
-        logInfo("完成一题的难度评定", {
-          contestId: item.contestId,
-          index: item.index,
-          error: row.error,
-          progress: `${done}/${dataset.length}`
-        });
-      });
-    } catch (error) {
-      orchestrationFailure = {
-        sampleId: "difficulty-evaluation-orchestration",
-        phase: "setup",
-        code: "DIFFICULTY_EVALUATION_STOPPED"
-      };
-      logError("难度评测已安全停止，不再发起后续请求", error);
-    }
-
-    const persistedRows: PersistedEvalRow[] = checkpoint.succeededRows();
-    const executionFailures = checkpoint.terminalFailures();
-    const integrity = reconcileEvaluation({
+    const continuation = await continueDifficultyEvaluationUnlessContaminated({
+      checkpoint,
       expectedSampleIds,
-      succeededSampleIds: persistedRows.map((row) => row.sampleId),
-      failures: [
-        ...executionFailures,
-        ...(orchestrationFailure === null ? [] : [orchestrationFailure])
-      ]
+      continueClean: async (): Promise<EvaluationFailure | null> => {
+        const pendingIds = new Set(checkpoint.pendingSampleIds());
+        const pendingDataset = dataset.filter((source) => pendingIds.has(source.sourceId));
+        let done = dataset.length - pendingDataset.length;
+        try {
+          await mapWithConcurrency(pendingDataset, concurrency, async (source): Promise<void> => {
+            const item = source.item;
+            const problem = toReviewTaskProblem(item);
+
+            // 这是付费调用的提交点。只有 active 已经 fsync 并原子替换成功后，
+            // 才允许进入 runDifficultyPipeline。
+            checkpoint.markActive(source.sourceId);
+
+            let row: DifficultyCheckpointRow;
+            try {
+              const result = await runDifficultyPipeline({ problem, anchors, model });
+              const predictedRating = clampAndRoundDifficultyRating(result.rating);
+              row = {
+                contestId: item.contestId,
+                index: item.index,
+                actualRating: item.rating,
+                predictedRating,
+                error: predictedRating - item.rating,
+                confidence: result.confidence
+              };
+            } catch (error) {
+              done += 1;
+              const failure = executionFailure(source.sourceId, error);
+              checkpoint.markFailed(source.sourceId, failure);
+              logError("这一题的难度评定失败，停止发起后续请求", error, {
+                contestId: item.contestId,
+                index: item.index,
+                progress: `${done}/${dataset.length}`
+              });
+              throw new Error("DIFFICULTY_EVALUATION_SAMPLE_FAILED");
+            }
+
+            // 不保存模型理由；成功数值先原子持久化，之后才计入进度与报告。
+            checkpoint.markSucceeded(source.sourceId, row);
+            done += 1;
+            logInfo("完成一题的难度评定", {
+              contestId: item.contestId,
+              index: item.index,
+              error: row.error,
+              progress: `${done}/${dataset.length}`
+            });
+          });
+          return null;
+        } catch (error) {
+          logError("难度评测已安全停止，不再发起后续请求", error);
+          return {
+            sampleId: "difficulty-evaluation-orchestration",
+            phase: "setup",
+            code: "DIFFICULTY_EVALUATION_STOPPED"
+          };
+        }
+      }
     });
+
+    let persistedRows: PersistedEvalRow[];
+    let integrity: EvaluationCompleteness;
+    if (continuation.kind === "contaminated") {
+      persistedRows = [...continuation.persistedRows];
+      integrity = continuation.integrity;
+      logInfo("既有 difficulty 链含永久失败证据，直接写不完整报告", {
+        terminalFailures: continuation.terminalFailures.length,
+        pendingMissing: integrity.failures.filter(
+          (failure) => failure.code === "EVALUATION_SAMPLE_MISSING"
+        ).length
+      });
+    } else {
+      const orchestrationFailure = continuation.value;
+      persistedRows = checkpoint.succeededRows();
+      const executionFailures = checkpoint.terminalFailures();
+      integrity = reconcileEvaluation({
+        expectedSampleIds,
+        succeededSampleIds: persistedRows.map((row) => row.sampleId),
+        failures: [
+          ...executionFailures,
+          ...(orchestrationFailure === null ? [] : [orchestrationFailure])
+        ]
+      });
+    }
     const rows: EvalRow[] = persistedRows.map(({ sampleId: _sampleId, ...row }) => row);
     const report: DifficultyReport = {
       schemaVersion: 2,

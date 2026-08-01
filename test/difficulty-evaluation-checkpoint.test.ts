@@ -12,8 +12,9 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  continueDifficultyEvaluationUnlessContaminated,
   DifficultyEvaluationCheckpoint,
   difficultyCheckpointLockRecordSchema
 } from "../experiments/lib/difficulty-evaluation-checkpoint";
@@ -56,6 +57,19 @@ describe("difficulty 私有检查点", () => {
       datasetManifestFingerprint: digest,
       configurationFingerprint: digest,
       expectedSampleIds: ["source-a", "source-b"],
+      privateRoot,
+      containingWorkspace: workspace,
+      now: () => new Date("2026-08-01T00:00:00.000Z")
+    });
+  }
+
+  function openResumeGateCase(): DifficultyEvaluationCheckpoint {
+    return new DifficultyEvaluationCheckpoint({
+      label: "resume-gate",
+      reportRunId: "resume-gate-2026-08-01T00-00-00-000Z-12345678",
+      datasetManifestFingerprint: digest,
+      configurationFingerprint: digest,
+      expectedSampleIds: ["source-a", "source-b", "source-c", "source-d"],
       privateRoot,
       containingWorkspace: workspace,
       now: () => new Date("2026-08-01T00:00:00.000Z")
@@ -127,6 +141,94 @@ describe("difficulty 私有检查点", () => {
     expect(() => open("b".repeat(64))).toThrow("DIFFICULTY_CHECKPOINT_FINGERPRINT_MISMATCH");
   });
 
+  it("污染 resume 在模型调用门前收束，pending 保持不变并显式记为缺失", async () => {
+    let checkpoint = openResumeGateCase();
+    checkpoint.markActive("source-a");
+    checkpoint.markSucceeded("source-a", {
+      contestId: 1,
+      index: "A",
+      actualRating: 800,
+      predictedRating: 900,
+      error: 100,
+      confidence: 0.75
+    });
+    checkpoint.markActive("source-b");
+    checkpoint.markFailed("source-b", {
+      sampleId: "source-b",
+      phase: "execution",
+      code: "LLM_HTTP_ERROR",
+      httpStatus: 499
+    });
+    checkpoint.markActive("source-c");
+    checkpoint.close();
+
+    checkpoint = openResumeGateCase();
+    const modelCall = vi.fn(async () => undefined);
+    const continueClean = vi.fn(async () => {
+      checkpoint.markActive("source-d");
+      await modelCall();
+      return null;
+    });
+    const result = await continueDifficultyEvaluationUnlessContaminated({
+      checkpoint,
+      expectedSampleIds: ["source-a", "source-b", "source-c", "source-d"],
+      continueClean
+    });
+
+    expect(result.kind).toBe("contaminated");
+    expect(continueClean).not.toHaveBeenCalled();
+    expect(modelCall).not.toHaveBeenCalled();
+    expect(checkpoint.pendingSampleIds()).toEqual(["source-d"]);
+    if (result.kind === "contaminated") {
+      expect(result.persistedRows.map((row) => row.sampleId)).toEqual(["source-a"]);
+      expect(result.integrity).toMatchObject({
+        expected: 4,
+        succeeded: 1,
+        failed: 3,
+        complete: false
+      });
+      expect(result.integrity.failures).toEqual(expect.arrayContaining([
+        expect.objectContaining({ sampleId: "source-b", code: "LLM_HTTP_ERROR" }),
+        expect.objectContaining({
+          sampleId: "source-c",
+          code: "EVALUATION_ACTIVE_FROM_INTERRUPTED_RUN"
+        }),
+        expect.objectContaining({
+          sampleId: "source-d",
+          code: "EVALUATION_SAMPLE_MISSING"
+        })
+      ]));
+    }
+    checkpoint.close();
+  });
+
+  it("新建 clean checkpoint 仍进入模型调用路径", async () => {
+    const checkpoint = open();
+    const modelCall = vi.fn(async () => "finished");
+    const result = await continueDifficultyEvaluationUnlessContaminated({
+      checkpoint,
+      expectedSampleIds: ["source-a", "source-b"],
+      continueClean: async () => {
+        checkpoint.markActive("source-a");
+        const value = await modelCall();
+        checkpoint.markSucceeded("source-a", {
+          contestId: 1,
+          index: "A",
+          actualRating: 800,
+          predictedRating: 800,
+          error: 0,
+          confidence: 0.5
+        });
+        return value;
+      }
+    });
+
+    expect(result).toEqual({ kind: "continued", value: "finished" });
+    expect(modelCall).toHaveBeenCalledTimes(1);
+    expect(checkpoint.pendingSampleIds()).toEqual(["source-b"]);
+    checkpoint.close();
+  });
+
   it("同一标签只允许一个进程持有检查点，释放后才能安全续跑", () => {
     const firstCheckpoint = open();
     const lockRecord = difficultyCheckpointLockRecordSchema.parse(
@@ -151,7 +253,7 @@ describe("difficulty 私有检查点", () => {
     resumed.close();
   });
 
-  it("真实 SIGKILL 遗留锁只允许人工核验后移除，active 永久失败且仅续 pending", () => {
+  it("真实 SIGKILL 遗留锁只允许人工核验后移除，恢复后不再调度 pending", async () => {
     const fixture = fileURLToPath(
       new URL("./fixtures/difficulty-checkpoint-crash.ts", import.meta.url)
     );
@@ -187,18 +289,24 @@ describe("difficulty 私有检查点", () => {
       })
     ]);
     expect(resumed.pendingSampleIds()).toEqual(["source-b"]);
-    resumed.markActive("source-b");
-    resumed.markSucceeded("source-b", {
-      contestId: 2,
-      index: "B",
-      actualRating: 1600,
-      predictedRating: 1600,
-      error: 0,
-      confidence: 0.5
+    const continueClean = vi.fn(async () => undefined);
+    const result = await continueDifficultyEvaluationUnlessContaminated({
+      checkpoint: resumed,
+      expectedSampleIds: ["source-a", "source-b"],
+      continueClean
     });
-    expect(resumed.pendingSampleIds()).toEqual([]);
-    expect(resumed.terminalFailures()).toHaveLength(1);
-    expect(resumed.succeededRows().map((row) => row.sampleId)).toEqual(["source-b"]);
+    expect(continueClean).not.toHaveBeenCalled();
+    expect(resumed.pendingSampleIds()).toEqual(["source-b"]);
+    expect(result).toMatchObject({
+      kind: "contaminated",
+      integrity: { expected: 2, succeeded: 0, failed: 2, complete: false }
+    });
+    if (result.kind === "contaminated") {
+      expect(result.integrity.failures).toContainEqual(expect.objectContaining({
+        sampleId: "source-b",
+        code: "EVALUATION_SAMPLE_MISSING"
+      }));
+    }
     resumed.close();
   });
 
