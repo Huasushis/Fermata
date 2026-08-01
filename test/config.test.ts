@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   ConfigError,
@@ -104,6 +105,26 @@ describe("loadConfig：正常路径", () => {
     const { FERMATA_PORT, ...rest } = validEnv;
     const config = loadConfig({ env: rest, modelsYamlSource: validYaml });
     expect(config.server.port).toBe(8720);
+  });
+
+  it("正式 YAML 的难度档位使用 pro 默认请求且不显式发送思考字段", () => {
+    const source = readFileSync(new URL("../config/models.yaml", import.meta.url), "utf8");
+    const config = loadConfig({ env: validEnv, modelsYamlSource: source });
+    expect(config.models.experimentVersion).toBe(
+      "experiment-2026-08-difficulty-pro-default-request-v1"
+    );
+    expect(config.models.profiles["review-balanced"]?.difficulty).toEqual({
+      provider: "aether",
+      model: "deepseek-v4-pro",
+      temperature: 0.2,
+      thinking: false
+    });
+    expect(config.models.retry).toEqual({ maxAttempts: 3, baseDelayMs: 500 });
+    expect(config.models.timeouts).toMatchObject({
+      llmFirstOutputMs: 1_800_000,
+      llmOutputIdleMs: 600_000,
+      llmMaximumDurationMs: 14_400_000
+    });
   });
 });
 
@@ -214,7 +235,7 @@ profiles:
         )
     ],
     [
-      "其它 model",
+      "deepseek-v4-pro 不允许显式 thinkingRequest",
       (yaml: string) => yaml.replace("model: deepseek-v4-flash", "model: deepseek-v4-pro")
     ],
     [

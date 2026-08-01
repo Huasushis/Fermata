@@ -16,6 +16,7 @@
     "experiment:fetch-cf-dataset": "tsx experiments/fetch-cf-dataset.ts",
     "experiment:eval-difficulty": "tsx experiments/eval-difficulty.ts",
     "experiment:probe-difficulty-thinking": "tsx experiments/probe-difficulty-thinking.ts",
+    "experiment:probe-difficulty-pro": "tsx experiments/probe-difficulty-pro.ts",
     "experiment:calibrate-anchors": "tsx experiments/calibrate-anchors.ts",
     "experiment:fetch-hf-dataset": "tsx experiments/fetch-hf-dataset.ts",
     "experiment:calibrate-levels": "tsx experiments/calibrate-levels.ts",

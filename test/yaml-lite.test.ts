@@ -133,8 +133,12 @@ describe("parseYamlLite：解析真实的 config/models.yaml", () => {
     expect(defaultProfile).toBeTruthy();
     expect(defaultProfile.difficulty).toBeTruthy();
     expect(defaultProfile.difficulty).toMatchObject({
-      thinkingRequest: "disabled"
+      provider: "aether",
+      model: "deepseek-v4-pro",
+      temperature: 0.2,
+      thinking: false
     });
+    expect(defaultProfile.difficulty).not.toHaveProperty("thinkingRequest");
     expect(defaultProfile.difficulty).not.toHaveProperty("reasoningEffort");
     expect(defaultProfile.thinking).toMatchObject({
       solver: expect.any(Object),
@@ -148,7 +152,7 @@ describe("parseYamlLite：解析真实的 config/models.yaml", () => {
       llmMaximumDurationMs: 14_400_000
     });
     expect(parsed.experimentVersion).toBe(
-      "experiment-2026-08-difficulty-rubric-restored-v1"
+      "experiment-2026-08-difficulty-pro-default-request-v1"
     );
   });
 });

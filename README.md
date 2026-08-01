@@ -77,7 +77,9 @@ npm test            # vitest run
 深度思考。`enabled` 必须同时配置 `reasoningEffort: low`；`disabled` 不允许带
 推理强度，未配置 `thinkingRequest` 时两个请求字段都不发送。当
 `thinkingRequest: enabled` 时仍保留 `temperature` 配置以维持档位形状，但当前
-服务端会忽略这个字段。
+服务端会忽略这个字段。当前 difficulty 候选改用 `deepseek-v4-pro` 的默认请求，
+因此既不配置 `thinkingRequest`，也不发送 `thinking` 或 `reasoning_effort`；pro
+若误配任一显式思考请求会在网络调用前被拒绝。
 
 Fermata 本身不解析 `.env` 文件，只读取进程已经收到的环境变量。上面的
 `run-with-env.mjs` 只接受 `Fermata/private/` 内的绝对路径，并沿已经打开的目录描述符
@@ -226,10 +228,10 @@ npm run experiment:calibrate-levels:detached -- \
 
 正式服务已有的 `settings.json` 会保留上次保存的 `experimentVersion`，不会因为替换
 `models.yaml` 自动改变。部署当前版本后，应在没有在途任务时，通过 Urmotiv 的 Fermata 设置页
-或管理接口把 `experimentVersion` 明确更新为
-`experiment-2026-08-difficulty-rubric-restored-v1`，再恢复领取任务；这样提交的审核结果才能准确说明使用了
-哪一版请求规则和难度量尺。当前默认已恢复到显式关闭深度思考和 2048 输出上限；这只是撤回未通过
-协议探针的 Candidate B，不表示 Candidate A 的难度准确性已经通过标定门槛。
+或管理接口把 `experimentVersion` 明确更新为当前配置版本，再恢复领取任务；这样提交的审核结果才能
+准确说明使用了哪一版请求规则和难度量尺。Candidate D 当前登记为
+`experiment-2026-08-difficulty-pro-default-request-v1`，但必须先通过下面的两题协议探针和全新 83 题
+准确性实验；探针或准确性未通过时不能仅因配置文件已经切换就投入正式领取任务。
 
 Candidate B 的协议验证使用
 `npm run experiment:probe-difficulty-thinking`。这个入口只依次检查一个人工合成的短题和三个与
@@ -244,6 +246,23 @@ Candidate B 的协议验证使用
 `LLM_OUTPUT_LENGTH_LIMIT`，所以完整性为假，也没有启动 83 题实验。按预先登记的唯一升级条件，
 第二轮只把上限改为 4096，但同一道公开题仍得到相同失败码；因此没有继续提高上限，Candidate B 已
 停止。两份不完整报告都已保留，后续候选不得把它们改写成成功结果。
+
+Candidate D 使用独立入口 `npm run experiment:probe-difficulty-pro`，不会读取或改写 Candidate B
+报告。入口固定依次检查人工短题与公开题 CF 2006E，固定 2048 输出上限、每题最多一次真实 fetch，
+并在付费前持久化 active 检查点；首题失败后不会发送第二题。成功必须同时满足输出 schema、
+`finish_reason=stop` 和真实 HTTP EOF。运行前还会核对完整 Git HEAD、runner 自身 SHA-256、
+tracked/untracked 干净状态、Candidate C 锚点、public83 零重叠、模型配置和当前服务身份指纹。
+Candidate D 的私有预登记固定为 `private/difficulty-pro-probe-20260801-a/manifest.private.json`；
+CF 2006E 快照复用既有只读公开材料目录中的 `difficulty-thinking-probes-20260801-c/2006E.json`，
+但不读取 Candidate B 报告。runner 同时硬绑定该公开材料登记、public83、Candidate C 锚点和模型
+配置的已跟踪 SHA-256，不能通过同步改写新 manifest 绕过。私有目录须为 `0700`，文件须仅 owner
+可访问。manifest 的精确契约由 runner 导出的
+`difficultyProProbeManifestSchema` 定义，并须预先绑定提交、runner、配置、锚点、public83 和服务
+指纹以及来源文件的字节数、文件/题面哈希。运行必须通过 `scripts/run-with-env.mjs` 提供与 HEAD
+一致的 `EVAL_CODE_VERSION`。结果只写入 Git 忽略的 `private/difficulty-pro-probe-results/`，不含
+题面、预测或模型原文；report/summary 只是非权威证据，只有精确文件名的 completion certificate
+才可声明 `complete: true`，并逐一绑定检查点、报告和汇总哈希。崩溃、关闭 dispatcher 失败或任一
+不完整状态都会占用该标签，不能重跑洗掉。
 
 思维/代码标定必须先在 `experiments/data/levels/manifest.private.json` 登记私有数据集清单。
 清单逐项绑定安全编号、文件名和文件原始字节的 SHA-256 校验值；目录里漏文件、多文件、改后缀、
@@ -303,7 +322,7 @@ Candidate B 的协议验证使用
 
 | 流水线 | 状态 | 说明 |
 | --- | --- | --- |
-| CF 难度（difficulty.ts） | **Candidate A 完整但未达标；Candidate B 已在探针阶段淘汰** | 修改前 public83 v4 的 83/83 完整报告为 MAE 302.4、±200 命中率 56.6%；加入 800–3500 完整量尺的 Candidate A 独立 83/83 报告为 MAE 289.2、命中率 55.4%。MAE 改善 13.3，但命中率下降 1.2 个百分点，低、中档退化且高档 MAE 仍为 387.8；没有达到 MAE ≤ 200、命中率 ≥ 75% 的门槛。Candidate B 在 2048、4096 两档都无法让同一道公开高难题完成输出，未运行 83 题；默认配置已恢复 Candidate A 的非思考请求。`config/anchors/difficulty.json` 仍只有 2 条手工种子且标记为 `provisional: true`。 |
+| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；Candidate D 待协议探针** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate B 在 2048、4096 两档协议探针均因高难题长度停止而淘汰。Candidate D 只把 difficulty 改为 `deepseek-v4-pro` 默认请求，尚未运行两题协议探针，更未运行新的 83 题准确性实验。 |
 | 思维难度（thinking.ts） | **旧实验均不可作基线** | 两份早期报告无法证明完整；后两份明确只完成 6/24、9/24，而且都缺高分段。 |
 | 代码难度（coding.ts） | **旧实验均不可作基线** | 与思维难度共用的旧实验不完整；小样本曾出现难度分段升高但代码难度均值下降，需要在完整基线上复核。 |
 | 查重判断（verdict.ts） | **旧设计不可作准确性基线** | 旧实验只有 3 个正常样本和 3 个人工重复样本；正常组只验证“不是不通过”，没有区分通过与需要修改。 |
@@ -335,7 +354,7 @@ Candidate B 的协议验证使用
 ```
 config/
   models.yaml              模型档位配置（每条流水线用什么模型/温度/是否思考，见文件内注释）
-  anchors/difficulty.json  CF 难度评估的参照题（当前发布的是 2 条临时数据，见"当前校准状态"）
+  anchors/difficulty.json  CF 难度评估的参照题（当前为 7 条 Candidate C 临时数据，见"当前校准状态"）
 scripts/
   env-file.mjs             run-with-env 和后台启动器共用的简单 env 解析规则
   private-runtime.mjs      从 Fermata/private/ 的目录描述符安全读取或创建私有运行文件
