@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   anchoredPrivatePath,
   closePrivateDirectory,
+  durablyCommitCreatedPrivateDirectory,
   preparePrivateDirectory,
   readProtectedEnvFile
 } from "../scripts/private-runtime.mjs";
@@ -53,6 +54,14 @@ describe("Fermata 私有运行路径", () => {
       "PRIVATE_DIRECTORY_HANDLE_CLOSED"
     );
     closePrivateDirectory(result);
+  });
+
+  it("新建目录先 fsync 自身、再 fsync 持有目录项的父目录", () => {
+    const synchronized = [];
+    durablyCommitCreatedPrivateDirectory(101, 202, (descriptor) => {
+      synchronized.push(descriptor);
+    });
+    expect(synchronized).toEqual([101, 202]);
   });
 
   it("拒绝项目私有根之外和旧归档方向的运行目录", () => {

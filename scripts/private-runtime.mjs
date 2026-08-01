@@ -7,6 +7,7 @@ import {
   constants,
   fchmodSync,
   fstatSync,
+  fsyncSync,
   mkdirSync,
   openSync,
   readSync,
@@ -199,6 +200,19 @@ export function closePrivateDirectory(privateDirectoryHandle) {
   }
 }
 
+/**
+ * 新建私有末级目录时，先同步目录自身元数据，再同步持有其目录项的父目录。
+ * 只有两步都成功后调用方才可把目录视为付费前持久化边界。
+ */
+export function durablyCommitCreatedPrivateDirectory(
+  directoryDescriptor,
+  parentDirectoryDescriptor,
+  synchronize = fsyncSync
+) {
+  synchronize(directoryDescriptor);
+  synchronize(parentDirectoryDescriptor);
+}
+
 export function preparePrivateDirectory(
   privateDirectory,
   {
@@ -239,6 +253,7 @@ export function preparePrivateDirectory(
       created = true;
       finalDescriptor = openSync(finalAnchoredPath, directoryOpenFlags);
       fchmodSync(finalDescriptor, 0o700);
+      durablyCommitCreatedPrivateDirectory(finalDescriptor, chain.descriptor);
     }
     assertOwnedPrivateDirectoryDescriptor(finalDescriptor);
     closeAncestorChain(chain.descriptors, finalDescriptor);
