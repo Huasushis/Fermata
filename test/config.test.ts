@@ -85,6 +85,7 @@ describe("loadConfig：正常路径", () => {
     });
     expect(config.codeforces).toEqual({ key: "cf-key", secret: "cf-secret" });
     expect(config.models.defaults.modelProfileName).toBe("test-profile");
+    expect(config.models.thresholds.duplicateSimilarityReject).toBe(0.9);
   });
 
   it("CODEFORCES_KEY/SECRET 都留空时 codeforces 为 null（可选凭据）", () => {
@@ -155,6 +156,16 @@ profiles:
       temperature: 0.2
 `;
     expect(() => loadConfig({ env: validEnv, modelsYamlSource: brokenYaml })).toThrow(ConfigError);
+  });
+
+  it("查重强制拒绝阈值必须在 0-1 内", () => {
+    for (const invalidThreshold of ["-0.1", "1.1"]) {
+      const brokenYaml = validYaml.replace(
+        "duplicateSimilarityReject: 0.9",
+        `duplicateSimilarityReject: ${invalidThreshold}`
+      );
+      expect(() => loadConfig({ env: validEnv, modelsYamlSource: brokenYaml })).toThrow(ConfigError);
+    }
   });
 
   it("defaults.modelProfileName 在 profiles 中不存在时抛出 ConfigError", () => {

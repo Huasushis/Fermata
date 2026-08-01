@@ -2,26 +2,31 @@ import { describe, expect, it, vi } from "vitest";
 import {
   extractHighestDuplicateSimilarity,
   runVerdictPipeline,
-  shouldForceRejectAsDuplicate,
-  VERDICT_THRESHOLDS
+  shouldForceRejectAsDuplicate
 } from "../src/pipelines/verdict";
 import type { ReviewTaskItem, ReviewTaskProblem } from "../src/pipelines/types";
 
 describe("shouldForceRejectAsDuplicate", () => {
   it("相似度超过阈值且模型确认同题时才强制拒绝", () => {
-    expect(shouldForceRejectAsDuplicate(0.95, true)).toBe(true);
+    expect(shouldForceRejectAsDuplicate(0.95, true, 0.9)).toBe(true);
   });
 
   it("相似度超过阈值但模型不确认同题时不强制拒绝", () => {
-    expect(shouldForceRejectAsDuplicate(0.95, false)).toBe(false);
+    expect(shouldForceRejectAsDuplicate(0.95, false, 0.9)).toBe(false);
   });
 
   it("模型确认同题但相似度没超过阈值时不强制拒绝", () => {
-    expect(shouldForceRejectAsDuplicate(0.5, true)).toBe(false);
+    expect(shouldForceRejectAsDuplicate(0.5, true, 0.9)).toBe(false);
   });
 
   it("正好等于阈值时不触发（严格大于）", () => {
-    expect(shouldForceRejectAsDuplicate(VERDICT_THRESHOLDS.duplicateSimilarityReject, true)).toBe(false);
+    expect(shouldForceRejectAsDuplicate(0.9, true, 0.9)).toBe(false);
+  });
+
+  it("读取调用方的阈值，而不是隐含使用 0.9", () => {
+    expect(shouldForceRejectAsDuplicate(0.95, true, 0.94)).toBe(true);
+    expect(shouldForceRejectAsDuplicate(0.95, true, 0.95)).toBe(false);
+    expect(shouldForceRejectAsDuplicate(0.95, true, 0.96)).toBe(false);
   });
 });
 
@@ -97,12 +102,43 @@ const modelConfig = (fetchMock: (input: string | URL | Request, init?: RequestIn
 });
 
 function jsonResponse(payload: unknown): Response {
-  return new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: JSON.stringify(payload) } }] }), {
+  return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { role: "assistant", content: JSON.stringify(payload) } }] }), {
     status: 200
   });
 }
 
 describe("runVerdictPipeline：整体接线", () => {
+  it("付费请求前拒绝超出 0-1 的阈值快照", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({}));
+    await expect(
+      runVerdictPipeline({
+        problem,
+        reviewItems: [],
+        difficulty: { rating: 1500, confidence: 0.8, rationale: "中等" },
+        thinking: {
+          level: 3,
+          signals: { solved: true, approachSimilarity: 0.5, selfCorrections: 1, keyInsightCount: 1 },
+          solverNarrativeLength: 100,
+          rationale: "还行"
+        },
+        coding: {
+          level: 2,
+          signals: {
+            effectiveLineCount: 20,
+            maxNestingDepth: 2,
+            detectedDataStructures: [],
+            maxDataStructureWeight: 0
+          },
+          referenceCodeLength: 200
+        },
+        expectedRound: 2,
+        duplicateSimilarityRejectThreshold: 1.1,
+        model: modelConfig(fetchMock)
+      })
+    ).rejects.toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("正常情况下透传模型的 verdict，并产出满足 reviewInputSchema 的 review", async () => {
     const fetchMock = vi.fn(async () =>
       jsonResponse({
@@ -120,6 +156,7 @@ describe("runVerdictPipeline：整体接线", () => {
       thinking: { level: 3, signals: { solved: true, approachSimilarity: 0.5, selfCorrections: 1, keyInsightCount: 1 }, solverNarrativeLength: 100, rationale: "还行" },
       coding: { level: 2, signals: { effectiveLineCount: 20, maxNestingDepth: 2, detectedDataStructures: [], maxDataStructureWeight: 0 }, referenceCodeLength: 200 },
       expectedRound: 2,
+      duplicateSimilarityRejectThreshold: 0.9,
       model: modelConfig(fetchMock)
     });
 
@@ -154,10 +191,12 @@ describe("runVerdictPipeline：整体接线", () => {
       thinking: { level: 2, signals: { solved: true, approachSimilarity: 0.9, selfCorrections: 0, keyInsightCount: 0 }, solverNarrativeLength: 50, rationale: "容易" },
       coding: { level: 1, signals: { effectiveLineCount: 10, maxNestingDepth: 1, detectedDataStructures: [], maxDataStructureWeight: 0 }, referenceCodeLength: 100 },
       expectedRound: 1,
+      duplicateSimilarityRejectThreshold: 0.9,
       model: modelConfig(fetchMock)
     });
 
     expect(result.forcedDuplicateReject).toBe(true);
+    expect(result.duplicateSimilarityRejectThreshold).toBe(0.9);
     expect(result.review.verdict).toBe("reject");
     expect(result.review.improvements).toContain("疑似重复题目");
   });
@@ -179,6 +218,7 @@ describe("runVerdictPipeline：整体接线", () => {
       thinking: { level: 2, signals: { solved: true, approachSimilarity: 0.9, selfCorrections: 0, keyInsightCount: 0 }, solverNarrativeLength: 50, rationale: "容易" },
       coding: { level: 1, signals: { effectiveLineCount: 10, maxNestingDepth: 1, detectedDataStructures: [], maxDataStructureWeight: 0 }, referenceCodeLength: 100 },
       expectedRound: 1,
+      duplicateSimilarityRejectThreshold: 0.9,
       model: modelConfig(fetchMock)
     });
 

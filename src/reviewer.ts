@@ -278,13 +278,19 @@ export class ReviewerWorker {
         return;
       }
 
-      const { review, forcedDuplicateReject } = await runVerdictPipeline({
+      const {
+        review,
+        forcedDuplicateReject,
+        duplicateSimilarityRejectThreshold
+      } = await runVerdictPipeline({
         problem: task.problem,
         reviewItems: task.reviewItems,
         difficulty,
         thinking,
         coding,
         expectedRound: task.problem.reviewRound,
+        duplicateSimilarityRejectThreshold:
+          this.#appConfig.models.thresholds.duplicateSimilarityReject,
         model: this.resolveModelConfig(
           profile.verdict,
           inFlight.abortController.signal
@@ -315,7 +321,8 @@ export class ReviewerWorker {
       logInfo("完成审题任务", {
         problemId: task.problem.id,
         problemStatus: completion.problemStatus,
-        forcedDuplicateReject
+        forcedDuplicateReject,
+        duplicateSimilarityRejectThreshold
       });
     } catch (error) {
       if (!inFlight.abandoned) {

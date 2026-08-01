@@ -90,9 +90,13 @@ const COMBINED_LLM_JSON = JSON.stringify({
   privateNote: ""
 });
 
-function llmSuccessResponse(): Response {
+function llmSuccessResponse(overrides: Readonly<Record<string, unknown>> = {}): Response {
+  const combined = {
+    ...(JSON.parse(COMBINED_LLM_JSON) as Record<string, unknown>),
+    ...overrides
+  };
   return new Response(
-    JSON.stringify({ choices: [{ message: { role: "assistant", content: COMBINED_LLM_JSON } }] }),
+    JSON.stringify({ choices: [{ finish_reason: "stop", message: { role: "assistant", content: JSON.stringify(combined) } }] }),
     { status: 200 }
   );
 }
@@ -190,6 +194,58 @@ describe("ReviewerWorker：基本轮询与处理", () => {
       expect.objectContaining({ modelProfileName: "test-profile", experimentVersion: "exp-test" })
     );
     expect(worker.getStatus().activeTasks).toBe(0);
+  });
+
+  it("verdict 使用 config/models.yaml 快照中的查重阈值", async () => {
+    const client = createFakeUrmotivClient();
+    const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
+    const task = sampleTask(assignmentId);
+    client.claimMock.mockResolvedValueOnce({
+      items: [
+        {
+          ...task,
+          reviewItems: [
+            {
+              id: "3fa85f64-5717-4562-b3fc-2c963f66afa7",
+              type: "org.ustc.urmotiv.anklang.similarity",
+              summary: "合成查重记录",
+              data: { similarity: 0.95 },
+              contentHash: task.problem.contentHash,
+              createdAt: "2026-07-26T00:00:00.000Z"
+            }
+          ]
+        }
+      ]
+    });
+    const highThresholdConfig: AppConfig = {
+      ...appConfig,
+      models: {
+        ...appConfig.models,
+        thresholds: { duplicateSimilarityReject: 0.99 }
+      }
+    };
+    const settingsStore = createFakeSettingsStore({
+      enabled: true,
+      pollingIntervalSeconds: 30,
+      maximumConcurrentTasks: 2,
+      modelProfileName: "test-profile",
+      experimentVersion: "exp-test"
+    });
+
+    worker = new ReviewerWorker({
+      urmotivClient: client,
+      settingsStore,
+      appConfig: highThresholdConfig,
+      anchors: [],
+      fetch: vi.fn(async () => llmSuccessResponse({ sameProblemAsExisting: true }))
+    });
+    worker.start();
+    await flushAsync();
+
+    expect(client.completeMock).toHaveBeenCalledWith(
+      assignmentId,
+      expect.objectContaining({ review: expect.objectContaining({ verdict: "approve" }) })
+    );
   });
 
   it("claim 的 maximumTasks 不超过 maximumConcurrentTasks", async () => {

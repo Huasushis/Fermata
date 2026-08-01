@@ -7,7 +7,8 @@
  * tagIds / improvements / privateNote / expectedRound，没有独立的
  * "publicComment" 字段——improvements 本身就是必填、面向审核意见的主要内容。
  *
- * 阈值规则："已有审核条目显示的最高相似度超过 VERDICT_THRESHOLDS.duplicateSimilarityReject，
+ * 阈值规则："已有审核条目显示的最高相似度超过 config/models.yaml 中
+ * thresholds.duplicateSimilarityReject 的当次配置快照，
  * 且模型自己也判断是同一道题" 时，不管模型给的 verdict 是什么，都强制改判为 reject。
  * 这条规则本身（shouldForceRejectAsDuplicate）是纯函数，不依赖网络，可以直接测试。
  *
@@ -29,14 +30,6 @@ import type { DifficultyResult } from "./difficulty";
 import type { ThinkingResult } from "./thinking";
 import type { PipelineModelConfig, ReviewTaskItem, ReviewTaskProblem } from "./types";
 
-export const VERDICT_THRESHOLDS = {
-  /**
-   * 已有审核条目里的相似度超过这个值、且模型自己也确认是同一道题时，强制拒绝。
-   * 初始标定，修改前必须先跑评测脚本对比，不能凭感觉改。
-   */
-  duplicateSimilarityReject: 0.9
-} as const;
-
 export interface VerdictPipelineInput {
   readonly problem: ReviewTaskProblem;
   readonly reviewItems: readonly ReviewTaskItem[];
@@ -45,6 +38,8 @@ export interface VerdictPipelineInput {
   readonly coding: CodingResult;
   /** 对应 problem.reviewRound，写进 review.expectedRound 做乐观锁。 */
   readonly expectedRound: number;
+  /** 当次任务的阈值快照；由调用方从 config/models.yaml 传入，禁止在流水线内写死。 */
+  readonly duplicateSimilarityRejectThreshold: number;
   readonly model: PipelineModelConfig;
 }
 
@@ -54,6 +49,8 @@ export interface VerdictOutput {
   /** 是否被查重阈值规则强制改判过，方便上层记录/日志，不影响提交内容。 */
   readonly forcedDuplicateReject: boolean;
   readonly highestKnownSimilarity: number;
+  /** 实际用于本次判定的阈值，供任务日志和实验报告溯源。 */
+  readonly duplicateSimilarityRejectThreshold: number;
 }
 
 const verdictRawOutputSchema = z.object({
@@ -63,8 +60,15 @@ const verdictRawOutputSchema = z.object({
   sameProblemAsExisting: z.boolean(),
   privateNote: z.string().trim().max(2_000).default("")
 });
+const duplicateSimilarityRejectThresholdSchema = z.number().min(0).max(1);
 
 export async function runVerdictPipeline(input: VerdictPipelineInput): Promise<VerdictOutput> {
+  // 在付费模型请求之前校验调用方给的配置快照；正式 worker 的值来自
+  // config schema，这里还是保留一道边界，防止实验或新调用方绕过配置校验。
+  const duplicateSimilarityRejectThreshold =
+    duplicateSimilarityRejectThresholdSchema.parse(
+      input.duplicateSimilarityRejectThreshold
+    );
   const highestKnownSimilarity = extractHighestDuplicateSimilarity(input.reviewItems);
   const messages = buildVerdictMessages(input, highestKnownSimilarity);
   const { data } = await chatCompleteJson(
@@ -75,7 +79,11 @@ export async function runVerdictPipeline(input: VerdictPipelineInput): Promise<V
     input.model.runtime
   );
 
-  const forcedDuplicateReject = shouldForceRejectAsDuplicate(highestKnownSimilarity, data.sameProblemAsExisting);
+  const forcedDuplicateReject = shouldForceRejectAsDuplicate(
+    highestKnownSimilarity,
+    data.sameProblemAsExisting,
+    duplicateSimilarityRejectThreshold
+  );
   const verdict = forcedDuplicateReject ? "reject" : data.verdict;
   const improvements = forcedDuplicateReject
     ? `系统判定与已有题目高度相似（已知最高相似度 ${highestKnownSimilarity.toFixed(2)}），疑似重复题目，请核实。${data.mainImprovement}`
@@ -93,12 +101,21 @@ export async function runVerdictPipeline(input: VerdictPipelineInput): Promise<V
     expectedRound: input.expectedRound
   } satisfies ReviewInput);
 
-  return { review, forcedDuplicateReject, highestKnownSimilarity };
+  return {
+    review,
+    forcedDuplicateReject,
+    highestKnownSimilarity,
+    duplicateSimilarityRejectThreshold
+  };
 }
 
 /** 相似度超过阈值、且模型自己也认为是同一道题时，强制拒绝。纯函数，方便直接测试阈值边界。 */
-export function shouldForceRejectAsDuplicate(highestSimilarity: number, llmConfirmsSameProblem: boolean): boolean {
-  return highestSimilarity > VERDICT_THRESHOLDS.duplicateSimilarityReject && llmConfirmsSameProblem;
+export function shouldForceRejectAsDuplicate(
+  highestSimilarity: number,
+  llmConfirmsSameProblem: boolean,
+  duplicateSimilarityRejectThreshold: number
+): boolean {
+  return highestSimilarity > duplicateSimilarityRejectThreshold && llmConfirmsSameProblem;
 }
 
 /**
