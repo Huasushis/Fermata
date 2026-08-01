@@ -19,6 +19,7 @@
     "experiment:fetch-hf-dataset": "tsx experiments/fetch-hf-dataset.ts",
     "experiment:calibrate-levels": "tsx experiments/calibrate-levels.ts",
     "experiment:calibrate-levels:detached": "node scripts/start-detached-calibration.mjs",
+    "experiment:verify-legacy-reports": "node scripts/verify-legacy-report-registry.mjs",
     "experiment:eval-verdict": "tsx experiments/eval-verdict.ts"
   },
   "dependencies": {

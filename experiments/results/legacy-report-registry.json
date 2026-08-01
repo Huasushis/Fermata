@@ -1,0 +1,167 @@
+{
+  "schemaVersion": 1,
+  "registeredAt": "2026-08-01T05:19:50.000Z",
+  "policy": {
+    "baselineEligible": false,
+    "reason": "这些产物都早于当前完整性规则，或已明确不完整；只能作为修改前证据。",
+    "rawAreaContentInspected": false
+  },
+  "archiveCategories": [
+    {
+      "id": "A",
+      "root": "../previous-server-work/urmotiv-codex/fermata-repo/experiments/results",
+      "safeArtifactSha256": [
+        "594bc5869aed4e625224f67bea324fd3a6c8d530f959a5c7804cb6e12aa00e28",
+        "c2f5eec378b312f4497a7a89ea428c68939eb9258f8d20eb32e3d1be123db3cd",
+        "97cbb4be0fbbdf01678746b0347388a794284e4331c6d9ea7149791d0661f6df",
+        "4300afd1f0a1fecc0b9e5ad153a6f65ece4921a0fd2bd240445dba84840dc909",
+        "37244dea301de8585ee307c0505d35ababbada4e0e7dee69506583a73c1ae355",
+        "2cb98a5d6e662b63b9c2f85d2b5b6bae0a3280e89a4dd7d69dcf865b16c80f7b",
+        "77fff99425eb7c334179c150cfcdc29cc7a931f662575cfcbbe5220ed8c21774",
+        "e59550d6df16058bd28facdde05ae28b40b70ccf5a559fbbd0a4f1abf2f1a030",
+        "d026afafdec3fd0734b8f662e5bf95cfa1ab89e015addfcd0190a6a28eabf1bb",
+        "398c20811308b69bdcd3739ec601d7c5b9bbb4fb1fcccaf25eb8f34d3e0c7796",
+        "bc836b66ff3b59d3d08a42238dc308927a070e872343f613738e3d02931478c3"
+      ],
+      "rawAreaFileEntries": 10
+    },
+    {
+      "id": "B",
+      "root": "../previous-server-work/urmotiv-codex/fermata-accuracy-20260731/experiments/results",
+      "safeArtifactSha256": [
+        "661b263ac18d04842f0356e9a3ba4ca04611d6a3d34e6594c431a28f720a3192",
+        "6e51f9d9091e7efbe8d1221532d287fe5e2e43e363eda6d22f1c0ca417e76883"
+      ],
+      "rawAreaFileEntries": 4
+    },
+    {
+      "id": "C",
+      "root": "../previous-server-work/urmotiv-codex/fermata-timeout-review-20260731/experiments/results",
+      "duplicateOf": "A",
+      "safeArtifactSha256": [
+        "594bc5869aed4e625224f67bea324fd3a6c8d530f959a5c7804cb6e12aa00e28",
+        "c2f5eec378b312f4497a7a89ea428c68939eb9258f8d20eb32e3d1be123db3cd",
+        "97cbb4be0fbbdf01678746b0347388a794284e4331c6d9ea7149791d0661f6df",
+        "4300afd1f0a1fecc0b9e5ad153a6f65ece4921a0fd2bd240445dba84840dc909",
+        "37244dea301de8585ee307c0505d35ababbada4e0e7dee69506583a73c1ae355",
+        "2cb98a5d6e662b63b9c2f85d2b5b6bae0a3280e89a4dd7d69dcf865b16c80f7b",
+        "77fff99425eb7c334179c150cfcdc29cc7a931f662575cfcbbe5220ed8c21774",
+        "e59550d6df16058bd28facdde05ae28b40b70ccf5a559fbbd0a4f1abf2f1a030",
+        "d026afafdec3fd0734b8f662e5bf95cfa1ab89e015addfcd0190a6a28eabf1bb",
+        "398c20811308b69bdcd3739ec601d7c5b9bbb4fb1fcccaf25eb8f34d3e0c7796",
+        "bc836b66ff3b59d3d08a42238dc308927a070e872343f613738e3d02931478c3"
+      ],
+      "rawAreaFileEntries": 0
+    }
+  ],
+  "logicalExperiments": [
+    {
+      "kind": "cf-difficulty",
+      "label": "baseline-provisional",
+      "generatedAt": "2026-07-26T13:54:45.674Z",
+      "sampleCount": 24,
+      "metrics": { "mae": 283.33, "within200Percent": 54.17 },
+      "completeness": "legacy-unverifiable",
+      "reasons": ["旧格式没有 expected、失败或跳过计数。"],
+      "sourceCopies": ["A", "C"],
+      "artifacts": [
+        { "format": "json", "sha256": "594bc5869aed4e625224f67bea324fd3a6c8d530f959a5c7804cb6e12aa00e28" },
+        { "format": "markdown", "sha256": "c2f5eec378b312f4497a7a89ea428c68939eb9258f8d20eb32e3d1be123db3cd" }
+      ],
+      "baselineEligible": false
+    },
+    {
+      "kind": "cf-difficulty",
+      "label": "calibrated-v2",
+      "generatedAt": "2026-07-26T15:31:33.891Z",
+      "sampleCount": 33,
+      "metrics": { "mae": 281.818, "within200Percent": 63.636 },
+      "completeness": "legacy-unverifiable",
+      "reasons": ["旧格式没有 expected、失败或跳过计数。", "样本数少于当前最低要求 60。"],
+      "sourceCopies": ["A", "C"],
+      "artifacts": [
+        { "format": "json", "sha256": "97cbb4be0fbbdf01678746b0347388a794284e4331c6d9ea7149791d0661f6df" },
+        { "format": "markdown", "sha256": "4300afd1f0a1fecc0b9e5ad153a6f65ece4921a0fd2bd240445dba84840dc909" }
+      ],
+      "baselineEligible": false
+    },
+    {
+      "kind": "thinking-coding-levels",
+      "label": "v2",
+      "generatedAt": "2026-07-26T15:45:09.260Z",
+      "sampleCount": 6,
+      "expectedSampleCount": null,
+      "bandCounts": { "low": 3, "medium": 3, "high": 0 },
+      "completeness": "legacy-unverifiable",
+      "reasons": ["旧格式没有 expected 或 complete。", "缺少高分段。"],
+      "sourceCopies": ["A", "C"],
+      "artifacts": [
+        { "format": "json", "sha256": "37244dea301de8585ee307c0505d35ababbada4e0e7dee69506583a73c1ae355" },
+        { "format": "markdown", "sha256": "2cb98a5d6e662b63b9c2f85d2b5b6bae0a3280e89a4dd7d69dcf865b16c80f7b" }
+      ],
+      "baselineEligible": false
+    },
+    {
+      "kind": "thinking-coding-levels",
+      "label": "v3-baseline",
+      "generatedAt": "2026-07-30T07:49:47.725Z",
+      "sampleCount": 5,
+      "expectedSampleCount": null,
+      "bandCounts": { "low": 3, "medium": 2, "high": 0 },
+      "completeness": "legacy-unverifiable",
+      "reasons": ["旧格式没有 expected 或 complete。", "缺少高分段。"],
+      "sourceCopies": ["A", "C"],
+      "artifacts": [
+        { "format": "json", "sha256": "77fff99425eb7c334179c150cfcdc29cc7a931f662575cfcbbe5220ed8c21774" },
+        { "format": "markdown", "sha256": "e59550d6df16058bd28facdde05ae28b40b70ccf5a559fbbd0a4f1abf2f1a030" }
+      ],
+      "baselineEligible": false
+    },
+    {
+      "kind": "thinking-coding-levels",
+      "label": "v3-timeout-fixed",
+      "generatedAt": "2026-07-30T12:04:04.533Z",
+      "sampleCount": 6,
+      "expectedSampleCount": 24,
+      "completeness": "incomplete",
+      "reasons": ["只完成 6/24，缺少 18 个样本。"],
+      "sourceCopies": ["A", "C"],
+      "artifacts": [
+        { "format": "json", "sha256": "d026afafdec3fd0734b8f662e5bf95cfa1ab89e015addfcd0190a6a28eabf1bb" },
+        { "format": "markdown", "sha256": "398c20811308b69bdcd3739ec601d7c5b9bbb4fb1fcccaf25eb8f34d3e0c7796" }
+      ],
+      "baselineEligible": false
+    },
+    {
+      "kind": "verdict",
+      "label": "v1",
+      "generatedAt": "2026-07-26T15:20:27.660Z",
+      "sampleCount": 6,
+      "expectedSampleCount": 6,
+      "caseCounts": { "normal": 3, "syntheticDuplicate": 3 },
+      "completeness": "legacy-unverifiable",
+      "reasons": ["只验证正常题不是不通过，未区分通过与需要修改。", "样本数少于当前最低要求 90。"],
+      "sourceCopies": ["A", "C"],
+      "artifacts": [
+        { "format": "markdown", "sha256": "bc836b66ff3b59d3d08a42238dc308927a070e872343f613738e3d02931478c3" }
+      ],
+      "baselineEligible": false
+    },
+    {
+      "kind": "thinking-coding-levels",
+      "label": "v4b-safety-fixed",
+      "generatedAt": "2026-07-30T21:00:09.879Z",
+      "sampleCount": 9,
+      "expectedSampleCount": 24,
+      "missingBandCount": 1,
+      "completeness": "incomplete",
+      "reasons": ["只完成 9/24，缺少 15 个样本。", "缺少高分段。"],
+      "sourceCopies": ["B"],
+      "artifacts": [
+        { "format": "json", "sha256": "661b263ac18d04842f0356e9a3ba4ca04611d6a3d34e6594c431a28f720a3192" },
+        { "format": "markdown", "sha256": "6e51f9d9091e7efbe8d1221532d287fe5e2e43e363eda6d22f1c0ca417e76883" }
+      ],
+      "baselineEligible": false
+    }
+  ]
+}
