@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "kind": "evaluation-report-completion",
+  "executionRunId": "public83-before-20260801-v2-2026-08-01T07-49-10-135Z-fb87cde34147",
+  "chainRunId": "d9af2ddb-ce41-4310-a12d-456d352411ea",
+  "experimentComplete": false,
+  "artifacts": {
+    "raw": {
+      "fileName": "difficulty-public83-before-20260801-v2-2026-08-01T07-49-10-135Z-fb87cde34147-raw.json",
+      "sha256": "0373c4a64a92a2427869891f65b55f87628e1308d4bfe53a59f94c231cedfddc"
+    },
+    "summary": {
+      "fileName": "difficulty-public83-before-20260801-v2-2026-08-01T07-49-10-135Z-fb87cde34147-summary.json",
+      "sha256": "861661731f42fb08d994f89afd118e5db869953a7a99206400c8f85890ee4d72"
+    },
+    "markdown": {
+      "fileName": "difficulty-public83-before-20260801-v2-2026-08-01T07-49-10-135Z-fb87cde34147.md",
+      "sha256": "113e2d6394e84112fb41ec298f0b7bad2d81cda944cfe92a8ce8417d08ccbbdf"
+    }
+  }
+}
