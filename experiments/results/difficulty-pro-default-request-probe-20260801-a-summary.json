@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "label": "difficulty-pro-default-request-probe-20260801-a",
+  "codeVersion": "5408ff6e41e2afe1420ad465aaa4d81ffbfecb85",
+  "runnerSha256": "96df9cad4e63e1bd289cde49c01bbd102088ab784fd0a3fbbb87a22f3621404c",
+  "experimentVersion": "experiment-2026-08-difficulty-pro-default-request-v1",
+  "sourceManifestSha256": "edd286b5511ea7887e685c1cf7ee2b8aba75bf58f2ef5c914617807c3d6dc68e",
+  "modelsConfigSha256": "392151d4e102187401e119086c3f888b7e9ab72a98c4b10e8b2c358e4a72c2a2",
+  "candidateCAnchorsSha256": "48b4c5f95732347b2a0a48f4143f50dbc6bc6706f427aa75179def45988b9a7f",
+  "public83ManifestSha256": "6c6d7a60b4568e1477c6da88eeb7f7a33ce8bd94e8ee650c5fa02a0d4161ea7a",
+  "providerIdentityFingerprint": "630b4c6feb6b32c4bbcacaad0fca69938a2cf503b4cb63569ff94fc6d62b53d6",
+  "maxOutputTokens": 2048,
+  "expected": 2,
+  "succeeded": 0,
+  "terminalFailures": 1,
+  "notRun": 1,
+  "complete": false,
+  "results": [
+    {
+      "sampleId": "synthetic-protocol-sum",
+      "status": "failed",
+      "requestCount": 1,
+      "fetchInvocationCount": 1,
+      "httpStatus": 404,
+      "code": "LLM_HTTP_ERROR"
+    },
+    {
+      "sampleId": "cf-2006e-public-probe",
+      "status": "not_run",
+      "requestCount": 0,
+      "fetchInvocationCount": 0,
+      "httpStatus": null,
+      "code": "PROBE_NOT_RUN_AFTER_FAILURE"
+    }
+  ],
+  "privateCheckpointSha256": "aaa84bcfb3b49f6068fdf2e1c5a83dce6827b9c880aed840c68f658cf83e52ee",
+  "privateReportSha256": "7ef8c96c9d13b1bc9ac587a246ff5a7b827cd0974959efddca5512f49eecf935",
+  "privateSummarySha256": "2122623f076fc49ade7f61c4b85d412c889c488e47721813205899e0652e87db",
+  "privateCompletionSha256": "8096f6d3524eb3397b1af436ae007b64ee68edc30310f8d9480b236887553ed9",
+  "decision": {
+    "mayRunFullEvaluation": false,
+    "candidateViable": false,
+    "reasonCode": "LLM_HTTP_ERROR"
+  }
+}
