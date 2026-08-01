@@ -302,7 +302,15 @@ completion 的 SHA-256 为 `b63f08ea270b0459a4140706996b7b936bdc5f869db49afc4a1f
 正文到达真实 EOF、标准 JSON `data` 数组内有 22 个安全模型 id，并且精确包含
 `deepseek-v4-flash` 与 `deepseek-v4-pro`。这只能证明模型目录声明存在这些 id，不能替代任何生成
 请求的协议预检。当前 v3 只把 provider base URL pathname 修正为 `/v1`，请求体中的模型、温度、
-thinking 和输出上限保持不变；新的 b 固定标签尚未运行，不得据此启动 83 题付费实验。
+thinking 和输出上限保持不变。
+
+新的 b 固定标签已在提交 `9baf6dcba9f3613bc35162da960176013d195631` 上实际运行：expected=1、
+succeeded=0、failed=1、complete=false，且 request/fetch 都精确为 1。服务返回 HTTP 200，但客户端
+在遇到不认可的响应格式后取消了正文，没有观察到真实 HTTP EOF，也没有进入结构化输出或
+`finish_reason=stop` 校验；固定结果码为 `LLM_RESPONSE_FORMAT_INVALID`，标签锁已释放。私有
+completion 的 SHA-256 为 `3f44838b6a8cb9a7e75e1dc785c7275cc9f39be890100c6f8d13f8b35f73fc95`。
+这个标签同样已经占用，不能重跑。下一次协议探针前必须先让客户端在格式校验失败后仍安全排空响应体
+并等待真实 EOF，再登记新的代码版本和唯一标签；不得据此启动 83 题付费实验。
 
 这个 connectivity 结果无论成功与否都只回答“difficulty 的这一种 flash 请求能否完成一次协议
 往返”，不能证明 `review-balanced` 整条 reviewer 可运行。尤其 `thinking.solver` 与 `verdict`
@@ -399,7 +407,7 @@ completion marker 表示这条执行链已完整收束并阻止重放，不等�
 
 | 流水线 | 状态 | 说明 |
 | --- | --- | --- |
-| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；旧连通性请求因缺 `/v1` 返回 404，新 b 尚未运行** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate B 在 2048、4096 两档协议探针均因高难题长度停止而淘汰。Candidate D 与恢复后的 Candidate C 请求都在旧根路径配置下返回 404；一次只读 `/v1/models` 已确认目录声明包含 flash/pro，但新的 provider-v1 单请求 b 探针尚未运行。旧失败证据均保留，且没有启动新的 83 题。当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
+| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；provider-v1 的 b 请求仍因未读到 EOF 而不完整** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate D 与恢复后的 Candidate C 请求都在旧根路径配置下返回 404；一次只读 `/v1/models` 已确认目录声明包含 flash/pro。修正 `/v1` 后的 b 单请求得到 HTTP 200，但客户端遇到不认可格式后取消正文，未观察真实 EOF，因此仍是不完整失败。旧失败证据均保留，且没有启动新的 83 题。当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
 | 思维难度（thinking.ts） | **旧实验均不可作基线** | 两份早期报告无法证明完整；后两份明确只完成 6/24、9/24，而且都缺高分段。 |
 | 代码难度（coding.ts） | **旧实验均不可作基线** | 与思维难度共用的旧实验不完整；小样本曾出现难度分段升高但代码难度均值下降，需要在完整基线上复核。 |
 | 查重判断（verdict.ts） | **旧设计不可作准确性基线** | 旧实验只有 3 个正常样本和 3 个人工重复样本；正常组只验证“不是不通过”，没有区分通过与需要修改。 |
