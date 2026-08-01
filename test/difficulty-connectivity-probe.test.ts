@@ -4,7 +4,8 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  rmSync
+  rmSync,
+  writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,16 +20,19 @@ import type { LlmRuntimeOptions } from "../src/llm";
 import type { ReviewTaskProblem } from "../src/pipelines/types";
 import {
   acquireDifficultyConnectivityLabelLock,
+  assertDifficultyConnectivityCodeBinding,
   assertDifficultyConnectivityLabelNamespaceUnused,
   assertDifficultyConnectivityRepositoryStatus,
   buildDifficultyConnectivityCheckpoint,
   buildDifficultyConnectivityCompletion,
   difficultyConnectivityCheckpointSchema,
+  difficultyConnectivityCompletionSchema,
   difficultyConnectivityCommonEvidenceSchema,
   difficultyConnectivityExpectedCandidateCAnchorsSha256,
   difficultyConnectivityExpectedModelsConfigSha256,
   difficultyConnectivityExpectedProviderIdentitySha256,
   difficultyConnectivityProbeCompletionFileName,
+  difficultyConnectivityProbeArtifactSchemaVersion,
   difficultyConnectivityProbeExperimentVersion,
   difficultyConnectivityProbeLabel,
   difficultyConnectivityProbeLockRecordSchema,
@@ -167,22 +171,24 @@ function setupPrivateDirectory() {
 }
 
 describe("Candidate C 连通性请求契约", () => {
-  it("历史 c 继续绑定 v4 与旧配置哈希，当前 v5 不得复用它", () => {
+  it("全新 d 身份严格绑定 v5、schema v2 与当前配置，a/b/c 永久历史化", () => {
     expect(difficultyConnectivityProbeExperimentVersion).toBe(
-      "experiment-2026-08-difficulty-candidate-c-provider-v1-drain-v4"
+      "experiment-2026-08-difficulty-candidate-c-provider-v1-drain-v5"
     );
+    expect(difficultyConnectivityProbeArtifactSchemaVersion).toBe(2);
     expect(difficultyConnectivityExpectedModelsConfigSha256).toBe(
-      "fcc7f9f8805c2c8bec3c909dc66b85c025363cb14c2c6e053d8e36313f826703"
+      "326a0f7d67122db493529929944b8984d64f66092535a596a89afe66ad744df8"
     );
     expect(sha256ConnectivityProbe(
       readFileSync(new URL("../config/models.yaml", import.meta.url))
-    )).not.toBe(difficultyConnectivityExpectedModelsConfigSha256);
+    )).toBe(difficultyConnectivityExpectedModelsConfigSha256);
     expect(difficultyConnectivityProbeLabel).toBe(
-      "difficulty-candidate-c-connectivity-probe-20260801-c"
+      "difficulty-candidate-c-connectivity-probe-20260801-d"
     );
     expect(difficultyConnectivityPreviousProbeLabels).toEqual([
       "difficulty-candidate-c-connectivity-probe-20260801-a",
-      "difficulty-candidate-c-connectivity-probe-20260801-b"
+      "difficulty-candidate-c-connectivity-probe-20260801-b",
+      "difficulty-candidate-c-connectivity-probe-20260801-c"
     ]);
     for (const previousLabel of difficultyConnectivityPreviousProbeLabels) {
       expect(difficultyConnectivityProbeCompletionFileName).not.toContain(
@@ -227,6 +233,49 @@ describe("Candidate C 连通性请求契约", () => {
         "CONNECTIVITY_PROBE_REPOSITORY_NOT_CLEAN"
       );
     }
+  });
+
+  it("提交前 runner 字节、错误 EVAL_CODE_VERSION 或脏工作树都 fail closed", () => {
+    const trackedRunner = "tracked runner bytes";
+    const headCodeVersion = "a".repeat(40);
+    expect(assertDifficultyConnectivityCodeBinding({
+      headCodeVersion,
+      evalCodeVersion: headCodeVersion,
+      currentRunner: trackedRunner,
+      trackedRunner
+    })).toEqual({
+      codeVersion: headCodeVersion,
+      runnerSha256: sha256ConnectivityProbe(trackedRunner)
+    });
+    for (const invalid of [
+      {
+        headCodeVersion,
+        evalCodeVersion: headCodeVersion,
+        currentRunner: "uncommitted runner bytes",
+        trackedRunner
+      },
+      {
+        headCodeVersion,
+        evalCodeVersion: "b".repeat(40),
+        currentRunner: trackedRunner,
+        trackedRunner
+      },
+      {
+        headCodeVersion: "not-a-commit",
+        evalCodeVersion: "not-a-commit",
+        currentRunner: trackedRunner,
+        trackedRunner
+      }
+    ]) {
+      expect(() => assertDifficultyConnectivityCodeBinding(invalid)).toThrow(
+        "CONNECTIVITY_PROBE_CONFIGURATION_INVALID"
+      );
+    }
+    expect(() => assertDifficultyConnectivityRepositoryStatus({
+      porcelain: " M README.md\n",
+      trackedPrivatePaths: "",
+      privatePathIgnored: true
+    })).toThrow("CONNECTIVITY_PROBE_REPOSITORY_NOT_CLEAN");
   });
 });
 
@@ -547,7 +596,7 @@ describe("Candidate C 单请求与真实 EOF", () => {
 });
 
 describe("Candidate C 私有检查点、completion 与标签锁", () => {
-  it("保留旧 a/b 产物，但 c 只认自己的独立命名空间", () => {
+  it("保留旧 a/b/c 产物，但 d 只认自己的独立命名空间", () => {
     const fixture = setupPrivateDirectory();
     try {
       for (const previousLabel of difficultyConnectivityPreviousProbeLabels) {
@@ -562,17 +611,37 @@ describe("Candidate C 私有检查点、completion 与标签锁", () => {
         assertDifficultyConnectivityLabelNamespaceUnused(fixture.handle)
       ).not.toThrow();
 
-      publishDifficultyConnectivityArtifactExclusive(
-        fixture.handle,
-        `${difficultyConnectivityProbeLabel}.evidence.private.json`,
-        "current-label-test",
-        { complete: false }
+      writeFileSync(
+        join(fixture.output, difficultyConnectivityProbeCompletionFileName),
+        `${JSON.stringify({
+          label: "difficulty-candidate-c-connectivity-probe-20260801-c",
+          complete: false
+        })}\n`,
+        { encoding: "utf8", flag: "wx", mode: 0o600 }
       );
       expect(() =>
         assertDifficultyConnectivityLabelNamespaceUnused(fixture.handle)
       ).toThrow("CONNECTIVITY_PROBE_LABEL_ALREADY_USED");
     } finally {
       closePrivateDirectory(fixture.handle);
+    }
+  });
+
+  it("a/b/c 的旧 completion 即使改名也不能通过 d 的严格 schema", () => {
+    const completion = buildDifficultyConnectivityCompletion({
+      commonEvidence: validCommonEvidence(),
+      result: validResult(),
+      globalFailureCode: null,
+      labelLockReleased: true,
+      checkpointSha256: "a".repeat(64)
+    });
+    for (const previousLabel of difficultyConnectivityPreviousProbeLabels) {
+      expect(() => difficultyConnectivityCompletionSchema.parse({
+        ...completion,
+        label: previousLabel,
+        completionAuthorityFileName:
+          `${previousLabel}.completion.private.json`
+      })).toThrow();
     }
   });
 

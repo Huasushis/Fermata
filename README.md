@@ -149,11 +149,12 @@ node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:calibrate-a
 # 真实 HEAD、Git 可见的干净工作树，以及 runner 与登记依赖的实际字节。
 node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:eval-difficulty -- --label=calibrated
 
-# 这个历史入口仍固定到已经占用的 c 标签与 v4 配置，仅为保留旧证据链；禁止重跑。
-# 下一次预检必须在独立提交中先登记新的唯一标签和当前版本，再使用专用私有 env。
-# 不得删除 c 的私有产物、改写旧标签或复用旧 completion 来再次发起请求。
+# 当前入口只登记全新 d 标签与 v5 配置。包含本登记的提交成为 HEAD、推送完成且工作树完全干净后，
+# 才能在单独人工核对中运行恰好一次；提交前、EVAL_CODE_VERSION 不匹配或有任意 tracked/untracked
+# 改动都会在读取私有运行目录和发起请求前失败。a/b/c 已永久占用，禁止删除、重跑或复用 completion。
 # FERMATA_CONNECTIVITY_ENV_FILE=/home/ubuntu/codex-urmotiv/Fermata/private/fermata-connectivity-probe.env
-# 禁止执行：node scripts/run-with-env.mjs "$FERMATA_CONNECTIVITY_ENV_FILE" npm run experiment:probe-difficulty-connectivity
+# 经上述核对后仅执行一次：
+# node scripts/run-with-env.mjs "$FERMATA_CONNECTIVITY_ENV_FILE" npm run experiment:probe-difficulty-connectivity
 
 # 4. 思维/代码难度标定：检验 rating 越高等级是否单调上升。
 # 首次运行不加 --resume。
@@ -284,7 +285,7 @@ CF 2006E 快照复用既有只读公开材料目录中的 `difficulty-thinking-p
 
 Candidate D 已实际在第一个合成请求收到 HTTP 404，因此报告不完整、候选已失败；没有发送第二题，
 也没有启动新的 83 题实验。当前配置只把 difficulty 恢复到 Candidate C 的 flash 请求，不改动
-同档位其它流水线。新的 `npm run experiment:probe-difficulty-connectivity` 是一次独立、固定标签的
+同档位其它流水线。`npm run experiment:probe-difficulty-connectivity` 是一次独立、固定标签的
 单合成题预检：只允许一个真实 fetch，付费前同步落盘 active 检查点，必须验证结构化输出、
 `finish_reason=stop` 并持续读取到真实 HTTP EOF；499、取消、流中断、缺结果、第二次修复请求或锁
 释放失败都会使 completion 的 `complete=false`。它同时绑定干净 Git HEAD、runner、models.yaml、
@@ -326,8 +327,15 @@ failed=1、complete=false，request/fetch 都精确为 1，HTTP 200，正文到�
 子阶段会随首错排空保留到真实 HTTP EOF；排空中断、取消、停顿超时或正文超限也只携带这一固定
 枚举，不保存或记录原始事件、服务商响应字段名、字段值、文本或长度。历史 c completion 没有这个新增字段，
 继续以其原始哈希为准。后续产物格式已升为第 2 版，公共证据、checkpoint 和 completion 都在写盘前
-经过精确字段与固定全局错误码校验；未知字段或错误码只产生固定本地失败码。本次代码没有登记新的
-探针标签，也没有发起付费请求。在新提交及新配置哈希固定前，不得运行下一次连通性探针。
+经过精确字段与固定全局错误码校验；未知字段或错误码只产生固定本地失败码。下一次且仅一次的探针
+已登记为 `difficulty-candidate-c-connectivity-probe-20260801-d`，绑定当前 v5 版本和
+`config/models.yaml` 的 SHA-256
+`326a0f7d67122db493529929944b8984d64f66092535a596a89afe66ad744df8`。codeVersion 不用可被伪造的
+预填值：入口要求 `EVAL_CODE_VERSION` 精确等于提交后的 HEAD，当前 runner 字节必须等于该 HEAD 中
+的 runner，且整个 Git 可见工作树必须干净，再把 codeVersion 与 runner SHA-256 写入第 2 版证据。
+因此包含登记改动的提交尚未成为 HEAD、runner 有未提交修改、工作树有其它改动或 d 命名空间已有
+锁/checkpoint/completion 时，都会在请求前失败关闭。a/b/c 明确是历史不可重跑身份，d 不读取或
+复用它们的 completion；登记本身没有发起付费请求，也没有创建或改写实验产物。
 
 这个 connectivity 结果无论成功与否都只回答“difficulty 的这一种 flash 请求能否完成一次协议
 往返”，不能证明 `review-balanced` 整条 reviewer 可运行。尤其 `thinking.solver` 与 `verdict`

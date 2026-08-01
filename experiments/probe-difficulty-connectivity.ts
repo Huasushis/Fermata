@@ -1,5 +1,5 @@
 /**
- * Candidate C 恢复配置的单样本连通性/协议预检。
+ * Candidate C 恢复配置的 d 标签单样本连通性/协议预检。
  *
  * 只发送一个人工合成短题，严格允许一次真实 fetch。成功必须同时满足当前
  * provider 身份、Git/runner/config/锚点绑定、请求体契约、结构化输出、
@@ -57,13 +57,16 @@ import { loadDifficultyAnchorsStrict } from "./lib/difficulty-anchors-strict";
 import { hasUnknownPrefixedEnvironmentKeys } from "./lib/evaluation-integrity";
 
 export const difficultyConnectivityProbeExperimentVersion =
-  "experiment-2026-08-difficulty-candidate-c-provider-v1-drain-v4";
+  "experiment-2026-08-difficulty-candidate-c-provider-v1-drain-v5";
+export const difficultyConnectivityProbeArtifactSchemaVersion = 2;
+// 这些标签都已经留下永久证据；新 runner 只登记 d，不读取、复用或重跑它们。
 export const difficultyConnectivityPreviousProbeLabels = [
   "difficulty-candidate-c-connectivity-probe-20260801-a",
-  "difficulty-candidate-c-connectivity-probe-20260801-b"
+  "difficulty-candidate-c-connectivity-probe-20260801-b",
+  "difficulty-candidate-c-connectivity-probe-20260801-c"
 ] as const;
 export const difficultyConnectivityProbeLabel =
-  "difficulty-candidate-c-connectivity-probe-20260801-c";
+  "difficulty-candidate-c-connectivity-probe-20260801-d";
 export const difficultyConnectivityProbeMaxOutputTokens = 2_048;
 
 const repositoryDirectory = fileURLToPath(new URL("../", import.meta.url));
@@ -78,7 +81,7 @@ const lockFileName = `${difficultyConnectivityProbeLabel}.lock.private`;
 export const difficultyConnectivityProbeCompletionFileName =
   `${difficultyConnectivityProbeLabel}.completion.private.json`;
 export const difficultyConnectivityExpectedModelsConfigSha256 =
-  "fcc7f9f8805c2c8bec3c909dc66b85c025363cb14c2c6e053d8e36313f826703";
+  "326a0f7d67122db493529929944b8984d64f66092535a596a89afe66ad744df8";
 export const difficultyConnectivityExpectedCandidateCAnchorsSha256 =
   "48b4c5f95732347b2a0a48f4143f50dbc6bc6706f427aa75179def45988b9a7f";
 // 旧 a 探针确认根路径配置会命中不存在的 chat/completions；当前身份只把
@@ -249,9 +252,9 @@ export type DifficultyConnectivityProbeGlobalFailureCode = z.infer<
 
 export const difficultyConnectivityCommonEvidenceSchema = z
   .object({
-    // 新增终止序列子阶段后，后续探针产物必须使用第 2 版；历史 c 的第 1 版
-    // completion 保持原字节与哈希，不由当前 schema 重新解释。
-    schemaVersion: z.literal(2),
+    // d 使用第 2 版；历史 a/b/c 产物保持原字节与哈希，不由当前 schema
+    // 重新解释，也不能充当 d 的 completion。
+    schemaVersion: z.literal(difficultyConnectivityProbeArtifactSchemaVersion),
     label: z.literal(difficultyConnectivityProbeLabel),
     experimentVersion: z.literal(difficultyConnectivityProbeExperimentVersion),
     codeVersion: gitCommitSchema,
@@ -457,6 +460,28 @@ export function assertDifficultyConnectivityRepositoryStatus(input: {
   ) {
     throw new Error("CONNECTIVITY_PROBE_REPOSITORY_NOT_CLEAN");
   }
+}
+
+export function assertDifficultyConnectivityCodeBinding(input: {
+  readonly headCodeVersion: string;
+  readonly evalCodeVersion: string | undefined;
+  readonly currentRunner: string | Uint8Array;
+  readonly trackedRunner: string | Uint8Array;
+}): { readonly codeVersion: string; readonly runnerSha256: string } {
+  const parsedCodeVersion = gitCommitSchema.safeParse(input.headCodeVersion);
+  const currentRunnerSha256 = sha256ConnectivityProbe(input.currentRunner);
+  const trackedRunnerSha256 = sha256ConnectivityProbe(input.trackedRunner);
+  if (
+    !parsedCodeVersion.success ||
+    input.evalCodeVersion !== parsedCodeVersion.data ||
+    currentRunnerSha256 !== trackedRunnerSha256
+  ) {
+    throw new Error("CONNECTIVITY_PROBE_CONFIGURATION_INVALID");
+  }
+  return {
+    codeVersion: parsedCodeVersion.data,
+    runnerSha256: currentRunnerSha256
+  };
 }
 
 function observeResponseEof(
@@ -1056,25 +1081,26 @@ export function assertDifficultyConnectivityLabelNamespaceUnused(
   }
 }
 
-function assertBoundGitState(): {
+function assertBoundGitState(evalCodeVersion: string | undefined): {
   readonly codeVersion: string;
   readonly runnerSha256: string;
 } {
-  const codeVersion = execFileSync("git", ["rev-parse", "HEAD"], {
+  const headCodeVersion = execFileSync("git", ["rev-parse", "HEAD"], {
     cwd: repositoryDirectory,
     encoding: "utf8",
     stdio: "pipe"
   }).trim();
-  gitCommitSchema.parse(codeVersion);
   const trackedRunner = execFileSync("git", ["show", `HEAD:${runnerRepositoryPath}`], {
     cwd: repositoryDirectory,
     stdio: ["ignore", "pipe", "ignore"]
   });
   const currentRunner = readFileSync(fileURLToPath(import.meta.url));
-  const runnerSha256 = sha256ConnectivityProbe(currentRunner);
-  if (runnerSha256 !== sha256ConnectivityProbe(trackedRunner)) {
-    throw new Error("CONNECTIVITY_PROBE_CONFIGURATION_INVALID");
-  }
+  const binding = assertDifficultyConnectivityCodeBinding({
+    headCodeVersion,
+    evalCodeVersion,
+    currentRunner,
+    trackedRunner
+  });
   const porcelain = execFileSync(
     "git",
     ["status", "--porcelain=v1", "--untracked-files=all"],
@@ -1100,7 +1126,7 @@ function assertBoundGitState(): {
     trackedPrivatePaths,
     privatePathIgnored
   });
-  return { codeVersion, runnerSha256 };
+  return binding;
 }
 
 function syntheticProblem(): ReviewTaskProblem {
@@ -1126,10 +1152,9 @@ async function main(): Promise<void> {
   ) {
     throw new Error("CONNECTIVITY_PROBE_CONFIGURATION_INVALID");
   }
-  const { codeVersion, runnerSha256 } = assertBoundGitState();
-  if (process.env.EVAL_CODE_VERSION !== codeVersion) {
-    throw new Error("CONNECTIVITY_PROBE_CONFIGURATION_INVALID");
-  }
+  const { codeVersion, runnerSha256 } = assertBoundGitState(
+    process.env.EVAL_CODE_VERSION
+  );
 
   const modelsConfigDocument = readFileSync(modelsConfigUrl);
   const modelsConfigSha256 = sha256ConnectivityProbe(modelsConfigDocument);
@@ -1172,7 +1197,7 @@ async function main(): Promise<void> {
   const commonEvidence = parseConnectivityArtifact(
     difficultyConnectivityCommonEvidenceSchema,
     {
-      schemaVersion: 2,
+      schemaVersion: difficultyConnectivityProbeArtifactSchemaVersion,
       label: difficultyConnectivityProbeLabel,
       experimentVersion: difficultyConnectivityProbeExperimentVersion,
       codeVersion,
