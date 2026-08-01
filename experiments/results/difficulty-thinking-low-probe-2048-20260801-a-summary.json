@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "label": "difficulty-thinking-low-probe-2048-20260801-a",
+  "codeVersion": "481147c501b6dd9bfe4d41843491729b49c8f4e1",
+  "runnerSha256": "16662c05a79971b19b33dd44350fc362713cff83f7cdb58ac794fad23589eab3",
+  "experimentVersion": "experiment-2026-08-difficulty-rubric-thinking-low-v1",
+  "sourceManifestSha256": "edd286b5511ea7887e685c1cf7ee2b8aba75bf58f2ef5c914617807c3d6dc68e",
+  "providerIdentityFingerprint": "6e913442f0833b7950c9ae934e46f437dad6ffd72bf847fbe3acee058256050c",
+  "maxOutputTokens": 2048,
+  "expected": 4,
+  "succeeded": 1,
+  "terminalFailures": 1,
+  "notRun": 2,
+  "complete": false,
+  "results": [
+    {
+      "sampleId": "synthetic-protocol-sum",
+      "status": "succeeded",
+      "requestCount": 1,
+      "httpStatus": 200,
+      "code": "PROBE_SUCCEEDED"
+    },
+    {
+      "sampleId": "cf-2006E",
+      "status": "failed",
+      "requestCount": 1,
+      "httpStatus": 200,
+      "code": "LLM_OUTPUT_LENGTH_LIMIT"
+    },
+    {
+      "sampleId": "cf-2018E1",
+      "status": "not_run",
+      "requestCount": 0,
+      "httpStatus": null,
+      "code": "PROBE_NOT_RUN_AFTER_FAILURE"
+    },
+    {
+      "sampleId": "cf-2002H",
+      "status": "not_run",
+      "requestCount": 0,
+      "httpStatus": null,
+      "code": "PROBE_NOT_RUN_AFTER_FAILURE"
+    }
+  ],
+  "privateReportSha256": "c8dba02558837d5f9ab6ddb36ce2a3b615ca499a8655c3beca6c35fc180b33fe",
+  "privateCheckpointSha256": "c584d198a60bc12e43ab4bbd78242523e44541d9651d104d938f00314d4187f4",
+  "decision": {
+    "mayRunFullEvaluation": false,
+    "mayProbeAt4096": true,
+    "reasonCode": "LLM_OUTPUT_LENGTH_LIMIT"
+  }
+}
