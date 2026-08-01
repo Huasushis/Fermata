@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../src/config";
 import { ReviewerWorker, type ReviewerWorkerOptions } from "../src/reviewer";
 import { SettingsConflictError, type SettingsStoreLike } from "../src/settings-store";
-import { UrmotivApiError, type UrmotivClientLike } from "../src/urmotiv-client";
+import {
+  UrmotivApiError,
+  UrmotivNetworkError,
+  type UrmotivClientLike
+} from "../src/urmotiv-client";
 import type { FermataPublicSettings, RobotReviewTask } from "../src/urmotiv-schemas";
 
 function createFakeSettingsStore(initial: FermataPublicSettings): SettingsStoreLike {
@@ -127,7 +131,7 @@ interface FakeUrmotivClient extends UrmotivClientLike {
   readonly completeMock: ReturnType<typeof vi.fn>;
 }
 
-function createFakeUrmotivClient(): FakeUrmotivClient {
+function createFakeUrmotivClient(requestTimeoutMs = 30_000): FakeUrmotivClient {
   const claimMock = vi.fn(async () => ({ items: [] }));
   const renewMock = vi.fn(async (assignmentId: string) => ({
     assignmentId,
@@ -139,6 +143,7 @@ function createFakeUrmotivClient(): FakeUrmotivClient {
     problemStatus: "approved" as const
   }));
   return {
+    requestTimeoutMs,
     claimMock,
     renewMock,
     completeMock,
@@ -162,6 +167,7 @@ let worker: ReviewerWorker | null = null;
 
 beforeEach(() => {
   vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-07-26T00:00:00.000Z"));
 });
 
 afterEach(async () => {
@@ -201,9 +207,79 @@ describe("ReviewerWorker：基本轮询与处理", () => {
     expect(client.completeMock).toHaveBeenCalledTimes(1);
     expect(client.completeMock).toHaveBeenCalledWith(
       "3fa85f64-5717-4562-b3fc-2c963f66afa6",
-      expect.objectContaining({ modelProfileName: "test-profile", experimentVersion: "exp-test" })
+      expect.objectContaining({
+        requestId: expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+        ),
+        modelProfileName: "test-profile",
+        experimentVersion: "exp-test"
+      })
     );
     expect(worker.getStatus().activeTasks).toBe(0);
+  });
+
+  it("不同任务的完成操作生成不同 UUID", async () => {
+    const client = createFakeUrmotivClient();
+    client.claimMock.mockResolvedValueOnce({
+      items: [
+        sampleTask("3fa85f64-5717-4562-b3fc-2c963f66afa6"),
+        sampleTask("3fa85f64-5717-4562-b3fc-2c963f66afa7")
+      ]
+    });
+    const settingsStore = createFakeSettingsStore({
+      enabled: true,
+      pollingIntervalSeconds: 30,
+      maximumConcurrentTasks: 2,
+      modelProfileName: "test-profile",
+      experimentVersion: "exp-test"
+    });
+    worker = createReviewer({
+      urmotivClient: client,
+      settingsStore,
+      appConfig,
+      anchors: [],
+      fetch: vi.fn(async () => llmSuccessResponse())
+    });
+    worker.start();
+    await flushAsync(100);
+
+    expect(client.completeMock).toHaveBeenCalledTimes(2);
+    const requestIds = client.completeMock.mock.calls.map((call) => call[1]?.requestId);
+    expect(requestIds).toEqual([
+      expect.stringMatching(/^[0-9a-f-]{36}$/),
+      expect.stringMatching(/^[0-9a-f-]{36}$/)
+    ]);
+    expect(new Set(requestIds).size).toBe(2);
+  });
+
+  it("完成交付重试耗尽后当前任务路径不会更换 UUID 再提交", async () => {
+    const client = createFakeUrmotivClient();
+    const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
+    client.claimMock.mockResolvedValueOnce({ items: [sampleTask(assignmentId)] });
+    client.completeMock.mockRejectedValueOnce(new UrmotivNetworkError("响应状态不确定"));
+    const settingsStore = createFakeSettingsStore({
+      enabled: true,
+      pollingIntervalSeconds: 30,
+      maximumConcurrentTasks: 1,
+      modelProfileName: "test-profile",
+      experimentVersion: "exp-test"
+    });
+    worker = createReviewer({
+      urmotivClient: client,
+      settingsStore,
+      appConfig,
+      anchors: [],
+      fetch: vi.fn(async () => llmSuccessResponse())
+    });
+    worker.start();
+    await flushAsync(100);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await flushAsync();
+
+    expect(client.completeMock).toHaveBeenCalledTimes(1);
+    expect(client.completeMock.mock.calls[0]?.[1]?.requestId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+    );
   });
 
   it("verdict 使用 config/models.yaml 快照中的查重阈值", async () => {
@@ -633,15 +709,19 @@ describe("ReviewerWorker：续租", () => {
     }
   );
 
-  it("续租遇到普通网络失败后用短间隔重试，不再等待完整续租周期", async () => {
+  it("续租网络结果不确定时短间隔重试复用同一 UUID，成功后的新一轮改用新 UUID", async () => {
     const client = createFakeUrmotivClient();
     const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
     client.claimMock.mockResolvedValueOnce({ items: [sampleTask(assignmentId)] });
     client.renewMock
-      .mockRejectedValueOnce(new Error("临时网络故障"))
+      .mockRejectedValueOnce(new UrmotivNetworkError("临时网络故障"))
       .mockResolvedValueOnce({
         assignmentId,
         leaseExpiresAt: "2026-07-26T00:20:00.000Z"
+      })
+      .mockResolvedValueOnce({
+        assignmentId,
+        leaseExpiresAt: "2026-07-26T00:25:00.000Z"
       });
 
     const deferred = createDeferred<Response>();
@@ -673,11 +753,122 @@ describe("ReviewerWorker：续租", () => {
     await vi.advanceTimersByTimeAsync(1_000);
     await flushAsync();
     expect(client.renewMock).toHaveBeenCalledTimes(2);
+    const firstInput = client.renewMock.mock.calls[0]?.[1];
+    const retryInput = client.renewMock.mock.calls[1]?.[1];
+    expect(firstInput).toEqual(retryInput);
+    expect(firstInput).toEqual(expect.objectContaining({
+      requestId: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+      ),
+      expectedLeaseExpiresAt: "2026-07-26T00:05:00.000Z",
+      leaseSeconds: 10
+    }));
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushAsync();
+    expect(client.renewMock).toHaveBeenCalledTimes(3);
+    const nextCycleInput = client.renewMock.mock.calls[2]?.[1];
+    expect(nextCycleInput).toEqual(expect.objectContaining({
+      expectedLeaseExpiresAt: "2026-07-26T00:20:00.000Z"
+    }));
+    expect(nextCycleInput?.requestId).not.toBe(firstInput?.requestId);
 
     deferred.resolve(llmSuccessResponse());
     await flushAsync();
     expect(client.completeMock).toHaveBeenCalledTimes(1);
     expect(worker.getStatus().activeTasks).toBe(0);
+  });
+
+  it.each([429, 500])(
+    "续租收到可重试的 HTTP %i 时跨短间隔仍复用同一 UUID 和载荷",
+    async (status) => {
+      const client = createFakeUrmotivClient();
+      const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
+      client.claimMock.mockResolvedValueOnce({ items: [sampleTask(assignmentId)] });
+      client.renewMock
+        .mockRejectedValueOnce(new UrmotivApiError(status, "暂时不可用"))
+        .mockResolvedValueOnce({
+          assignmentId,
+          leaseExpiresAt: "2026-07-26T00:20:00.000Z"
+        });
+
+      const deferred = createDeferred<Response>();
+      const settingsStore = createFakeSettingsStore({
+        enabled: true,
+        pollingIntervalSeconds: 30,
+        maximumConcurrentTasks: 2,
+        modelProfileName: "test-profile",
+        experimentVersion: "exp-test"
+      });
+      worker = createReviewer({
+        urmotivClient: client,
+        settingsStore,
+        appConfig,
+        anchors: [],
+        leaseSeconds: 10,
+        fetch: vi.fn(async () => {
+          await deferred.promise;
+          return llmSuccessResponse();
+        })
+      });
+      worker.start();
+      await flushAsync();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await flushAsync();
+
+      expect(client.renewMock).toHaveBeenCalledTimes(2);
+      expect(client.renewMock.mock.calls[1]?.[1]).toEqual(
+        client.renewMock.mock.calls[0]?.[1]
+      );
+
+      deferred.resolve(llmSuccessResponse());
+      await flushAsync();
+    }
+  );
+
+  it("续租重试预算使用客户端实际 120 秒超时，预算不足时不启动越界请求", async () => {
+    const client = createFakeUrmotivClient(120_000);
+    const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
+    const task = sampleTask(assignmentId);
+    client.claimMock.mockResolvedValueOnce({
+      items: [{ ...task, leaseExpiresAt: "2026-07-26T00:01:00.000Z" }]
+    });
+    client.renewMock.mockRejectedValueOnce(new UrmotivNetworkError("响应状态不确定"));
+    const deferred = createDeferred<Response>();
+    const settingsStore = createFakeSettingsStore({
+      enabled: true,
+      pollingIntervalSeconds: 30,
+      maximumConcurrentTasks: 1,
+      modelProfileName: "test-profile",
+      experimentVersion: "exp-test"
+    });
+    worker = createReviewer({
+      urmotivClient: client,
+      settingsStore,
+      appConfig,
+      anchors: [],
+      leaseSeconds: 10,
+      fetch: vi.fn(async () => {
+        await deferred.promise;
+        return llmSuccessResponse();
+      })
+    });
+    worker.start();
+    await flushAsync();
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushAsync();
+    expect(client.renewMock).toHaveBeenCalledTimes(1);
+    expect(worker.getStatus().activeTasks).toBe(0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(client.renewMock).toHaveBeenCalledTimes(1);
+    expect(client.completeMock).not.toHaveBeenCalled();
+
+    deferred.resolve(llmSuccessResponse());
+    await flushAsync();
   });
 });
 

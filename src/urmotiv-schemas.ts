@@ -2,7 +2,7 @@
  * 从 Urmotiv contracts 同步，勿手改。
  *
  * Fermata 是独立仓库，不通过 workspace 依赖 Urmotiv，所以把机器人 API 用到的契约
- * 子集手工镜像到这一个文件里。对齐时间：2026-07-26。来源：
+ * 子集手工镜像到这一个文件里。对齐时间：2026-08-01。来源：
  *
  *   - packages/contracts/src/problem.ts
  *     （problemTypeSchema、difficultyLevelSchema、codeforcesDifficultySchema）
@@ -106,6 +106,7 @@ export type ClaimRobotReviewTasksResponse = z.infer<typeof claimRobotReviewTasks
 
 export const renewRobotReviewTaskInputSchema = z
   .object({
+    requestId: z.string().uuid().optional(),
     expectedLeaseExpiresAt: z.string().datetime(),
     leaseSeconds: z.number().int().min(30).max(1_800).default(300)
   })
@@ -119,6 +120,7 @@ export type RenewRobotReviewTaskResponse = z.infer<typeof renewRobotReviewTaskRe
 
 export const completeRobotReviewTaskInputSchema = z
   .object({
+    requestId: z.string().uuid().optional(),
     expectedLeaseExpiresAt: z.string().datetime(),
     expectedProblemRevision: z.number().int().positive(),
     experimentVersion: z.string().trim().min(1).max(120),

@@ -11,6 +11,7 @@
  * 难度/思维/代码三条流水线互相没有数据依赖（都只需要题面+题解本身），所以并发
  * 跑；verdict 流水线需要三者的结果，放在它们都完成之后单独跑。
  */
+import { randomUUID } from "node:crypto";
 import {
   getProviderCredentials,
   missingProvidersForProfile,
@@ -31,7 +32,17 @@ import {
   productionEligibilityBlocked,
   type ProductionEligibilityDecision
 } from "./production-eligibility";
-import { isAuthenticationError, isForbiddenError, isTaskConflictError, UrmotivApiError, type UrmotivClientLike } from "./urmotiv-client";
+import {
+  isAuthenticationError,
+  isForbiddenError,
+  isRetryableUrmotivDeliveryError,
+  isTaskConflictError,
+  URMOTIV_RETRY_DEADLINE_SAFETY_MS,
+  UrmotivApiError,
+  UrmotivNetworkError,
+  type RenewRobotReviewTaskRequest,
+  type UrmotivClientLike
+} from "./urmotiv-client";
 import type { ClaimRobotReviewTasksResponse, RobotReviewTask } from "./urmotiv-schemas";
 
 export interface ReviewerStatus {
@@ -58,6 +69,12 @@ interface InFlightTask {
   leaseExpiresAt: string;
   renewalTimer: NodeJS.Timeout | null;
   renewalPromise: Promise<void> | null;
+  /**
+   * 没有拿到 HTTP 响应，或只收到 429/5xx 的续租仍是同一个逻辑操作；短间隔
+   * 重试必须逐字段复用这份输入。成功或收到不可重试的确定响应后才能清掉，下一
+   * 轮正常续租才生成新 UUID。
+   */
+  renewalOperation: RenewRobotReviewTaskRequest | null;
   /** 续租发现任务已经不属于我们时置为 true，处理逻辑会尽快放弃、不再提交。 */
   abandoned: boolean;
 }
@@ -244,6 +261,7 @@ export class ReviewerWorker {
       leaseExpiresAt: task.leaseExpiresAt,
       renewalTimer: null,
       renewalPromise: null,
+      renewalOperation: null,
       abandoned: false
     };
     this.#inFlight.set(task.assignmentId, inFlight);
@@ -335,6 +353,7 @@ export class ReviewerWorker {
       }
 
       const completion = await this.#urmotivClient.complete(task.assignmentId, {
+        requestId: randomUUID(),
         expectedLeaseExpiresAt: inFlight.leaseExpiresAt,
         expectedProblemRevision: task.problem.revision,
         experimentVersion,
@@ -374,6 +393,15 @@ export class ReviewerWorker {
       logError("提交审核意见时机器人令牌认证失败", error, { problemId: task.problem.id });
       return;
     }
+    if (isRetryableUrmotivDeliveryError(error)) {
+      const message = error instanceof UrmotivNetworkError
+        ? "提交审核意见的结果不确定；当前任务不会更换请求标识重新提交"
+        : "提交审核意见仍未完成；当前任务不会更换请求标识重新提交";
+      logError(message, error, {
+        problemId: task.problem.id
+      });
+      return;
+    }
     logError("处理审题任务失败", error, { problemId: task.problem.id });
   }
 
@@ -411,21 +439,44 @@ export class ReviewerWorker {
     this.scheduleRenewalAfter(inFlight, renewIntervalMs);
   }
 
-  private scheduleRenewalRetry(inFlight: InFlightTask): void {
+  private scheduleRenewalRetry(inFlight: InFlightTask): boolean {
     const normalRetryMs = Math.max(
       1_000,
       Math.min(30_000, Math.floor((this.#leaseSeconds * 1_000) / 10))
     );
     const leaseExpiresAtMs = Date.parse(inFlight.leaseExpiresAt);
     const remainingLeaseMs = leaseExpiresAtMs - Date.now();
+    const requestTimeoutMs = this.#urmotivClient.requestTimeoutMs;
+    if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs < 1_000) {
+      return false;
+    }
+    const minimumDeliveryBudgetMs =
+      requestTimeoutMs + URMOTIV_RETRY_DEADLINE_SAFETY_MS;
+    if (!Number.isFinite(remainingLeaseMs) || remainingLeaseMs <= minimumDeliveryBudgetMs + 1_000) {
+      return false;
+    }
+    const latestSafeDelayMs = remainingLeaseMs - minimumDeliveryBudgetMs;
     const retryMs =
-      Number.isFinite(remainingLeaseMs) && remainingLeaseMs > 0
-        ? Math.max(
-            1_000,
-            Math.min(normalRetryMs, Math.floor(remainingLeaseMs / 4))
-          )
-        : normalRetryMs;
+      Math.max(
+        1_000,
+        Math.min(normalRetryMs, Math.floor(remainingLeaseMs / 4), latestSafeDelayMs)
+      );
     this.scheduleRenewalAfter(inFlight, retryMs);
+    return true;
+  }
+
+  private hasFullRenewalDeliveryBudget(inFlight: InFlightTask): boolean {
+    const operation = inFlight.renewalOperation;
+    if (operation === null) {
+      return true;
+    }
+    const requestTimeoutMs = this.#urmotivClient.requestTimeoutMs;
+    const leaseExpiresAtMs = Date.parse(operation.expectedLeaseExpiresAt);
+    return Number.isFinite(requestTimeoutMs)
+      && requestTimeoutMs >= 1_000
+      && Number.isFinite(leaseExpiresAtMs)
+      && leaseExpiresAtMs - Date.now()
+        > requestTimeoutMs + URMOTIV_RETRY_DEADLINE_SAFETY_MS;
   }
 
   private scheduleRenewalAfter(
@@ -461,17 +512,34 @@ export class ReviewerWorker {
     }
     // 在途续租成功或普通失败时可能刚安排了下一次定时器，提交前一并清掉。
     this.clearRenewal(inFlight);
+    if (inFlight.renewalOperation !== null) {
+      logWarn("提交前续租结果仍不确定，停止当前任务且不更换请求标识提交", {
+        assignmentId: inFlight.assignmentId
+      });
+      this.abandonTask(inFlight);
+    }
   }
 
   private async renewTask(inFlight: InFlightTask): Promise<void> {
     if (inFlight.abandoned || !this.#inFlight.has(inFlight.assignmentId)) {
       return;
     }
-    try {
-      const result = await this.#urmotivClient.renew(inFlight.assignmentId, {
-        expectedLeaseExpiresAt: inFlight.leaseExpiresAt,
-        leaseSeconds: this.#leaseSeconds
+    if (!this.hasFullRenewalDeliveryBudget(inFlight)) {
+      logWarn("续租重试开始前安全预算已经不足，停止当前任务", {
+        assignmentId: inFlight.assignmentId
       });
+      this.abandonTask(inFlight);
+      return;
+    }
+    const operation = inFlight.renewalOperation ?? {
+      requestId: randomUUID(),
+      expectedLeaseExpiresAt: inFlight.leaseExpiresAt,
+      leaseSeconds: this.#leaseSeconds
+    };
+    inFlight.renewalOperation = operation;
+    try {
+      const result = await this.#urmotivClient.renew(inFlight.assignmentId, operation);
+      inFlight.renewalOperation = null;
       inFlight.leaseExpiresAt = result.leaseExpiresAt;
       // processTask 可能在这次 await 期间已经完成并把任务从 #inFlight 里删掉了
       // （它自己的 finally 会调用 clearRenewal，但没法取消一个已经在飞行中的
@@ -481,6 +549,25 @@ export class ReviewerWorker {
         this.scheduleRenewal(inFlight);
       }
     } catch (error) {
+      if (isRetryableUrmotivDeliveryError(error)) {
+        logError("续租暂未完成，将在安全租约预算内复用同一请求标识重试", error, {
+          assignmentId: inFlight.assignmentId
+        });
+        if (
+          !inFlight.abandoned
+          && this.#inFlight.has(inFlight.assignmentId)
+          && this.scheduleRenewalRetry(inFlight)
+        ) {
+          return;
+        }
+        logWarn("续租仍未完成且安全重试预算不足，停止当前任务", {
+          assignmentId: inFlight.assignmentId
+        });
+        this.abandonTask(inFlight);
+        return;
+      }
+      // 确定的非重试 HTTP 响应和本地契约错误不能当作暂时故障继续复用。
+      inFlight.renewalOperation = null;
       if (isTaskConflictError(error)) {
         logWarn("续租失败：任务已经不属于我们，标记放弃", { assignmentId: inFlight.assignmentId });
         this.abandonTask(inFlight);
@@ -500,10 +587,10 @@ export class ReviewerWorker {
         this.abandonTask(inFlight);
         return;
       }
-      logError("续租失败，将在租约到期前尽快再试", error, { assignmentId: inFlight.assignmentId });
-      if (!inFlight.abandoned && this.#inFlight.has(inFlight.assignmentId)) {
-        this.scheduleRenewalRetry(inFlight);
-      }
+      logError("续租收到确定失败或本地协议错误，停止当前任务且不自动重试", error, {
+        assignmentId: inFlight.assignmentId
+      });
+      this.abandonTask(inFlight);
     }
   }
 

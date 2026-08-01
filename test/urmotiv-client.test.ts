@@ -6,13 +6,16 @@ import {
   UrmotivApiError,
   UrmotivClient,
   UrmotivContractError,
-  UrmotivNetworkError
+  UrmotivNetworkError,
+  type CompleteRobotReviewTaskRequest
 } from "../src/urmotiv-client";
-import type { CompleteRobotReviewTaskInput, RobotReviewTask } from "../src/urmotiv-schemas";
+import type { RobotReviewTask } from "../src/urmotiv-schemas";
 
 const robotToken = "urv_test_token_1234567890";
 const baseUrl = "https://urmotiv.example.test";
 const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
+const renewalRequestId = "3fa85f64-5717-4562-b3fc-2c963f66afa7";
+const completionRequestId = "3fa85f64-5717-4562-b3fc-2c963f66afa8";
 const contentHash = "a".repeat(64);
 
 function sampleTask(): RobotReviewTask {
@@ -34,8 +37,9 @@ function sampleTask(): RobotReviewTask {
   };
 }
 
-function validCompleteInput(): CompleteRobotReviewTaskInput {
+function validCompleteInput(): CompleteRobotReviewTaskRequest {
   return {
+    requestId: completionRequestId,
     expectedLeaseExpiresAt: "2026-07-26T00:05:00.000Z",
     expectedProblemRevision: 3,
     experimentVersion: "experiment-2026-07",
@@ -84,12 +88,18 @@ describe("UrmotivClient：正常路径", () => {
   });
 
   it("renew 把 assignmentId 拼进路径", async () => {
-    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       expect(String(url)).toBe(`${baseUrl}/api/v1/robot/review-tasks/${assignmentId}/renew`);
+      expect(JSON.parse(String(init?.body))).toEqual({
+        requestId: renewalRequestId,
+        expectedLeaseExpiresAt: "2026-07-26T00:05:00.000Z",
+        leaseSeconds: 300
+      });
       return jsonResponse({ assignmentId, leaseExpiresAt: "2026-07-26T00:10:00.000Z" });
     });
     const client = new UrmotivClient({ baseUrl, robotToken, fetch: fetchMock });
     const result = await client.renew(assignmentId, {
+      requestId: renewalRequestId,
       expectedLeaseExpiresAt: "2026-07-26T00:05:00.000Z",
       leaseSeconds: 300
     });
@@ -100,6 +110,7 @@ describe("UrmotivClient：正常路径", () => {
     const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       expect(String(url)).toBe(`${baseUrl}/api/v1/robot/review-tasks/${assignmentId}/complete`);
       const body = JSON.parse(String(init?.body));
+      expect(body.requestId).toBe(completionRequestId);
       expect(body.review.verdict).toBe("approve");
       return jsonResponse({ assignmentId, accepted: true, problemStatus: "approved" });
     });
@@ -127,6 +138,35 @@ describe("UrmotivClient：本地校验先于网络请求", () => {
     await expect(client.claim({ leaseSeconds: 999_999 })).rejects.toThrow();
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("renew 在请求标识不是 UUID 时直接抛错，不发请求", async () => {
+    const fetchMock = vi.fn();
+    const client = new UrmotivClient({ baseUrl, robotToken, fetch: fetchMock });
+    await expect(client.renew(assignmentId, {
+      requestId: "not-a-uuid",
+      expectedLeaseExpiresAt: "2026-07-26T00:05:00.000Z",
+      leaseSeconds: 300
+    })).rejects.toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["renew", "complete"] as const)(
+    "%s 在运行时缺少请求标识时直接拒绝且不发请求",
+    async (operation) => {
+      const fetchMock = vi.fn();
+      const client = new UrmotivClient({ baseUrl, robotToken, fetch: fetchMock });
+      if (operation === "renew") {
+        await expect(client.renew(assignmentId, {
+          expectedLeaseExpiresAt: "2026-07-26T00:05:00.000Z",
+          leaseSeconds: 300
+        } as never)).rejects.toThrow();
+      } else {
+        const { requestId: _requestId, ...withoutRequestId } = validCompleteInput();
+        await expect(client.complete(assignmentId, withoutRequestId as never)).rejects.toThrow();
+      }
+      expect(fetchMock).not.toHaveBeenCalled();
+    }
+  );
 });
 
 describe("UrmotivClient：按状态码分类错误", () => {
@@ -159,11 +199,16 @@ describe("UrmotivClient：按状态码分类错误", () => {
       const fetchMock = vi.fn(async () => jsonResponse({ error: { code: "CONFLICT", message: "任务已变化" } }, status));
       const client = new UrmotivClient({ baseUrl, robotToken, fetch: fetchMock });
       await expect(
-        client.renew(assignmentId, { expectedLeaseExpiresAt: "2026-07-26T00:05:00.000Z", leaseSeconds: 300 })
+        client.renew(assignmentId, {
+          requestId: renewalRequestId,
+          expectedLeaseExpiresAt: "2026-07-26T00:05:00.000Z",
+          leaseSeconds: 300
+        })
       ).rejects.toSatisfy((error: unknown) => {
         expect(isTaskConflictError(error)).toBe(true);
         return true;
       });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     }
   });
 
@@ -203,6 +248,7 @@ describe("UrmotivClient：按状态码分类错误", () => {
       });
       const error = await client
         .renew(assignmentId, {
+          requestId: renewalRequestId,
           expectedLeaseExpiresAt: "2026-07-26T00:05:00.000Z",
           leaseSeconds: 300
         })
@@ -216,6 +262,168 @@ describe("UrmotivClient：按状态码分类错误", () => {
 });
 
 describe("UrmotivClient：网络与契约错误", () => {
+  it.each([429, 500])(
+    "renew 收到可重试的 HTTP %i 时仍逐字复用同一请求体",
+    async (status) => {
+      const requestBodies: string[] = [];
+      const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        requestBodies.push(String(init?.body));
+        if (requestBodies.length === 1) {
+          return jsonResponse({ error: { code: "TEMPORARY", message: "稍后重试" } }, status);
+        }
+        return jsonResponse({ assignmentId, leaseExpiresAt: "2099-01-01T00:10:00.000Z" });
+      });
+      const client = new UrmotivClient({ baseUrl, robotToken, fetch: fetchMock });
+
+      await expect(client.renew(assignmentId, {
+        requestId: renewalRequestId,
+        expectedLeaseExpiresAt: "2099-01-01T00:05:00.000Z",
+        leaseSeconds: 300
+      })).resolves.toEqual({ assignmentId, leaseExpiresAt: "2099-01-01T00:10:00.000Z" });
+
+      expect(requestBodies).toEqual([requestBodies[0], requestBodies[0]]);
+    }
+  );
+
+  it.each([400, 401, 403, 404, 409])(
+    "renew 收到确定且不可重试的 HTTP %i 时只请求一次",
+    async (status) => {
+      const fetchMock = vi.fn(async () =>
+        jsonResponse({ error: { code: "REJECTED", message: "固定拒绝" } }, status)
+      );
+      const client = new UrmotivClient({ baseUrl, robotToken, fetch: fetchMock });
+
+      await expect(client.renew(assignmentId, {
+        requestId: renewalRequestId,
+        expectedLeaseExpiresAt: "2099-01-01T00:05:00.000Z",
+        leaseSeconds: 300
+      })).rejects.toBeInstanceOf(UrmotivApiError);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it("renew 的网络重试逐字复用同一个 UUID 和请求体", async () => {
+    const requestBodies: string[] = [];
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      requestBodies.push(String(init?.body));
+      if (requestBodies.length === 1) {
+        throw new Error("响应在到达客户端前断开");
+      }
+      return jsonResponse({ assignmentId, leaseExpiresAt: "2099-01-01T00:10:00.000Z" });
+    });
+    const client = new UrmotivClient({ baseUrl, robotToken, fetch: fetchMock });
+
+    await expect(client.renew(assignmentId, {
+      requestId: renewalRequestId,
+      expectedLeaseExpiresAt: "2099-01-01T00:05:00.000Z",
+      leaseSeconds: 300
+    })).resolves.toEqual({ assignmentId, leaseExpiresAt: "2099-01-01T00:10:00.000Z" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(requestBodies).toEqual([requestBodies[0], requestBodies[0]]);
+    expect(JSON.parse(requestBodies[0]!)).toEqual({
+      requestId: renewalRequestId,
+      expectedLeaseExpiresAt: "2099-01-01T00:05:00.000Z",
+      leaseSeconds: 300
+    });
+  });
+
+  it("complete 的网络重试逐字复用同一个 UUID 和请求体", async () => {
+    const requestBodies: string[] = [];
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      requestBodies.push(String(init?.body));
+      if (requestBodies.length === 1) {
+        throw new Error("响应在到达客户端前断开");
+      }
+      return jsonResponse({ assignmentId, accepted: true, problemStatus: "approved" });
+    });
+    const client = new UrmotivClient({ baseUrl, robotToken, fetch: fetchMock });
+    const input = {
+      ...validCompleteInput(),
+      expectedLeaseExpiresAt: "2099-01-01T00:05:00.000Z"
+    };
+
+    await expect(client.complete(assignmentId, input)).resolves.toEqual({
+      assignmentId,
+      accepted: true,
+      problemStatus: "approved"
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(requestBodies).toEqual([requestBodies[0], requestBodies[0]]);
+    expect(JSON.parse(requestBodies[0]!).requestId).toBe(completionRequestId);
+  });
+
+  it.each([429, 500])(
+    "complete 收到可重试的 HTTP %i 时有界复用同一 UUID 和请求体",
+    async (status) => {
+      const requestBodies: string[] = [];
+      const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        requestBodies.push(String(init?.body));
+        if (requestBodies.length === 1) {
+          return jsonResponse({ error: { code: "TEMPORARY", message: "稍后重试" } }, status);
+        }
+        return jsonResponse({ assignmentId, accepted: true, problemStatus: "approved" });
+      });
+      const client = new UrmotivClient({ baseUrl, robotToken, fetch: fetchMock });
+
+      await expect(client.complete(assignmentId, {
+        ...validCompleteInput(),
+        expectedLeaseExpiresAt: "2099-01-01T00:05:00.000Z"
+      })).resolves.toEqual({ assignmentId, accepted: true, problemStatus: "approved" });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(requestBodies).toEqual([requestBodies[0], requestBodies[0]]);
+      expect(JSON.parse(requestBodies[0]!).requestId).toBe(completionRequestId);
+    }
+  );
+
+  it("complete 的两次网络尝试都失败时仍只使用原 UUID，并返回结果不确定错误", async () => {
+    const requestBodies: string[] = [];
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      requestBodies.push(String(init?.body));
+      throw new Error("响应在到达客户端前断开");
+    });
+    const client = new UrmotivClient({ baseUrl, robotToken, fetch: fetchMock });
+
+    await expect(client.complete(assignmentId, {
+      ...validCompleteInput(),
+      expectedLeaseExpiresAt: "2099-01-01T00:05:00.000Z"
+    })).rejects.toBeInstanceOf(UrmotivNetworkError);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(requestBodies).toEqual([requestBodies[0], requestBodies[0]]);
+    expect(JSON.parse(requestBodies[0]!).requestId).toBe(completionRequestId);
+  });
+
+  it("按实际 120 秒客户端超时判断租约不足时不启动网络重试", async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new Error("网络中断");
+    });
+    const client = new UrmotivClient({
+      baseUrl,
+      robotToken,
+      timeoutMs: 120_000,
+      fetch: fetchMock
+    });
+    const leaseExpiresAt = new Date(Date.now() + 60_000).toISOString();
+
+    await expect(client.renew(assignmentId, {
+      requestId: renewalRequestId,
+      expectedLeaseExpiresAt: leaseExpiresAt,
+      leaseSeconds: 300
+    })).rejects.toBeInstanceOf(UrmotivNetworkError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("确定的 2xx 契约错误不自动重试", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ accepted: "maybe" }));
+    const client = new UrmotivClient({ baseUrl, robotToken, fetch: fetchMock });
+
+    await expect(client.complete(assignmentId, {
+      ...validCompleteInput(),
+      expectedLeaseExpiresAt: "2099-01-01T00:05:00.000Z"
+    })).rejects.toBeInstanceOf(UrmotivContractError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("fetch 抛出异常时包装成 UrmotivNetworkError", async () => {
     const fetchMock = vi.fn(async () => {
       throw new Error("connect ECONNREFUSED");

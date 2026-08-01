@@ -15,8 +15,10 @@
  *     不重试；是否要连带怀疑整个令牌失效由调用方结合频率自行判断。
  *   - 404/409：任务已经不存在、租约已过期被别人抢走、或者版本号对不上——
  *     说明这个任务从我们手里"丢"了，放弃即可，不重试。
- * 本文件只负责发请求、按状态码分类抛出类型化错误；要不要重试、重试几次，
- * 由调用方（src/reviewer.ts）决定，这里不做任何自动重试。
+ * claim 不自动重试，避免一次响应丢失后重复领取。renew/complete 由调用方为每个
+ * 逻辑操作生成 UUID 请求标识；本文件只对没有拿到 HTTP 响应、429 限流和 5xx
+ * 服务端故障做一次有界重试，并逐字复用调用方给出的请求体。其它确定响应和契约
+ * 错误不重试。
  */
 import { z } from "zod";
 import {
@@ -27,22 +29,32 @@ import {
   renewRobotReviewTaskResponseSchema,
   robotReviewTaskCompletionSchema,
   type ClaimRobotReviewTasksResponse,
-  type CompleteRobotReviewTaskInput,
   type RenewRobotReviewTaskResponse,
   type RobotReviewTaskCompletion
 } from "./urmotiv-schemas";
 
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
-// claim/renew 的请求体里有几个字段带 zod `.default(...)`。用 `z.infer`（也就是
-// schema 的输出类型）当参数类型会强迫调用方把带默认值的字段也显式填上，等于
-// 白白浪费了 schema 里已经声明好的默认值。这里改用 `z.input`（解析前的类型），
-// 让调用方可以省略 leaseSeconds 之类的字段，交给 `.parse()` 去补默认值——
-// complete() 不用这个处理，因为它的 review 字段总是由 verdict 流水线完整构造，
-// 不依赖默认值，直接用契约里导出的 CompleteRobotReviewTaskInput（输出类型）
-// 反而能强制调用方不要漏字段。
+// 请求参数类型使用 `z.input`（解析前的类型），让 schema 自己补齐 leaseSeconds、
+// tagIds 等默认值；真正发送前仍统一经过下面的本地边界 schema 校验。
 export type ClaimRobotReviewTasksRequest = z.input<typeof claimRobotReviewTasksInputSchema>;
-export type RenewRobotReviewTaskRequest = z.input<typeof renewRobotReviewTaskInputSchema>;
+// Urmotiv 在滚动升级期间仍把 requestId 标成 optional；Fermata 已是新客户端，
+// 所以在自己的 HTTP 边界叠加 required 约束，不能只依赖 TypeScript 阻止 JS/any 漏传。
+const requiredRequestIdSchema = z.string().uuid();
+const fermataRenewRobotReviewTaskInputSchema = renewRobotReviewTaskInputSchema.extend({
+  requestId: requiredRequestIdSchema
+});
+const fermataCompleteRobotReviewTaskInputSchema = completeRobotReviewTaskInputSchema.extend({
+  requestId: requiredRequestIdSchema
+});
+
+export type RenewRobotReviewTaskRequest = z.input<typeof fermataRenewRobotReviewTaskInputSchema>;
+export type CompleteRobotReviewTaskRequest = z.input<typeof fermataCompleteRobotReviewTaskInputSchema>;
+
+/** 与生产装配使用的默认值保持一致，供 worker 计算续租重试的最小安全预算。 */
+export const DEFAULT_URMOTIV_REQUEST_TIMEOUT_MS = 30_000;
+export const URMOTIV_RETRY_DEADLINE_SAFETY_MS = 1_000;
+const IDEMPOTENT_OPERATION_MAXIMUM_ATTEMPTS = 2;
 
 export interface UrmotivClientOptions {
   readonly baseUrl: string;
@@ -103,6 +115,14 @@ export function isAuthenticationError(error: unknown): error is UrmotivApiError 
   return error instanceof UrmotivApiError && error.status === 401;
 }
 
+/** 没有响应、限流和服务端故障可依靠操作请求标识安全重放；其它确定响应不重试。 */
+export function isRetryableUrmotivDeliveryError(
+  error: unknown
+): error is UrmotivNetworkError | UrmotivApiError {
+  return error instanceof UrmotivNetworkError
+    || (error instanceof UrmotivApiError && (error.status === 429 || error.status >= 500));
+}
+
 const assignmentIdSchema = z.string().uuid();
 
 /**
@@ -111,9 +131,11 @@ const assignmentIdSchema = z.string().uuid();
  * 具体类，测试时可以传一个不发真实请求的假实现。
  */
 export interface UrmotivClientLike {
+  /** 单次 HTTP 尝试的最长等待时间；worker 用它保留完整的租约重试预算。 */
+  readonly requestTimeoutMs: number;
   claim(input?: ClaimRobotReviewTasksRequest): Promise<ClaimRobotReviewTasksResponse>;
   renew(assignmentId: string, input: RenewRobotReviewTaskRequest): Promise<RenewRobotReviewTaskResponse>;
-  complete(assignmentId: string, input: CompleteRobotReviewTaskInput): Promise<RobotReviewTaskCompletion>;
+  complete(assignmentId: string, input: CompleteRobotReviewTaskRequest): Promise<RobotReviewTaskCompletion>;
 }
 
 export class UrmotivClient implements UrmotivClientLike {
@@ -125,8 +147,14 @@ export class UrmotivClient implements UrmotivClientLike {
   public constructor(options: UrmotivClientOptions) {
     this.#baseUrl = new URL(ensureTrailingSlash(z.string().url().parse(options.baseUrl)));
     this.#robotToken = z.string().trim().min(1).parse(options.robotToken);
-    this.#timeoutMs = z.number().int().min(1_000).max(120_000).parse(options.timeoutMs ?? 30_000);
+    this.#timeoutMs = z.number().int().min(1_000).max(120_000).parse(
+      options.timeoutMs ?? DEFAULT_URMOTIV_REQUEST_TIMEOUT_MS
+    );
     this.#fetch = options.fetch ?? globalThis.fetch;
+  }
+
+  public get requestTimeoutMs(): number {
+    return this.#timeoutMs;
   }
 
   // 这三个方法都标成 async：方法体里 schema.parse(...) 校验失败会同步抛错，
@@ -136,9 +164,9 @@ export class UrmotivClient implements UrmotivClientLike {
   // 处理“这个 Promise 会不会 reject”一种情况。
   public async claim(input: ClaimRobotReviewTasksRequest = {}): Promise<ClaimRobotReviewTasksResponse> {
     const body = claimRobotReviewTasksInputSchema.parse(input);
-    return this.request(
+    return this.requestOnce(
       "api/v1/robot/review-tasks/claim",
-      body,
+      JSON.stringify(body),
       claimRobotReviewTasksResponseSchema
     );
   }
@@ -148,28 +176,63 @@ export class UrmotivClient implements UrmotivClientLike {
     input: RenewRobotReviewTaskRequest
   ): Promise<RenewRobotReviewTaskResponse> {
     const id = assignmentIdSchema.parse(assignmentId);
-    const body = renewRobotReviewTaskInputSchema.parse(input);
-    return this.request(
+    const body = fermataRenewRobotReviewTaskInputSchema.parse(input);
+    return this.requestIdempotently(
       `api/v1/robot/review-tasks/${id}/renew`,
-      body,
-      renewRobotReviewTaskResponseSchema
+      JSON.stringify(body),
+      renewRobotReviewTaskResponseSchema,
+      body.expectedLeaseExpiresAt
     );
   }
 
   public async complete(
     assignmentId: string,
-    input: CompleteRobotReviewTaskInput
+    input: CompleteRobotReviewTaskRequest
   ): Promise<RobotReviewTaskCompletion> {
     const id = assignmentIdSchema.parse(assignmentId);
-    const body = completeRobotReviewTaskInputSchema.parse(input);
-    return this.request(
+    const body = fermataCompleteRobotReviewTaskInputSchema.parse(input);
+    return this.requestIdempotently(
       `api/v1/robot/review-tasks/${id}/complete`,
-      body,
-      robotReviewTaskCompletionSchema
+      JSON.stringify(body),
+      robotReviewTaskCompletionSchema,
+      body.expectedLeaseExpiresAt
     );
   }
 
-  private async request<T>(relativePath: string, body: unknown, responseSchema: z.ZodType<T>): Promise<T> {
+  private async requestIdempotently<T>(
+    relativePath: string,
+    serializedBody: string,
+    responseSchema: z.ZodType<T>,
+    leaseExpiresAt: string
+  ): Promise<T> {
+    for (let attempt = 1; attempt <= IDEMPOTENT_OPERATION_MAXIMUM_ATTEMPTS; attempt += 1) {
+      try {
+        return await this.requestOnce(relativePath, serializedBody, responseSchema);
+      } catch (error) {
+        const hasAnotherAttempt = attempt < IDEMPOTENT_OPERATION_MAXIMUM_ATTEMPTS;
+        if (
+          !isRetryableUrmotivDeliveryError(error)
+          || !hasAnotherAttempt
+          || !this.hasFullRetryBudget(leaseExpiresAt)
+        ) {
+          throw error;
+        }
+      }
+    }
+    throw new UrmotivNetworkError(`请求 Urmotiv 机器人 API 失败：${relativePath}`);
+  }
+
+  private hasFullRetryBudget(leaseExpiresAt: string): boolean {
+    const deadlineMs = Date.parse(leaseExpiresAt);
+    return Number.isFinite(deadlineMs)
+      && deadlineMs - Date.now() > this.#timeoutMs + URMOTIV_RETRY_DEADLINE_SAFETY_MS;
+  }
+
+  private async requestOnce<T>(
+    relativePath: string,
+    serializedBody: string,
+    responseSchema: z.ZodType<T>
+  ): Promise<T> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.#timeoutMs);
 
@@ -185,7 +248,7 @@ export class UrmotivClient implements UrmotivClientLike {
             Authorization: `Bearer ${this.#robotToken}`,
             "X-Urmotiv-API-Version": "1"
           },
-          body: JSON.stringify(body),
+          body: serializedBody,
           signal: controller.signal
         }),
         controller.signal
