@@ -1,0 +1,816 @@
+{
+  "schemaVersion": 2,
+  "runId": "public83-before-20260801-v4-2026-08-01T08-25-58-319Z-318a764341ad",
+  "label": "public83-before-20260801-v4",
+  "generatedAt": "2026-08-01T08:25:58.320Z",
+  "codeVersion": "64fd7a67d1906de4087f6d64cefce2038b543ea6",
+  "configurationFingerprint": "72c7df6c6f762a2c626a411f2061bda3d2bbde86f2093a2fe738b5eae5771120",
+  "chain": {
+    "chainRunId": "b42c7cb1-bda0-498a-a715-39bfbe534402",
+    "originalReportRunId": "public83-before-20260801-v4-2026-08-01T08-25-58-319Z-318a764341ad",
+    "createdAt": "2026-08-01T08:25:58.355Z",
+    "executionKind": "new"
+  },
+  "dataset": {
+    "discoveredFiles": 83,
+    "excludedAnchors": 0,
+    "manifest": {
+      "enabled": true,
+      "expectedFiles": 83,
+      "fingerprint": "509473b84d457c91c25cdae65037e0931d1bd0d7a4c34a344e7334ebee233cfe",
+      "verified": true
+    }
+  },
+  "integrity": {
+    "expected": 83,
+    "succeeded": 83,
+    "failed": 0,
+    "complete": true,
+    "failures": []
+  },
+  "summary": {
+    "count": 83,
+    "meanAbsoluteError": 302.4096385542169,
+    "hitRateWithin200": 0.5662650602409639,
+    "byBucket": {
+      "800": {
+        "count": 3,
+        "meanAbsoluteError": 0
+      },
+      "900": {
+        "count": 3,
+        "meanAbsoluteError": 100
+      },
+      "1000": {
+        "count": 3,
+        "meanAbsoluteError": 200
+      },
+      "1100": {
+        "count": 3,
+        "meanAbsoluteError": 133.33333333333334
+      },
+      "1200": {
+        "count": 3,
+        "meanAbsoluteError": 233.33333333333334
+      },
+      "1300": {
+        "count": 3,
+        "meanAbsoluteError": 133.33333333333334
+      },
+      "1400": {
+        "count": 3,
+        "meanAbsoluteError": 133.33333333333334
+      },
+      "1500": {
+        "count": 3,
+        "meanAbsoluteError": 233.33333333333334
+      },
+      "1600": {
+        "count": 3,
+        "meanAbsoluteError": 100
+      },
+      "1700": {
+        "count": 3,
+        "meanAbsoluteError": 166.66666666666666
+      },
+      "1800": {
+        "count": 3,
+        "meanAbsoluteError": 166.66666666666666
+      },
+      "1900": {
+        "count": 3,
+        "meanAbsoluteError": 166.66666666666666
+      },
+      "2000": {
+        "count": 3,
+        "meanAbsoluteError": 266.6666666666667
+      },
+      "2100": {
+        "count": 3,
+        "meanAbsoluteError": 233.33333333333334
+      },
+      "2200": {
+        "count": 3,
+        "meanAbsoluteError": 333.3333333333333
+      },
+      "2300": {
+        "count": 3,
+        "meanAbsoluteError": 233.33333333333334
+      },
+      "2400": {
+        "count": 3,
+        "meanAbsoluteError": 266.6666666666667
+      },
+      "2500": {
+        "count": 3,
+        "meanAbsoluteError": 300
+      },
+      "2600": {
+        "count": 3,
+        "meanAbsoluteError": 133.33333333333334
+      },
+      "2700": {
+        "count": 3,
+        "meanAbsoluteError": 166.66666666666666
+      },
+      "2800": {
+        "count": 3,
+        "meanAbsoluteError": 333.3333333333333
+      },
+      "2900": {
+        "count": 3,
+        "meanAbsoluteError": 433.3333333333333
+      },
+      "3000": {
+        "count": 3,
+        "meanAbsoluteError": 466.6666666666667
+      },
+      "3100": {
+        "count": 3,
+        "meanAbsoluteError": 566.6666666666666
+      },
+      "3200": {
+        "count": 3,
+        "meanAbsoluteError": 600
+      },
+      "3300": {
+        "count": 3,
+        "meanAbsoluteError": 1033.3333333333333
+      },
+      "3400": {
+        "count": 2,
+        "meanAbsoluteError": 800
+      },
+      "3500": {
+        "count": 3,
+        "meanAbsoluteError": 700
+      }
+    }
+  },
+  "rows": [
+    {
+      "contestId": 1776,
+      "index": "J",
+      "actualRating": 2500,
+      "predictedRating": 2400,
+      "error": -100,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1776,
+      "index": "L",
+      "actualRating": 1500,
+      "predictedRating": 1800,
+      "error": 300,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1783,
+      "index": "C",
+      "actualRating": 1700,
+      "predictedRating": 1600,
+      "error": -100,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 1829,
+      "index": "E",
+      "actualRating": 1100,
+      "predictedRating": 1300,
+      "error": 200,
+      "confidence": 0.8
+    },
+    {
+      "contestId": 1862,
+      "index": "A",
+      "actualRating": 800,
+      "predictedRating": 800,
+      "error": 0,
+      "confidence": 0.85
+    },
+    {
+      "contestId": 1862,
+      "index": "E",
+      "actualRating": 1600,
+      "predictedRating": 1500,
+      "error": -100,
+      "confidence": 0.8
+    },
+    {
+      "contestId": 1866,
+      "index": "E",
+      "actualRating": 2700,
+      "predictedRating": 2400,
+      "error": -300,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1866,
+      "index": "F",
+      "actualRating": 3100,
+      "predictedRating": 2600,
+      "error": -500,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1866,
+      "index": "H",
+      "actualRating": 2100,
+      "predictedRating": 2600,
+      "error": 500,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1866,
+      "index": "M",
+      "actualRating": 2400,
+      "predictedRating": 2400,
+      "error": 0,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1893,
+      "index": "C",
+      "actualRating": 2000,
+      "predictedRating": 2400,
+      "error": 400,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1893,
+      "index": "E",
+      "actualRating": 3500,
+      "predictedRating": 2800,
+      "error": -700,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1906,
+      "index": "C",
+      "actualRating": 3000,
+      "predictedRating": 2800,
+      "error": -200,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1906,
+      "index": "D",
+      "actualRating": 2800,
+      "predictedRating": 2600,
+      "error": -200,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1906,
+      "index": "I",
+      "actualRating": 2900,
+      "predictedRating": 2400,
+      "error": -500,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1949,
+      "index": "A",
+      "actualRating": 3300,
+      "predictedRating": 1800,
+      "error": -1500,
+      "confidence": 0.6
+    },
+    {
+      "contestId": 1949,
+      "index": "D",
+      "actualRating": 2600,
+      "predictedRating": 2400,
+      "error": -200,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1949,
+      "index": "F",
+      "actualRating": 2200,
+      "predictedRating": 2400,
+      "error": 200,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 1951,
+      "index": "A",
+      "actualRating": 900,
+      "predictedRating": 900,
+      "error": 0,
+      "confidence": 0.8
+    },
+    {
+      "contestId": 1951,
+      "index": "C",
+      "actualRating": 1400,
+      "predictedRating": 1400,
+      "error": 0,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1951,
+      "index": "H",
+      "actualRating": 3200,
+      "predictedRating": 2600,
+      "error": -600,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1955,
+      "index": "B",
+      "actualRating": 1000,
+      "predictedRating": 1200,
+      "error": 200,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 1955,
+      "index": "C",
+      "actualRating": 1300,
+      "predictedRating": 1100,
+      "error": -200,
+      "confidence": 0.8
+    },
+    {
+      "contestId": 1955,
+      "index": "F",
+      "actualRating": 1800,
+      "predictedRating": 1300,
+      "error": -500,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1955,
+      "index": "G",
+      "actualRating": 1900,
+      "predictedRating": 1800,
+      "error": -100,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1989,
+      "index": "B",
+      "actualRating": 1200,
+      "predictedRating": 1300,
+      "error": 100,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 1989,
+      "index": "E",
+      "actualRating": 2300,
+      "predictedRating": 2200,
+      "error": -100,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1998,
+      "index": "D",
+      "actualRating": 2100,
+      "predictedRating": 2200,
+      "error": 100,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 1999,
+      "index": "F",
+      "actualRating": 1500,
+      "predictedRating": 1600,
+      "error": 100,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 2000,
+      "index": "H",
+      "actualRating": 2200,
+      "predictedRating": 2600,
+      "error": 400,
+      "confidence": 0.8
+    },
+    {
+      "contestId": 2002,
+      "index": "E",
+      "actualRating": 2300,
+      "predictedRating": 2200,
+      "error": -100,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2002,
+      "index": "G",
+      "actualRating": 3400,
+      "predictedRating": 2600,
+      "error": -800,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2003,
+      "index": "F",
+      "actualRating": 2800,
+      "predictedRating": 2400,
+      "error": -400,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2004,
+      "index": "G",
+      "actualRating": 3200,
+      "predictedRating": 2600,
+      "error": -600,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2008,
+      "index": "A",
+      "actualRating": 800,
+      "predictedRating": 800,
+      "error": 0,
+      "confidence": 0.9
+    },
+    {
+      "contestId": 2008,
+      "index": "H",
+      "actualRating": 2100,
+      "predictedRating": 2200,
+      "error": 100,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 2013,
+      "index": "B",
+      "actualRating": 900,
+      "predictedRating": 900,
+      "error": 0,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 2018,
+      "index": "E2",
+      "actualRating": 3400,
+      "predictedRating": 2600,
+      "error": -800,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2020,
+      "index": "F",
+      "actualRating": 2900,
+      "predictedRating": 2400,
+      "error": -500,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 2022,
+      "index": "E1",
+      "actualRating": 2500,
+      "predictedRating": 1800,
+      "error": -700,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 2028,
+      "index": "B",
+      "actualRating": 1400,
+      "predictedRating": 1600,
+      "error": 200,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 2029,
+      "index": "D",
+      "actualRating": 1900,
+      "predictedRating": 1800,
+      "error": -100,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 2029,
+      "index": "H",
+      "actualRating": 3500,
+      "predictedRating": 2800,
+      "error": -700,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2030,
+      "index": "C",
+      "actualRating": 1100,
+      "predictedRating": 1300,
+      "error": 200,
+      "confidence": 0.6
+    },
+    {
+      "contestId": 2030,
+      "index": "F",
+      "actualRating": 2400,
+      "predictedRating": 1800,
+      "error": -600,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2030,
+      "index": "G2",
+      "actualRating": 3100,
+      "predictedRating": 2600,
+      "error": -500,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2031,
+      "index": "F",
+      "actualRating": 2800,
+      "predictedRating": 2400,
+      "error": -400,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2033,
+      "index": "B",
+      "actualRating": 900,
+      "predictedRating": 1200,
+      "error": 300,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2033,
+      "index": "D",
+      "actualRating": 1300,
+      "predictedRating": 1400,
+      "error": 100,
+      "confidence": 0.8
+    },
+    {
+      "contestId": 2033,
+      "index": "F",
+      "actualRating": 1800,
+      "predictedRating": 1800,
+      "error": 0,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2034,
+      "index": "E",
+      "actualRating": 2200,
+      "predictedRating": 1800,
+      "error": -400,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 2035,
+      "index": "C",
+      "actualRating": 1400,
+      "predictedRating": 1600,
+      "error": 200,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 2035,
+      "index": "E",
+      "actualRating": 2300,
+      "predictedRating": 1800,
+      "error": -500,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 2037,
+      "index": "C",
+      "actualRating": 1000,
+      "predictedRating": 1200,
+      "error": 200,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 2039,
+      "index": "B",
+      "actualRating": 1000,
+      "predictedRating": 1200,
+      "error": 200,
+      "confidence": 0.6
+    },
+    {
+      "contestId": 2039,
+      "index": "G",
+      "actualRating": 3500,
+      "predictedRating": 2800,
+      "error": -700,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2041,
+      "index": "C",
+      "actualRating": 2000,
+      "predictedRating": 1800,
+      "error": -200,
+      "confidence": 0.6
+    },
+    {
+      "contestId": 2041,
+      "index": "F",
+      "actualRating": 2400,
+      "predictedRating": 2600,
+      "error": 200,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2041,
+      "index": "K",
+      "actualRating": 3100,
+      "predictedRating": 2400,
+      "error": -700,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2041,
+      "index": "M",
+      "actualRating": 2000,
+      "predictedRating": 1800,
+      "error": -200,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 2042,
+      "index": "F",
+      "actualRating": 2600,
+      "predictedRating": 2800,
+      "error": 200,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2043,
+      "index": "C",
+      "actualRating": 1600,
+      "predictedRating": 1600,
+      "error": 0,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2043,
+      "index": "D",
+      "actualRating": 1800,
+      "predictedRating": 1800,
+      "error": 0,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2043,
+      "index": "F",
+      "actualRating": 2700,
+      "predictedRating": 2600,
+      "error": -100,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2044,
+      "index": "G1",
+      "actualRating": 1700,
+      "predictedRating": 1400,
+      "error": -300,
+      "confidence": 0.6
+    },
+    {
+      "contestId": 2045,
+      "index": "A",
+      "actualRating": 1700,
+      "predictedRating": 1600,
+      "error": -100,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2045,
+      "index": "E",
+      "actualRating": 2700,
+      "predictedRating": 2600,
+      "error": -100,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2045,
+      "index": "L",
+      "actualRating": 3000,
+      "predictedRating": 2400,
+      "error": -600,
+      "confidence": 0.6
+    },
+    {
+      "contestId": 2046,
+      "index": "F1",
+      "actualRating": 3300,
+      "predictedRating": 2600,
+      "error": -700,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2049,
+      "index": "B",
+      "actualRating": 1300,
+      "predictedRating": 1400,
+      "error": 100,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 2050,
+      "index": "G",
+      "actualRating": 1900,
+      "predictedRating": 1600,
+      "error": -300,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 2051,
+      "index": "D",
+      "actualRating": 1200,
+      "predictedRating": 1400,
+      "error": 200,
+      "confidence": 0.8
+    },
+    {
+      "contestId": 2053,
+      "index": "B",
+      "actualRating": 1200,
+      "predictedRating": 1600,
+      "error": 400,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2053,
+      "index": "C",
+      "actualRating": 1500,
+      "predictedRating": 1800,
+      "error": 300,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2053,
+      "index": "F",
+      "actualRating": 2600,
+      "predictedRating": 2600,
+      "error": 0,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2055,
+      "index": "F",
+      "actualRating": 3200,
+      "predictedRating": 2600,
+      "error": -600,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 2057,
+      "index": "E2",
+      "actualRating": 2500,
+      "predictedRating": 2600,
+      "error": 100,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2061,
+      "index": "D",
+      "actualRating": 1600,
+      "predictedRating": 1800,
+      "error": 200,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2061,
+      "index": "G",
+      "actualRating": 2900,
+      "predictedRating": 2600,
+      "error": -300,
+      "confidence": 0.7
+    },
+    {
+      "contestId": 2062,
+      "index": "E2",
+      "actualRating": 3000,
+      "predictedRating": 2400,
+      "error": -600,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2065,
+      "index": "A",
+      "actualRating": 800,
+      "predictedRating": 800,
+      "error": 0,
+      "confidence": 0.9
+    },
+    {
+      "contestId": 2065,
+      "index": "C1",
+      "actualRating": 1100,
+      "predictedRating": 1100,
+      "error": 0,
+      "confidence": 0.75
+    },
+    {
+      "contestId": 2066,
+      "index": "E",
+      "actualRating": 3300,
+      "predictedRating": 2400,
+      "error": -900,
+      "confidence": 0.75
+    }
+  ]
+}
