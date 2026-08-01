@@ -2,6 +2,7 @@ import { describeError } from "../../src/logger";
 import { mapWithConcurrency } from "./concurrency";
 import {
   LevelsCalibrationStateError,
+  calibrationActiveStageSchema,
   calibrationCodingResultSchema,
   calibrationFailureCodeSchema,
   calibrationFailureCountKey,
@@ -11,6 +12,7 @@ import {
   calibrationThinkingResultSchema,
   completeCalibrationRows,
   type CalibrationCheckpointState,
+  type CalibrationActiveStage,
   type CalibrationCodingResult,
   type CalibrationDatasetItem,
   type CalibrationFailureCode,
@@ -22,8 +24,7 @@ import {
 } from "./levels-calibration-state";
 
 export interface CalibrationItemIdentity {
-  readonly contestId: number;
-  readonly index: string;
+  readonly safeId: string;
   readonly rating: number;
 }
 
@@ -104,15 +105,30 @@ export async function runLevelsCalibrationStages(
   const failureCountsByKey = validateInitialFailureCounts(
     input.initialState?.failureCounts ?? []
   );
+  const activeStagesByKey = validateInitialActiveStages(
+    input.items,
+    input.initialState?.activeStages ?? []
+  );
+  for (const active of activeStagesByKey.values()) {
+    mergeFailureCount(failureCountsByKey, {
+      stage: active.stage,
+      errorCode: "STALE_IN_FLIGHT",
+      status: null,
+      count: 1
+    });
+  }
+  activeStagesByKey.clear();
   const initialCompletedKeys = new Set(
     completeCalibrationRows([...progressByKey.values()]).map(calibrationRowKey)
   );
   let thinkingCompletedThisRun = 0;
   let codingCompletedThisRun = 0;
+  let stopStartingStages = failureCountsByKey.size > 0;
 
   const snapshot = (): CalibrationCheckpointState => ({
     progress: [...progressByKey.values()].sort(compareProgress),
-    failureCounts: [...failureCountsByKey.values()].sort(compareFailureCounts)
+    failureCounts: [...failureCountsByKey.values()].sort(compareFailureCounts),
+    activeStages: [...activeStagesByKey.values()].sort(compareActiveStages)
   });
   let checkpointWriteQueue = Promise.resolve();
   const saveCheckpoint = async (): Promise<void> => {
@@ -121,7 +137,59 @@ export async function runLevelsCalibrationStages(
       await input.saveCheckpoint(state);
     });
     checkpointWriteQueue = write;
-    await write;
+    try {
+      await write;
+    } catch (error) {
+      stopStartingStages = true;
+      throw error;
+    }
+  };
+  const runPaidStage = async <T>(stageInput: {
+    readonly item: CalibrationDatasetItem;
+    readonly stage: CalibrationFailureStage;
+    readonly execute: () => Promise<unknown>;
+    readonly schema: {
+      safeParse: (
+        value: unknown
+      ) =>
+        | { readonly success: true; readonly data: T }
+        | { readonly success: false };
+    };
+    readonly onFailure: (
+      failure: CalibrationFailureCount
+    ) => void | Promise<void>;
+  }): Promise<
+    | { readonly started: false }
+    | { readonly started: true; readonly result: T | null }
+  > => {
+    if (stopStartingStages) {
+      return { started: false };
+    }
+    activeStagesByKey.set(
+      activeStageKey(stageInput.item.safeId, stageInput.stage),
+      {
+        safeId: stageInput.item.safeId,
+        stage: stageInput.stage
+      }
+    );
+    await saveCheckpoint();
+    if (stopStartingStages) {
+      activeStagesByKey.delete(
+        activeStageKey(stageInput.item.safeId, stageInput.stage)
+      );
+      await saveCheckpoint();
+      return { started: false };
+    }
+
+    // runStage 会在返回 Promise 前同步调用 execute。最后一次 stop 检查与实际发起
+    // 请求之间没有 await/Promise 交接，另一 worker 无法在这条窄缝里关闸后仍新增请求。
+    const running = runStage({
+      stage: stageInput.stage,
+      execute: stageInput.execute,
+      schema: stageInput.schema,
+      onFailure: stageInput.onFailure
+    });
+    return { started: true, result: await running };
   };
   const fullyCompletedProblemCount = (): number =>
     [...progressByKey.values()].filter(
@@ -130,15 +198,74 @@ export async function runLevelsCalibrationStages(
     ).length;
 
   await mapWithConcurrency(input.items, input.concurrency, async (item) => {
-    const key = calibrationRowKey(item);
-    let progress = progressByKey.get(key);
-    if (progress?.thinking === undefined) {
-      const thinking = await runStage({
-        stage: "thinking",
-        execute: () => input.runThinking(item),
-        schema: calibrationThinkingResultSchema,
+    try {
+      if (stopStartingStages) {
+        return;
+      }
+      const key = calibrationRowKey(item);
+      let progress = progressByKey.get(key);
+      if (progress?.thinking === undefined) {
+        const thinkingStage = await runPaidStage({
+          item,
+          stage: "thinking",
+          execute: () => input.runThinking(item),
+          schema: calibrationThinkingResultSchema,
+          onFailure: async (failure) => {
+            stopStartingStages = true;
+            mergeFailureCount(failureCountsByKey, failure);
+            activeStagesByKey.delete(activeStageKey(item.safeId, "thinking"));
+            await saveCheckpoint();
+            input.onStageFailed?.({
+              ...identityOf(item),
+              stage: failure.stage,
+              errorCode: failure.errorCode,
+              status: failure.status,
+              fullyCompletedProblemCount: fullyCompletedProblemCount(),
+              expectedProblemCount: input.items.length
+            });
+          }
+        });
+        if (!thinkingStage.started || thinkingStage.result === null) {
+          return;
+        }
+        const thinking = thinkingStage.result;
+        progress = {
+          safeId: item.safeId,
+          contestId: item.contestId,
+          index: item.index,
+          rating: item.rating,
+          humanThinkingLevel: item.humanThinkingLevel,
+          humanCodingLevel: item.humanCodingLevel,
+          thinking
+        };
+        progressByKey.set(key, progress);
+        activeStagesByKey.delete(activeStageKey(item.safeId, "thinking"));
+        await saveCheckpoint();
+        thinkingCompletedThisRun += 1;
+        input.onStageCompleted?.({
+          ...identityOf(item),
+          stage: "thinking",
+          level: thinking.level,
+          fullyCompletedProblemCount: fullyCompletedProblemCount(),
+          expectedProblemCount: input.items.length
+        });
+      }
+
+      if (progress === undefined) {
+        throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
+      }
+      if (progress.coding !== undefined) {
+        return;
+      }
+      const codingStage = await runPaidStage({
+        item,
+        stage: "coding",
+        execute: () => input.runCoding(item),
+        schema: calibrationCodingResultSchema,
         onFailure: async (failure) => {
+          stopStartingStages = true;
           mergeFailureCount(failureCountsByKey, failure);
+          activeStagesByKey.delete(activeStageKey(item.safeId, "coding"));
           await saveCheckpoint();
           input.onStageFailed?.({
             ...identityOf(item),
@@ -150,67 +277,29 @@ export async function runLevelsCalibrationStages(
           });
         }
       });
-      if (thinking === null) {
+      if (!codingStage.started || codingStage.result === null) {
         return;
       }
+      const coding = codingStage.result;
       progress = {
-        contestId: item.contestId,
-        index: item.index,
-        rating: item.rating,
-        thinking
+        ...progress,
+        coding
       };
       progressByKey.set(key, progress);
+      activeStagesByKey.delete(activeStageKey(item.safeId, "coding"));
       await saveCheckpoint();
-      thinkingCompletedThisRun += 1;
+      codingCompletedThisRun += 1;
       input.onStageCompleted?.({
         ...identityOf(item),
-        stage: "thinking",
-        level: thinking.level,
+        stage: "coding",
+        level: coding.level,
         fullyCompletedProblemCount: fullyCompletedProblemCount(),
         expectedProblemCount: input.items.length
       });
+    } catch (error) {
+      stopStartingStages = true;
+      throw error;
     }
-
-    if (progress === undefined) {
-      throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
-    }
-    if (progress.coding !== undefined) {
-      return;
-    }
-    const coding = await runStage({
-      stage: "coding",
-      execute: () => input.runCoding(item),
-      schema: calibrationCodingResultSchema,
-      onFailure: async (failure) => {
-        mergeFailureCount(failureCountsByKey, failure);
-        await saveCheckpoint();
-        input.onStageFailed?.({
-          ...identityOf(item),
-          stage: failure.stage,
-          errorCode: failure.errorCode,
-          status: failure.status,
-          fullyCompletedProblemCount: fullyCompletedProblemCount(),
-          expectedProblemCount: input.items.length
-        });
-      }
-    });
-    if (coding === null) {
-      return;
-    }
-    progress = {
-      ...progress,
-      coding
-    };
-    progressByKey.set(key, progress);
-    await saveCheckpoint();
-    codingCompletedThisRun += 1;
-    input.onStageCompleted?.({
-      ...identityOf(item),
-      stage: "coding",
-      level: coding.level,
-      fullyCompletedProblemCount: fullyCompletedProblemCount(),
-      expectedProblemCount: input.items.length
-    });
   });
 
   const finalState = snapshot();
@@ -321,10 +410,20 @@ function validateInitialProgress(
   items: readonly CalibrationDatasetItem[],
   initialProgress: readonly CalibrationProgress[]
 ): Map<string, CalibrationProgress> {
-  const expectedRatings = new Map(
-    items.map((item) => [calibrationRowKey(item), item.rating] as const)
+  const expectedMetadata = new Map(
+    items.map((item) => [
+      calibrationRowKey(item),
+      {
+        safeId: item.safeId,
+        contestId: item.contestId,
+        index: item.index,
+        rating: item.rating,
+        humanThinkingLevel: item.humanThinkingLevel,
+        humanCodingLevel: item.humanCodingLevel
+      }
+    ] as const)
   );
-  if (expectedRatings.size !== items.length) {
+  if (expectedMetadata.size !== items.length) {
     throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
   }
   const progressByKey = new Map<string, CalibrationProgress>();
@@ -334,15 +433,45 @@ function validateInitialProgress(
       throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
     }
     const key = calibrationRowKey(parsed.data);
+    const expected = expectedMetadata.get(key);
     if (
       progressByKey.has(key) ||
-      expectedRatings.get(key) !== parsed.data.rating
+      expected === undefined ||
+      expected.safeId !== parsed.data.safeId ||
+      expected.contestId !== parsed.data.contestId ||
+      expected.index !== parsed.data.index ||
+      expected.rating !== parsed.data.rating ||
+      expected.humanThinkingLevel !== parsed.data.humanThinkingLevel ||
+      expected.humanCodingLevel !== parsed.data.humanCodingLevel
     ) {
       throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
     }
     progressByKey.set(key, parsed.data);
   }
   return progressByKey;
+}
+
+function validateInitialActiveStages(
+  items: readonly CalibrationDatasetItem[],
+  initialActiveStages: readonly CalibrationActiveStage[]
+): Map<string, CalibrationActiveStage> {
+  const expectedSafeIds = new Set(items.map((item) => item.safeId));
+  if (expectedSafeIds.size !== items.length) {
+    throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
+  }
+  const activeStagesByKey = new Map<string, CalibrationActiveStage>();
+  for (const candidate of initialActiveStages) {
+    const parsed = calibrationActiveStageSchema.safeParse(candidate);
+    if (!parsed.success || !expectedSafeIds.has(parsed.data.safeId)) {
+      throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
+    }
+    const key = activeStageKey(parsed.data.safeId, parsed.data.stage);
+    if (activeStagesByKey.has(key)) {
+      throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
+    }
+    activeStagesByKey.set(key, parsed.data);
+  }
+  return activeStagesByKey;
 }
 
 function validateInitialFailureCounts(
@@ -365,10 +494,25 @@ function validateInitialFailureCounts(
 
 function identityOf(item: CalibrationDatasetItem): CalibrationItemIdentity {
   return {
-    contestId: item.contestId,
-    index: item.index,
+    safeId: item.safeId,
     rating: item.rating
   };
+}
+
+function activeStageKey(
+  safeId: string,
+  stage: CalibrationFailureStage
+): string {
+  return `${safeId}:${stage}`;
+}
+
+function compareActiveStages(
+  left: CalibrationActiveStage,
+  right: CalibrationActiveStage
+): number {
+  return activeStageKey(left.safeId, left.stage).localeCompare(
+    activeStageKey(right.safeId, right.stage)
+  );
 }
 
 function compareProgress(

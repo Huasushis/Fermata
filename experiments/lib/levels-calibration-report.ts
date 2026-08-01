@@ -2,19 +2,30 @@ import { z } from "zod";
 import {
   LevelsCalibrationStateError,
   assessCalibrationCompleteness,
+  calibrationActiveStageSchema,
   calibrationFailureCountKey,
   calibrationFailureCountSchema,
   calibrationProgressSchema,
+  calibrationRunIdSchema,
   calibrationRowKey,
+  calibrationSafeIdSchema,
   completeCalibrationRows,
   levelBandOf,
   levelsExperimentFingerprintSchema,
   type CalibrationFailureCount,
+  type CalibrationActiveStage,
   type CalibrationProgress,
   type CalibrationRow,
   type LevelsExperimentFingerprint,
   type LevelsReportRunConfiguration
 } from "./levels-calibration-state";
+
+export const LEVEL_ACCURACY_THRESHOLDS = {
+  minimumProblemCount: 60,
+  exactRate: 0.6,
+  withinOneRate: 0.9,
+  maximumMae: 0.6
+} as const;
 
 /** 报告直接读取这里的等级说明；修改后必须用新标签重跑实验。 */
 export const levelAnchorDefinitions = {
@@ -70,18 +81,22 @@ const reportRunConfigurationSchema = z
     ) {
       context.addIssue({
         code: "custom",
-        message: "每次向模型服务发出请求的最长时间不能小于另外两项等待时间。"
+        message: "首个有效输出前的最终保护配置值不能小于另外两项等待配置值。"
       });
     }
   });
 
 export interface LevelsCalibrationReportInput {
   readonly label: string;
+  readonly datasetId: string;
+  readonly chainRunId: string;
+  readonly executionRunId: string;
   readonly profileName: string;
   readonly fingerprint: LevelsExperimentFingerprint;
   readonly runConfiguration: LevelsReportRunConfiguration;
   readonly progress: readonly CalibrationProgress[];
   readonly failureCounts: readonly CalibrationFailureCount[];
+  readonly activeStages: readonly CalibrationActiveStage[];
   readonly expectedProblemCount: number;
   readonly resumedThinkingProblemCount: number;
   readonly resumedCompleteProblemCount: number;
@@ -89,8 +104,21 @@ export interface LevelsCalibrationReportInput {
   readonly generatedAt: string;
 }
 
+export interface LevelAccuracyMetrics {
+  readonly count: number;
+  readonly exactMatches: number;
+  readonly exactRate: number;
+  readonly withinOneMatches: number;
+  readonly withinOneRate: number;
+  readonly mae: number;
+  readonly passed: boolean;
+}
+
 export interface LevelsCalibrationSummary {
   readonly label: string;
+  readonly datasetId: string;
+  readonly chainRunId: string;
+  readonly executionRunId: string;
   readonly profileName: string;
   readonly experimentFingerprint: LevelsExperimentFingerprint;
   readonly runConfiguration: LevelsReportRunConfiguration;
@@ -104,7 +132,15 @@ export interface LevelsCalibrationSummary {
   readonly allProblemsCompleted: boolean;
   readonly allBandsPresent: boolean;
   readonly missingBands: readonly string[];
+  readonly activeStageCount: number;
+  readonly minimumSampleSizeMet: boolean;
+  readonly integrityClean: boolean;
+  readonly operationalComplete: boolean;
   readonly complete: boolean;
+  readonly thinkingAccuracy: LevelAccuracyMetrics;
+  readonly codingAccuracy: LevelAccuracyMetrics;
+  readonly accuracyPassed: boolean;
+  readonly eligible: boolean;
   readonly failureCounts: readonly CalibrationFailureCount[];
   readonly bandSummaries: readonly {
     readonly band: string;
@@ -137,7 +173,10 @@ export function buildLevelsCalibrationReport(
         calibrationFailureCountKey(right)
       )
     );
-  assertNoDuplicateKeys(progress, failureCounts);
+  const activeStages = input.activeStages.map((entry) =>
+    calibrationActiveStageSchema.parse(entry)
+  );
+  assertNoDuplicateKeys(progress, failureCounts, activeStages);
   const runConfiguration = reportRunConfigurationSchema.parse(
     input.runConfiguration
   );
@@ -167,13 +206,39 @@ export function buildLevelsCalibrationReport(
     rows,
     input.expectedProblemCount
   );
+  const operationalComplete =
+    completeness.complete && activeStages.length === 0;
+  const minimumSampleSizeMet =
+    input.expectedProblemCount >= LEVEL_ACCURACY_THRESHOLDS.minimumProblemCount;
+  const integrityClean = failureCounts.length === 0;
+  const complete = operationalComplete && integrityClean;
+  const thinkingAccuracy = buildAccuracyMetrics(
+    rows.map((row) => ({
+      predicted: row.thinkingLevel,
+      expected: row.humanThinkingLevel
+    })),
+    operationalComplete
+  );
+  const codingAccuracy = buildAccuracyMetrics(
+    rows.map((row) => ({
+      predicted: row.codingLevel,
+      expected: row.humanCodingLevel
+    })),
+    operationalComplete
+  );
+  const accuracyPassed =
+    operationalComplete &&
+    minimumSampleSizeMet &&
+    thinkingAccuracy.passed &&
+    codingAccuracy.passed;
+  const eligible = complete && accuracyPassed;
   const monotonicThinking =
-    completeness.complete &&
+    operationalComplete &&
     isNonDecreasing(
       bandSummaries.map((summary) => summary.averageThinking)
     );
   const monotonicCoding =
-    completeness.complete &&
+    operationalComplete &&
     isNonDecreasing(bandSummaries.map((summary) => summary.averageCoding));
   const incompleteProblemCount = input.expectedProblemCount - rows.length;
   const thinkingCompletedProblemCount = progress.filter(
@@ -191,6 +256,9 @@ export function buildLevelsCalibrationReport(
 
   const summary: LevelsCalibrationSummary = {
     label: input.label,
+    datasetId: input.datasetId,
+    chainRunId: input.chainRunId,
+    executionRunId: input.executionRunId,
     profileName: input.profileName,
     experimentFingerprint: fingerprint,
     runConfiguration,
@@ -204,7 +272,15 @@ export function buildLevelsCalibrationReport(
     allProblemsCompleted: completeness.allProblemsCompleted,
     allBandsPresent: completeness.allBandsPresent,
     missingBands: completeness.missingBands,
-    complete: completeness.complete,
+    activeStageCount: activeStages.length,
+    minimumSampleSizeMet,
+    integrityClean,
+    operationalComplete,
+    complete,
+    thinkingAccuracy,
+    codingAccuracy,
+    accuracyPassed,
+    eligible,
     failureCounts,
     bandSummaries,
     monotonicThinking,
@@ -232,15 +308,18 @@ function buildMarkdown(
         );
   const resultRows =
     rows.length === 0
-      ? ["| 暂无完整结果 | - | - | - |"]
+      ? ["| 暂无完整结果 | - | - | - | - | - |"]
       : rows.map(
           (row) =>
-            `| CF${row.contestId}${row.index} | ${row.rating} | ${row.thinkingLevel} | ${row.codingLevel} |`
+            `| ${row.safeId} | ${row.rating} | ${row.humanThinkingLevel} | ${row.thinkingLevel} | ${row.humanCodingLevel} | ${row.codingLevel} |`
         );
 
   return [
     `# 思维/代码难度标定报告（${summary.label}）`,
     "",
+    `- 数据集安全编号：${summary.datasetId}`,
+    `- 实验链编号：${summary.chainRunId}`,
+    `- 本次执行编号：${summary.executionRunId}`,
     `- 模型档位：${summary.profileName}`,
     `- 实验校验摘要：${summary.experimentFingerprint.combinedHash}`,
     `- 已完成题数：${summary.problemCount} / ${summary.expectedProblemCount}（按官方 rating 升序）`,
@@ -249,6 +328,12 @@ function buildMarkdown(
     `- 从已有中间结果复用思维阶段：${summary.resumedThinkingProblemCount}`,
     `- 本次仍未完成：${summary.incompleteProblemCount}`,
     `- 缺少的 rating 段：${summary.missingBands.length === 0 ? "无" : summary.missingBands.join("、")}`,
+    `- 当前是否跑完全部预登记阶段：${summary.operationalComplete ? "是" : "否"}`,
+    `- 是否达到至少 ${LEVEL_ACCURACY_THRESHOLDS.minimumProblemCount} 题：${summary.minimumSampleSizeMet ? "是" : "否"}`,
+    `- 实验链是否没有失败、取消、中断、跳过或陈旧在途证据：${summary.integrityClean ? "是" : "否"}`,
+    `- 完整性是否合格：${summary.complete ? "是" : "否"}`,
+    `- 准确性是否达到最低指标：${summary.accuracyPassed ? "是" : "否"}`,
+    `- 是否可作为合格标定证据：${summary.eligible ? "是" : "否"}`,
     `- 生成时间：${summary.generatedAt}`,
     "",
     "## 本次运行参数",
@@ -257,9 +342,9 @@ function buildMarkdown(
     `- 解题模型服务：${summary.runConfiguration.providers.solver.name}（地址校验值 ${summary.runConfiguration.providers.solver.addressCheck}）`,
     `- 分析模型服务：${summary.runConfiguration.providers.analyst.name}（地址校验值 ${summary.runConfiguration.providers.analyst.addressCheck}）`,
     `- 代码模型服务：${summary.runConfiguration.providers.coding.name}（地址校验值 ${summary.runConfiguration.providers.coding.addressCheck}）`,
-    `- 收到第一段输出后，连续没有新数据的等待上限：${summary.runConfiguration.outputIdleTimeoutMs} 毫秒`,
-    `- 等待第一段输出的上限：${summary.runConfiguration.firstOutputTimeoutMs} 毫秒`,
-    `- 每次向模型服务发出请求的最长时间：${summary.runConfiguration.maximumDurationMs} 毫秒`,
+    `- 收到首个有效输出事件后，连续没有新有效内容的等待上限：${summary.runConfiguration.outputIdleTimeoutMs} 毫秒`,
+    `- 等待首个有效输出事件的上限：${summary.runConfiguration.firstOutputTimeoutMs} 毫秒`,
+    `- 首个有效输出事件到达前（包括明确 429 的重试等待）的最终保护：${summary.runConfiguration.maximumDurationMs} 毫秒；有效输出开始后会清除此保护，它不是持续输出请求的总时限。`,
     `- 最多尝试次数：${summary.runConfiguration.maxAttempts}（只有模型服务明确返回请求过多时才会再次尝试）`,
     `- 首次重试前等待：${summary.runConfiguration.baseDelayMs} 毫秒`,
     `- 同时处理题数：${summary.runConfiguration.concurrency}`,
@@ -281,8 +366,14 @@ function buildMarkdown(
         `| ${band.band} | ${band.count} | ${band.averageThinking} | ${band.averageCoding} |`
     ),
     "",
-    `- 思维难度随 rating 分段单调不降：${summary.complete ? (summary.monotonicThinking ? "是" : "否") : "结果不完整，不能判断"}`,
-    `- 代码难度随 rating 分段单调不降：${summary.complete ? (summary.monotonicCoding ? "是" : "否") : "结果不完整，不能判断"}`,
+    `- 思维难度随 rating 分段单调不降：${summary.operationalComplete ? (summary.monotonicThinking ? "是" : "否") : "结果不完整，不能判断"}`,
+    `- 代码难度随 rating 分段单调不降：${summary.operationalComplete ? (summary.monotonicCoding ? "是" : "否") : "结果不完整，不能判断"}`,
+    "",
+    "## 人工标准准确性",
+    "",
+    `- 最低指标：至少 ${LEVEL_ACCURACY_THRESHOLDS.minimumProblemCount} 题；完全一致率至少 ${formatPercent(LEVEL_ACCURACY_THRESHOLDS.exactRate)}，相差不超过 1 级至少 ${formatPercent(LEVEL_ACCURACY_THRESHOLDS.withinOneRate)}，平均绝对误差不超过 ${LEVEL_ACCURACY_THRESHOLDS.maximumMae}。`,
+    `- 思维难度：完全一致 ${formatPercent(summary.thinkingAccuracy.exactRate)}，相差不超过 1 级 ${formatPercent(summary.thinkingAccuracy.withinOneRate)}，平均绝对误差 ${summary.thinkingAccuracy.mae}，${summary.thinkingAccuracy.passed ? "达标" : "未达标"}。`,
+    `- 代码难度：完全一致 ${formatPercent(summary.codingAccuracy.exactRate)}，相差不超过 1 级 ${formatPercent(summary.codingAccuracy.withinOneRate)}，平均绝对误差 ${summary.codingAccuracy.mae}，${summary.codingAccuracy.passed ? "达标" : "未达标"}。`,
     "",
     "## 阶段失败次数",
     "",
@@ -294,19 +385,19 @@ function buildMarkdown(
     "",
     "## 逐题结果",
     "",
-    "| 题目 | rating | 思维 | 代码 |",
-    "| --- | --- | --- | --- |",
+    "| 安全编号 | rating | 人工思维 | 模型思维 | 人工代码 | 模型代码 |",
+    "| --- | --- | --- | --- | --- | --- |",
     ...resultRows,
     "",
     "## 结论与后续",
     "",
-    !summary.allProblemsCompleted
-      ? "- 本次有题目尚未完成，不能据此调整提示词、工作流或数值映射；请用 --resume 继续补齐。"
-      : !summary.allBandsPresent
-        ? "- 标定集没有同时覆盖低、中、高三个 rating 段，不能判断趋势，也不能据此调整提示词、工作流或数值映射。"
-        : summary.monotonicThinking && summary.monotonicCoding
-          ? "- 当前映射表在标定集上呈单调趋势，可作为初始标准启用；扩大样本后再复核。"
-          : "- 当前映射表在完整标定集上出现非单调段，需要先分析逐题误差，再调整对应流水线并重跑实验。",
+    !summary.integrityClean
+      ? "- 本实验链留下失败、取消、中断、跳过或陈旧在途证据；本链只保留为失败报告，不会继续发起新的付费阶段；合格标定必须使用全新标签从零运行。"
+      : !summary.operationalComplete
+        ? "- 本次有题目尚未完成，但实验链尚无失败证据；不能据此调整提示词、工作流或数值映射，请用同标签 --resume 继续。"
+        : !summary.accuracyPassed
+          ? "- 完整运行的准确性没有达到最低指标，需要调整提示词或处理步骤，并用全新标签重跑。"
+          : "- 本次运行完整、实验链干净且达到人工标准最低指标，可以作为候选标定证据。",
     "- 修改任何映射常量后，必须以新的 --label 重跑本脚本并保留两份报告做对比。"
   ].join("\n");
 }
@@ -323,6 +414,9 @@ function providerReportSchema() {
 function assertSafeReportInput(input: LevelsCalibrationReportInput): void {
   if (
     !/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(input.label) ||
+    !calibrationSafeIdSchema.safeParse(input.datasetId).success ||
+    !calibrationRunIdSchema.safeParse(input.chainRunId).success ||
+    !calibrationRunIdSchema.safeParse(input.executionRunId).success ||
     !/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(input.profileName) ||
     !Number.isSafeInteger(input.expectedProblemCount) ||
     input.expectedProblemCount < 1 ||
@@ -347,16 +441,70 @@ function isSafeCount(value: number, maximum: number): boolean {
 
 function assertNoDuplicateKeys(
   progress: readonly CalibrationProgress[],
-  failureCounts: readonly CalibrationFailureCount[]
+  failureCounts: readonly CalibrationFailureCount[],
+  activeStages: readonly CalibrationActiveStage[]
 ): void {
   const progressKeys = progress.map(calibrationRowKey);
   const failureKeys = failureCounts.map(calibrationFailureCountKey);
+  const activeKeys = activeStages.map(
+    (active) => `${active.safeId}:${active.stage}`
+  );
   if (
     new Set(progressKeys).size !== progressKeys.length ||
-    new Set(failureKeys).size !== failureKeys.length
+    new Set(failureKeys).size !== failureKeys.length ||
+    new Set(activeKeys).size !== activeKeys.length
   ) {
     throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
   }
+}
+
+function buildAccuracyMetrics(
+  values: readonly {
+    readonly predicted: number;
+    readonly expected: number;
+  }[],
+  canPass: boolean
+): LevelAccuracyMetrics {
+  if (values.length === 0) {
+    return {
+      count: 0,
+      exactMatches: 0,
+      exactRate: 0,
+      withinOneMatches: 0,
+      withinOneRate: 0,
+      mae: 0,
+      passed: false
+    };
+  }
+  const errors = values.map((value) =>
+    Math.abs(value.predicted - value.expected)
+  );
+  const exactMatches = errors.filter((error) => error === 0).length;
+  const withinOneMatches = errors.filter((error) => error <= 1).length;
+  const exactRate = exactMatches / values.length;
+  const withinOneRate = withinOneMatches / values.length;
+  const mae = errors.reduce((sum, error) => sum + error, 0) / values.length;
+  return {
+    count: values.length,
+    exactMatches,
+    exactRate: roundedMetric(exactRate),
+    withinOneMatches,
+    withinOneRate: roundedMetric(withinOneRate),
+    mae: roundedMetric(mae),
+    passed:
+      canPass &&
+      exactRate >= LEVEL_ACCURACY_THRESHOLDS.exactRate &&
+      withinOneRate >= LEVEL_ACCURACY_THRESHOLDS.withinOneRate &&
+      mae <= LEVEL_ACCURACY_THRESHOLDS.maximumMae
+  };
+}
+
+function roundedMetric(value: number): number {
+  return Number(value.toFixed(4));
+}
+
+function formatPercent(value: number): string {
+  return `${Number((value * 100).toFixed(2))}%`;
 }
 
 function roundedAverage(values: readonly number[]): number {

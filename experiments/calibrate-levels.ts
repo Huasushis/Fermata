@@ -7,15 +7,17 @@
  *   2. 在标定集上真实跑 thinking / coding 两条流水线，检验“官方 rating 越高，
  *      两个等级的输出趋势是否单调上升”，并给出映射表是否需要调整的结论。
  *
- * 数据要求：experiments/data/levels/ 下的题目 JSON 必须带 editorial（标准题解），
- * 思维流水线要用它对比模型的解题思路。用下面命令抽标定集：
+ * 数据要求：experiments/data/levels/ 下的题目 JSON 必须带 editorial（标准题解）、
+ * 人工确认的 humanThinkingLevel 和 humanCodingLevel。下面命令只能抓取候选题目，
+ * 不会产生这两项人工标准，也不会生成 manifest.private.json：
  *   DATA_SUBDIR=levels SAMPLE_SIZE_PER_BUCKET=1 npm run experiment:fetch-hf-dataset
+ * 抓取后必须人工标注至少 60 题并生成逐文件哈希清单，预检通过后才能付费标定。
  *
  * 用法：
  *   npm run experiment:calibrate-levels -- --label=v1
  */
-import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync } from "node:fs";
 import { getProviderCredentials, loadConfig, type ProfileConfig } from "../src/config";
 import { logError, logInfo, logWarn } from "../src/logger";
 import { runCodingPipeline } from "../src/pipelines/coding";
@@ -35,18 +37,19 @@ import {
   LEVEL_BAND_BOUNDARIES,
   LevelsCalibrationStateError,
   acquireLevelsLabelLock,
+  assertLevelsResumeModeSupported,
   assertCalibrationLabelUnused,
   buildLevelsExperimentFingerprint,
   buildLevelsReportRunConfiguration,
   buildLevelsRunConfiguration,
   checkpointUrl,
   completeCalibrationRows,
+  loadCalibrationDatasetDirectory,
   loadCalibrationCheckpoint,
-  preflightCalibrationDocuments,
   writeCalibrationCheckpoint,
-  writeJsonAtomically,
-  writeTextAtomically,
+  writeCalibrationReportArtifacts,
   type CalibrationCheckpointState,
+  type CalibrationDatasetBundle,
   type CalibrationDatasetItem,
   type LevelsExperimentFingerprint
 } from "./lib/levels-calibration-state";
@@ -76,33 +79,17 @@ const PIPELINE_SOURCE_FILES = {
   )
 } as const;
 
-function loadCalibrationSet(): CalibrationDatasetItem[] {
-  let fileNames: string[];
-  try {
-    fileNames = readdirSync(DATA_DIR)
-      .filter((name) => name.endsWith(".json"))
-      .sort();
-  } catch {
-    throw new LevelsCalibrationStateError("LEVELS_DATA_DIRECTORY_UNREADABLE");
-  }
-  let documents: string[];
-  try {
-    documents = fileNames.map((fileName) =>
-      readFileSync(new URL(fileName, DATA_DIR), "utf8")
-    );
-  } catch {
-    throw new LevelsCalibrationStateError("LEVELS_DATA_READ_FAILED");
-  }
-  return preflightCalibrationDocuments(documents);
+function loadCalibrationSet(): CalibrationDatasetBundle {
+  return loadCalibrationDatasetDirectory(DATA_DIR);
 }
 
 function toProblem(item: CalibrationDatasetItem): ReviewTaskProblem {
   return {
-    id: `calibration-${item.contestId}${item.index}`,
+    id: `calibration-${item.safeId}`,
     revision: 1,
     reviewRound: 1,
     contentHash: createHash("sha256").update(item.statement, "utf8").digest("hex"),
-    title: `CF${item.contestId}${item.index}`,
+    title: `标定题-${item.safeId}`,
     type: "traditional",
     tagIds: ["calibration.sample"],
     basicStatement: item.statement,
@@ -113,6 +100,7 @@ function toProblem(item: CalibrationDatasetItem): ReviewTaskProblem {
 function writeCheckpoint(
   label: string,
   profileName: string,
+  chainRunId: string,
   fingerprint: LevelsExperimentFingerprint,
   state: CalibrationCheckpointState
 ): void {
@@ -120,8 +108,10 @@ function writeCheckpoint(
     target: checkpointUrl(RAW_DIR, label),
     label,
     profileName,
+    chainRunId,
     fingerprint,
     progress: state.progress,
+    activeStages: state.activeStages,
     failureCounts: state.failureCounts
   });
 }
@@ -138,6 +128,10 @@ async function main(): Promise<void> {
     configuredMaximumDurationMs:
       config.models.timeouts.llmMaximumDurationMs,
     configuredMaxAttempts: config.models.retry.maxAttempts
+  });
+  assertLevelsResumeModeSupported({
+    label: options.label,
+    resumeFromLabel: options.resumeFromLabel
   });
   const label = options.label;
   const profileName = config.models.defaults.modelProfileName;
@@ -196,7 +190,8 @@ async function main(): Promise<void> {
     }
   });
 
-  const calibrationSet = loadCalibrationSet();
+  const calibrationBundle = loadCalibrationSet();
+  const calibrationSet = calibrationBundle.items;
   let pipelineSources: Record<string, string>;
   try {
     pipelineSources = Object.fromEntries(
@@ -210,6 +205,7 @@ async function main(): Promise<void> {
   }
   const fingerprint = buildLevelsExperimentFingerprint({
     dataset: calibrationSet,
+    datasetManifestHash: calibrationBundle.manifestHash,
     experimentVersion: config.models.experimentVersion,
     profileName,
     profile,
@@ -236,9 +232,14 @@ async function main(): Promise<void> {
         resultsDirectory: RESULTS_DIR
       });
     }
-    const resumedState: CalibrationCheckpointState =
+    const resumedState =
       options.resumeFromLabel === null
-        ? { progress: [], failureCounts: [] }
+        ? {
+            chainRunId: randomUUID(),
+            progress: [],
+            failureCounts: [],
+            activeStages: []
+          }
         : loadCalibrationCheckpoint({
             source: checkpointUrl(RAW_DIR, options.resumeFromLabel),
             expectedLabel: options.resumeFromLabel,
@@ -252,7 +253,13 @@ async function main(): Promise<void> {
     ).length;
     const pendingProblemCount =
       calibrationSet.length - resumedRows.length;
-    writeCheckpoint(label, profileName, fingerprint, resumedState);
+    writeCheckpoint(
+      label,
+      profileName,
+      resumedState.chainRunId,
+      fingerprint,
+      resumedState
+    );
 
     logInfo("开始标定", {
       label,
@@ -291,12 +298,17 @@ async function main(): Promise<void> {
         return selectCodingCalibrationResult(coding);
       },
       saveCheckpoint: (state) => {
-        writeCheckpoint(label, profileName, fingerprint, state);
+        writeCheckpoint(
+          label,
+          profileName,
+          resumedState.chainRunId,
+          fingerprint,
+          state
+        );
       },
       onStageCompleted: (event) => {
         logInfo("标定阶段完成", {
-          contestId: event.contestId,
-          index: event.index,
+          safeId: event.safeId,
           rating: event.rating,
           stage: event.stage,
           level: event.level,
@@ -304,9 +316,8 @@ async function main(): Promise<void> {
         });
       },
       onStageFailed: (event) => {
-        logWarn("标定阶段失败，稍后可续跑", {
-          contestId: event.contestId,
-          index: event.index,
+        logWarn("标定阶段失败，本链停止发起新的付费阶段", {
+          safeId: event.safeId,
           rating: event.rating,
           stage: event.stage,
           errorCode: event.errorCode,
@@ -317,45 +328,56 @@ async function main(): Promise<void> {
     });
 
     const generatedAt = new Date().toISOString();
-    const stamp = generatedAt.replace(/[:.]/g, "-");
+    const executionRunId = randomUUID();
     writeCalibrationCheckpoint({
-      target: new URL(`levels-${label}-${stamp}.json`, RAW_DIR),
+      target: new URL(
+        `levels-${label}-${executionRunId}-snapshot.json`,
+        RAW_DIR
+      ),
       label,
       profileName,
+      chainRunId: resumedState.chainRunId,
       fingerprint,
       progress: runResult.progress,
+      activeStages: runResult.activeStages,
       failureCounts: runResult.failureCounts
     });
     const report = buildLevelsCalibrationReport({
       label,
+      datasetId: calibrationBundle.datasetId,
+      chainRunId: resumedState.chainRunId,
+      executionRunId,
       profileName,
       fingerprint,
       runConfiguration: reportRunConfiguration,
       progress: runResult.progress,
       failureCounts: runResult.failureCounts,
+      activeStages: runResult.activeStages,
       expectedProblemCount: calibrationSet.length,
       resumedThinkingProblemCount,
       resumedCompleteProblemCount: resumedRows.length,
       completedProblemsThisRun: runResult.completedProblemsThisRun,
       generatedAt
     });
-    writeTextAtomically(
-      new URL(`levels-${label}-report.md`, RESULTS_DIR),
-      report.markdown
-    );
-    writeJsonAtomically(
-      new URL(`levels-${label}-summary.json`, RESULTS_DIR),
-      report.summary
-    );
+    writeCalibrationReportArtifacts({
+      resultsDirectory: RESULTS_DIR,
+      label,
+      executionRunId,
+      markdown: report.markdown,
+      summary: report.summary
+    });
 
-    if (!report.summary.complete) {
-      logWarn("标定结果不完整，报告仅供续跑定位，不能用于调整算法", {
+    if (!report.summary.eligible) {
+      logWarn("标定结果不合格，报告只作为本次实验的保留证据", {
         label,
         problems: report.summary.problemCount,
         thinkingProblems: report.summary.thinkingCompletedProblemCount,
         expectedProblems: calibrationSet.length,
         incompleteProblemCount: report.summary.incompleteProblemCount,
-        missingBands: report.summary.missingBands.join(",")
+        missingBands: report.summary.missingBands.join(","),
+        operationalComplete: report.summary.operationalComplete,
+        integrityClean: report.summary.integrityClean,
+        accuracyPassed: report.summary.accuracyPassed
       });
       process.exitCode = 1;
       return;

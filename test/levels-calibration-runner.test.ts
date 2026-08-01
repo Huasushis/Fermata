@@ -20,9 +20,12 @@ function item(
   rating = 1200
 ): CalibrationDatasetItem {
   return {
+    safeId: `sample-${contestId}-${index}`,
     contestId,
     index,
     rating,
+    humanThinkingLevel: 2,
+    humanCodingLevel: 2,
     statement: `题面-${contestId}`,
     editorial: `题解-${contestId}`
   };
@@ -87,9 +90,12 @@ function codingResult(level = 2): CalibrationCodingResult {
 
 function completeProgress(source: CalibrationDatasetItem): CalibrationProgress {
   return {
+    safeId: source.safeId,
     contestId: source.contestId,
     index: source.index,
     rating: source.rating,
+    humanThinkingLevel: source.humanThinkingLevel,
+    humanCodingLevel: source.humanCodingLevel,
     thinking: thinkingResult(),
     coding: codingResult()
   };
@@ -135,16 +141,23 @@ describe("思维和代码标定的分阶段执行", () => {
         return codingResult();
       },
       saveCheckpoint: (state) => {
+        const activeStage = state.activeStages?.[0]?.stage;
         events.push(
-          state.progress[0]?.coding === undefined
-            ? "save-thinking"
-            : "save-coding"
+          activeStage === "thinking"
+            ? "save-active-thinking"
+            : activeStage === "coding"
+              ? "save-active-coding"
+              : state.progress[0]?.coding === undefined
+                ? "save-thinking"
+                : "save-coding"
         );
       }
     });
     expect(events).toEqual([
+      "save-active-thinking",
       "thinking",
       "save-thinking",
+      "save-active-coding",
       "coding",
       "save-coding"
     ]);
@@ -188,6 +201,10 @@ describe("思维和代码标定的分阶段执行", () => {
         count: 1
       }
     ]);
+    expect(snapshots[0]?.activeStages).toEqual([
+      { safeId: "sample-1-A", stage: "thinking" }
+    ]);
+    expect(snapshots.at(-1)?.activeStages).toEqual([]);
     expect(JSON.stringify({ snapshots, failedEvents })).not.toContain(secret);
   });
 
@@ -197,7 +214,8 @@ describe("思维和代码标定的分阶段执行", () => {
       "LLM_FIRST_OUTPUT_TIMEOUT",
       "LLM_OUTPUT_IDLE_TIMEOUT",
       "LLM_TOTAL_TIMEOUT",
-      "LLM_STREAM_INTERRUPTED"
+      "LLM_STREAM_INTERRUPTED",
+      "LLM_CANCELLED"
     ] satisfies readonly CalibrationFailureCode[]
   )("保留当前模型错误码 %s，且不保存外部错误正文", async (errorCode) => {
     const secret = "MODEL_PROVIDER_ERROR_BODY_MUST_NOT_PERSIST";
@@ -224,6 +242,29 @@ describe("思维和代码标定的分阶段执行", () => {
     expect(JSON.stringify(result)).not.toContain(secret);
   });
 
+  it("付费阶段若被内部状态错误中断，最后检查点保留 active 供下次续跑判为陈旧在途", async () => {
+    const snapshots: CalibrationCheckpointState[] = [];
+    await expect(
+      runLevelsCalibrationStages({
+        items: [item(1)],
+        concurrency: 1,
+        runThinking: async () => {
+          throw new LevelsCalibrationStateError("LEVELS_ATOMIC_WRITE_FAILED");
+        },
+        runCoding: async () => codingResult(),
+        saveCheckpoint: (state) => {
+          snapshots.push(copyState(state));
+        }
+      })
+    ).rejects.toMatchObject({ code: "LEVELS_ATOMIC_WRITE_FAILED" });
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0]).toMatchObject({
+      progress: [],
+      failureCounts: [],
+      activeStages: [{ safeId: "sample-1-A", stage: "thinking" }]
+    });
+  });
+
   it("当前运行不会继续产生旧的笼统模型错误码", async () => {
     const result = await runLevelsCalibrationStages({
       items: [item(1)],
@@ -246,7 +287,7 @@ describe("思维和代码标定的分阶段执行", () => {
     ]);
   });
 
-  it("代码失败后保留思维结果，续跑时跳过思维并只补代码", async () => {
+  it("代码失败后保留思维结果，但受污染实验链续跑不再产生付费请求", async () => {
     const source = item(1);
     const firstThinking = vi.fn(async () => thinkingResult(3));
     const first = await runLevelsCalibrationStages({
@@ -273,28 +314,31 @@ describe("思维和代码标定的分阶段执行", () => {
       }
     ]);
 
-    const failedAgainThinking = vi.fn(async () => thinkingResult(5));
-    const failedAgain = await runLevelsCalibrationStages({
+    const contaminatedThinking = vi.fn(async () => thinkingResult(5));
+    const contaminatedCoding = vi.fn(async () => codingResult(4));
+    const contaminated = await runLevelsCalibrationStages({
       items: [source],
       concurrency: 1,
       initialState: first,
-      runThinking: failedAgainThinking,
-      runCoding: async () => {
-        throw Object.assign(new Error("仍然不能保存的异常说明"), {
-          code: "LLM_OUTPUT_IDLE_TIMEOUT"
-        });
-      },
+      runThinking: contaminatedThinking,
+      runCoding: contaminatedCoding,
       saveCheckpoint: () => undefined
     });
-    expect(failedAgainThinking).not.toHaveBeenCalled();
-    expect(failedAgain.failureCounts[0]?.count).toBe(2);
+    expect(contaminatedThinking).not.toHaveBeenCalled();
+    expect(contaminatedCoding).not.toHaveBeenCalled();
+    expect(contaminated.rows).toEqual([]);
+    expect(contaminated.failureCounts).toEqual(first.failureCounts);
 
     const resumedThinking = vi.fn(async () => thinkingResult(5));
     const resumedCoding = vi.fn(async () => codingResult(4));
     const resumed = await runLevelsCalibrationStages({
       items: [source],
       concurrency: 1,
-      initialState: failedAgain,
+      initialState: {
+        progress: first.progress,
+        failureCounts: [],
+        activeStages: []
+      },
       runThinking: resumedThinking,
       runCoding: resumedCoding,
       saveCheckpoint: () => undefined
@@ -305,7 +349,7 @@ describe("思维和代码标定的分阶段执行", () => {
       thinkingLevel: 3,
       codingLevel: 4
     });
-    expect(resumed.failureCounts).toEqual(failedAgain.failureCounts);
+    expect(resumed.failureCounts).toEqual([]);
   });
 
   it("已经完整的题目不会再次运行任何阶段", async () => {
@@ -318,7 +362,8 @@ describe("思维和代码标定的分阶段执行", () => {
       concurrency: 1,
       initialState: {
         progress: [completeProgress(source)],
-        failureCounts: []
+        failureCounts: [],
+        activeStages: []
       },
       runThinking,
       runCoding,
@@ -404,6 +449,11 @@ describe("思维和代码标定的分阶段执行", () => {
     const snapshots: CalibrationCheckpointState[] = [];
     let activeWrites = 0;
     let maximumActiveWrites = 0;
+    let codingArrived = 0;
+    let releaseCoding = (): void => undefined;
+    const codingBarrier = new Promise<void>((resolve) => {
+      releaseCoding = () => resolve();
+    });
     const result = await runLevelsCalibrationStages({
       items,
       concurrency: 3,
@@ -416,6 +466,11 @@ describe("思维和代码标定的分阶段执行", () => {
         return thinkingResult();
       },
       runCoding: async () => {
+        codingArrived += 1;
+        if (codingArrived === items.length) {
+          releaseCoding();
+        }
+        await codingBarrier;
         throw Object.assign(new Error("服务商原文"), {
           code: "LLM_HTTP_ERROR",
           status: 503
@@ -452,6 +507,144 @@ describe("思维和代码标定的分阶段执行", () => {
         errorCode: "LLM_HTTP_ERROR",
         status: 503,
         count: 3
+      }
+    ]);
+  });
+
+  it("首个普通失败后不启动排队题目或下一付费阶段，只等待在途请求落盘", async () => {
+    const sources = [
+      item(1),
+      item(2, "B", 1800),
+      item(3, "C", 2400)
+    ];
+    let notifySecondStarted = (): void => undefined;
+    const secondStarted = new Promise<void>((resolve) => {
+      notifySecondStarted = () => resolve();
+    });
+    let releaseSecond = (): void => undefined;
+    const secondCanFinish = new Promise<void>((resolve) => {
+      releaseSecond = () => resolve();
+    });
+    const runThinking = vi.fn(async (source: CalibrationDatasetItem) => {
+      if (source.safeId === sources[0]!.safeId) {
+        await secondStarted;
+        throw Object.assign(new Error("不能保存的取消说明"), {
+          code: "LLM_CANCELLED"
+        });
+      }
+      notifySecondStarted();
+      await secondCanFinish;
+      return thinkingResult();
+    });
+    const runCoding = vi.fn(async () => codingResult());
+    let settled = false;
+    const observed = runLevelsCalibrationStages({
+      items: sources,
+      concurrency: 2,
+      runThinking,
+      runCoding,
+      saveCheckpoint: async () => {
+        await Promise.resolve();
+      }
+    }).then((value) => {
+      settled = true;
+      return value;
+    });
+
+    await secondStarted;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    releaseSecond();
+    const result = await observed;
+
+    expect(runThinking).toHaveBeenCalledTimes(2);
+    expect(runThinking).not.toHaveBeenCalledWith(sources[2]);
+    expect(runCoding).not.toHaveBeenCalled();
+    expect(result.progress).toEqual([
+      expect.objectContaining({
+        safeId: sources[1]!.safeId,
+        thinking: thinkingResult()
+      })
+    ]);
+    expect(result.progress[0]?.coding).toBeUndefined();
+    expect(result.failureCounts).toEqual([
+      {
+        stage: "thinking",
+        errorCode: "LLM_CANCELLED",
+        status: null,
+        count: 1
+      }
+    ]);
+  });
+
+  it("最后一次停发检查与同步启动请求之间没有可被另一 worker 插入的微任务间隙", async () => {
+    const sources = [item(1), item(2, "B", 1800)];
+    let notifySecondStarted = (): void => undefined;
+    const secondStarted = new Promise<void>((resolve) => {
+      notifySecondStarted = () => resolve();
+    });
+    let rejectSecond = (_error: Error): void => undefined;
+    const secondResult = new Promise<never>((_resolve, reject) => {
+      rejectSecond = (error) => reject(error);
+    });
+    let failureClassified = false;
+    const failure = new Error("不能保存的取消说明");
+    Object.defineProperty(failure, "code", {
+      configurable: false,
+      enumerable: true,
+      get: () => {
+        failureClassified = true;
+        return "LLM_CANCELLED";
+      }
+    });
+    let rejectionScheduled = false;
+    let failureWasClassifiedWhenCodingStarted: boolean | undefined;
+    const runCoding = vi.fn(async () => {
+      failureWasClassifiedWhenCodingStarted = failureClassified;
+      return codingResult();
+    });
+
+    const result = await runLevelsCalibrationStages({
+      items: sources,
+      concurrency: 2,
+      runThinking: async (source) => {
+        if (source.safeId === sources[0]!.safeId) {
+          await secondStarted;
+          return thinkingResult();
+        }
+        notifySecondStarted();
+        return secondResult;
+      },
+      runCoding,
+      saveCheckpoint: (state) => {
+        if (
+          !rejectionScheduled &&
+          state.activeStages.some(
+            (active) =>
+              active.safeId === sources[0]!.safeId &&
+              active.stage === "coding"
+          )
+        ) {
+          rejectionScheduled = true;
+          queueMicrotask(() => {
+            queueMicrotask(() => {
+              queueMicrotask(() => rejectSecond(failure));
+            });
+          });
+        }
+      }
+    });
+
+    expect(rejectionScheduled).toBe(true);
+    expect(runCoding).toHaveBeenCalledOnce();
+    expect(failureWasClassifiedWhenCodingStarted).toBe(false);
+    expect(failureClassified).toBe(true);
+    expect(result.failureCounts).toEqual([
+      {
+        stage: "thinking",
+        errorCode: "LLM_CANCELLED",
+        status: null,
+        count: 1
       }
     ]);
   });
@@ -522,9 +715,92 @@ describe("思维和代码标定的分阶段执行", () => {
         saveCheckpoint
       })
     ).rejects.toMatchObject({ code: "LEVELS_ATOMIC_WRITE_FAILED" });
-    expect(arrived).toBe(sources.length);
+    expect(arrived).toBe(0);
     expect(saveCheckpoint).toHaveBeenCalledOnce();
     expect(runCoding).not.toHaveBeenCalled();
+  });
+
+  it("一个并发 worker 致命失败后会等待其他在途 worker 和检查点写入真正结束", async () => {
+    const sources = [
+      item(1),
+      item(2, "B", 1800),
+      item(3, "C", 2400)
+    ];
+    const snapshots: CalibrationCheckpointState[] = [];
+    let notifySecondStarted = (): void => undefined;
+    const secondStarted = new Promise<void>((resolve) => {
+      notifySecondStarted = () => resolve();
+    });
+    let notifyFatalThrown = (): void => undefined;
+    const fatalThrown = new Promise<void>((resolve) => {
+      notifyFatalThrown = () => resolve();
+    });
+    let releaseSecond = (): void => undefined;
+    const secondCanFinish = new Promise<void>((resolve) => {
+      releaseSecond = () => resolve();
+    });
+    const runCoding = vi.fn(async () => codingResult());
+    const runThinking = vi.fn(async (source: CalibrationDatasetItem) => {
+      if (source.safeId === sources[0]!.safeId) {
+        await secondStarted;
+        notifyFatalThrown();
+        throw new LevelsCalibrationStateError(
+          "LEVELS_ATOMIC_WRITE_FAILED"
+        );
+      }
+      notifySecondStarted();
+      await secondCanFinish;
+      return thinkingResult();
+    });
+    let settled = false;
+
+    const observed = runLevelsCalibrationStages({
+      items: sources,
+      concurrency: 2,
+      runThinking,
+      runCoding,
+      saveCheckpoint: async (state) => {
+        await Promise.resolve();
+        snapshots.push(copyState(state));
+      }
+    }).then(
+      (value) => ({ succeeded: true as const, value }),
+      (error: unknown) => ({ succeeded: false as const, error })
+    );
+    void observed.then(() => {
+      settled = true;
+    });
+
+    await fatalThrown;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    expect(runCoding).not.toHaveBeenCalled();
+
+    releaseSecond();
+    const outcome = await observed;
+    expect(outcome.succeeded).toBe(false);
+    if (!outcome.succeeded) {
+      expect(outcome.error).toMatchObject({
+        code: "LEVELS_ATOMIC_WRITE_FAILED"
+      });
+    }
+    expect(runCoding).not.toHaveBeenCalled();
+    expect(runThinking).toHaveBeenCalledTimes(2);
+    expect(runThinking).not.toHaveBeenCalledWith(sources[2]);
+    expect(snapshots.at(-1)).toMatchObject({
+      progress: [
+        {
+          safeId: sources[1]!.safeId,
+          thinking: thinkingResult()
+        }
+      ],
+      activeStages: [
+        { safeId: sources[0]!.safeId, stage: "thinking" }
+      ]
+    });
+    const writesAtRejection = snapshots.length;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(snapshots).toHaveLength(writesAtRejection);
   });
 
   it("等待异步保存思维检查点完成后才运行代码阶段", async () => {

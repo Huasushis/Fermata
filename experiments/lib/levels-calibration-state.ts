@@ -1,8 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
+  constants,
   fstatSync,
   fsyncSync,
+  lstatSync,
   openSync,
   readFileSync,
   readdirSync,
@@ -11,6 +13,7 @@ import {
   unlinkSync,
   writeFileSync
 } from "node:fs";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import {
@@ -32,12 +35,23 @@ const calibrationLabelSchema = z
 const calibrationProfileNameSchema = z
   .string()
   .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/);
+export const calibrationSafeIdSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/);
+export const calibrationRunIdSchema = z
+  .string()
+  .uuid()
+  .refine((value) => value !== "00000000-0000-0000-0000-000000000000");
+const humanLevelSchema = z.number().int().min(1).max(5);
 
 export const calibrationDatasetItemSchema = z
   .object({
+    safeId: calibrationSafeIdSchema,
     contestId: z.number().int().positive(),
     index: codeforcesProblemIndexSchema,
     rating: z.number().int().positive(),
+    humanThinkingLevel: humanLevelSchema,
+    humanCodingLevel: humanLevelSchema,
     statement: z.string().min(1),
     editorial: z.string().min(1)
   })
@@ -46,13 +60,74 @@ export type CalibrationDatasetItem = z.infer<typeof calibrationDatasetItemSchema
 
 const calibrationDatasetCandidateSchema = z
   .object({
+    safeId: calibrationSafeIdSchema.optional(),
     contestId: z.number().int().positive(),
     index: codeforcesProblemIndexSchema,
     rating: z.number().int().positive(),
+    humanThinkingLevel: humanLevelSchema,
+    humanCodingLevel: humanLevelSchema,
     statement: z.string().min(1),
     editorial: z.unknown().optional()
   })
   .strict();
+
+const calibrationDatasetManifestEntrySchema = z
+  .object({
+    safeId: calibrationSafeIdSchema,
+    fileName: z
+      .string()
+      .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}\.json$/),
+    sha256: digestSchema
+  })
+  .strict();
+
+export const calibrationDatasetManifestSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    datasetId: calibrationSafeIdSchema,
+    entries: z
+      .array(calibrationDatasetManifestEntrySchema)
+      .min(1)
+      .max(10_000)
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const safeIds = value.entries.map((entry) => entry.safeId);
+    const fileNames = value.entries.map((entry) => entry.fileName);
+    if (new Set(safeIds).size !== safeIds.length) {
+      context.addIssue({
+        code: "custom",
+        message: "标定集清单中的安全编号不能重复。"
+      });
+    }
+    if (new Set(fileNames).size !== fileNames.length) {
+      context.addIssue({
+        code: "custom",
+        message: "标定集清单中的文件不能重复。"
+      });
+    }
+  });
+export type CalibrationDatasetManifest = z.infer<
+  typeof calibrationDatasetManifestSchema
+>;
+
+export interface CalibrationDatasetFile {
+  readonly fileName: string;
+  readonly content: Uint8Array;
+}
+
+export interface CalibrationDatasetBundle {
+  readonly datasetId: string;
+  readonly manifestHash: string;
+  readonly items: readonly CalibrationDatasetItem[];
+}
+
+export interface CalibrationDatasetDirectoryLoadHooks {
+  /** 仅供合成竞态测试；生产调用不得传入。 */
+  readonly afterInitialDirectoryCheck?: () => void;
+  /** 仅供合成竞态测试；生产调用不得传入。 */
+  readonly beforeFinalDirectoryCheck?: () => void;
+}
 
 export const calibrationThinkingSignalsSchema = z
   .object({
@@ -163,9 +238,12 @@ export type CalibrationCodingResult = z.infer<
 
 export const calibrationProgressSchema = z
   .object({
+    safeId: calibrationSafeIdSchema,
     contestId: z.number().int().positive(),
     index: codeforcesProblemIndexSchema,
     rating: z.number().int().positive(),
+    humanThinkingLevel: humanLevelSchema,
+    humanCodingLevel: humanLevelSchema,
     thinking: calibrationThinkingResultSchema.optional(),
     coding: calibrationCodingResultSchema.optional()
   })
@@ -188,9 +266,12 @@ export type CalibrationProgress = z.infer<typeof calibrationProgressSchema>;
 
 export const calibrationRowSchema = z
   .object({
+    safeId: calibrationSafeIdSchema,
     contestId: z.number().int().positive(),
     index: codeforcesProblemIndexSchema,
     rating: z.number().int().positive(),
+    humanThinkingLevel: humanLevelSchema,
+    humanCodingLevel: humanLevelSchema,
     thinkingLevel: z.number().int().min(1).max(5),
     thinkingSignals: calibrationThinkingSignalsSchema,
     codingLevel: z.number().int().min(1).max(5),
@@ -225,12 +306,15 @@ export const calibrationFailureCodeSchema = z.enum([
   "LLM_OUTPUT_IDLE_TIMEOUT",
   "LLM_TOTAL_TIMEOUT",
   "LLM_STREAM_INTERRUPTED",
+  "LLM_CANCELLED",
   "LLM_RESPONSE_BODY_TOO_LARGE",
   "LLM_RESPONSE_FORMAT_INVALID",
   "LLM_JSON_OUTPUT_INVALID",
   "PARSE_ERROR",
   "VALIDATION_ERROR",
   "REQUEST_ABORTED",
+  "HISTORICAL_SKIP",
+  "STALE_IN_FLIGHT",
   "UNEXPECTED_ERROR"
 ]);
 export type CalibrationFailureCode = z.infer<
@@ -268,26 +352,32 @@ export type CalibrationFailureCount = z.infer<
   typeof calibrationFailureCountSchema
 >;
 
-const legacyCalibrationFailureCountSchema = z
+export const calibrationActiveStageSchema = z
   .object({
-    stage: calibrationFailureStageSchema,
-    errorCode: z.literal("LLM_REQUEST_FAILED"),
-    status: z.null(),
-    count: z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+    safeId: calibrationSafeIdSchema,
+    stage: calibrationFailureStageSchema
   })
   .strict();
-type LegacyCalibrationFailureCount = z.infer<
-  typeof legacyCalibrationFailureCountSchema
+export type CalibrationActiveStage = z.infer<
+  typeof calibrationActiveStageSchema
 >;
 
 export interface CalibrationCheckpointState {
   readonly progress: readonly CalibrationProgress[];
   readonly failureCounts: readonly CalibrationFailureCount[];
+  readonly activeStages: readonly CalibrationActiveStage[];
+}
+
+export interface LoadedCalibrationCheckpoint
+  extends CalibrationCheckpointState {
+  readonly chainRunId: string;
+  readonly activeStages: readonly CalibrationActiveStage[];
 }
 
 export const levelsExperimentFingerprintSchema = z
   .object({
-    schemaVersion: z.literal(1),
+    schemaVersion: z.literal(2),
+    datasetManifestHash: digestSchema,
     datasetHash: digestSchema,
     modelConfigurationHash: digestSchema,
     pipelineSourceHash: digestSchema,
@@ -304,6 +394,7 @@ export interface LevelsRunConfiguration {
   };
   readonly outputIdleTimeoutMs: number;
   readonly firstOutputTimeoutMs: number;
+  /** 首个有效输出前（含明确 429 的重试等待）的最终保护；开始有效输出后清除。 */
   readonly maximumDurationMs: number;
   readonly maxAttempts: number;
   readonly baseDelayMs: number;
@@ -327,6 +418,7 @@ export interface LevelsReportRunConfiguration {
   };
   readonly outputIdleTimeoutMs: number;
   readonly firstOutputTimeoutMs: number;
+  /** 首个有效输出前（含明确 429 的重试等待）的最终保护；不是持续输出的总时限。 */
   readonly maximumDurationMs: number;
   readonly maxAttempts: number;
   readonly baseDelayMs: number;
@@ -335,32 +427,22 @@ export interface LevelsReportRunConfiguration {
 
 const savedCheckpointSchema = z
   .object({
-    schemaVersion: z.literal(3),
+    schemaVersion: z.literal(4),
     label: calibrationLabelSchema,
     profileName: calibrationProfileNameSchema,
+    chainRunId: calibrationRunIdSchema,
     fingerprint: levelsExperimentFingerprintSchema,
     progress: z.array(calibrationProgressSchema),
+    activeStages: z.array(calibrationActiveStageSchema),
     failureCounts: z.array(calibrationFailureCountSchema)
   })
   .strict();
 
-const savedCheckpointReadSchema = z
-  .object({
-    schemaVersion: z.literal(3),
-    label: calibrationLabelSchema,
-    profileName: calibrationProfileNameSchema,
-    fingerprint: levelsExperimentFingerprintSchema,
-    progress: z.array(calibrationProgressSchema),
-    failureCounts: z.array(
-      z.union([
-        calibrationFailureCountSchema,
-        legacyCalibrationFailureCountSchema
-      ])
-    )
-  })
-  .strict();
-
 export type LevelsDataIssueCode =
+  | "LEVELS_DATA_MANIFEST_INVALID"
+  | "LEVELS_DATA_MANIFEST_MISMATCH"
+  | "LEVELS_DATA_HASH_MISMATCH"
+  | "LEVELS_DATA_MINIMUM_NOT_MET"
   | "LEVELS_DATA_JSON_INVALID"
   | "LEVELS_DATA_FIELDS_INVALID"
   | "LEVELS_DATA_EDITORIAL_MISSING"
@@ -390,7 +472,10 @@ export type LevelsCalibrationStateErrorCode =
   | "LEVELS_OUTPUT_DIRECTORY_FAILED"
   | "LEVELS_ATOMIC_WRITE_FAILED"
   | "LEVELS_LABEL_LOCKED"
-  | "LEVELS_LOCK_FAILED";
+  | "LEVELS_LOCK_FAILED"
+  | "LEVELS_RESUME_SOURCE_LOCKED"
+  | "LEVELS_CROSS_LABEL_RESUME_UNSUPPORTED"
+  | "LEVELS_REPORT_RUN_ALREADY_USED";
 
 const safeErrorMessages: Readonly<Record<LevelsCalibrationStateErrorCode, string>> = {
   LEVELS_DATA_DIRECTORY_UNREADABLE: "无法读取标定集目录。",
@@ -410,7 +495,11 @@ const safeErrorMessages: Readonly<Record<LevelsCalibrationStateErrorCode, string
   LEVELS_OUTPUT_DIRECTORY_FAILED: "无法准备标定结果目录。",
   LEVELS_ATOMIC_WRITE_FAILED: "无法安全写入标定结果。",
   LEVELS_LABEL_LOCKED: "同一标签已有标定任务在运行。",
-  LEVELS_LOCK_FAILED: "无法创建标定任务运行锁。"
+  LEVELS_LOCK_FAILED: "无法创建标定任务运行锁。",
+  LEVELS_RESUME_SOURCE_LOCKED: "续跑来源仍有标定任务在运行。",
+  LEVELS_CROSS_LABEL_RESUME_UNSUPPORTED:
+    "跨标签复制检查点已停用；只能续跑当前标签。",
+  LEVELS_REPORT_RUN_ALREADY_USED: "本次报告编号已经存在结果文件。"
 };
 
 export class LevelsCalibrationStateError extends Error {
@@ -429,14 +518,237 @@ export class LevelsCalibrationStateError extends Error {
 }
 
 /**
+ * 只允许同标签沿唯一检查点继续。跨标签复制会让同一祖先产生多个分支，其中一个
+ * 分支的失败证据可能被另一个分支绕开，因此在读取数据或发起模型请求前一律拒绝。
+ */
+export function assertLevelsResumeModeSupported(input: {
+  readonly label: string;
+  readonly resumeFromLabel: string | null;
+}): void {
+  if (
+    input.resumeFromLabel !== null &&
+    input.resumeFromLabel !== input.label
+  ) {
+    throw new LevelsCalibrationStateError(
+      "LEVELS_CROSS_LABEL_RESUME_UNSUPPORTED"
+    );
+  }
+}
+
+/**
  * 在任何模型请求发出前一次性检查全部输入。错误只按种类计数，不保留文件名、
  * JSON 片段或字段内容，避免错误信息带出题面和题解。
  */
+export function parseCalibrationDatasetManifest(
+  document: string
+): CalibrationDatasetManifest {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(document) as unknown;
+  } catch {
+    throw new LevelsCalibrationStateError("LEVELS_DATA_PRECHECK_FAILED", [
+      { code: "LEVELS_DATA_MANIFEST_INVALID", count: 1 }
+    ]);
+  }
+  const parsed = calibrationDatasetManifestSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new LevelsCalibrationStateError("LEVELS_DATA_PRECHECK_FAILED", [
+      { code: "LEVELS_DATA_MANIFEST_INVALID", count: 1 }
+    ]);
+  }
+  if (parsed.data.entries.length < 60) {
+    throw new LevelsCalibrationStateError("LEVELS_DATA_PRECHECK_FAILED", [
+      { code: "LEVELS_DATA_MINIMUM_NOT_MET", count: 60 - parsed.data.entries.length }
+    ]);
+  }
+  return parsed.data;
+}
+
+const CALIBRATION_DATASET_MANIFEST_FILE_NAME = "manifest.private.json";
+
+/**
+ * 从固定目录描述符读取完整数据集，避免“先检查路径、后沿路径读取”时文件被换成
+ * 符号链接。两次精确目录扫描夹住全部读取；真正发送给模型的是这里固定到内存的
+ * 字节，不会在付费阶段重新按路径读取。
+ */
+export function loadCalibrationDatasetDirectory(
+  directory: URL,
+  hooks: CalibrationDatasetDirectoryLoadHooks = {}
+): CalibrationDatasetBundle {
+  let directoryDescriptor: number;
+  try {
+    directoryDescriptor = openSync(
+      fileURLToPath(directory),
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+    );
+    if (!fstatSync(directoryDescriptor).isDirectory()) {
+      throw new Error("not-directory");
+    }
+  } catch {
+    throw new LevelsCalibrationStateError("LEVELS_DATA_DIRECTORY_UNREADABLE");
+  }
+
+  try {
+    let manifestContent: Uint8Array;
+    let manifestDocument: string;
+    try {
+      manifestContent = readPinnedDatasetFile(
+        directoryDescriptor,
+        CALIBRATION_DATASET_MANIFEST_FILE_NAME
+      );
+      manifestDocument = new TextDecoder("utf-8", { fatal: true }).decode(
+        manifestContent
+      );
+    } catch {
+      throw new LevelsCalibrationStateError("LEVELS_DATA_PRECHECK_FAILED", [
+        { code: "LEVELS_DATA_MANIFEST_MISMATCH", count: 1 }
+      ]);
+    }
+    const manifest = parseCalibrationDatasetManifest(manifestDocument);
+    const expectedNames = new Set([
+      CALIBRATION_DATASET_MANIFEST_FILE_NAME,
+      ...manifest.entries.map((entry) => entry.fileName)
+    ]);
+    assertExactDatasetDirectory(directoryDescriptor, expectedNames);
+    runDatasetLoadHook(hooks.afterInitialDirectoryCheck);
+
+    let files: CalibrationDatasetFile[];
+    try {
+      files = manifest.entries.map((entry) => ({
+        fileName: entry.fileName,
+        content: readPinnedDatasetFile(directoryDescriptor, entry.fileName)
+      }));
+    } catch {
+      throw new LevelsCalibrationStateError("LEVELS_DATA_READ_FAILED");
+    }
+
+    runDatasetLoadHook(hooks.beforeFinalDirectoryCheck);
+    assertExactDatasetDirectory(directoryDescriptor, expectedNames);
+    for (const [index, entry] of manifest.entries.entries()) {
+      let finalContent: Uint8Array;
+      try {
+        finalContent = readPinnedDatasetFile(
+          directoryDescriptor,
+          entry.fileName
+        );
+      } catch {
+        throw new LevelsCalibrationStateError("LEVELS_DATA_READ_FAILED");
+      }
+      if (!bytesEqual(files[index]!.content, finalContent)) {
+        throw new LevelsCalibrationStateError("LEVELS_DATA_PRECHECK_FAILED", [
+          { code: "LEVELS_DATA_MANIFEST_MISMATCH", count: 1 }
+        ]);
+      }
+    }
+    let finalManifestContent: Uint8Array;
+    try {
+      finalManifestContent = readPinnedDatasetFile(
+        directoryDescriptor,
+        CALIBRATION_DATASET_MANIFEST_FILE_NAME
+      );
+    } catch {
+      throw new LevelsCalibrationStateError("LEVELS_DATA_PRECHECK_FAILED", [
+        { code: "LEVELS_DATA_MANIFEST_MISMATCH", count: 1 }
+      ]);
+    }
+    if (!bytesEqual(manifestContent, finalManifestContent)) {
+      throw new LevelsCalibrationStateError("LEVELS_DATA_PRECHECK_FAILED", [
+        { code: "LEVELS_DATA_MANIFEST_MISMATCH", count: 1 }
+      ]);
+    }
+    return preflightCalibrationDatasetBundle({
+      manifestDocument,
+      manifestContent,
+      files
+    });
+  } finally {
+    try {
+      closeSync(directoryDescriptor);
+    } catch {
+      // 所有数据已固定在内存；关闭失败不能把文件系统原始信息带进日志。
+    }
+  }
+}
+
+/**
+ * 按预登记清单逐字节绑定数据文件。清单外文件、缺失文件、改名或内容变更都会
+ * 在调用模型前整体失败；错误只带固定码和数量，不带私有文件名。
+ */
+export function preflightCalibrationDatasetBundle(input: {
+  readonly manifestDocument: string;
+  readonly manifestContent?: Uint8Array;
+  readonly files: readonly CalibrationDatasetFile[];
+}): CalibrationDatasetBundle {
+  const manifest = parseCalibrationDatasetManifest(input.manifestDocument);
+  const expectedNames = manifest.entries.map((entry) => entry.fileName).sort();
+  const actualNames = input.files.map((entry) => entry.fileName).sort();
+  if (
+    new Set(actualNames).size !== actualNames.length ||
+    expectedNames.length !== actualNames.length ||
+    expectedNames.some((name, index) => name !== actualNames[index])
+  ) {
+    throw new LevelsCalibrationStateError("LEVELS_DATA_PRECHECK_FAILED", [
+      { code: "LEVELS_DATA_MANIFEST_MISMATCH", count: 1 }
+    ]);
+  }
+
+  const filesByName = new Map(
+    input.files.map((entry) => [entry.fileName, entry.content] as const)
+  );
+  let mismatchedHashes = 0;
+  const contents: Uint8Array[] = [];
+  const safeIds: string[] = [];
+  for (const entry of manifest.entries) {
+    const content = filesByName.get(entry.fileName);
+    if (content === undefined) {
+      throw new LevelsCalibrationStateError("LEVELS_DATA_PRECHECK_FAILED", [
+        { code: "LEVELS_DATA_MANIFEST_MISMATCH", count: 1 }
+      ]);
+    }
+    const actualHash = createHash("sha256")
+      .update(content)
+      .digest("hex");
+    if (actualHash !== entry.sha256) {
+      mismatchedHashes += 1;
+    }
+    contents.push(content);
+    safeIds.push(entry.safeId);
+  }
+  if (mismatchedHashes > 0) {
+    throw new LevelsCalibrationStateError("LEVELS_DATA_PRECHECK_FAILED", [
+      { code: "LEVELS_DATA_HASH_MISMATCH", count: mismatchedHashes }
+    ]);
+  }
+  let documents: string[];
+  try {
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    documents = contents.map((content) => decoder.decode(content));
+  } catch {
+    throw new LevelsCalibrationStateError("LEVELS_DATA_PRECHECK_FAILED", [
+      { code: "LEVELS_DATA_JSON_INVALID", count: 1 }
+    ]);
+  }
+
+  return {
+    datasetId: manifest.datasetId,
+    manifestHash: createHash("sha256")
+      .update(input.manifestContent ?? input.manifestDocument)
+      .digest("hex"),
+    items: preflightCalibrationDocuments(documents, safeIds)
+  };
+}
+
 export function preflightCalibrationDocuments(
-  documents: readonly string[]
+  documents: readonly string[],
+  safeIds?: readonly string[]
 ): CalibrationDatasetItem[] {
   if (documents.length === 0) {
     throw new LevelsCalibrationStateError("LEVELS_DATASET_EMPTY");
+  }
+  if (safeIds !== undefined && safeIds.length !== documents.length) {
+    throw new LevelsCalibrationStateError("LEVELS_DATA_PRECHECK_FAILED", [
+      { code: "LEVELS_DATA_MANIFEST_MISMATCH", count: 1 }
+    ]);
   }
 
   const issueCounts = new Map<LevelsDataIssueCode, number>();
@@ -447,7 +759,7 @@ export function preflightCalibrationDocuments(
     issueCounts.set(code, (issueCounts.get(code) ?? 0) + 1);
   };
 
-  for (const document of documents) {
+  for (const [documentIndex, document] of documents.entries()) {
     let raw: unknown;
     try {
       raw = JSON.parse(document) as unknown;
@@ -472,18 +784,34 @@ export function preflightCalibrationDocuments(
       recordIssue("LEVELS_DATA_EDITORIAL_MISSING");
       continue;
     }
+    if (
+      safeIds?.[documentIndex] !== undefined &&
+      candidate.data.safeId !== undefined &&
+      candidate.data.safeId !== safeIds[documentIndex]
+    ) {
+      recordIssue("LEVELS_DATA_MANIFEST_MISMATCH");
+      continue;
+    }
 
     const item = calibrationDatasetItemSchema.parse({
       ...candidate.data,
+      safeId:
+        safeIds?.[documentIndex] ??
+        candidate.data.safeId ??
+        `unregistered-${String(documentIndex + 1).padStart(6, "0")}`,
       editorial: candidate.data.editorial
     });
-    const key = calibrationRowKey(item);
+    const key = `${item.contestId}:${item.index}`;
     if (seenKeys.has(key)) {
       recordIssue("LEVELS_DATA_DUPLICATE");
       continue;
     }
     seenKeys.add(key);
     items.push(item);
+  }
+
+  if (new Set(items.map((item) => item.safeId)).size !== items.length) {
+    recordIssue("LEVELS_DATA_DUPLICATE");
   }
 
   if (issueCounts.size === 0) {
@@ -583,6 +911,7 @@ export function buildLevelsReportRunConfiguration(input: {
 
 export function buildLevelsExperimentFingerprint(input: {
   readonly dataset: readonly CalibrationDatasetItem[];
+  readonly datasetManifestHash: string;
   readonly experimentVersion: string;
   readonly profileName: string;
   readonly profile: unknown;
@@ -592,6 +921,10 @@ export function buildLevelsExperimentFingerprint(input: {
 }): LevelsExperimentFingerprint {
   try {
     assertSafeLevelsRunConfiguration(input.runConfiguration);
+    const datasetManifestHash = input.datasetManifestHash;
+    if (!digestSchema.safeParse(datasetManifestHash).success) {
+      throw new Error("标定集清单摘要格式无效。");
+    }
     const datasetHash = hashCanonicalValue(input.dataset);
     const modelConfigurationHash = hashCanonicalValue({
       experimentVersion: input.experimentVersion,
@@ -604,13 +937,15 @@ export function buildLevelsExperimentFingerprint(input: {
       calibrationProtocol: input.calibrationProtocol
     });
     const combinedHash = hashCanonicalValue({
-      schemaVersion: 1,
+      schemaVersion: 2,
+      datasetManifestHash,
       datasetHash,
       modelConfigurationHash,
       pipelineSourceHash
     });
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      datasetManifestHash,
       datasetHash,
       modelConfigurationHash,
       pipelineSourceHash,
@@ -622,9 +957,15 @@ export function buildLevelsExperimentFingerprint(input: {
 }
 
 export function calibrationRowKey(
-  value: { readonly contestId: number; readonly index: string }
+  value: {
+    readonly safeId?: string;
+    readonly contestId: number;
+    readonly index: string;
+  }
 ): string {
-  return `${value.contestId}:${value.index}`;
+  return value.safeId === undefined
+    ? `${value.contestId}:${value.index}`
+    : `safe:${value.safeId}`;
 }
 
 export function calibrationFailureCountKey(
@@ -659,11 +1000,13 @@ export function assertCalibrationLabelUnused(input: {
   const temporarySuffix = String.raw`(?:\.tmp(?:-[A-Za-z0-9-]+)?)?`;
   const timestamp =
     String.raw`\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z`;
+  const runId =
+    String.raw`[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}`;
   const rawArtifact = new RegExp(
-    `^levels-${escapedLabel}-(?:checkpoint|${timestamp})\\.json${temporarySuffix}$`
+    `^levels-${escapedLabel}-(?:checkpoint|${timestamp}|${runId}-snapshot)\\.json${temporarySuffix}$`
   );
   const resultArtifact = new RegExp(
-    `^levels-${escapedLabel}-(?:summary\\.json|report\\.md)${temporarySuffix}$`
+    `^levels-${escapedLabel}-(?:summary\\.json|report\\.md|${runId}-(?:summary\\.json|report\\.md|completion\\.json))${temporarySuffix}$`
   );
   if (
     rawFileNames.some((fileName) => rawArtifact.test(fileName)) ||
@@ -679,7 +1022,7 @@ export function loadCalibrationCheckpoint(input: {
   readonly expectedProfileName: string;
   readonly expectedFingerprint: LevelsExperimentFingerprint;
   readonly expectedItems: readonly CalibrationDatasetItem[];
-}): CalibrationCheckpointState {
+}): LoadedCalibrationCheckpoint {
   let sourceText: string;
   try {
     sourceText = readFileSync(input.source, "utf8");
@@ -706,13 +1049,13 @@ export function loadCalibrationCheckpoint(input: {
   if (
     typeof parsedSchemaVersion === "number" &&
     Number.isInteger(parsedSchemaVersion) &&
-    parsedSchemaVersion !== 3
+    parsedSchemaVersion !== 4
   ) {
     throw new LevelsCalibrationStateError(
       "LEVELS_CHECKPOINT_VERSION_UNSUPPORTED"
     );
   }
-  const parsed = savedCheckpointReadSchema.safeParse(parsedJson);
+  const parsed = savedCheckpointSchema.safeParse(parsedJson);
   if (!parsed.success) {
     throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
   }
@@ -726,32 +1069,78 @@ export function loadCalibrationCheckpoint(input: {
     throw new LevelsCalibrationStateError("LEVELS_FINGERPRINT_MISMATCH");
   }
 
-  const expectedRatings = new Map<string, number>(
+  const expectedMetadata = new Map(
     input.expectedItems.map(
-      (item) => [calibrationRowKey(item), item.rating] as const
+      (item) => [
+        calibrationRowKey(item),
+        {
+          contestId: item.contestId,
+          index: item.index,
+          rating: item.rating,
+          humanThinkingLevel: item.humanThinkingLevel,
+          humanCodingLevel: item.humanCodingLevel
+        }
+      ] as const
     )
   );
-  if (expectedRatings.size !== input.expectedItems.length) {
+  if (expectedMetadata.size !== input.expectedItems.length) {
     throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
   }
   const seenKeys = new Set<string>();
   for (const progress of parsed.data.progress) {
     const key = calibrationRowKey(progress);
+    const expected = expectedMetadata.get(key);
     if (
       seenKeys.has(key) ||
-      expectedRatings.get(key) !== progress.rating
+      expected === undefined ||
+      expected.contestId !== progress.contestId ||
+      expected.index !== progress.index ||
+      expected.rating !== progress.rating ||
+      expected.humanThinkingLevel !== progress.humanThinkingLevel ||
+      expected.humanCodingLevel !== progress.humanCodingLevel
     ) {
       throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
     }
     seenKeys.add(key);
   }
-  assertUniqueLoadedFailureCounts(parsed.data.failureCounts);
-  const failureCounts = normalizeLoadedFailureCounts(
-    parsed.data.failureCounts
+  assertUniqueFailureCounts(parsed.data.failureCounts);
+  assertUniqueActiveStages(parsed.data.activeStages);
+  const failureCountsByKey = new Map(
+    parsed.data.failureCounts.map(
+      (failure) => [calibrationFailureCountKey(failure), failure] as const
+    )
+  );
+  for (const active of parsed.data.activeStages) {
+    if (!input.expectedItems.some((item) => item.safeId === active.safeId)) {
+      throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
+    }
+    const stale: CalibrationFailureCount = {
+      stage: active.stage,
+      errorCode: "STALE_IN_FLIGHT",
+      status: null,
+      count: 1
+    };
+    const key = calibrationFailureCountKey(stale);
+    const existing = failureCountsByKey.get(key);
+    const merged = calibrationFailureCountSchema.safeParse({
+      ...stale,
+      count: (existing?.count ?? 0) + 1
+    });
+    if (!merged.success) {
+      throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
+    }
+    failureCountsByKey.set(key, merged.data);
+  }
+  const failureCounts = [...failureCountsByKey.values()].sort((left, right) =>
+    calibrationFailureCountKey(left).localeCompare(
+      calibrationFailureCountKey(right)
+    )
   );
   return {
+    chainRunId: parsed.data.chainRunId,
     progress: parsed.data.progress,
-    failureCounts
+    failureCounts,
+    activeStages: []
   };
 }
 
@@ -759,16 +1148,20 @@ export function writeCalibrationCheckpoint(input: {
   readonly target: URL;
   readonly label: string;
   readonly profileName: string;
+  readonly chainRunId: string;
   readonly fingerprint: LevelsExperimentFingerprint;
   readonly progress: readonly CalibrationProgress[];
+  readonly activeStages: readonly CalibrationActiveStage[];
   readonly failureCounts: readonly CalibrationFailureCount[];
 }): void {
   const candidate = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     label: input.label,
     profileName: input.profileName,
+    chainRunId: input.chainRunId,
     fingerprint: input.fingerprint,
     progress: input.progress,
+    activeStages: input.activeStages,
     failureCounts: input.failureCounts
   } as const;
   const parsed = savedCheckpointSchema.safeParse(candidate);
@@ -776,6 +1169,7 @@ export function writeCalibrationCheckpoint(input: {
     throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
   }
   assertUniqueProgress(parsed.data.progress);
+  assertUniqueActiveStages(parsed.data.activeStages);
   assertUniqueFailureCounts(parsed.data.failureCounts);
   writeJsonAtomically(input.target, parsed.data);
 }
@@ -790,9 +1184,12 @@ export function completeCalibrationRows(
     }
     rows.push(
       calibrationRowSchema.parse({
+        safeId: entry.safeId,
         contestId: entry.contestId,
         index: entry.index,
         rating: entry.rating,
+        humanThinkingLevel: entry.humanThinkingLevel,
+        humanCodingLevel: entry.humanCodingLevel,
         thinkingLevel: entry.thinking.level,
         thinkingSignals: entry.thinking.signals,
         codingLevel: entry.coding.level,
@@ -831,6 +1228,7 @@ export function writeTextAtomically(target: URL, value: string): void {
     descriptor = null;
     renameSync(temporaryPath, targetPath);
     temporaryExists = false;
+    fsyncParentDirectory(targetPath);
   } catch {
     throw new LevelsCalibrationStateError("LEVELS_ATOMIC_WRITE_FAILED");
   } finally {
@@ -849,6 +1247,82 @@ export function writeTextAtomically(target: URL, value: string): void {
       }
     }
   }
+}
+
+export interface CalibrationReportArtifacts {
+  readonly reportFileName: string;
+  readonly summaryFileName: string;
+  readonly completionFileName: string;
+}
+
+/**
+ * 每次执行都以新的编号写一对报告；完成标记最后落盘并绑定两份文件的摘要。
+ * 即使同标签续跑，也不会覆盖此前的成功或失败证据。
+ */
+export function writeCalibrationReportArtifacts(input: {
+  readonly resultsDirectory: URL;
+  readonly label: string;
+  readonly executionRunId: string;
+  readonly markdown: string;
+  readonly summary: unknown;
+}): CalibrationReportArtifacts {
+  if (
+    !calibrationLabelSchema.safeParse(input.label).success ||
+    !calibrationRunIdSchema.safeParse(input.executionRunId).success
+  ) {
+    throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
+  }
+  const prefix = `levels-${input.label}-${input.executionRunId}`;
+  const artifacts = {
+    reportFileName: `${prefix}-report.md`,
+    summaryFileName: `${prefix}-summary.json`,
+    completionFileName: `${prefix}-completion.json`
+  } as const;
+  let existingNames: string[];
+  try {
+    existingNames = readdirSync(input.resultsDirectory);
+  } catch {
+    throw new LevelsCalibrationStateError("LEVELS_OUTPUT_DIRECTORY_FAILED");
+  }
+  if (Object.values(artifacts).some((name) => existingNames.includes(name))) {
+    throw new LevelsCalibrationStateError("LEVELS_REPORT_RUN_ALREADY_USED");
+  }
+
+  let summaryText: string;
+  try {
+    summaryText = JSON.stringify(input.summary, null, 2);
+  } catch {
+    throw new LevelsCalibrationStateError("LEVELS_ATOMIC_WRITE_FAILED");
+  }
+  writeTextAtomically(
+    new URL(artifacts.reportFileName, input.resultsDirectory),
+    input.markdown
+  );
+  writeTextAtomically(
+    new URL(artifacts.summaryFileName, input.resultsDirectory),
+    summaryText
+  );
+  writeJsonAtomically(
+    new URL(artifacts.completionFileName, input.resultsDirectory),
+    {
+      schemaVersion: 1,
+      label: input.label,
+      executionRunId: input.executionRunId,
+      report: {
+        fileName: artifacts.reportFileName,
+        sha256: createHash("sha256")
+          .update(input.markdown, "utf8")
+          .digest("hex")
+      },
+      summary: {
+        fileName: artifacts.summaryFileName,
+        sha256: createHash("sha256")
+          .update(summaryText, "utf8")
+          .digest("hex")
+      }
+    }
+  );
+  return artifacts;
 }
 
 export interface LevelsLabelLock {
@@ -917,6 +1391,23 @@ export function acquireLevelsLabelLock(directory: URL, label: string): LevelsLab
   };
 }
 
+export function acquireLevelsResumeSourceLock(
+  directory: URL,
+  label: string
+): LevelsLabelLock {
+  try {
+    return acquireLevelsLabelLock(directory, label);
+  } catch (error) {
+    if (
+      error instanceof LevelsCalibrationStateError &&
+      error.code === "LEVELS_LABEL_LOCKED"
+    ) {
+      throw new LevelsCalibrationStateError("LEVELS_RESUME_SOURCE_LOCKED");
+    }
+    throw error;
+  }
+}
+
 export function levelBandOf(rating: number): LevelBand {
   if (rating < LEVEL_BAND_BOUNDARIES[0]) {
     return "低";
@@ -973,56 +1464,15 @@ function assertUniqueFailureCounts(
   }
 }
 
-function assertUniqueLoadedFailureCounts(
-  failureCounts: readonly (
-    | CalibrationFailureCount
-    | LegacyCalibrationFailureCount
-  )[]
+function assertUniqueActiveStages(
+  activeStages: readonly CalibrationActiveStage[]
 ): void {
-  const keys = failureCounts.map(calibrationFailureCountKey);
+  const keys = activeStages.map(
+    (active) => `${active.safeId}:${active.stage}`
+  );
   if (new Set(keys).size !== keys.length) {
     throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
   }
-}
-
-/**
- * 旧检查点的笼统错误码无法可靠区分网络失败和各类等待超时。读取时将它归入
- * 未知错误并合并计数；新检查点和报告不再允许写回旧码。
- */
-function normalizeLoadedFailureCounts(
-  failureCounts: readonly (
-    | CalibrationFailureCount
-    | LegacyCalibrationFailureCount
-  )[]
-): CalibrationFailureCount[] {
-  const normalizedByKey = new Map<string, CalibrationFailureCount>();
-  for (const failure of failureCounts) {
-    const normalized = calibrationFailureCountSchema.safeParse({
-      ...failure,
-      errorCode:
-        failure.errorCode === "LLM_REQUEST_FAILED"
-          ? "UNEXPECTED_ERROR"
-          : failure.errorCode
-    });
-    if (!normalized.success) {
-      throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
-    }
-    const key = calibrationFailureCountKey(normalized.data);
-    const count = (normalizedByKey.get(key)?.count ?? 0) + normalized.data.count;
-    const merged = calibrationFailureCountSchema.safeParse({
-      ...normalized.data,
-      count
-    });
-    if (!merged.success) {
-      throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
-    }
-    normalizedByKey.set(key, merged.data);
-  }
-  return [...normalizedByKey.values()].sort((left, right) =>
-    calibrationFailureCountKey(left).localeCompare(
-      calibrationFailureCountKey(right)
-    )
-  );
 }
 
 function assertSafeLevelsRunConfiguration(
@@ -1078,6 +1528,7 @@ function fingerprintsEqual(
 ): boolean {
   return (
     left.schemaVersion === right.schemaVersion &&
+    left.datasetManifestHash === right.datasetManifestHash &&
     left.datasetHash === right.datasetHash &&
     left.modelConfigurationHash === right.modelConfigurationHash &&
     left.pipelineSourceHash === right.pipelineSourceHash &&
@@ -1111,6 +1562,135 @@ function stableSerialize(value: unknown): string {
     return `{${entries.join(",")}}`;
   }
   throw new Error("无法生成稳定摘要。");
+}
+
+function readPinnedDatasetFile(
+  directoryDescriptor: number,
+  fileName: string
+): Uint8Array {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}\.json$/.test(fileName)) {
+    throw new LevelsCalibrationStateError("LEVELS_DATA_READ_FAILED");
+  }
+  let descriptor: number | null = null;
+  try {
+    descriptor = openSync(
+      datasetDescriptorPath(directoryDescriptor, fileName),
+      constants.O_RDONLY | constants.O_NOFOLLOW
+    );
+    const before = fstatSync(descriptor, { bigint: true });
+    if (!before.isFile()) {
+      throw new Error("not-regular");
+    }
+    const content = readFileSync(descriptor);
+    const after = fstatSync(descriptor, { bigint: true });
+    if (
+      !after.isFile() ||
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.size !== after.size ||
+      before.mtimeNs !== after.mtimeNs ||
+      before.ctimeNs !== after.ctimeNs ||
+      BigInt(content.byteLength) !== after.size
+    ) {
+      throw new Error("file-changed");
+    }
+    return content;
+  } catch {
+    throw new LevelsCalibrationStateError("LEVELS_DATA_READ_FAILED");
+  } finally {
+    if (descriptor !== null) {
+      try {
+        closeSync(descriptor);
+      } catch {
+        // 只向调用方返回固定码，不包含路径或操作系统错误。
+      }
+    }
+  }
+}
+
+function assertExactDatasetDirectory(
+  directoryDescriptor: number,
+  expectedNames: ReadonlySet<string>
+): void {
+  try {
+    const directoryPath = datasetDescriptorPath(directoryDescriptor);
+    const entries = readdirSync(directoryPath, { withFileTypes: true });
+    if (
+      entries.length !== expectedNames.size ||
+      entries.some(
+        (entry) => !entry.isFile() || !expectedNames.has(entry.name)
+      )
+    ) {
+      throw new Error("directory-mismatch");
+    }
+    for (const name of expectedNames) {
+      const metadata = lstatSync(
+        datasetDescriptorPath(directoryDescriptor, name),
+        { bigint: true }
+      );
+      if (!metadata.isFile()) {
+        throw new Error("not-regular");
+      }
+    }
+  } catch {
+    throw new LevelsCalibrationStateError("LEVELS_DATA_PRECHECK_FAILED", [
+      { code: "LEVELS_DATA_MANIFEST_MISMATCH", count: 1 }
+    ]);
+  }
+}
+
+function datasetDescriptorPath(
+  directoryDescriptor: number,
+  fileName?: string
+): string {
+  const base = `/proc/self/fd/${directoryDescriptor}`;
+  return fileName === undefined ? base : `${base}/${fileName}`;
+}
+
+function runDatasetLoadHook(hook: (() => void) | undefined): void {
+  if (hook === undefined) {
+    return;
+  }
+  try {
+    hook();
+  } catch {
+    throw new LevelsCalibrationStateError("LEVELS_DATA_PRECHECK_FAILED", [
+      { code: "LEVELS_DATA_MANIFEST_MISMATCH", count: 1 }
+    ]);
+  }
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) {
+    return false;
+  }
+  for (let index = 0; index < left.byteLength; index += 1) {
+    if (left[index] !== right[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function fsyncParentDirectory(targetPath: string): void {
+  let descriptor: number | null = null;
+  try {
+    descriptor = openSync(
+      dirname(targetPath),
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+    );
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = null;
+  } finally {
+    if (descriptor !== null) {
+      try {
+        closeSync(descriptor);
+      } catch {
+        // 调用方会把同步失败转换成固定错误码；这里仅避免泄露路径信息。
+      }
+    }
+  }
 }
 
 function errnoCode(error: unknown): string | undefined {
