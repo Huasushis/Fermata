@@ -39,7 +39,13 @@ import {
   type ModelSpec,
   type ProviderCredentials
 } from "../src/config";
-import { createUndiciLlmFetch, type FetchLike, type LlmRuntimeOptions } from "../src/llm";
+import {
+  createUndiciLlmFetch,
+  type FetchLike,
+  type LlmRequestError,
+  type LlmResponseFormatFailureStage,
+  type LlmRuntimeOptions
+} from "../src/llm";
 import { describeError } from "../src/logger";
 import {
   runDifficultyPipeline,
@@ -50,11 +56,13 @@ import { loadDifficultyAnchorsStrict } from "./lib/difficulty-anchors-strict";
 import { hasUnknownPrefixedEnvironmentKeys } from "./lib/evaluation-integrity";
 
 export const difficultyConnectivityProbeExperimentVersion =
-  "experiment-2026-08-difficulty-candidate-c-provider-v1-v3";
-export const difficultyConnectivityPreviousProbeLabel =
-  "difficulty-candidate-c-connectivity-probe-20260801-a";
+  "experiment-2026-08-difficulty-candidate-c-provider-v1-drain-v4";
+export const difficultyConnectivityPreviousProbeLabels = [
+  "difficulty-candidate-c-connectivity-probe-20260801-a",
+  "difficulty-candidate-c-connectivity-probe-20260801-b"
+] as const;
 export const difficultyConnectivityProbeLabel =
-  "difficulty-candidate-c-connectivity-probe-20260801-b";
+  "difficulty-candidate-c-connectivity-probe-20260801-c";
 export const difficultyConnectivityProbeMaxOutputTokens = 2_048;
 
 const repositoryDirectory = fileURLToPath(new URL("../", import.meta.url));
@@ -69,7 +77,7 @@ const lockFileName = `${difficultyConnectivityProbeLabel}.lock.private`;
 export const difficultyConnectivityProbeCompletionFileName =
   `${difficultyConnectivityProbeLabel}.completion.private.json`;
 export const difficultyConnectivityExpectedModelsConfigSha256 =
-  "18aa2eaf2c99482b0946f7257f5367bab77d1edeb33eccf174850c32607fdf81";
+  "fcc7f9f8805c2c8bec3c909dc66b85c025363cb14c2c6e053d8e36313f826703";
 const expectedCandidateCAnchorsSha256 =
   "48b4c5f95732347b2a0a48f4143f50dbc6bc6706f427aa75179def45988b9a7f";
 // 旧 a 探针确认根路径配置会命中不存在的 chat/completions；当前身份只把
@@ -120,6 +128,7 @@ export interface DifficultyConnectivityProbeResult {
   readonly responseBodyCancelled: boolean;
   readonly schemaValidated: true | null;
   readonly stopAndHttpEofVerified: true | null;
+  readonly formatFailureStage: LlmResponseFormatFailureStage | null;
   readonly code: string;
 }
 
@@ -158,6 +167,19 @@ const safeLlmFailureCodes = new Set([
   "LLM_RESPONSE_BODY_TOO_LARGE",
   "LLM_RESPONSE_FORMAT_INVALID",
   "LLM_JSON_OUTPUT_INVALID"
+]);
+const safeFormatFailureStages = new Set<LlmResponseFormatFailureStage>([
+  "missing_body",
+  "content_type",
+  "json_utf8",
+  "json_parse",
+  "response_shape",
+  "sse_utf8",
+  "event_json",
+  "event_shape",
+  "delta_shape",
+  "finish_shape",
+  "trailing_data"
 ]);
 
 const expectedCandidateCAnchors = [
@@ -370,7 +392,8 @@ function failedResult(
     | "httpEofObserved"
     | "responseBodyCancelled"
   >,
-  code: string
+  code: string,
+  formatFailureStage: LlmResponseFormatFailureStage | null = null
 ): DifficultyConnectivityProbeResult {
   return {
     sampleId: "synthetic-connectivity-sum",
@@ -382,6 +405,7 @@ function failedResult(
     responseBodyCancelled: snapshot.responseBodyCancelled,
     schemaValidated: null,
     stopAndHttpEofVerified: null,
+    formatFailureStage,
     code
   };
 }
@@ -397,6 +421,19 @@ function safeFailureCode(error: unknown, snapshot: RequestGuardSnapshot): string
   return safeLlmFailureCodes.has(described)
     ? described
     : "CONNECTIVITY_PROBE_UNCLASSIFIED_FAILURE";
+}
+
+function safeFormatFailureStage(
+  error: unknown
+): LlmResponseFormatFailureStage | null {
+  if (typeof error !== "object" || error === null) return null;
+  const stage = (error as Partial<LlmRequestError> & {
+    readonly formatFailureStage?: unknown;
+  }).formatFailureStage;
+  return typeof stage === "string" &&
+    safeFormatFailureStages.has(stage as LlmResponseFormatFailureStage)
+    ? stage as LlmResponseFormatFailureStage
+    : null;
 }
 
 export async function executeDifficultyConnectivityProbe(input: {
@@ -448,11 +485,16 @@ export async function executeDifficultyConnectivityProbe(input: {
       responseBodyCancelled: false,
       schemaValidated: true,
       stopAndHttpEofVerified: true,
+      formatFailureStage: null,
       code: "CONNECTIVITY_PROBE_SUCCEEDED"
     };
   } catch (error) {
     const snapshot = guard.snapshot();
-    return failedResult(snapshot, safeFailureCode(error, snapshot));
+    return failedResult(
+      snapshot,
+      safeFailureCode(error, snapshot),
+      safeFormatFailureStage(error)
+    );
   }
 }
 
@@ -469,6 +511,7 @@ export function isCompleteDifficultyConnectivityResult(
     !result.responseBodyCancelled &&
     result.schemaValidated === true &&
     result.stopAndHttpEofVerified === true &&
+    result.formatFailureStage === null &&
     result.code === "CONNECTIVITY_PROBE_SUCCEEDED"
   );
 }

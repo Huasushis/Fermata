@@ -43,7 +43,7 @@ function completionResponse(content: string): Response {
     JSON.stringify({
       choices: [{ finish_reason: "stop", message: { role: "assistant", content } }]
     }),
-    { status: 200 }
+    { status: 200, headers: { "Content-Type": "application/json" } }
   );
 }
 

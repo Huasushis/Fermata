@@ -97,7 +97,7 @@ function llmSuccessResponse(overrides: Readonly<Record<string, unknown>> = {}): 
   };
   return new Response(
     JSON.stringify({ choices: [{ finish_reason: "stop", message: { role: "assistant", content: JSON.stringify(combined) } }] }),
-    { status: 200 }
+    { status: 200, headers: { "Content-Type": "application/json" } }
   );
 }
 

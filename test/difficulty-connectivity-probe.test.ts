@@ -29,7 +29,7 @@ import {
   difficultyConnectivityProbeLabel,
   difficultyConnectivityProbeLockRecordSchema,
   difficultyConnectivityProbeRequestBodySchema,
-  difficultyConnectivityPreviousProbeLabel,
+  difficultyConnectivityPreviousProbeLabels,
   executeDifficultyConnectivityProbe,
   isCompleteDifficultyConnectivityResult,
   publishDifficultyConnectivityArtifactExclusive,
@@ -97,6 +97,7 @@ function validResult(): DifficultyConnectivityProbeResult {
     responseBodyCancelled: false,
     schemaValidated: true,
     stopAndHttpEofVerified: true,
+    formatFailureStage: null,
     code: "CONNECTIVITY_PROBE_SUCCEEDED"
   };
 }
@@ -137,9 +138,9 @@ function setupPrivateDirectory() {
 }
 
 describe("Candidate C 连通性请求契约", () => {
-  it("新版本与 provider /v1 身份固定，不能沿用旧 a 标签", () => {
+  it("新版本与 provider /v1 身份固定，不能沿用旧 a/b 标签", () => {
     expect(difficultyConnectivityProbeExperimentVersion).toBe(
-      "experiment-2026-08-difficulty-candidate-c-provider-v1-v3"
+      "experiment-2026-08-difficulty-candidate-c-provider-v1-drain-v4"
     );
     expect(
       sha256ConnectivityProbe(
@@ -147,14 +148,17 @@ describe("Candidate C 连通性请求契约", () => {
       )
     ).toBe(difficultyConnectivityExpectedModelsConfigSha256);
     expect(difficultyConnectivityProbeLabel).toBe(
+      "difficulty-candidate-c-connectivity-probe-20260801-c"
+    );
+    expect(difficultyConnectivityPreviousProbeLabels).toEqual([
+      "difficulty-candidate-c-connectivity-probe-20260801-a",
       "difficulty-candidate-c-connectivity-probe-20260801-b"
-    );
-    expect(difficultyConnectivityPreviousProbeLabel).toBe(
-      "difficulty-candidate-c-connectivity-probe-20260801-a"
-    );
-    expect(difficultyConnectivityProbeCompletionFileName).not.toContain(
-      `${difficultyConnectivityPreviousProbeLabel}.`
-    );
+    ]);
+    for (const previousLabel of difficultyConnectivityPreviousProbeLabels) {
+      expect(difficultyConnectivityProbeCompletionFileName).not.toContain(
+        `${previousLabel}.`
+      );
+    }
     expect(difficultyConnectivityExpectedProviderIdentitySha256).toBe(
       "6e913442f0833b7950c9ae934e46f437dad6ffd72bf847fbe3acee058256050c"
     );
@@ -258,7 +262,57 @@ describe("Candidate C 单请求与真实 EOF", () => {
       requestCount: 1,
       fetchInvocationCount: 2,
       httpEofObserved: true,
+      formatFailureStage: null,
       code: "CONNECTIVITY_PROBE_MULTIPLE_REQUEST_BLOCKED"
+    });
+  });
+
+  it("畸形首事件排空到 EOF 后保留固定阶段且不取消正文", async () => {
+    const encoder = new TextEncoder();
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    let cancelled = false;
+    const baseFetch = vi.fn(async () => new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamController = controller;
+          controller.enqueue(encoder.encode("data: not-json\n\n"));
+        },
+        cancel() {
+          cancelled = true;
+        }
+      }),
+      { status: 200, headers: { "Content-Type": "text/event-stream" } }
+    ));
+
+    let settled = false;
+    const pending = executeDifficultyConnectivityProbe({
+      problem,
+      anchors: [],
+      spec,
+      credentials,
+      runtime,
+      baseFetch
+    }).finally(() => {
+      settled = true;
+    });
+    await vi.waitFor(() => expect(baseFetch).toHaveBeenCalledTimes(1));
+    streamController.enqueue(encoder.encode("ignored-after-format-error"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    expect(cancelled).toBe(false);
+    streamController.close();
+
+    await expect(pending).resolves.toMatchObject({
+      status: "failed",
+      requestCount: 1,
+      fetchInvocationCount: 1,
+      httpStatus: 200,
+      httpEofObserved: true,
+      responseBodyCancelled: false,
+      schemaValidated: null,
+      stopAndHttpEofVerified: null,
+      formatFailureStage: "event_json",
+      code: "LLM_RESPONSE_FORMAT_INVALID"
     });
   });
 
@@ -350,15 +404,17 @@ describe("Candidate C 单请求与真实 EOF", () => {
 });
 
 describe("Candidate C 私有检查点、completion 与标签锁", () => {
-  it("保留旧 a 产物，但 b 只认自己的独立命名空间", () => {
+  it("保留旧 a/b 产物，但 c 只认自己的独立命名空间", () => {
     const fixture = setupPrivateDirectory();
     try {
-      publishDifficultyConnectivityArtifactExclusive(
-        fixture.handle,
-        `${difficultyConnectivityPreviousProbeLabel}.completion.private.json`,
-        "previous-label-test",
-        { complete: false }
-      );
+      for (const previousLabel of difficultyConnectivityPreviousProbeLabels) {
+        publishDifficultyConnectivityArtifactExclusive(
+          fixture.handle,
+          `${previousLabel}.completion.private.json`,
+          `previous-${previousLabel.at(-1) ?? "unknown"}-label-test`,
+          { complete: false }
+        );
+      }
       expect(() =>
         assertDifficultyConnectivityLabelNamespaceUnused(fixture.handle)
       ).not.toThrow();

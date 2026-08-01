@@ -118,7 +118,10 @@ describe("runCodingPipeline：整体接线", () => {
           }
         ]
       };
-      return new Response(JSON.stringify(body), { status: 200 });
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
     });
     const result = await runCodingPipeline({
       problem,

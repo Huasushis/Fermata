@@ -22,7 +22,7 @@ export type ProductionEligibilityDecision =
     };
 
 export const currentBlockedProductionExperimentVersion =
-  "experiment-2026-08-difficulty-candidate-c-provider-v1-v3";
+  "experiment-2026-08-difficulty-candidate-c-provider-v1-drain-v4";
 
 export interface ProductionEligibilityVerifier {
   verify(profileName: string): ProductionEligibilityDecision;

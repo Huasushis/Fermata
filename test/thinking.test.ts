@@ -71,7 +71,7 @@ function textResponse(content: string, reasoning?: string): Response {
         }
       ]
     }),
-    { status: 200 }
+    { status: 200, headers: { "Content-Type": "application/json" } }
   );
 }
 

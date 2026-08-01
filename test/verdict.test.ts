@@ -103,7 +103,8 @@ const modelConfig = (fetchMock: (input: string | URL | Request, init?: RequestIn
 
 function jsonResponse(payload: unknown): Response {
   return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { role: "assistant", content: JSON.stringify(payload) } }] }), {
-    status: 200
+    status: 200,
+    headers: { "Content-Type": "application/json" }
   });
 }
 

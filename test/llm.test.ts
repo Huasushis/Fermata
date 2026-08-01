@@ -563,6 +563,279 @@ describe("chatComplete：正常路径", () => {
     ).rejects.toMatchObject({ code: "LLM_RESPONSE_FORMAT_INVALID" });
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it("SSE 事件首错后静默丢弃多个分块，等真实 EOF 才抛固定首错且不取消", async () => {
+    const encoder = new TextEncoder();
+    let cancelled = false;
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+      },
+      cancel() {
+        cancelled = true;
+      }
+    });
+    const fetchMock = vi.fn(
+      async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      })
+    );
+    let settled = false;
+    const resultPromise = chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    });
+    void resultPromise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      }
+    );
+
+    streamController.enqueue(encoder.encode("data: {not-json}\n\n"));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(settled).toBe(false);
+    expect(cancelled).toBe(false);
+
+    streamController.enqueue(encoder.encode(
+      'data: {"choices":[{"delta":{"content":"不应再解析"},"finish_reason":"length"}]}\n\n'
+    ));
+    streamController.enqueue(encoder.encode("不应被解码或保留的尾部"));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(settled).toBe(false);
+    expect(cancelled).toBe(false);
+
+    streamController.close();
+    await expect(resultPromise).rejects.toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "event_json"
+    });
+    expect(cancelled).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("SSE 未知 finish 首错不会被尾部事件替换，排空 EOF 后保留安全阶段", async () => {
+    const encoder = new TextEncoder();
+    let cancelled = false;
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+      },
+      cancel() {
+        cancelled = true;
+      }
+    });
+    const fetchMock = vi.fn(
+      async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      })
+    );
+    const resultPromise = chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    });
+
+    streamController.enqueue(encoder.encode(
+      'data: {"choices":[{"delta":{"content":"残缺"},"finish_reason":"provider-private"}]}\n\n'
+    ));
+    streamController.enqueue(encoder.encode("data: {not-json}\n\n"));
+    streamController.close();
+
+    await expect(resultPromise).rejects.toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "finish_shape"
+    });
+    expect(cancelled).toBe(false);
+  });
+
+  it("SSE length 终止也先排空到延迟 EOF，再返回固定长度错误且不取消", async () => {
+    const encoder = new TextEncoder();
+    let cancelled = false;
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+      },
+      cancel() {
+        cancelled = true;
+      }
+    });
+    const fetchMock = vi.fn(
+      async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      })
+    );
+    let settled = false;
+    const resultPromise = chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    });
+    void resultPromise.finally(() => {
+      settled = true;
+    }).catch(() => undefined);
+
+    streamController.enqueue(encoder.encode(
+      'data: {"choices":[{"delta":{"content":"已达上限"},"finish_reason":"length"}]}\n\n'
+    ));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(settled).toBe(false);
+    expect(cancelled).toBe(false);
+    streamController.close();
+
+    await expect(resultPromise).rejects.toMatchObject({
+      code: "LLM_OUTPUT_LENGTH_LIMIT"
+    });
+    expect(cancelled).toBe(false);
+  });
+
+  it("不支持的 content-type 只丢弃正文，延迟 EOF 前不结束也不取消", async () => {
+    const encoder = new TextEncoder();
+    let cancelled = false;
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+      },
+      cancel() {
+        cancelled = true;
+      }
+    });
+    const fetchMock = vi.fn(
+      async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/plain; charset=utf-8" }
+      })
+    );
+    let settled = false;
+    const resultPromise = chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    });
+    void resultPromise.finally(() => {
+      settled = true;
+    }).catch(() => undefined);
+
+    streamController.enqueue(encoder.encode("任意服务商正文"));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(settled).toBe(false);
+    expect(cancelled).toBe(false);
+    streamController.close();
+
+    await expect(resultPromise).rejects.toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "content_type"
+    });
+    expect(cancelled).toBe(false);
+  });
+
+  it("JSON UTF-8 首错后排空到 EOF，不用后续字节替换安全阶段", async () => {
+    let cancelled = false;
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+      },
+      cancel() {
+        cancelled = true;
+      }
+    });
+    const fetchMock = vi.fn(
+      async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })
+    );
+    const resultPromise = chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    });
+
+    streamController.enqueue(Uint8Array.of(0xff));
+    streamController.enqueue(new TextEncoder().encode("不应再解析"));
+    streamController.close();
+
+    await expect(resultPromise).rejects.toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "json_utf8"
+    });
+    expect(cancelled).toBe(false);
+  });
+
+  it("协议首错后的底层断流仍报告中断，不把未到达 EOF 伪装成格式完成", async () => {
+    const sensitiveTransportError = "不应泄露的排空断流细节";
+    let cancelled = false;
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+      },
+      cancel() {
+        cancelled = true;
+      }
+    });
+    const fetchMock = vi.fn(
+      async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      })
+    );
+    const resultPromise = chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    });
+
+    streamController.enqueue(new TextEncoder().encode("data: {not-json}\n\n"));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    streamController.error(new Error(sensitiveTransportError));
+
+    const error = await resultPromise.catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      code: "LLM_STREAM_INTERRUPTED",
+      formatFailureStage: "event_json"
+    });
+    expect((error as Error).message).not.toContain(sensitiveTransportError);
+    expect(cancelled).toBe(false);
+  });
+
+  it("协议首错后的排空仍受累计字节上限约束，超限时取消且保留首错阶段", async () => {
+    let cancelled = false;
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+      },
+      cancel() {
+        cancelled = true;
+      }
+    });
+    const fetchMock = vi.fn(
+      async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      })
+    );
+    const resultPromise = chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    });
+
+    streamController.enqueue(new TextEncoder().encode("data: {not-json}\n\n"));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    streamController.enqueue(new Uint8Array(maximumLlmResponseBodyBytes));
+
+    await expect(resultPromise).rejects.toMatchObject({
+      code: "LLM_RESPONSE_BODY_TOO_LARGE",
+      formatFailureStage: "event_json"
+    });
+    expect(cancelled).toBe(true);
+  });
 });
 
 describe("chatComplete：按输出活动判断是否停住", () => {
@@ -709,6 +982,103 @@ describe("chatComplete：按输出活动判断是否停住", () => {
       );
       await vi.advanceTimersByTimeAsync(101);
       await rejection;
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("格式首错后的排空分块刷新既有 idle 边界，停住后按 idle 中止而不伪称 EOF", async () => {
+    vi.useFakeTimers();
+    try {
+      let cancelled = false;
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      const encoder = new TextEncoder();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamController = controller;
+        },
+        cancel() {
+          cancelled = true;
+        }
+      });
+      const fetchMock = vi.fn(
+        async () => new Response(body, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" }
+        })
+      );
+      const resultPromise = chatComplete(provider, spec, [], {
+        outputIdleTimeoutMs: 1_000,
+        firstOutputTimeoutMs: 1_000,
+        maximumDurationMs: 5_000,
+        maxAttempts: 1,
+        baseDelayMs: 1,
+        fetch: fetchMock
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      streamController.enqueue(encoder.encode("data: {not-json}\n\n"));
+      await vi.advanceTimersByTimeAsync(0);
+
+      await vi.advanceTimersByTimeAsync(900);
+      streamController.enqueue(encoder.encode("排空中的非空分块"));
+      await vi.advanceTimersByTimeAsync(0);
+      const rejection = expect(resultPromise).rejects.toMatchObject({
+        code: "LLM_OUTPUT_IDLE_TIMEOUT",
+        formatFailureStage: "event_json"
+      });
+      await vi.advanceTimersByTimeAsync(1_001);
+      await rejection;
+      expect(cancelled).toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("持续排空也不能延长既有 maximumDuration 最终边界", async () => {
+    vi.useFakeTimers();
+    try {
+      let cancelled = false;
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      const encoder = new TextEncoder();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamController = controller;
+        },
+        cancel() {
+          cancelled = true;
+        }
+      });
+      const fetchMock = vi.fn(
+        async () => new Response(body, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" }
+        })
+      );
+      const resultPromise = chatComplete(provider, spec, [], {
+        outputIdleTimeoutMs: 1_000,
+        firstOutputTimeoutMs: 1_000,
+        maximumDurationMs: 2_500,
+        maxAttempts: 1,
+        baseDelayMs: 1,
+        fetch: fetchMock
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      streamController.enqueue(encoder.encode("data: {not-json}\n\n"));
+      await vi.advanceTimersByTimeAsync(0);
+      for (let elapsed = 900; elapsed <= 1_800; elapsed += 900) {
+        await vi.advanceTimersByTimeAsync(900);
+        streamController.enqueue(encoder.encode(`排空分块${elapsed}`));
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      const rejection = expect(resultPromise).rejects.toMatchObject({
+        code: "LLM_TOTAL_TIMEOUT",
+        formatFailureStage: "event_json"
+      });
+      await vi.advanceTimersByTimeAsync(701);
+      await rejection;
+      expect(cancelled).toBe(true);
       expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
@@ -983,7 +1353,12 @@ describe("chatComplete：响应正文大小限制", () => {
     expect(new TextEncoder().encode(responseBody).byteLength).toBe(
       maximumLlmResponseBodyBytes
     );
-    const fetchMock = vi.fn(async () => new Response(responseBody, { status: 200 }));
+    const fetchMock = vi.fn(
+      async () => new Response(responseBody, {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })
+    );
     const result = await chatComplete(provider, spec, [], {
       ...runtime,
       fetch: fetchMock

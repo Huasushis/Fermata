@@ -209,10 +209,13 @@ export class LlmRequestError extends Error {
     | "LLM_OUTPUT_LENGTH_LIMIT"
     | "LLM_OUTPUT_CONTENT_FILTERED";
   public readonly status: number | undefined;
+  /** 排空格式首错时若被超时、取消或断流覆盖，保留安全的最初协议阶段。 */
+  public readonly formatFailureStage: LlmResponseFormatFailureStage | undefined;
 
   public constructor(
     code: LlmRequestError["code"],
-    status?: number
+    status?: number,
+    formatFailureStage?: LlmResponseFormatFailureStage
   ) {
     const messages: Record<LlmRequestError["code"], string> = {
       LLM_HTTP_ERROR: "模型服务返回了错误状态。",
@@ -229,26 +232,48 @@ export class LlmRequestError extends Error {
     this.name = "LlmRequestError";
     this.code = code;
     this.status = status;
+    this.formatFailureStage = formatFailureStage;
   }
 }
 
 /** 响应正文超过固定上限。异常只带固定说明，不保留任何正文片段。 */
 export class LlmResponseBodyTooLargeError extends Error {
   public readonly code = "LLM_RESPONSE_BODY_TOO_LARGE";
+  public readonly formatFailureStage: LlmResponseFormatFailureStage | undefined;
 
-  public constructor() {
+  public constructor(formatFailureStage?: LlmResponseFormatFailureStage) {
     super("模型服务响应正文超过大小限制。");
     this.name = "LlmResponseBodyTooLargeError";
+    this.formatFailureStage = formatFailureStage;
   }
 }
 
-/** 拿到了 2xx 响应，但结构不符合 OpenAI 兼容格式的基本假设（choices/message/content）。 */
+/**
+ * 2xx 响应的安全格式失败阶段。闭集只描述协议层位置，不包含服务商正文、
+ * 字段值或其它可能泄露模型输出的信息。
+ */
+export type LlmResponseFormatFailureStage =
+  | "missing_body"
+  | "content_type"
+  | "json_utf8"
+  | "json_parse"
+  | "response_shape"
+  | "sse_utf8"
+  | "event_json"
+  | "event_shape"
+  | "delta_shape"
+  | "finish_shape"
+  | "trailing_data";
+
+/** 拿到了 2xx 响应，但结构不符合 OpenAI 兼容格式的基本假设。 */
 export class LlmResponseFormatError extends Error {
   public readonly code = "LLM_RESPONSE_FORMAT_INVALID";
+  public readonly formatFailureStage: LlmResponseFormatFailureStage;
 
-  public constructor() {
+  public constructor(formatFailureStage: LlmResponseFormatFailureStage) {
     super("模型服务响应格式不正确。");
     this.name = "LlmResponseFormatError";
+    this.formatFailureStage = formatFailureStage;
   }
 }
 
@@ -496,8 +521,16 @@ async function requestWithRetry(
           return { ok: false, status: response.status, raw: undefined };
         }
       } else {
-        const raw = await parseResponseBody(response, controller, () => {
-          watchdog.receivedValidOutput();
+        const raw = await parseResponseBody(response, controller, {
+          onValidOutput: () => {
+            watchdog.receivedValidOutput();
+          },
+          onInvalidResponseDrainStarted: (formatFailureStage) => {
+            watchdog.invalidResponseDrainStarted(formatFailureStage);
+          },
+          onInvalidResponseDrainActivity: () => {
+            watchdog.receivedInvalidResponseDrainActivity();
+          }
         });
         const timeoutError = watchdog.error();
         if (timeoutError !== undefined) {
@@ -513,7 +546,11 @@ async function requestWithRetry(
         throw timeoutError;
       }
       if (runtime.signal?.aborted) {
-        throw new LlmRequestError("LLM_CANCELLED");
+        throw new LlmRequestError(
+          "LLM_CANCELLED",
+          undefined,
+          watchdog.formatFailureStage()
+        );
       }
       if (
         error instanceof LlmResponseBodyTooLargeError ||
@@ -525,7 +562,9 @@ async function requestWithRetry(
       // fetch 无法证明请求是否已经到达模型服务。自动重发可能让同一题重复计费，
       // 因此只有服务端明确返回“请求过多”(429)时才自动重试。
       throw new LlmRequestError(
-        responseReceived ? "LLM_STREAM_INTERRUPTED" : "LLM_NETWORK_FAILED"
+        responseReceived ? "LLM_STREAM_INTERRUPTED" : "LLM_NETWORK_FAILED",
+        undefined,
+        watchdog.formatFailureStage()
       );
     } finally {
       runtime.signal?.removeEventListener("abort", cancelForTaskState);
@@ -576,6 +615,8 @@ class LlmRequestWatchdog {
   #maximumDurationTimer: NodeJS.Timeout | null = null;
   #timeoutCode: LlmTimeoutCode | null = null;
   #receivedValidOutput = false;
+  #drainingInvalidResponse = false;
+  #formatFailureStage: LlmResponseFormatFailureStage | undefined;
 
   public constructor(
     controller: AbortController,
@@ -617,10 +658,52 @@ class LlmRequestWatchdog {
     }, this.#outputIdleTimeoutMs);
   }
 
+  /**
+   * 协议首错并不证明 HTTP 正文已经结束。进入排空阶段后，首输出等待改为
+   * 对原始分块的连续停顿保护；若此前已有合法输出并清除了最终保护，则从
+   * 排空开始重新用同一 maximumDurationMs 建立最终边界。它不是 120 秒之类
+   * 的隐藏短时限，也不会因持续收到分块而无限延长。
+   */
+  public invalidResponseDrainStarted(
+    formatFailureStage?: LlmResponseFormatFailureStage
+  ): void {
+    if (this.#timeoutCode !== null || this.#drainingInvalidResponse) return;
+    this.#drainingInvalidResponse = true;
+    this.#formatFailureStage = formatFailureStage;
+    if (this.#firstOutputTimer !== null) {
+      clearTimeout(this.#firstOutputTimer);
+      this.#firstOutputTimer = null;
+    }
+    if (this.#maximumDurationTimer === null) {
+      this.#maximumDurationTimer = setTimeout(() => {
+        this.#abort("LLM_TOTAL_TIMEOUT");
+      }, this.#maximumDurationMs);
+    }
+    this.receivedInvalidResponseDrainActivity();
+  }
+
+  public receivedInvalidResponseDrainActivity(): void {
+    if (this.#timeoutCode !== null || !this.#drainingInvalidResponse) return;
+    if (this.#outputIdleTimer !== null) {
+      clearTimeout(this.#outputIdleTimer);
+    }
+    this.#outputIdleTimer = setTimeout(() => {
+      this.#abort("LLM_OUTPUT_IDLE_TIMEOUT");
+    }, this.#outputIdleTimeoutMs);
+  }
+
   public error(): LlmRequestError | undefined {
     return this.#timeoutCode === null
       ? undefined
-      : new LlmRequestError(this.#timeoutCode);
+      : new LlmRequestError(
+        this.#timeoutCode,
+        undefined,
+        this.#formatFailureStage
+      );
+  }
+
+  public formatFailureStage(): LlmResponseFormatFailureStage | undefined {
+    return this.#formatFailureStage;
   }
 
   public close(): void {
@@ -772,90 +855,172 @@ async function delayBeforeRetry(
   }
 }
 
+interface ResponseBodyActivityObserver {
+  readonly onValidOutput: () => void;
+  readonly onInvalidResponseDrainStarted: (
+    formatFailureStage?: LlmResponseFormatFailureStage
+  ) => void;
+  readonly onInvalidResponseDrainActivity: () => void;
+}
+
 async function parseResponseBody(
   response: Response,
   requestController: AbortController,
-  onValidOutput: () => void
+  observer: ResponseBodyActivityObserver
 ): Promise<unknown> {
-  const mediaType = response.headers.get("content-type")?.toLowerCase() ?? "";
-  if (response.ok && mediaType.includes("text/event-stream")) {
+  if (response.body === null) {
+    throw new LlmResponseFormatError("missing_body");
+  }
+  const mediaType = response.headers
+    .get("content-type")
+    ?.split(";", 1)[0]
+    ?.trim()
+    .toLowerCase();
+  if (mediaType === "text/event-stream") {
     return readChatCompletionEventStream(
       response,
       requestController,
-      onValidOutput
+      observer
     );
   }
-  const text = await readResponseTextWithLimit(response, requestController);
-  if (text.length === 0) {
-    throw new LlmResponseFormatError();
+  if (
+    mediaType !== undefined &&
+    mediaType.length > 0 &&
+    mediaType !== "application/json" &&
+    !mediaType.endsWith("+json")
+  ) {
+    return drainResponseAfterProtocolError(
+      response,
+      requestController,
+      observer,
+      new LlmResponseFormatError("content_type")
+    );
   }
+  const text = await readResponseTextWithLimit(
+    response,
+    requestController,
+    observer
+  );
   let raw: unknown;
   try {
     raw = JSON.parse(text) as unknown;
   } catch {
-    throw new LlmResponseFormatError();
+    throw new LlmResponseFormatError("json_parse");
   }
   // JSON 回退没有可靠的逐事件边界，只在 HTTP EOF 后验证整个响应。
   // 它必须明确 finish_reason=stop 且最终 content 非空白，然后才算
   // 收到有效模型输出。reasoning-only 不会被暗中升格为最终答案。
   extractChatCompletion(raw, true);
-  onValidOutput();
+  observer.onValidOutput();
   return raw;
 }
 
 async function readResponseTextWithLimit(
   response: Response,
-  requestController: AbortController
+  requestController: AbortController,
+  observer: ResponseBodyActivityObserver
 ): Promise<string> {
-  if (response.body === null) {
-    return "";
-  }
-
+  if (response.body === null) throw new LlmResponseFormatError("missing_body");
   const reader = response.body.getReader();
-  let bytes = new Uint8Array(0);
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let text = "";
   let totalBytes = 0;
   let readerFinished = false;
+  let readerErrored = false;
+  let firstProtocolError: LlmResponseFormatError | undefined;
   try {
     for (;;) {
-      const chunk = await waitForOrAbort(
-        reader.read(),
-        requestController.signal
-      );
+      let chunk: Awaited<ReturnType<typeof reader.read>>;
+      try {
+        chunk = await waitForOrAbort(reader.read(), requestController.signal);
+      } catch (error) {
+        readerErrored = !requestController.signal.aborted;
+        throw error;
+      }
       if (chunk.done) {
         readerFinished = true;
+        if (firstProtocolError !== undefined) throw firstProtocolError;
         try {
-          return new TextDecoder("utf-8", { fatal: true }).decode(
-            bytes.subarray(0, totalBytes)
-          );
+          text += decoder.decode();
+          return text;
         } catch {
-          throw new LlmResponseFormatError();
+          throw new LlmResponseFormatError("json_utf8");
         }
       }
-      if (chunk.value.byteLength > maximumLlmResponseBodyBytes - totalBytes) {
-        try {
-          const cancellation = reader.cancel();
-          void cancellation.catch(() => undefined);
-        } catch {
-          // 取消失败不能替换固定异常，也不能把底层错误原文带出去。
+      totalBytes = addResponseChunkSize(
+        totalBytes,
+        chunk.value.byteLength,
+        firstProtocolError?.formatFailureStage
+      );
+      if (firstProtocolError !== undefined) {
+        if (chunk.value.byteLength > 0) {
+          observer.onInvalidResponseDrainActivity();
         }
-        requestController.abort();
-        throw new LlmResponseBodyTooLargeError();
+        continue;
       }
-      const requiredBytes = totalBytes + chunk.value.byteLength;
-      if (requiredBytes > bytes.byteLength) {
-        const nextCapacity = Math.min(
-          maximumLlmResponseBodyBytes,
-          Math.max(requiredBytes, Math.max(64 * 1024, bytes.byteLength * 2))
+      try {
+        text += decoder.decode(chunk.value, { stream: true });
+      } catch {
+        firstProtocolError = new LlmResponseFormatError("json_utf8");
+        // 首错后的正文不再解码或拼接；清除已收内容，只保留固定阶段。
+        text = "";
+        observer.onInvalidResponseDrainStarted(
+          firstProtocolError.formatFailureStage
         );
-        const expanded = new Uint8Array(nextCapacity);
-        expanded.set(bytes.subarray(0, totalBytes));
-        bytes = expanded;
       }
-      bytes.set(chunk.value, totalBytes);
-      totalBytes += chunk.value.byteLength;
     }
   } finally {
-    if (!readerFinished) {
+    if (!readerFinished && !readerErrored) {
+      cancelReaderWithoutReplacingResult(reader);
+      requestController.abort();
+    }
+    try {
+      reader.releaseLock();
+    } catch {
+      // 读取结果或固定错误已经确定，不再用流清理错误覆盖它。
+    }
+  }
+}
+
+async function drainResponseAfterProtocolError(
+  response: Response,
+  requestController: AbortController,
+  observer: ResponseBodyActivityObserver,
+  firstProtocolError: LlmResponseFormatError
+): Promise<never> {
+  if (response.body === null) throw firstProtocolError;
+  const reader = response.body.getReader();
+  let readerFinished = false;
+  let readerErrored = false;
+  let totalBytes = 0;
+  observer.onInvalidResponseDrainStarted(
+    firstProtocolError.formatFailureStage
+  );
+  try {
+    for (;;) {
+      let chunk: Awaited<ReturnType<typeof reader.read>>;
+      try {
+        chunk = await waitForOrAbort(reader.read(), requestController.signal);
+      } catch (error) {
+        readerErrored = !requestController.signal.aborted;
+        throw error;
+      }
+      if (chunk.done) {
+        readerFinished = true;
+        throw firstProtocolError;
+      }
+      totalBytes = addResponseChunkSize(
+        totalBytes,
+        chunk.value.byteLength,
+        firstProtocolError.formatFailureStage
+      );
+      // 排空阶段不解码、不拼接、不解析，也不保留任何响应字节。
+      if (chunk.value.byteLength > 0) {
+        observer.onInvalidResponseDrainActivity();
+      }
+    }
+  } finally {
+    if (!readerFinished && !readerErrored) {
       cancelReaderWithoutReplacingResult(reader);
       requestController.abort();
     }
@@ -878,10 +1043,10 @@ interface ChatCompletionStreamState {
 async function readChatCompletionEventStream(
   response: Response,
   requestController: AbortController,
-  onValidOutput: () => void
+  observer: ResponseBodyActivityObserver
 ): Promise<unknown> {
   if (response.body === null) {
-    throw new LlmRequestError("LLM_STREAM_INTERRUPTED");
+    throw new LlmResponseFormatError("missing_body");
   }
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -896,15 +1061,24 @@ async function readChatCompletionEventStream(
   let trailingCarriageReturn = false;
   let totalBytes = 0;
   let readerFinished = false;
+  let readerErrored = false;
+  let firstProtocolError:
+    | LlmResponseFormatError
+    | LlmRequestError
+    | undefined;
 
   try {
     for (;;) {
-      const chunk = await waitForOrAbort(
-        reader.read(),
-        requestController.signal
-      );
+      let chunk: Awaited<ReturnType<typeof reader.read>>;
+      try {
+        chunk = await waitForOrAbort(reader.read(), requestController.signal);
+      } catch (error) {
+        readerErrored = !requestController.signal.aborted;
+        throw error;
+      }
       if (chunk.done) {
         readerFinished = true;
+        if (firstProtocolError !== undefined) throw firstProtocolError;
         ({ pending, trailingCarriageReturn } = appendEventStreamText(
           pending,
           trailingCarriageReturn,
@@ -916,10 +1090,14 @@ async function readChatCompletionEventStream(
           if (boundary < 0) break;
           const event = pending.slice(0, boundary);
           pending = pending.slice(boundary + 2);
-          if (consumeChatCompletionEvent(event, state)) onValidOutput();
+          if (consumeChatCompletionEvent(event, state)) {
+            observer.onValidOutput();
+          }
         }
         if (pending.trim().length > 0) {
-          if (consumeChatCompletionEvent(pending, state)) onValidOutput();
+          if (consumeChatCompletionEvent(pending, state)) {
+            observer.onValidOutput();
+          }
         }
         if (!state.sawChoice || !state.sawStop) {
           throw new LlmRequestError("LLM_STREAM_INTERRUPTED");
@@ -933,27 +1111,50 @@ async function readChatCompletionEventStream(
       totalBytes = addResponseChunkSize(
         totalBytes,
         chunk.value.byteLength,
-        reader,
-        requestController
+        firstProtocolError instanceof LlmResponseFormatError
+          ? firstProtocolError.formatFailureStage
+          : undefined
       );
+      if (firstProtocolError !== undefined) {
+        if (chunk.value.byteLength > 0) {
+          observer.onInvalidResponseDrainActivity();
+        }
+        continue;
+      }
       if (chunk.value.byteLength === 0) continue;
-      ({ pending, trailingCarriageReturn } = appendEventStreamText(
-        pending,
-        trailingCarriageReturn,
-        decodeEventStreamText(decoder, chunk.value),
-        false
-      ));
+      try {
+        ({ pending, trailingCarriageReturn } = appendEventStreamText(
+          pending,
+          trailingCarriageReturn,
+          decodeEventStreamText(decoder, chunk.value),
+          false
+        ));
 
-      for (;;) {
-        const boundary = pending.indexOf("\n\n");
-        if (boundary < 0) break;
-        const event = pending.slice(0, boundary);
-        pending = pending.slice(boundary + 2);
-        if (consumeChatCompletionEvent(event, state)) onValidOutput();
+        for (;;) {
+          const boundary = pending.indexOf("\n\n");
+          if (boundary < 0) break;
+          const event = pending.slice(0, boundary);
+          pending = pending.slice(boundary + 2);
+          if (consumeChatCompletionEvent(event, state)) {
+            observer.onValidOutput();
+          }
+        }
+      } catch (error) {
+        if (!isDrainableResponseProtocolError(error)) throw error;
+        firstProtocolError = error;
+        // 首错后不再保留、解码或解析模型正文，避免后续字段替换首错。
+        pending = "";
+        state.content = "";
+        state.reasoning = "";
+        observer.onInvalidResponseDrainStarted(
+          error instanceof LlmResponseFormatError
+            ? error.formatFailureStage
+            : undefined
+        );
       }
     }
   } finally {
-    if (!readerFinished) {
+    if (!readerFinished && !readerErrored) {
       cancelReaderWithoutReplacingResult(reader);
       requestController.abort();
     }
@@ -965,6 +1166,17 @@ async function readChatCompletionEventStream(
   }
 }
 
+function isDrainableResponseProtocolError(
+  error: unknown
+): error is LlmResponseFormatError | LlmRequestError {
+  return (
+    error instanceof LlmResponseFormatError ||
+    (error instanceof LlmRequestError &&
+      (error.code === "LLM_OUTPUT_LENGTH_LIMIT" ||
+        error.code === "LLM_OUTPUT_CONTENT_FILTERED"))
+  );
+}
+
 function decodeEventStreamText(
   decoder: TextDecoder,
   bytes?: Uint8Array
@@ -974,7 +1186,7 @@ function decodeEventStreamText(
       ? decoder.decode()
       : decoder.decode(bytes, { stream: true });
   } catch {
-    throw new LlmResponseFormatError();
+    throw new LlmResponseFormatError("sse_utf8");
   }
 }
 
@@ -1018,7 +1230,7 @@ function consumeChatCompletionEvent(
   if (data.length === 0) return false;
   if (state.sawDone) {
     // [DONE] 后只能是 HTTP 正常收尾；继续出现非空事件说明响应次序损坏。
-    throw new LlmResponseFormatError();
+    throw new LlmResponseFormatError("trailing_data");
   }
   if (data === "[DONE]") {
     state.sawDone = true;
@@ -1029,18 +1241,18 @@ function consumeChatCompletionEvent(
   try {
     raw = JSON.parse(data) as unknown;
   } catch {
-    throw new LlmResponseFormatError();
+    throw new LlmResponseFormatError("event_json");
   }
   if (typeof raw !== "object" || raw === null) {
-    throw new LlmResponseFormatError();
+    throw new LlmResponseFormatError("event_shape");
   }
   const rawRecord = raw as Record<string, unknown>;
   if (Object.prototype.hasOwnProperty.call(rawRecord, "error")) {
-    throw new LlmResponseFormatError();
+    throw new LlmResponseFormatError("event_shape");
   }
   const choices = rawRecord.choices;
   if (!Array.isArray(choices)) {
-    throw new LlmResponseFormatError();
+    throw new LlmResponseFormatError("event_shape");
   }
   if (choices.length === 0) {
     // 部分服务商会在答案后发送只含用量的事件。
@@ -1049,27 +1261,27 @@ function consumeChatCompletionEvent(
   if (state.sawStop) {
     // finish_reason=stop 之后只允许用量事件或 [DONE]。继续出现答案片段说明
     // 服务端的流不完整或次序异常，不能把前半段误当成完整结果。
-    throw new LlmResponseFormatError();
+    throw new LlmResponseFormatError("trailing_data");
   }
   const choice = choices[0];
   if (typeof choice !== "object" || choice === null) {
-    throw new LlmResponseFormatError();
+    throw new LlmResponseFormatError("event_shape");
   }
   state.sawChoice = true;
   const choiceRecord = choice as Record<string, unknown>;
-  assertSafeFinishReason(choiceRecord.finish_reason);
+  assertSafeFinishReason(choiceRecord.finish_reason, "finish_shape");
   const deltaOrMessage =
     typeof choiceRecord.delta === "object" && choiceRecord.delta !== null
       ? choiceRecord.delta
       : choiceRecord.message;
   if (typeof deltaOrMessage !== "object" || deltaOrMessage === null) {
-    throw new LlmResponseFormatError();
+    throw new LlmResponseFormatError("delta_shape");
   }
   const part = deltaOrMessage as Record<string, unknown>;
   for (const field of ["reasoning_content", "reasoning", "content"] as const) {
     const value = part[field];
     if (value !== undefined && value !== null && typeof value !== "string") {
-      throw new LlmResponseFormatError();
+      throw new LlmResponseFormatError("delta_shape");
     }
   }
   let hasValidOutput = false;
@@ -1090,7 +1302,10 @@ function consumeChatCompletionEvent(
   return hasValidOutput;
 }
 
-function assertSafeFinishReason(finishReason: unknown): void {
+function assertSafeFinishReason(
+  finishReason: unknown,
+  failureStage: LlmResponseFormatFailureStage
+): void {
   if (
     finishReason === undefined ||
     finishReason === null ||
@@ -1106,7 +1321,7 @@ function assertSafeFinishReason(finishReason: unknown): void {
   }
   // 未知终止原因（包括工具调用）不能被当作完整文本，也不能把服务商
   // 返回的原始字符串放进异常或日志。
-  throw new LlmResponseFormatError();
+  throw new LlmResponseFormatError(failureStage);
 }
 
 function chatCompletionStreamResult(state: ChatCompletionStreamState): unknown {
@@ -1127,13 +1342,10 @@ function chatCompletionStreamResult(state: ChatCompletionStreamState): unknown {
 function addResponseChunkSize(
   totalBytes: number,
   nextBytes: number,
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  requestController: AbortController
+  formatFailureStage?: LlmResponseFormatFailureStage
 ): number {
   if (nextBytes > maximumLlmResponseBodyBytes - totalBytes) {
-    cancelReaderWithoutReplacingResult(reader);
-    requestController.abort();
-    throw new LlmResponseBodyTooLargeError();
+    throw new LlmResponseBodyTooLargeError(formatFailureStage);
   }
   return totalBytes + nextBytes;
 }
@@ -1158,30 +1370,30 @@ function extractChatCompletion(
   requireStop = false
 ): ChatCompletionResult {
   if (typeof raw !== "object" || raw === null) {
-    throw new LlmResponseFormatError();
+    throw new LlmResponseFormatError("response_shape");
   }
   const choices = (raw as Record<string, unknown>).choices;
   if (!Array.isArray(choices) || choices.length === 0) {
-    throw new LlmResponseFormatError();
+    throw new LlmResponseFormatError("response_shape");
   }
   const first: unknown = choices[0];
   if (typeof first !== "object" || first === null) {
-    throw new LlmResponseFormatError();
+    throw new LlmResponseFormatError("response_shape");
   }
   const firstRecord = first as Record<string, unknown>;
   if (requireStop) {
-    assertSafeFinishReason(firstRecord.finish_reason);
+    assertSafeFinishReason(firstRecord.finish_reason, "finish_shape");
     if (firstRecord.finish_reason !== "stop") {
-      throw new LlmResponseFormatError();
+      throw new LlmResponseFormatError("finish_shape");
     }
   }
   const message = firstRecord.message;
   if (typeof message !== "object" || message === null) {
-    throw new LlmResponseFormatError();
+    throw new LlmResponseFormatError("response_shape");
   }
   const content = (message as Record<string, unknown>).content;
   if (typeof content !== "string" || content.trim().length === 0) {
-    throw new LlmResponseFormatError();
+    throw new LlmResponseFormatError("response_shape");
   }
   const reasoningRaw = (message as Record<string, unknown>).reasoning_content;
   const reasoning = typeof reasoningRaw === "string" ? reasoningRaw : null;
