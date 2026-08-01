@@ -131,7 +131,277 @@ describe("LLM 生产 HTTP 传输层", () => {
     )).resolves.toMatchObject({ content: "代理路径成功" });
     expect(proxyReceivedRequest).toBe(true);
   });
+
+  it("大且持续分块的 404 正文只留下固定状态，清理后仍能继续请求", async () => {
+    let requestCount = 0;
+    let errorBodyClosed = false;
+    const server = createServer((_request, response) => {
+      requestCount += 1;
+      if (requestCount === 1) {
+        response.writeHead(404, "provider-private-status", {
+          "Content-Type": "application/json",
+          "X-Provider-Error": "provider-private-header"
+        });
+        response.flushHeaders();
+        const chunk = Buffer.alloc(512 * 1024, 0x78);
+        response.write(chunk);
+        const timer = setInterval(() => {
+          response.write(chunk);
+        }, 10);
+        response.once("close", () => {
+          clearInterval(timer);
+          errorBodyClosed = true;
+        });
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        choices: [{
+          message: { role: "assistant", content: "错误响应后仍可用" },
+          finish_reason: "stop"
+        }]
+      }));
+    });
+    const baseUrl = await listen(server);
+    const dispatcher = new Agent({ connectTimeout: 1_000 });
+    dispatchers.push(dispatcher);
+    const undiciFetch = createUndiciLlmFetch(dispatcher);
+    let errorResponseBody: ReadableStream<Uint8Array> | null | undefined;
+    let errorResponseStatusText: string | undefined;
+    let errorResponseHeaders: Array<[string, string]> | undefined;
+    const inspectingFetch = async (
+      input: string | URL | Request,
+      init?: RequestInit
+    ): Promise<Response> => {
+      const response = await undiciFetch(input, init);
+      if (!response.ok) {
+        errorResponseBody = response.body;
+        errorResponseStatusText = response.statusText;
+        errorResponseHeaders = Array.from(response.headers.entries());
+      }
+      return response;
+    };
+
+    const observed = await captureProcessAsyncFailures(async () => {
+      const error = await chatComplete(
+        { baseUrl: `${baseUrl}/v1`, apiKey: "local-test-key" },
+        { model: "local-model", temperature: 0, thinking: false },
+        [],
+        {
+          outputIdleTimeoutMs: 1_000,
+          firstOutputTimeoutMs: 1_000,
+          maximumDurationMs: 2_000,
+          maxAttempts: 3,
+          baseDelayMs: 1,
+          fetch: inspectingFetch
+        }
+      ).catch((caught: unknown) => caught);
+      expect(error).toMatchObject({
+        code: "LLM_HTTP_ERROR",
+        status: 404,
+        message: "模型服务返回了错误状态。"
+      });
+      expect(requestCount).toBe(1);
+
+      return chatComplete(
+        { baseUrl: `${baseUrl}/v1`, apiKey: "local-test-key" },
+        { model: "local-model", temperature: 0, thinking: false },
+        [],
+        {
+          outputIdleTimeoutMs: 1_000,
+          firstOutputTimeoutMs: 1_000,
+          maximumDurationMs: 2_000,
+          maxAttempts: 1,
+          baseDelayMs: 1,
+          fetch: undiciFetch
+        }
+      );
+    });
+
+    expect(observed.result).toEqual({
+      content: "错误响应后仍可用",
+      reasoning: null
+    });
+    expect(errorResponseBody).toBeNull();
+    expect(errorResponseStatusText).toBe("");
+    expect(errorResponseHeaders).toEqual([]);
+    expect(errorBodyClosed).toBe(true);
+    expect(requestCount).toBe(2);
+    expect(observed.uncaughtExceptions).toEqual([]);
+    expect(observed.unhandledRejections).toEqual([]);
+  });
+
+  it("慢速分块 429 安全重试，成功流仍等待真正 EOF，后续请求仍可用", async () => {
+    let requestCount = 0;
+    let rateLimitBodyClosed = false;
+    let markSuccessfulStreamStarted!: () => void;
+    const successfulStreamStarted = new Promise<void>((resolve) => {
+      markSuccessfulStreamStarted = resolve;
+    });
+    let releaseSuccessfulEof!: () => void;
+    const successfulEof = new Promise<void>((resolve) => {
+      releaseSuccessfulEof = resolve;
+    });
+    const server = createServer((_request, response) => {
+      requestCount += 1;
+      if (requestCount === 1) {
+        response.writeHead(429, "provider-private-status", {
+          "Content-Type": "application/json",
+          "X-Provider-Error": "provider-private-header"
+        });
+        response.flushHeaders();
+        const chunk = Buffer.alloc(512 * 1024, 0x79);
+        response.write(chunk);
+        const timer = setInterval(() => {
+          response.write(chunk);
+        }, 10);
+        response.once("close", () => {
+          clearInterval(timer);
+          rateLimitBodyClosed = true;
+        });
+        return;
+      }
+      if (requestCount === 2) {
+        response.writeHead(200, { "Content-Type": "text/event-stream" });
+        response.write(
+          'data: {"choices":[{"delta":{"content":"限流后完整"},"finish_reason":"stop"}]}\n\n'
+        );
+        response.write("data: [DONE]\n\n");
+        markSuccessfulStreamStarted();
+        void successfulEof.then(() => {
+          response.end();
+        });
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        choices: [{
+          message: { role: "assistant", content: "后续请求可用" },
+          finish_reason: "stop"
+        }]
+      }));
+    });
+    const baseUrl = await listen(server);
+    const dispatcher = new Agent({ connectTimeout: 1_000 });
+    dispatchers.push(dispatcher);
+    const undiciFetch = createUndiciLlmFetch(dispatcher);
+    const nonSuccessResponses: Array<{
+      readonly status: number;
+      readonly body: ReadableStream<Uint8Array> | null;
+      readonly statusText: string;
+      readonly headers: Array<[string, string]>;
+    }> = [];
+    const inspectingFetch = async (
+      input: string | URL | Request,
+      init?: RequestInit
+    ): Promise<Response> => {
+      const response = await undiciFetch(input, init);
+      if (!response.ok) {
+        nonSuccessResponses.push({
+          status: response.status,
+          body: response.body,
+          statusText: response.statusText,
+          headers: Array.from(response.headers.entries())
+        });
+      }
+      return response;
+    };
+
+    const observed = await captureProcessAsyncFailures(async () => {
+      let retrySettled = false;
+      const retried = chatComplete(
+        { baseUrl: `${baseUrl}/v1`, apiKey: "local-test-key" },
+        { model: "local-model", temperature: 0, thinking: false },
+        [],
+        {
+          outputIdleTimeoutMs: 1_000,
+          firstOutputTimeoutMs: 1_000,
+          maximumDurationMs: 2_000,
+          maxAttempts: 2,
+          baseDelayMs: 1,
+          fetch: inspectingFetch
+        }
+      );
+      void retried.then(
+        () => {
+          retrySettled = true;
+        },
+        () => {
+          retrySettled = true;
+        }
+      );
+      await successfulStreamStarted;
+      await nextEventLoopTurn();
+      expect(retrySettled).toBe(false);
+      releaseSuccessfulEof();
+      const retriedResult = await retried;
+
+      const followingResult = await chatComplete(
+        { baseUrl: `${baseUrl}/v1`, apiKey: "local-test-key" },
+        { model: "local-model", temperature: 0, thinking: false },
+        [],
+        {
+          outputIdleTimeoutMs: 1_000,
+          firstOutputTimeoutMs: 1_000,
+          maximumDurationMs: 2_000,
+          maxAttempts: 1,
+          baseDelayMs: 1,
+          fetch: undiciFetch
+        }
+      );
+      return { retriedResult, followingResult };
+    });
+
+    expect(observed.result).toEqual({
+      retriedResult: { content: "限流后完整", reasoning: null },
+      followingResult: { content: "后续请求可用", reasoning: null }
+    });
+    expect(nonSuccessResponses).toEqual([{
+      status: 429,
+      body: null,
+      statusText: "",
+      headers: []
+    }]);
+    expect(rateLimitBodyClosed).toBe(true);
+    expect(requestCount).toBe(3);
+    expect(observed.uncaughtExceptions).toEqual([]);
+    expect(observed.unhandledRejections).toEqual([]);
+  });
 });
+
+async function captureProcessAsyncFailures<T>(
+  action: () => Promise<T>
+): Promise<{
+  readonly result: T;
+  readonly uncaughtExceptions: unknown[];
+  readonly unhandledRejections: unknown[];
+}> {
+  const uncaughtExceptions: unknown[] = [];
+  const unhandledRejections: unknown[] = [];
+  const onUncaughtException = (error: unknown): void => {
+    uncaughtExceptions.push(error);
+  };
+  const onUnhandledRejection = (reason: unknown): void => {
+    unhandledRejections.push(reason);
+  };
+  process.on("uncaughtException", onUncaughtException);
+  process.on("unhandledRejection", onUnhandledRejection);
+  try {
+    const result = await action();
+    await nextEventLoopTurn();
+    await nextEventLoopTurn();
+    return { result, uncaughtExceptions, unhandledRejections };
+  } finally {
+    process.removeListener("uncaughtException", onUncaughtException);
+    process.removeListener("unhandledRejection", onUnhandledRejection);
+  }
+}
+
+function nextEventLoopTurn(): Promise<void> {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+}
 
 async function listen(server: Server): Promise<string> {
   servers.push(server);

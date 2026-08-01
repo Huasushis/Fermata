@@ -123,6 +123,16 @@ async function requestWithUndici(
     bodyTimeout: 0
   });
 
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    // 错误正文可能很大、迟迟不结束，也可能回显请求里的私有题面。不要把
+    // BodyReadable 转成 Web ReadableStream：在 Node 的适配器边界取消这类
+    // 流会让 Undici 在稍后的回调里再次关闭 controller，进而抛出未捕获的
+    // ERR_INVALID_STATE。先在原始 Node 流上安装错误处理，再立即销毁；上层
+    // 只会看到状态码，不会读取正文、服务商错误头或自定义状态文字。
+    destroyUndiciErrorBodyWithoutReading(response.body);
+    return new Response(null, { status: response.statusCode });
+  }
+
   const headers = new Headers();
   for (const [name, value] of Object.entries(response.headers)) {
     if (Array.isArray(value)) {
@@ -132,7 +142,7 @@ async function requestWithUndici(
     }
   }
 
-  if ([204, 205, 304].includes(response.statusCode)) {
+  if ([204, 205].includes(response.statusCode)) {
     await response.body.dump();
     return new Response(null, {
       status: response.statusCode,
@@ -146,6 +156,20 @@ async function requestWithUndici(
     statusText: response.statusText,
     headers
   });
+}
+
+function destroyUndiciErrorBodyWithoutReading(body: Readable): void {
+  const ignoreDestroyError = (): void => undefined;
+  const removeDestroyErrorHandler = (): void => {
+    body.removeListener("error", ignoreDestroyError);
+  };
+
+  // Undici 会把尚未读完的 BodyReadable.destroy() 转成一次异步
+  // RequestAbortedError。监听器必须在 destroy() 前就位，并保留到 close，
+  // 否则这个仅用于清理的错误可能变成进程级未捕获异常。
+  body.on("error", ignoreDestroyError);
+  body.once("close", removeDestroyErrorHandler);
+  body.destroy();
 }
 
 /** 模型请求未完成；只包含固定分类和状态码，不带服务商错误正文。 */
