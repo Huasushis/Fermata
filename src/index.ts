@@ -6,6 +6,8 @@ import { ConfigError, loadConfig, missingProvidersForProfile, type ProfileConfig
 import { logError, logInfo, logWarn } from "./logger";
 import { loadDifficultyAnchors } from "./pipelines/difficulty";
 import { ReviewerWorker } from "./reviewer";
+import { createDefaultReviewerSettings } from "./reviewer-activation";
+import { createProductionEligibilityVerifier } from "./production-eligibility";
 import { createManagementServer } from "./server";
 import { SettingsStore } from "./settings-store";
 import { UrmotivClient } from "./urmotiv-client";
@@ -38,13 +40,7 @@ function run(): void {
 
   const settingsStore = new SettingsStore({
     filePath: config.server.settingsPath,
-    defaultSettings: {
-      enabled: true,
-      pollingIntervalSeconds: config.models.defaults.pollingIntervalSeconds,
-      maximumConcurrentTasks: config.models.defaults.maximumConcurrentTasks,
-      modelProfileName: config.models.defaults.modelProfileName,
-      experimentVersion: config.models.experimentVersion
-    }
+    defaultSettings: createDefaultReviewerSettings(config.models)
   });
 
   const urmotivClient = new UrmotivClient({
@@ -52,11 +48,14 @@ function run(): void {
     robotToken: config.urmotiv.robotToken
   });
 
+  const productionEligibility = createProductionEligibilityVerifier(config);
+
   const reviewer = new ReviewerWorker({
     urmotivClient,
     settingsStore,
     appConfig: config,
-    anchors
+    anchors,
+    productionEligibility: (profileName) => productionEligibility.verify(profileName)
   });
 
   const secretsConfigured = (): boolean => {

@@ -44,6 +44,19 @@ describe("SettingsStore：初始化", () => {
     expect(second.get()).toEqual({ settings: changed, revision: 2 });
   });
 
+  it("已有旧 experimentVersion 保持原值，不会被新部署的默认值自动改写", () => {
+    const oldSettings = { ...defaultSettings, enabled: true, experimentVersion: "experiment-old" };
+    writeFileSync(filePath, JSON.stringify({ revision: 7, settings: oldSettings }), "utf8");
+
+    const store = new SettingsStore({
+      filePath,
+      defaultSettings: { ...defaultSettings, enabled: false, experimentVersion: "experiment-current" }
+    });
+
+    expect(store.get()).toEqual({ settings: oldSettings, revision: 7 });
+    expect(JSON.parse(readFileSync(filePath, "utf8"))).toEqual({ revision: 7, settings: oldSettings });
+  });
+
   it("文件存在但内容不是合法 JSON 时拒绝启动", () => {
     writeFileSync(filePath, "{ not valid json", "utf8");
     expect(() => new SettingsStore({ filePath, defaultSettings })).toThrow(SettingsFileCorruptedError);
@@ -52,6 +65,15 @@ describe("SettingsStore：初始化", () => {
   it("文件存在但不满足 schema 时拒绝启动", () => {
     writeFileSync(filePath, JSON.stringify({ revision: 1, settings: { enabled: "not-a-boolean" } }), "utf8");
     expect(() => new SettingsStore({ filePath, defaultSettings })).toThrow(SettingsFileCorruptedError);
+  });
+
+  it("已有设置缺少 experimentVersion 时拒绝启动，不会用当前默认版本补写", () => {
+    const { experimentVersion: _missing, ...settingsWithoutVersion } = defaultSettings;
+    const original = JSON.stringify({ revision: 3, settings: settingsWithoutVersion });
+    writeFileSync(filePath, original, "utf8");
+
+    expect(() => new SettingsStore({ filePath, defaultSettings })).toThrow(SettingsFileCorruptedError);
+    expect(readFileSync(filePath, "utf8")).toBe(original);
   });
 });
 

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../src/config";
-import { ReviewerWorker } from "../src/reviewer";
+import { ReviewerWorker, type ReviewerWorkerOptions } from "../src/reviewer";
 import { SettingsConflictError, type SettingsStoreLike } from "../src/settings-store";
 import { UrmotivApiError, type UrmotivClientLike } from "../src/urmotiv-client";
 import type { FermataPublicSettings, RobotReviewTask } from "../src/urmotiv-schemas";
@@ -148,6 +148,16 @@ function createFakeUrmotivClient(): FakeUrmotivClient {
   };
 }
 
+function createReviewer(options: ReviewerWorkerOptions): ReviewerWorker {
+  return new ReviewerWorker({
+    ...options,
+    productionEligibility: options.productionEligibility ?? (() => ({
+      eligible: true,
+      evidenceFingerprint: "a".repeat(64)
+    }))
+  });
+}
+
 let worker: ReviewerWorker | null = null;
 
 beforeEach(() => {
@@ -177,7 +187,7 @@ describe("ReviewerWorker：基本轮询与处理", () => {
       experimentVersion: "exp-test"
     });
 
-    worker = new ReviewerWorker({
+    worker = createReviewer({
       urmotivClient: client,
       settingsStore,
       appConfig,
@@ -232,7 +242,7 @@ describe("ReviewerWorker：基本轮询与处理", () => {
       experimentVersion: "exp-test"
     });
 
-    worker = new ReviewerWorker({
+    worker = createReviewer({
       urmotivClient: client,
       settingsStore,
       appConfig: highThresholdConfig,
@@ -257,7 +267,7 @@ describe("ReviewerWorker：基本轮询与处理", () => {
       modelProfileName: "test-profile",
       experimentVersion: "exp-test"
     });
-    worker = new ReviewerWorker({ urmotivClient: client, settingsStore, appConfig, anchors: [] });
+    worker = createReviewer({ urmotivClient: client, settingsStore, appConfig, anchors: [] });
     worker.start();
     await flushAsync();
 
@@ -273,6 +283,39 @@ describe("ReviewerWorker：基本轮询与处理", () => {
       modelProfileName: "test-profile",
       experimentVersion: "exp-test"
     });
+    worker = createReviewer({ urmotivClient: client, settingsStore, appConfig, anchors: [] });
+    worker.start();
+    await flushAsync();
+
+    expect(client.claimMock).not.toHaveBeenCalled();
+  });
+
+  it("enabled 为 true 但 experimentVersion 仍是旧值时也拒绝领取任务", async () => {
+    const client = createFakeUrmotivClient();
+    const settingsStore = createFakeSettingsStore({
+      enabled: true,
+      pollingIntervalSeconds: 30,
+      maximumConcurrentTasks: 2,
+      modelProfileName: "test-profile",
+      experimentVersion: "exp-old"
+    });
+    worker = createReviewer({ urmotivClient: client, settingsStore, appConfig, anchors: [] });
+    worker.start();
+    await flushAsync();
+
+    expect(client.claimMock).not.toHaveBeenCalled();
+  });
+
+  it("enabled 与 experimentVersion 都匹配但没有生产资格证据时仍不领取任务", async () => {
+    const client = createFakeUrmotivClient();
+    const settingsStore = createFakeSettingsStore({
+      enabled: true,
+      pollingIntervalSeconds: 30,
+      maximumConcurrentTasks: 2,
+      modelProfileName: "test-profile",
+      experimentVersion: "exp-test"
+    });
+    // 故意不用测试 helper 注入合格证据；生产门遗漏装配时也必须 fail-closed。
     worker = new ReviewerWorker({ urmotivClient: client, settingsStore, appConfig, anchors: [] });
     worker.start();
     await flushAsync();
@@ -289,7 +332,7 @@ describe("ReviewerWorker：基本轮询与处理", () => {
       modelProfileName: "not-a-real-profile",
       experimentVersion: "exp-test"
     });
-    worker = new ReviewerWorker({ urmotivClient: client, settingsStore, appConfig, anchors: [] });
+    worker = createReviewer({ urmotivClient: client, settingsStore, appConfig, anchors: [] });
     worker.start();
     await flushAsync();
 
@@ -305,7 +348,7 @@ describe("ReviewerWorker：基本轮询与处理", () => {
       modelProfileName: "test-profile",
       experimentVersion: "exp-test"
     });
-    worker = new ReviewerWorker({ urmotivClient: client, settingsStore, appConfig, anchors: [] });
+    worker = createReviewer({ urmotivClient: client, settingsStore, appConfig, anchors: [] });
     worker.start();
     await flushAsync();
     expect(client.claimMock).toHaveBeenCalledTimes(1);
@@ -327,7 +370,7 @@ describe("ReviewerWorker：基本轮询与处理", () => {
       modelProfileName: "test-profile",
       experimentVersion: "exp-test"
     });
-    worker = new ReviewerWorker({
+    worker = createReviewer({
       urmotivClient: client,
       settingsStore,
       appConfig,
@@ -366,7 +409,7 @@ describe("ReviewerWorker：续租", () => {
       modelProfileName: "test-profile",
       experimentVersion: "exp-test"
     });
-    worker = new ReviewerWorker({
+    worker = createReviewer({
       urmotivClient: client,
       settingsStore,
       appConfig,
@@ -416,7 +459,7 @@ describe("ReviewerWorker：续租", () => {
       modelProfileName: "test-profile",
       experimentVersion: "exp-test"
     });
-    worker = new ReviewerWorker({
+    worker = createReviewer({
       urmotivClient: client,
       settingsStore,
       appConfig,
@@ -468,7 +511,7 @@ describe("ReviewerWorker：续租", () => {
       modelProfileName: "test-profile",
       experimentVersion: "exp-test"
     });
-    worker = new ReviewerWorker({
+    worker = createReviewer({
       urmotivClient: client,
       settingsStore,
       appConfig,
@@ -516,7 +559,7 @@ describe("ReviewerWorker：续租", () => {
       modelProfileName: "test-profile",
       experimentVersion: "exp-test"
     });
-    worker = new ReviewerWorker({
+    worker = createReviewer({
       urmotivClient: client,
       settingsStore,
       appConfig,
@@ -565,7 +608,7 @@ describe("ReviewerWorker：续租", () => {
         modelProfileName: "test-profile",
         experimentVersion: "exp-test"
       });
-      worker = new ReviewerWorker({
+      worker = createReviewer({
         urmotivClient: client,
         settingsStore,
         appConfig,
@@ -609,7 +652,7 @@ describe("ReviewerWorker：续租", () => {
       modelProfileName: "test-profile",
       experimentVersion: "exp-test"
     });
-    worker = new ReviewerWorker({
+    worker = createReviewer({
       urmotivClient: client,
       settingsStore,
       appConfig,
@@ -652,7 +695,7 @@ describe("ReviewerWorker：停机", () => {
       modelProfileName: "test-profile",
       experimentVersion: "exp-test"
     });
-    worker = new ReviewerWorker({
+    worker = createReviewer({
       urmotivClient: client,
       settingsStore,
       appConfig,
@@ -706,7 +749,7 @@ describe("ReviewerWorker：停机", () => {
       modelProfileName: "test-profile",
       experimentVersion: "exp-test"
     });
-    worker = new ReviewerWorker({ urmotivClient: client, settingsStore, appConfig, anchors: [] });
+    worker = createReviewer({ urmotivClient: client, settingsStore, appConfig, anchors: [] });
     worker.start();
     await flushAsync();
     expect(client.claimMock).toHaveBeenCalledTimes(1);

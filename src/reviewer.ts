@@ -26,6 +26,11 @@ import type { PipelineModelConfig } from "./pipelines/types";
 import { runThinkingPipeline } from "./pipelines/thinking";
 import { runVerdictPipeline } from "./pipelines/verdict";
 import type { SettingsStoreLike } from "./settings-store";
+import { resolveReviewerActivation } from "./reviewer-activation";
+import {
+  productionEligibilityBlocked,
+  type ProductionEligibilityDecision
+} from "./production-eligibility";
 import { isAuthenticationError, isForbiddenError, isTaskConflictError, UrmotivApiError, type UrmotivClientLike } from "./urmotiv-client";
 import type { ClaimRobotReviewTasksResponse, RobotReviewTask } from "./urmotiv-schemas";
 
@@ -43,6 +48,8 @@ export interface ReviewerWorkerOptions {
   readonly leaseSeconds?: number;
   /** 传给所有流水线的 LLM 请求用的 fetch，默认全局 fetch；测试用来注入假实现。 */
   readonly fetch?: FetchLike;
+  /** 服务端生产资格证据门；未注入时固定拒绝，不能因测试/装配遗漏而放行。 */
+  readonly productionEligibility?: (profileName: string) => ProductionEligibilityDecision;
 }
 
 interface InFlightTask {
@@ -62,6 +69,7 @@ export class ReviewerWorker {
   readonly #anchors: readonly DifficultyAnchor[];
   readonly #leaseSeconds: number;
   readonly #fetch: FetchLike | undefined;
+  readonly #productionEligibility: (profileName: string) => ProductionEligibilityDecision;
 
   #running = false;
   #stopping = false;
@@ -77,6 +85,7 @@ export class ReviewerWorker {
     this.#anchors = options.anchors;
     this.#leaseSeconds = options.leaseSeconds ?? 300;
     this.#fetch = options.fetch;
+    this.#productionEligibility = options.productionEligibility ?? productionEligibilityBlocked;
   }
 
   public start(): void {
@@ -160,7 +169,29 @@ export class ReviewerWorker {
 
   private async pollOnce(): Promise<void> {
     const { settings } = this.#settingsStore.get();
-    if (!settings.enabled) {
+    let productionDecision: ProductionEligibilityDecision | undefined;
+    const readProductionEligibility = (): ProductionEligibilityDecision => {
+      productionDecision ??= this.#productionEligibility(settings.modelProfileName);
+      return productionDecision;
+    };
+    const activation = resolveReviewerActivation(
+      settings,
+      this.#appConfig.models,
+      readProductionEligibility
+    );
+    if (!activation.active) {
+      if (activation.reason === "experiment_version_mismatch") {
+        logWarn("运行期 experimentVersion 与当前配置不一致，拒绝领取任务；请由操作员核对后明确更新设置");
+      } else if (activation.reason === "profile_missing") {
+        logWarn("当前设置的 modelProfileName 在 config/models.yaml 里不存在，跳过这一轮轮询", {
+          modelProfileName: settings.modelProfileName
+        });
+      } else if (activation.reason === "production_evidence_rejected") {
+        const decision = readProductionEligibility();
+        logWarn("生产资格证据未通过，拒绝领取任务", {
+          reason: decision.eligible ? "evidence_invalid" : decision.reason
+        });
+      }
       return;
     }
 
@@ -169,14 +200,7 @@ export class ReviewerWorker {
       return;
     }
 
-    const profiles: Record<string, ProfileConfig | undefined> = this.#appConfig.models.profiles;
-    const profile = profiles[settings.modelProfileName];
-    if (profile === undefined) {
-      logWarn("当前设置的 modelProfileName 在 config/models.yaml 里不存在，跳过这一轮轮询", {
-        modelProfileName: settings.modelProfileName
-      });
-      return;
-    }
+    const profile = activation.profile;
     const missing = missingProvidersForProfile(this.#appConfig, profile);
     if (missing.length > 0) {
       logWarn("当前模型档位缺少 provider 密钥，跳过这一轮轮询", { missing: missing.join(",") });

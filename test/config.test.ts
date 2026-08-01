@@ -7,6 +7,7 @@ import {
   missingProvidersForProfile,
   providersUsedByProfile
 } from "../src/config";
+import { currentBlockedProductionExperimentVersion } from "../src/production-eligibility";
 
 const validYaml = `
 experimentVersion: "exp-test"
@@ -107,17 +108,19 @@ describe("loadConfig：正常路径", () => {
     expect(config.server.port).toBe(8720);
   });
 
-  it("正式 YAML 的难度档位使用 pro 默认请求且不显式发送思考字段", () => {
+  it("正式 YAML 恢复 Candidate C 的 flash 档位并显式关闭深度思考", () => {
     const source = readFileSync(new URL("../config/models.yaml", import.meta.url), "utf8");
     const config = loadConfig({ env: validEnv, modelsYamlSource: source });
     expect(config.models.experimentVersion).toBe(
-      "experiment-2026-08-difficulty-pro-default-request-v1"
+      "experiment-2026-08-difficulty-candidate-c-restored-v2"
     );
+    expect(config.models.experimentVersion).toBe(currentBlockedProductionExperimentVersion);
     expect(config.models.profiles["review-balanced"]?.difficulty).toEqual({
       provider: "aether",
-      model: "deepseek-v4-pro",
+      model: "deepseek-v4-flash",
       temperature: 0.2,
-      thinking: false
+      thinking: false,
+      thinkingRequest: "disabled"
     });
     expect(config.models.retry).toEqual({ maxAttempts: 3, baseDelayMs: 500 });
     expect(config.models.timeouts).toMatchObject({

@@ -11,9 +11,9 @@
  * 天然满足乐观锁需要的原子性，不需要额外加锁。
  *
  * 文件损坏处理：如果 settings.json 存在但内容解析/校验失败，直接抛错而不是
- * 默默地退回默认值——因为默认值里 enabled 可能是 true，静默恢复有可能在
- * 操作员没意识到的情况下重新打开机器人开关，这是安全相关的设置，宁可启动
- * 失败也不要默默改变已保存的状态。
+ * 默默地退回默认值。当前首次初始化虽然固定 enabled=false，但损坏后静默重建
+ * 仍会丢失操作员保存的版本和档位选择；这是安全相关的设置，宁可启动失败也
+ * 不要默默改变已保存的状态。
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";

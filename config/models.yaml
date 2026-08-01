@@ -7,13 +7,14 @@
 #
 # 这里配置的是"有哪些模型档位可用"；真正生效的是 enabled/modelProfileName/
 # pollingIntervalSeconds/maximumConcurrentTasks/experimentVersion 这几项运行期
-# 设置，它们保存在运行期的 settings.json 里（见 src/settings-store.ts），首次
-# 启动时用下面 defaults 一节初始化，之后可以通过 fermata-control 插件的管理
-# 接口热更新，不需要重新部署。provider 只能是 aether 或 dashscope 这两种，
+# 设置，它们保存在运行期的 settings.json 里（见 src/settings-store.ts）。首次
+# 启动会用下面 defaults 初始化档位/轮询/并发/版本，但 enabled 固定为 false；
+# 必须由操作员通过 fermata-control 管理接口明确开启。之后可以热更新，不需要
+# 重新部署。provider 只能是 aether 或 dashscope 这两种，
 # 分别对应 .env 里的 AETHER_* 和 DASHSCOPE_* 变量，具体 baseUrl/apiKey 从环境
 # 变量读取，不写在这个文件里。
 
-experimentVersion: "experiment-2026-08-difficulty-pro-default-request-v1"
+experimentVersion: "experiment-2026-08-difficulty-candidate-c-restored-v2"
 
 defaults:
   modelProfileName: review-balanced
@@ -36,9 +37,10 @@ profiles:
   review-balanced:
     difficulty:
       provider: aether
-      model: deepseek-v4-pro
+      model: deepseek-v4-flash
       temperature: 0.2
       thinking: false
+      thinkingRequest: disabled
     thinking:
       solver:
         provider: aether
