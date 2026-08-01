@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "kind": "evaluation-report-completion",
+  "executionRunId": "public83-current-control-oldanchors-20260801-a-2026-08-01T10-58-15-308Z-dc90481a19c6",
+  "chainRunId": "65f90255-460c-4f96-91a7-5e69469147df",
+  "experimentComplete": true,
+  "artifacts": {
+    "raw": {
+      "fileName": "difficulty-public83-current-control-oldanchors-20260801-a-2026-08-01T10-58-15-308Z-dc90481a19c6-raw.json",
+      "sha256": "403d3ad04e947e0baf36874ef276f607205861b55f51865e928ec6507555d087"
+    },
+    "summary": {
+      "fileName": "difficulty-public83-current-control-oldanchors-20260801-a-2026-08-01T10-58-15-308Z-dc90481a19c6-summary.json",
+      "sha256": "050db820b06f630774ae99a12c7160faeea73e1e8e8db6f823de6539cd6e290d"
+    },
+    "markdown": {
+      "fileName": "difficulty-public83-current-control-oldanchors-20260801-a-2026-08-01T10-58-15-308Z-dc90481a19c6.md",
+      "sha256": "943ce3ae42a79947852a5f9b12f25bb9a0cd6960b177790c8a586d252824fd58"
+    }
+  }
+}
