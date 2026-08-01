@@ -8,7 +8,8 @@ import {
   LlmResponseBodyTooLargeError,
   LlmResponseFormatError,
   maximumExplicitLlmOutputTokens,
-  maximumLlmResponseBodyBytes
+  maximumLlmResponseBodyBytes,
+  type ModelCallSpec
 } from "../src/llm";
 import { logError } from "../src/logger";
 
@@ -66,7 +67,7 @@ describe("chatComplete：正常路径", () => {
     expect(result).toEqual({ content: "答案", reasoning: null });
   });
 
-  it("thinkingRequest 只在显式配置时发送，且与是否保留推理文本解耦", async () => {
+  it("thinkingRequest 精确构造请求，且与是否保留推理文本解耦", async () => {
     const requestBodies: Record<string, unknown>[] = [];
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
@@ -75,23 +76,143 @@ describe("chatComplete：正常路径", () => {
 
     const retained = await chatComplete(
       provider,
-      { ...spec, thinking: true, thinkingRequest: "disabled" },
+      {
+        ...spec,
+        provider: "aether",
+        model: "deepseek-v4-flash",
+        thinking: true,
+        thinkingRequest: "enabled",
+        reasoningEffort: "low"
+      },
       [],
       { ...runtime, fetch: fetchMock }
     );
     const discarded = await chatComplete(
       provider,
-      { ...spec, thinking: false, thinkingRequest: "disabled" },
+      {
+        ...spec,
+        provider: "aether",
+        model: "deepseek-v4-flash",
+        thinking: false,
+        thinkingRequest: "enabled",
+        reasoningEffort: "low"
+      },
+      [],
+      { ...runtime, fetch: fetchMock }
+    );
+    await chatComplete(
+      provider,
+      {
+        ...spec,
+        provider: "aether",
+        model: "deepseek-v4-flash",
+        thinkingRequest: "disabled"
+      },
       [],
       { ...runtime, fetch: fetchMock }
     );
     await chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock });
 
-    expect(requestBodies[0]?.thinking).toEqual({ type: "disabled" });
-    expect(requestBodies[1]?.thinking).toEqual({ type: "disabled" });
-    expect(requestBodies[2]).not.toHaveProperty("thinking");
+    expect(requestBodies[0]).toEqual({
+      model: "deepseek-v4-flash",
+      temperature: 0.2,
+      stream: true,
+      messages: [],
+      thinking: { type: "enabled" },
+      reasoning_effort: "low"
+    });
+    expect(requestBodies[1]).toEqual(requestBodies[0]);
+    expect(requestBodies[2]).toEqual({
+      model: "deepseek-v4-flash",
+      temperature: 0.2,
+      stream: true,
+      messages: [],
+      thinking: { type: "disabled" }
+    });
+    expect(requestBodies[3]).toEqual({
+      model: "test-model",
+      temperature: 0.2,
+      stream: true,
+      messages: []
+    });
     expect(retained.reasoning).toBe("推理过程");
     expect(discarded.reasoning).toBeNull();
+  });
+
+  it.each([
+    [
+      "开启时缺 low",
+      { ...spec, provider: "aether", model: "deepseek-v4-flash", thinkingRequest: "enabled" }
+    ],
+    [
+      "开启时缺 provider",
+      { ...spec, model: "deepseek-v4-flash", thinkingRequest: "enabled", reasoningEffort: "low" }
+    ],
+    [
+      "其它 provider",
+      {
+        ...spec,
+        provider: "dashscope",
+        model: "deepseek-v4-flash",
+        thinkingRequest: "enabled",
+        reasoningEffort: "low"
+      }
+    ],
+    [
+      "其它 model",
+      {
+        ...spec,
+        provider: "aether",
+        model: "other-model",
+        thinkingRequest: "enabled",
+        reasoningEffort: "low"
+      }
+    ],
+    [
+      "关闭时携带 effort",
+      {
+        ...spec,
+        provider: "aether",
+        model: "deepseek-v4-flash",
+        thinkingRequest: "disabled",
+        reasoningEffort: "low"
+      }
+    ],
+    [
+      "关闭时缺 provider",
+      { ...spec, model: "deepseek-v4-flash", thinkingRequest: "disabled" }
+    ],
+    [
+      "关闭时使用其它 provider",
+      { ...spec, provider: "dashscope", model: "deepseek-v4-flash", thinkingRequest: "disabled" }
+    ],
+    [
+      "关闭时使用其它 model",
+      { ...spec, provider: "aether", model: "other-model", thinkingRequest: "disabled" }
+    ],
+    ["缺省请求却携带 effort", { ...spec, reasoningEffort: "low" }],
+    ["未支持的请求模式", { ...spec, thinkingRequest: "automatic" }],
+    [
+      "未支持的 effort",
+      {
+        ...spec,
+        provider: "aether",
+        model: "deepseek-v4-flash",
+        thinkingRequest: "enabled",
+        reasoningEffort: "medium"
+      }
+    ]
+  ])("无效推理组合在请求前被拒绝：%s", async (_name, invalidSpec) => {
+    const fetchMock = vi.fn(async () => completionResponse("不应请求"));
+    await expect(
+      chatComplete(
+        provider,
+        invalidSpec as unknown as ModelCallSpec,
+        [],
+        { ...runtime, fetch: fetchMock }
+      )
+    ).rejects.toBeInstanceOf(TypeError);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("requestJson 时请求体带 response_format", async () => {
@@ -438,6 +559,68 @@ describe("chatComplete：正常路径", () => {
 });
 
 describe("chatComplete：按输出活动判断是否停住", () => {
+  it("thinking=false 仍把 reasoning 事件算作有效活动，但最终不保留推理文本", async () => {
+    vi.useFakeTimers();
+    try {
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      const encoder = new TextEncoder();
+      const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            streamController = controller;
+          }
+        });
+        init?.signal?.addEventListener("abort", () => {
+          streamController.error(new DOMException("连接已停止", "AbortError"));
+        }, { once: true });
+        return new Response(body, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" }
+        });
+      });
+      const resultPromise = chatComplete(
+        provider,
+        {
+          ...spec,
+          provider: "aether",
+          model: "deepseek-v4-flash",
+          thinking: false,
+          thinkingRequest: "enabled",
+          reasoningEffort: "low"
+        },
+        [],
+        {
+          outputIdleTimeoutMs: 1_000,
+          firstOutputTimeoutMs: 1_000,
+          maximumDurationMs: 5_000,
+          maxAttempts: 1,
+          baseDelayMs: 1,
+          fetch: fetchMock
+        }
+      );
+
+      await vi.advanceTimersByTimeAsync(900);
+      streamController.enqueue(
+        encoder.encode('data: {"choices":[{"delta":{"reasoning_content":"有效推理"}}]}\n\n')
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(900);
+      streamController.enqueue(
+        encoder.encode(
+          'data: {"choices":[{"delta":{"content":"最终答案"},"finish_reason":"stop"}]}\n\n' +
+            "data: [DONE]\n\n"
+        )
+      );
+      streamController.close();
+      await vi.advanceTimersByTimeAsync(0);
+
+      await expect(resultPromise).resolves.toEqual({ content: "最终答案", reasoning: null });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("SSE 心跳不会刷新已开始输出后的停顿时间", async () => {
     vi.useFakeTimers();
     try {
@@ -1337,7 +1520,9 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body));
       expect(body.max_tokens).toBe(2_048);
-      expect(body.thinking).toEqual({ type: "disabled" });
+      expect(body.thinking).toEqual({ type: "enabled" });
+      expect(body.reasoning_effort).toBe("low");
+      expect(body.response_format).toBeUndefined();
       calls += 1;
       if (calls === 1) {
         return completionResponse("抱歉，我不知道怎么用 JSON 回答");
@@ -1349,7 +1534,13 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
     });
     const result = await chatCompleteJson(
       provider,
-      { ...spec, thinkingRequest: "disabled" },
+      {
+        ...spec,
+        provider: "aether",
+        model: "deepseek-v4-flash",
+        thinkingRequest: "enabled",
+        reasoningEffort: "low"
+      },
       [],
       resultSchema,
       { ...runtime, fetch: fetchMock },

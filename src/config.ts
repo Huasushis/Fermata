@@ -99,9 +99,11 @@ export const modelSpecSchema = z
     thinking: z.boolean(),
     // thinking 只决定是否保留响应中的 reasoning_content；thinkingRequest
     // 才是显式发给经过配置层限定的模型/网关的推理请求配置。当前只放行
-    // Aether deepseek-v4-flash 的 disabled，不向其它组合猜测能力。
+    // Aether deepseek-v4-flash；enabled 必须同时使用 low，disabled 或留空时
+    // 禁止配置 reasoningEffort，不向其它组合猜测能力。
     // 留空时不发送对应请求字段，保持原有服务商行为。
-    thinkingRequest: z.literal("disabled").optional()
+    thinkingRequest: z.enum(["enabled", "disabled"]).optional(),
+    reasoningEffort: z.literal("low").optional()
   })
   .strict()
   .superRefine((spec, context) => {
@@ -112,7 +114,21 @@ export const modelSpecSchema = z
       context.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["thinkingRequest"],
-        message: "当前只允许 Aether deepseek-v4-flash 显式关闭深度思考。"
+        message: "当前只允许 Aether deepseek-v4-flash 显式配置深度思考。"
+      });
+    }
+    if (spec.thinkingRequest === "enabled" && spec.reasoningEffort !== "low") {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["reasoningEffort"],
+        message: "开启深度思考时必须明确配置 reasoningEffort: low。"
+      });
+    }
+    if (spec.thinkingRequest !== "enabled" && spec.reasoningEffort !== undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["reasoningEffort"],
+        message: "reasoningEffort 只能与 thinkingRequest: enabled 一起使用。"
       });
     }
   });

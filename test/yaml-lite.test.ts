@@ -132,7 +132,10 @@ describe("parseYamlLite：解析真实的 config/models.yaml", () => {
     const defaultProfile = profiles[defaultProfileName] as Record<string, unknown>;
     expect(defaultProfile).toBeTruthy();
     expect(defaultProfile.difficulty).toBeTruthy();
-    expect(defaultProfile.difficulty).toMatchObject({ thinkingRequest: "disabled" });
+    expect(defaultProfile.difficulty).toMatchObject({
+      thinkingRequest: "enabled",
+      reasoningEffort: "low"
+    });
     expect(defaultProfile.thinking).toMatchObject({
       solver: expect.any(Object),
       analyst: expect.any(Object)
@@ -144,5 +147,8 @@ describe("parseYamlLite：解析真实的 config/models.yaml", () => {
       llmOutputIdleMs: 600_000,
       llmMaximumDurationMs: 14_400_000
     });
+    expect(parsed.experimentVersion).toBe(
+      "experiment-2026-08-difficulty-rubric-thinking-low-v1"
+    );
   });
 });

@@ -73,9 +73,11 @@ npm test            # vitest run
 跑起来。
 
 模型配置中的 `thinking` 只决定是否把响应里的推理过程保留给下游；可选的
-`thinkingRequest: disabled` 才会为当前 Aether `deepseek-v4-flash` 显式关闭
-深度思考。当前不允许其它值或模型/服务商组合；未配置 `thinkingRequest`
-时请求体不带这个开关，继续使用模型服务原有的默认行为。
+`thinkingRequest` 才会为当前 Aether `deepseek-v4-flash` 显式开启或关闭
+深度思考。`enabled` 必须同时配置 `reasoningEffort: low`；`disabled` 不允许带
+推理强度，未配置 `thinkingRequest` 时两个请求字段都不发送。当
+`thinkingRequest: enabled` 时仍保留 `temperature` 配置以维持档位形状，但当前
+服务端会忽略这个字段。
 
 Fermata 本身不解析 `.env` 文件，只读取进程已经收到的环境变量。上面的
 `run-with-env.mjs` 只接受 `Fermata/private/` 内的绝对路径，并沿已经打开的目录描述符
@@ -225,8 +227,9 @@ npm run experiment:calibrate-levels:detached -- \
 正式服务已有的 `settings.json` 会保留上次保存的 `experimentVersion`，不会因为替换
 `models.yaml` 自动改变。部署当前版本后，应在没有在途任务时，通过 Urmotiv 的 Fermata 设置页
 或管理接口把 `experimentVersion` 明确更新为
-`experiment-2026-08-difficulty-rubric-v1`，再恢复领取任务；这样提交的审核结果才能准确说明使用了
-哪一版请求规则和难度量尺。这个版本号只标识实现版本，不表示难度准确性已经通过标定门槛。
+`experiment-2026-08-difficulty-rubric-thinking-low-v1`，再恢复领取任务；这样提交的审核结果才能准确说明使用了
+哪一版请求规则和难度量尺。这个 Candidate B 版本号只标识实现版本，尚未进行
+准确性标定，不表示难度准确性已经通过标定门槛。
 
 思维/代码标定必须先在 `experiments/data/levels/manifest.private.json` 登记私有数据集清单。
 清单逐项绑定安全编号、文件名和文件原始字节的 SHA-256 校验值；目录里漏文件、多文件、改后缀、
@@ -286,7 +289,7 @@ npm run experiment:calibrate-levels:detached -- \
 
 | 流水线 | 状态 | 说明 |
 | --- | --- | --- |
-| CF 难度（difficulty.ts） | **修改前与候选均完整，候选仍未达标** | 修改前 public83 v4 的 83/83 完整报告为 MAE 302.4、±200 命中率 56.6%；加入 800–3500 完整量尺后的独立 83/83 候选报告为 MAE 289.2、命中率 55.4%。MAE 改善 13.3，但命中率下降 1.2 个百分点，低、中档退化且高档 MAE 仍为 387.8；没有达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，不能宣称准确性通过。`config/anchors/difficulty.json` 仍只有 2 条手工种子且标记为 `provisional: true`。 |
+| CF 难度（difficulty.ts） | **Candidate A 完整但未达标；Candidate B 尚未标定** | 修改前 public83 v4 的 83/83 完整报告为 MAE 302.4、±200 命中率 56.6%；加入 800–3500 完整量尺的 Candidate A 独立 83/83 报告为 MAE 289.2、命中率 55.4%。MAE 改善 13.3，但命中率下降 1.2 个百分点，低、中档退化且高档 MAE 仍为 387.8；没有达到 MAE ≤ 200、命中率 ≥ 75% 的门槛。当前 Candidate B 仅把 difficulty 请求改为有界的 low-thinking，尚未产出准确性报告，不能用 Candidate A 报告代替验收，也不能宣称准确性通过。`config/anchors/difficulty.json` 仍只有 2 条手工种子且标记为 `provisional: true`。 |
 | 思维难度（thinking.ts） | **旧实验均不可作基线** | 两份早期报告无法证明完整；后两份明确只完成 6/24、9/24，而且都缺高分段。 |
 | 代码难度（coding.ts） | **旧实验均不可作基线** | 与思维难度共用的旧实验不完整；小样本曾出现难度分段升高但代码难度均值下降，需要在完整基线上复核。 |
 | 查重判断（verdict.ts） | **旧设计不可作准确性基线** | 旧实验只有 3 个正常样本和 3 个人工重复样本；正常组只验证“不是不通过”，没有区分通过与需要修改。 |

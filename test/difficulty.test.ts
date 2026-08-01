@@ -53,7 +53,8 @@ describe("runDifficultyPipeline：整体接线", () => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       expect(body).toMatchObject({
         max_tokens: 2_048,
-        thinking: { type: "disabled" }
+        thinking: { type: "enabled" },
+        reasoning_effort: "low"
       });
       expect(body).not.toHaveProperty("response_format");
       return completionResponse('{"rating": 1730, "confidence": 0.8, "rationale": "中等题"}');
@@ -67,7 +68,8 @@ describe("runDifficultyPipeline：整体接线", () => {
           model: "deepseek-v4-flash",
           temperature: 0.2,
           thinking: false,
-          thinkingRequest: "disabled" as const
+          thinkingRequest: "enabled" as const,
+          reasoningEffort: "low" as const
         },
         credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
         runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
@@ -87,6 +89,7 @@ describe("runDifficultyPipeline：整体接线", () => {
       | {
           max_tokens?: number;
           thinking?: unknown;
+          reasoning_effort?: unknown;
           response_format?: unknown;
           messages: Array<{ role: string; content: string }>;
         }
@@ -107,7 +110,8 @@ describe("runDifficultyPipeline：整体接线", () => {
           model: "deepseek-v4-flash",
           temperature: 0.2,
           thinking: false,
-          thinkingRequest: "disabled" as const
+          thinkingRequest: "enabled" as const,
+          reasoningEffort: "low" as const
         },
         credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
         runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
@@ -118,7 +122,8 @@ describe("runDifficultyPipeline：整体接线", () => {
     expect(result.confidence).toBe(0.4);
     expect(requestBody).toBeDefined();
     expect(requestBody?.max_tokens).toBe(2_048);
-    expect(requestBody?.thinking).toEqual({ type: "disabled" });
+    expect(requestBody?.thinking).toEqual({ type: "enabled" });
+    expect(requestBody?.reasoning_effort).toBe("low");
     expect(requestBody).not.toHaveProperty("response_format");
 
     const system =
@@ -161,7 +166,8 @@ describe("runDifficultyPipeline：整体接线", () => {
           model: "deepseek-v4-flash",
           temperature: 0.2,
           thinking: false,
-          thinkingRequest: "disabled" as const
+          thinkingRequest: "enabled" as const,
+          reasoningEffort: "low" as const
         },
         credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
         runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
@@ -190,7 +196,8 @@ describe("runDifficultyPipeline：整体接线", () => {
           model: "deepseek-v4-flash",
           temperature: 0.2,
           thinking: false,
-          thinkingRequest: "disabled" as const
+          thinkingRequest: "enabled" as const,
+          reasoningEffort: "low" as const
         },
         credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
         runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
@@ -201,9 +208,10 @@ describe("runDifficultyPipeline：整体接线", () => {
     expect(requestBodies).toHaveLength(2);
     expect(requestBodies.map((body) => body.max_tokens)).toEqual([2_048, 2_048]);
     expect(requestBodies.map((body) => body.thinking)).toEqual([
-      { type: "disabled" },
-      { type: "disabled" }
+      { type: "enabled" },
+      { type: "enabled" }
     ]);
+    expect(requestBodies.map((body) => body.reasoning_effort)).toEqual(["low", "low"]);
     expect(requestBodies.every((body) => !("response_format" in body))).toBe(true);
   });
 });

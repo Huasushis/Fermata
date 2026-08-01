@@ -39,6 +39,8 @@ export interface ProviderCredentialsLike {
 }
 
 export interface ModelCallSpec {
+  /** 只在显式配置推理请求时必须提供，用于请求前再次限定服务商。 */
+  readonly provider?: "aether" | "dashscope";
   readonly model: string;
   readonly temperature: number;
   /**
@@ -46,10 +48,12 @@ export interface ModelCallSpec {
    */
   readonly thinking: boolean;
   /**
-   * 显式发送经配置层限定的深度思考请求。当前只放行关闭。
+   * 显式发送经配置层限定的深度思考请求。当前只放行
+   * Aether deepseek-v4-flash；enabled 必须带 low，disabled 不能带 effort。
    * 未配置时不发送 `thinking` 请求字段，保持原有请求行为。
    */
-  readonly thinkingRequest?: "disabled";
+  readonly thinkingRequest?: "enabled" | "disabled";
+  readonly reasoningEffort?: "low";
 }
 
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
@@ -265,6 +269,7 @@ export async function chatComplete(
   runtime: LlmRuntimeOptions,
   options: ChatCompletionOptions = {}
 ): Promise<ChatCompletionResult> {
+  validateThinkingRequest(spec);
   const fetchImpl = runtime.fetch ?? productionLlmFetch;
   const url = new URL("chat/completions", ensureTrailingSlash(provider.baseUrl));
   const body: Record<string, unknown> = {
@@ -278,6 +283,9 @@ export async function chatComplete(
   }
   if (spec.thinkingRequest !== undefined) {
     body.thinking = { type: spec.thinkingRequest };
+  }
+  if (spec.reasoningEffort !== undefined) {
+    body.reasoning_effort = spec.reasoningEffort;
   }
   if (options.maxOutputTokens !== undefined) {
     body.max_tokens = validateMaxOutputTokens(options.maxOutputTokens);
@@ -307,6 +315,42 @@ export async function chatComplete(
   return spec.thinking
     ? result
     : { content: result.content, reasoning: null };
+}
+
+/**
+ * 配置加载不是唯一入口；实验和测试也可以直接调用 chatComplete。
+ * 因此在发起任何可能计费的请求前重新检查组合，不依赖 TypeScript
+ * 类型或 config/models.yaml 已经跑过。
+ */
+function validateThinkingRequest(spec: ModelCallSpec): void {
+  const thinkingRequest: unknown = spec.thinkingRequest;
+  const reasoningEffort: unknown = spec.reasoningEffort;
+
+  if (
+    thinkingRequest !== undefined &&
+    thinkingRequest !== "enabled" &&
+    thinkingRequest !== "disabled"
+  ) {
+    throw new TypeError("模型深度思考请求配置无效。");
+  }
+  if (reasoningEffort !== undefined && reasoningEffort !== "low") {
+    throw new TypeError("模型推理强度配置无效。");
+  }
+  if (thinkingRequest === undefined) {
+    if (reasoningEffort !== undefined) {
+      throw new TypeError("未开启深度思考时不能配置推理强度。");
+    }
+    return;
+  }
+  if (spec.provider !== "aether" || spec.model !== "deepseek-v4-flash") {
+    throw new TypeError("当前模型不允许显式配置深度思考。");
+  }
+  if (thinkingRequest === "enabled" && reasoningEffort !== "low") {
+    throw new TypeError("开启深度思考时必须使用 low 推理强度。");
+  }
+  if (thinkingRequest === "disabled" && reasoningEffort !== undefined) {
+    throw new TypeError("关闭深度思考时不能配置推理强度。");
+  }
 }
 
 /**
