@@ -111,10 +111,11 @@ Urmotiv 的 `@urmotiv/contracts` 包。凡是和 Urmotiv 之间的数据结构�
 
 ## 7. 技术栈边界
 
-- 生产依赖只有 `zod`；`vitest`/`typescript`/`tsx` 是 devDependencies。新增
+- 生产依赖只有 `zod` 和 `undici`；后者只用于模型请求的可控超时与代理，
+  `vitest`/`typescript`/`tsx` 是 devDependencies。新增
   任何生产依赖之前，先确认真的没办法用 `node:*` 内置模块或者几十行手写代码
   解决——这是团队特意做的选择，不是疏漏。
 - 不引入 HTTP 框架（Fastify/Express 等），管理端口用 `node:http` 手写；
-  不引入 LLM SDK，`src/llm.ts` 直接用 `fetch` 调 OpenAI 兼容接口。
+  不引入 LLM SDK，`src/llm.ts` 用 `undici.request` 调 OpenAI 兼容接口。
 - 所有用户可见文案、注释、提交给 Urmotiv 的 `improvements`/`privateNote`
   文本、日志里的说明性文字都用简体中文。

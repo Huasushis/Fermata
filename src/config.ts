@@ -149,7 +149,7 @@ export const modelsYamlSchema = z
           context.addIssue({
             code: z.ZodIssueCode.custom,
             path: ["llmMaximumDurationMs"],
-            message: "模型请求的最终保护时长不能小于等待第一段输出或输出停顿的时长。"
+            message: "有效输出前的最终保护时长不能小于首输出或输出停顿的时长。"
           });
         }
       }),

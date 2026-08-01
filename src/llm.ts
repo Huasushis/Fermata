@@ -1,6 +1,7 @@
 /**
- * 一个很薄的 OpenAI 兼容 Chat Completions 客户端，直接用 fetch 调用，不装任何
- * SDK。支持：
+ * 一个很薄的 OpenAI 兼容 Chat Completions 客户端。生产请求使用显式
+ * 配置的 Undici 传输层，不使用 Node global fetch 隐藏的 300 秒响应头/
+ * 正文超时。支持：
  *   - baseUrl + apiKey 的服务商组合（aether、阿里云百炼 compatible-mode 等，
  *     调用方负责传对应的 baseUrl/apiKey，这个模块本身不知道"provider"这个
  *     概念）；
@@ -11,8 +12,15 @@
  *     避免同一道题在模型已经开始生成后被重复计费。
  *
  * 使用流式响应持续接收推理与最终答案。这里的流式不是为了边生成边展示，
- * 而是为了确认模型仍在工作：只有长时间没有收到任何新数据时才中断请求。
+ * 而是为了确认模型仍在工作：只有通过格式检查的非空白 content/
+ * reasoning 事件才会续时，心跳、用量和 role-only 事件都不会。
  */
+import { Readable } from "node:stream";
+import {
+  type Dispatcher,
+  EnvHttpProxyAgent,
+  request as undiciRequest
+} from "undici";
 import { z } from "zod";
 
 export interface ChatMessage {
@@ -43,11 +51,11 @@ export interface ModelCallSpec {
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 export interface LlmRuntimeOptions {
-  /** 已经收到首段输出后，连续多久没有新数据才认为连接停住。 */
+  /** 收到首个有效模型事件后，连续多久没有新有效事件才认为连接停住。 */
   readonly outputIdleTimeoutMs: number;
-  /** 等待第一段输出的时间；深度推理通常需要明显长于普通请求。 */
+  /** 等待第一个有效模型事件的时间；深度推理通常需要明显长于普通请求。 */
   readonly firstOutputTimeoutMs?: number;
-  /** 防止异常连接永久占用任务的最终保护时长。 */
+  /** 首个有效事件前（包括 429 等待）的最终保护；有效输出开始后不是绝对总时限。 */
   readonly maximumDurationMs?: number;
   /** 总尝试次数；只有收到 429 时才会使用后续尝试。 */
   readonly maxAttempts: number;
@@ -61,6 +69,84 @@ export interface LlmRuntimeOptions {
 export const maximumLlmResponseBodyBytes = 4 * 1024 * 1024;
 export const defaultLlmFirstOutputTimeoutMs = 30 * 60 * 1_000;
 export const defaultLlmMaximumDurationMs = 4 * 60 * 60 * 1_000;
+
+let productionDispatcher: EnvHttpProxyAgent | undefined;
+
+function getProductionDispatcher(): EnvHttpProxyAgent {
+  productionDispatcher ??= new EnvHttpProxyAgent({
+    // 连接、响应头和正文都只由下面的业务看门狗管理。Undici 的
+    // 隐含默认值会在深度推理仍正常运行时提前切断请求。
+    connectTimeout: 0,
+    headersTimeout: 0,
+    bodyTimeout: 0
+  });
+  return productionDispatcher;
+}
+
+const productionLlmFetch: FetchLike = (input, init) =>
+  requestWithUndici(getProductionDispatcher(), input, init);
+
+/**
+ * 使用指定 Dispatcher 创建与生产路径完全相同的请求适配器。主要供本地
+ * HTTP 集成测试注入短超时 Agent；正常运行使用上面支持代理环境变量的
+ * EnvHttpProxyAgent。
+ */
+export function createUndiciLlmFetch(dispatcher: Dispatcher): FetchLike {
+  return (input, init) => requestWithUndici(dispatcher, input, init);
+}
+
+async function requestWithUndici(
+  dispatcher: Dispatcher,
+  input: string | URL | Request,
+  init?: RequestInit
+): Promise<Response> {
+  if (input instanceof Request) {
+    throw new TypeError("LLM 传输层不接受 Request 对象。");
+  }
+  if (init?.method?.toUpperCase() !== "POST" || typeof init.body !== "string") {
+    throw new TypeError("LLM 传输层只接受带文本正文的 POST 请求。");
+  }
+  const requestHeaders: Record<string, string> = {};
+  new Headers(init.headers).forEach((value, name) => {
+    requestHeaders[name] = value;
+  });
+
+  const response = await undiciRequest(input, {
+    dispatcher,
+    method: "POST",
+    headers: requestHeaders,
+    body: init.body,
+    signal: init.signal,
+    // 这两项必须在每次请求上明确禁用，不依赖 Dispatcher 的默认
+    // 值；这样即使代理 Agent 或测试 Agent 带有较短默认值也不会回归。
+    headersTimeout: 0,
+    bodyTimeout: 0
+  });
+
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(response.headers)) {
+    if (Array.isArray(value)) {
+      for (const item of value) headers.append(name, item);
+    } else if (value !== undefined) {
+      headers.append(name, value);
+    }
+  }
+
+  if ([204, 205, 304].includes(response.statusCode)) {
+    await response.body.dump();
+    return new Response(null, {
+      status: response.statusCode,
+      statusText: response.statusText,
+      headers
+    });
+  }
+  const body = Readable.toWeb(response.body) as ReadableStream<Uint8Array>;
+  return new Response(body, {
+    status: response.statusCode,
+    statusText: response.statusText,
+    headers
+  });
+}
 
 /** 模型请求未完成；只包含固定分类和状态码，不带服务商错误正文。 */
 export class LlmRequestError extends Error {
@@ -83,7 +169,7 @@ export class LlmRequestError extends Error {
       LLM_NETWORK_FAILED: "模型服务连接未能完成。",
       LLM_FIRST_OUTPUT_TIMEOUT: "模型服务长时间没有返回第一段输出。",
       LLM_OUTPUT_IDLE_TIMEOUT: "模型服务的输出长时间没有继续。",
-      LLM_TOTAL_TIMEOUT: "模型服务请求超过最终保护时长。",
+      LLM_TOTAL_TIMEOUT: "模型服务在有效输出前超过最终保护时长。",
       LLM_STREAM_INTERRUPTED: "模型服务的输出在完成前中断。",
       LLM_CANCELLED: "模型请求已按任务状态停止。"
     };
@@ -131,7 +217,7 @@ export async function chatComplete(
   runtime: LlmRuntimeOptions,
   options: { readonly requestJson?: boolean } = {}
 ): Promise<ChatCompletionResult> {
-  const fetchImpl = runtime.fetch ?? globalThis.fetch;
+  const fetchImpl = runtime.fetch ?? productionLlmFetch;
   const url = new URL("chat/completions", ensureTrailingSlash(provider.baseUrl));
   const body: Record<string, unknown> = {
     model: spec.model,
@@ -308,15 +394,14 @@ async function requestWithRetry(
         }
       } else {
         const raw = await parseResponseBody(response, controller, () => {
-          watchdog.receivedOutput();
+          watchdog.receivedValidOutput();
         });
         const timeoutError = watchdog.error();
         if (timeoutError !== undefined) {
           throw timeoutError;
         }
-        if (Date.now() >= deadline) {
-          throw new LlmRequestError("LLM_TOTAL_TIMEOUT");
-        }
+        // 首个有效模型事件会清除绝对保护计时。正常持续输出后只看
+        // 有效事件间的停顿，因此不能在这里再用初始 deadline 拒绝结果。
         return { ok: true, status: response.status, raw };
       }
     } catch (error) {
@@ -387,7 +472,7 @@ class LlmRequestWatchdog {
   #outputIdleTimer: NodeJS.Timeout | null = null;
   #maximumDurationTimer: NodeJS.Timeout | null = null;
   #timeoutCode: LlmTimeoutCode | null = null;
-  #receivedOutput = false;
+  #receivedValidOutput = false;
 
   public constructor(
     controller: AbortController,
@@ -406,13 +491,19 @@ class LlmRequestWatchdog {
     }, this.#maximumDurationMs);
   }
 
-  public receivedOutput(): void {
+  public receivedValidOutput(): void {
     if (this.#timeoutCode !== null) return;
-    if (!this.#receivedOutput) {
-      this.#receivedOutput = true;
+    if (!this.#receivedValidOutput) {
+      this.#receivedValidOutput = true;
       if (this.#firstOutputTimer !== null) {
         clearTimeout(this.#firstOutputTimer);
         this.#firstOutputTimer = null;
+      }
+      // maximumDurationMs 只约束首个有效事件前的阶段，不得把正在
+      // 持续产生有效输出的付费请求当作超时取消。
+      if (this.#maximumDurationTimer !== null) {
+        clearTimeout(this.#maximumDurationTimer);
+        this.#maximumDurationTimer = null;
       }
     }
     if (this.#outputIdleTimer !== null) {
@@ -568,35 +659,37 @@ async function delayBeforeRetry(
 async function parseResponseBody(
   response: Response,
   requestController: AbortController,
-  onOutput: () => void
+  onValidOutput: () => void
 ): Promise<unknown> {
   const mediaType = response.headers.get("content-type")?.toLowerCase() ?? "";
   if (response.ok && mediaType.includes("text/event-stream")) {
     return readChatCompletionEventStream(
       response,
       requestController,
-      onOutput
+      onValidOutput
     );
   }
-  const text = await readResponseTextWithLimit(
-    response,
-    requestController,
-    onOutput
-  );
+  const text = await readResponseTextWithLimit(response, requestController);
   if (text.length === 0) {
-    return undefined;
+    throw new LlmResponseFormatError();
   }
+  let raw: unknown;
   try {
-    return JSON.parse(text) as unknown;
+    raw = JSON.parse(text) as unknown;
   } catch {
-    return undefined;
+    throw new LlmResponseFormatError();
   }
+  // JSON 回退没有可靠的逐事件边界，只在 HTTP EOF 后验证整个响应。
+  // 它必须明确 finish_reason=stop 且最终 content 非空白，然后才算
+  // 收到有效模型输出。reasoning-only 不会被暗中升格为最终答案。
+  extractChatCompletion(raw, true);
+  onValidOutput();
+  return raw;
 }
 
 async function readResponseTextWithLimit(
   response: Response,
-  requestController: AbortController,
-  onOutput: () => void
+  requestController: AbortController
 ): Promise<string> {
   if (response.body === null) {
     return "";
@@ -621,9 +714,6 @@ async function readResponseTextWithLimit(
         } catch {
           throw new LlmResponseFormatError();
         }
-      }
-      if (chunk.value.byteLength > 0) {
-        onOutput();
       }
       if (chunk.value.byteLength > maximumLlmResponseBodyBytes - totalBytes) {
         try {
@@ -672,7 +762,7 @@ interface ChatCompletionStreamState {
 async function readChatCompletionEventStream(
   response: Response,
   requestController: AbortController,
-  onOutput: () => void
+  onValidOutput: () => void
 ): Promise<unknown> {
   if (response.body === null) {
     throw new LlmRequestError("LLM_STREAM_INTERRUPTED");
@@ -710,15 +800,19 @@ async function readChatCompletionEventStream(
           if (boundary < 0) break;
           const event = pending.slice(0, boundary);
           pending = pending.slice(boundary + 2);
-          consumeChatCompletionEvent(event, state);
+          if (consumeChatCompletionEvent(event, state)) onValidOutput();
         }
         if (pending.trim().length > 0) {
-          consumeChatCompletionEvent(pending, state);
+          if (consumeChatCompletionEvent(pending, state)) onValidOutput();
         }
         if (!state.sawChoice || (!state.sawStop && !state.sawDone)) {
           throw new LlmRequestError("LLM_STREAM_INTERRUPTED");
         }
-        return chatCompletionStreamResult(state);
+        const raw = chatCompletionStreamResult(state);
+        // 思考内容是辅助信息，不是最终回答。即使 thinking=true，
+        // reasoning-only 或空白 content 也是不完整响应。
+        extractChatCompletion(raw);
+        return raw;
       }
       totalBytes = addResponseChunkSize(
         totalBytes,
@@ -727,7 +821,6 @@ async function readChatCompletionEventStream(
         requestController
       );
       if (chunk.value.byteLength === 0) continue;
-      onOutput();
       ({ pending, trailingCarriageReturn } = appendEventStreamText(
         pending,
         trailingCarriageReturn,
@@ -740,7 +833,7 @@ async function readChatCompletionEventStream(
         if (boundary < 0) break;
         const event = pending.slice(0, boundary);
         pending = pending.slice(boundary + 2);
-        consumeChatCompletionEvent(event, state);
+        if (consumeChatCompletionEvent(event, state)) onValidOutput();
       }
     }
   } finally {
@@ -799,21 +892,21 @@ function appendEventStreamText(
 function consumeChatCompletionEvent(
   event: string,
   state: ChatCompletionStreamState
-): void {
+): boolean {
   const data = event
     .split("\n")
     .filter((line) => line.startsWith("data:"))
     .map((line) => line.slice("data:".length).trimStart())
     .join("\n")
     .trim();
-  if (data.length === 0) return;
+  if (data.length === 0) return false;
   if (state.sawDone) {
     // [DONE] 后只能是 HTTP 正常收尾；继续出现非空事件说明响应次序损坏。
     throw new LlmResponseFormatError();
   }
   if (data === "[DONE]") {
     state.sawDone = true;
-    return;
+    return false;
   }
 
   let raw: unknown;
@@ -835,7 +928,7 @@ function consumeChatCompletionEvent(
   }
   if (choices.length === 0) {
     // 部分服务商会在答案后发送只含用量的事件。
-    return;
+    return false;
   }
   if (state.sawStop) {
     // finish_reason=stop 之后只允许用量事件或 [DONE]。继续出现答案片段说明
@@ -862,13 +955,17 @@ function consumeChatCompletionEvent(
       throw new LlmResponseFormatError();
     }
   }
+  let hasValidOutput = false;
   if (typeof part.reasoning_content === "string") {
     state.reasoning += part.reasoning_content;
+    hasValidOutput ||= /\S/u.test(part.reasoning_content);
   } else if (typeof part.reasoning === "string") {
     state.reasoning += part.reasoning;
+    hasValidOutput ||= /\S/u.test(part.reasoning);
   }
   if (typeof part.content === "string") {
     state.content += part.content;
+    hasValidOutput ||= /\S/u.test(part.content);
   }
   if (choiceRecord.finish_reason !== undefined && choiceRecord.finish_reason !== null) {
     if (choiceRecord.finish_reason !== "stop") {
@@ -876,6 +973,7 @@ function consumeChatCompletionEvent(
     }
     state.sawStop = true;
   }
+  return hasValidOutput;
 }
 
 function chatCompletionStreamResult(state: ChatCompletionStreamState): unknown {
@@ -922,7 +1020,10 @@ function cancelReaderWithoutReplacingResult(
   }
 }
 
-function extractChatCompletion(raw: unknown): ChatCompletionResult {
+function extractChatCompletion(
+  raw: unknown,
+  requireStop = false
+): ChatCompletionResult {
   if (typeof raw !== "object" || raw === null) {
     throw new LlmResponseFormatError();
   }
@@ -934,12 +1035,16 @@ function extractChatCompletion(raw: unknown): ChatCompletionResult {
   if (typeof first !== "object" || first === null) {
     throw new LlmResponseFormatError();
   }
-  const message = (first as Record<string, unknown>).message;
+  const firstRecord = first as Record<string, unknown>;
+  if (requireStop && firstRecord.finish_reason !== "stop") {
+    throw new LlmResponseFormatError();
+  }
+  const message = firstRecord.message;
   if (typeof message !== "object" || message === null) {
     throw new LlmResponseFormatError();
   }
   const content = (message as Record<string, unknown>).content;
-  if (typeof content !== "string") {
+  if (typeof content !== "string" || content.trim().length === 0) {
     throw new LlmResponseFormatError();
   }
   const reasoningRaw = (message as Record<string, unknown>).reasoning_content;

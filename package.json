@@ -23,6 +23,7 @@
     "experiment:eval-verdict": "tsx experiments/eval-verdict.ts"
   },
   "dependencies": {
+    "undici": "8.9.0",
     "zod": "latest"
   },
   "devDependencies": {

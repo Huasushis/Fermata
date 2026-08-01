@@ -20,7 +20,8 @@ function completionResponse(content: string, reasoning?: string): Response {
     JSON.stringify({
       choices: [
         {
-          message: { role: "assistant", content, ...(reasoning === undefined ? {} : { reasoning_content: reasoning }) }
+          message: { role: "assistant", content, ...(reasoning === undefined ? {} : { reasoning_content: reasoning }) },
+          finish_reason: "stop"
         }
       ]
     }),
@@ -325,6 +326,93 @@ describe("chatComplete：正常路径", () => {
 });
 
 describe("chatComplete：按输出活动判断是否停住", () => {
+  it("SSE 心跳不会刷新已开始输出后的停顿时间", async () => {
+    vi.useFakeTimers();
+    try {
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      const encoder = new TextEncoder();
+      const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            streamController = controller;
+          }
+        });
+        init?.signal?.addEventListener("abort", () => {
+          streamController.error(new DOMException("连接已停止", "AbortError"));
+        }, { once: true });
+        return new Response(body, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" }
+        });
+      });
+      const resultPromise = chatComplete(provider, spec, [], {
+        outputIdleTimeoutMs: 1_000,
+        firstOutputTimeoutMs: 1_000,
+        maximumDurationMs: 5_000,
+        maxAttempts: 3,
+        baseDelayMs: 1,
+        fetch: fetchMock
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      streamController.enqueue(
+        encoder.encode('data: {"choices":[{"delta":{"content":"有效输出"}}]}\n\n')
+      );
+      const rejection = expect(resultPromise).rejects.toMatchObject({
+        code: "LLM_OUTPUT_IDLE_TIMEOUT"
+      });
+      await vi.advanceTimersByTimeAsync(900);
+      streamController.enqueue(encoder.encode(": heartbeat\n\n"));
+      await vi.advanceTimersByTimeAsync(101);
+      await rejection;
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("role-only 事件不算首个有效模型输出", async () => {
+    vi.useFakeTimers();
+    try {
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      const encoder = new TextEncoder();
+      const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            streamController = controller;
+          }
+        });
+        init?.signal?.addEventListener("abort", () => {
+          streamController.error(new DOMException("连接已停止", "AbortError"));
+        }, { once: true });
+        return new Response(body, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" }
+        });
+      });
+      const resultPromise = chatComplete(provider, spec, [], {
+        outputIdleTimeoutMs: 1_000,
+        firstOutputTimeoutMs: 1_000,
+        maximumDurationMs: 5_000,
+        maxAttempts: 3,
+        baseDelayMs: 1,
+        fetch: fetchMock
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const rejection = expect(resultPromise).rejects.toMatchObject({
+        code: "LLM_FIRST_OUTPUT_TIMEOUT"
+      });
+      await vi.advanceTimersByTimeAsync(900);
+      streamController.enqueue(
+        encoder.encode('data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n')
+      );
+      await vi.advanceTimersByTimeAsync(101);
+      await rejection;
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("持续收到数据时会续时，即使总耗时超过单次停顿上限也不会取消", async () => {
     vi.useFakeTimers();
     try {
@@ -476,7 +564,7 @@ describe("chatComplete：按输出活动判断是否停住", () => {
     }
   });
 
-  it("持续输出也受四小时级最终保护的可配置测试值约束", async () => {
+  it("持续有效输出超过首输出前最终保护值也不会被取消", async () => {
     vi.useFakeTimers();
     try {
       let streamController!: ReadableStreamDefaultController<Uint8Array>;
@@ -508,17 +596,21 @@ describe("chatComplete：按输出活动判断是否停住", () => {
         fetch: fetchMock
       });
       await vi.advanceTimersByTimeAsync(0);
-      for (let elapsed = 500; elapsed < 2_500; elapsed += 500) {
+      for (let elapsed = 500; elapsed <= 3_000; elapsed += 500) {
         await vi.advanceTimersByTimeAsync(500);
         streamController.enqueue(
-          encoder.encode('data: {"choices":[{"delta":{"content":"."}}]}\n\n')
+          encoder.encode(
+            `data: {"choices":[{"delta":{"content":"."}${
+              elapsed === 3_000 ? ',"finish_reason":"stop"' : ""
+            }}]}\n\n${elapsed === 3_000 ? "data: [DONE]\n\n" : ""}`
+          )
         );
       }
-      const rejection = expect(resultPromise).rejects.toMatchObject({
-        code: "LLM_TOTAL_TIMEOUT"
+      streamController.close();
+      await expect(resultPromise).resolves.toEqual({
+        content: "......",
+        reasoning: null
       });
-      await vi.advanceTimersByTimeAsync(500);
-      await rejection;
       expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
@@ -560,7 +652,10 @@ describe("chatComplete：响应正文大小限制", () => {
   it("UTF-8 多字节字符跨数据块时仍能正确解析", async () => {
     const encoded = new TextEncoder().encode(
       JSON.stringify({
-        choices: [{ message: { content: "分块中文回答" } }]
+        choices: [{
+          message: { content: "分块中文回答" },
+          finish_reason: "stop"
+        }]
       })
     );
     const body = new ReadableStream<Uint8Array>({
@@ -579,7 +674,7 @@ describe("chatComplete：响应正文大小限制", () => {
 
   it("正文恰好等于固定字节上限时允许读取", async () => {
     const prefix = '{"choices":[{"message":{"content":"';
-    const suffix = '"}}]}';
+    const suffix = '"},"finish_reason":"stop"}]}';
     const fixedBytes = new TextEncoder().encode(prefix + suffix).byteLength;
     const content = "a".repeat(maximumLlmResponseBodyBytes - fixedBytes);
     const responseBody = prefix + content + suffix;
@@ -788,6 +883,14 @@ describe("chatComplete：只在服务端明确拒绝接单时重试", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("499 表示已取消的请求，不会自动重发", async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 499 }));
+    await expect(
+      chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock })
+    ).rejects.toMatchObject({ code: "LLM_HTTP_ERROR", status: 499 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("网络异常不自动重发，因为无法证明模型服务没有开始生成", async () => {
     const fetchMock = vi.fn(async () => {
       throw new Error("ECONNRESET");
@@ -962,6 +1065,84 @@ describe("chatComplete：响应结构异常", () => {
     await expect(chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock })).rejects.toBeInstanceOf(
       LlmResponseFormatError
     );
+  });
+
+  it("JSON 回退必须明确以 finish_reason=stop 完成", async () => {
+    for (const finishReason of [undefined, null, "length"]) {
+      const choice: Record<string, unknown> = {
+        message: { role: "assistant", content: "不应采用" }
+      };
+      if (finishReason !== undefined) choice.finish_reason = finishReason;
+      const fetchMock = vi.fn(
+        async () => new Response(JSON.stringify({ choices: [choice] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        })
+      );
+      await expect(
+        chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock })
+      ).rejects.toBeInstanceOf(LlmResponseFormatError);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("JSON 回退拒绝空白和 role-only 最终内容", async () => {
+    for (const message of [
+      { role: "assistant", content: " \n\t " },
+      { role: "assistant" }
+    ]) {
+      const fetchMock = vi.fn(
+        async () => new Response(JSON.stringify({
+          choices: [{ message, finish_reason: "stop" }]
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        })
+      );
+      await expect(
+        chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock })
+      ).rejects.toBeInstanceOf(LlmResponseFormatError);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("reasoning-only 不会被当作最终答案", async () => {
+    const responses = [
+      new Response(JSON.stringify({
+        choices: [{
+          message: {
+            role: "assistant",
+            content: "   ",
+            reasoning_content: "已经推理但没有最终回答"
+          },
+          finish_reason: "stop"
+        }]
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      }),
+      new Response([
+        'data: {"choices":[{"delta":{"reasoning_content":"只有推理"}}]}',
+        "",
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "",
+        "data: [DONE]",
+        ""
+      ].join("\n"), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      })
+    ];
+    for (const response of responses) {
+      const fetchMock = vi.fn(async () => response);
+      await expect(
+        chatComplete(provider, { ...spec, thinking: true }, [], {
+          ...runtime,
+          fetch: fetchMock
+        })
+      ).rejects.toBeInstanceOf(LlmResponseFormatError);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
   });
 });
 

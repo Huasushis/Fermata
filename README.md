@@ -35,7 +35,7 @@ USTC 算法竞赛协会的独立 AI 审题服务：用机器人令牌轮询 Urmo
 │    PUT  /api/v1/settings/public  改设置（enabled/并发上限/轮询间隔等）│
 │    POST /api/v1/actions/wake     跳过等待，立即触发一轮轮询           │
 │                                                                    │
-│  src/llm.ts  直接用 fetch 调 OpenAI 兼容接口（Aether / 阿里云百炼）    │
+│  src/llm.ts  用显式可控 HTTP 客户端调 OpenAI 兼容接口            │
 │  src/codeforces.ts  CF API 客户端 + 题面抓取（签名、限速、HTML 解析）  │
 │  src/settings-store.ts  内存 + settings.json 持久化，乐观锁           │
 └──────────────────────────────────────┬─────────────────────────────┘
@@ -196,9 +196,10 @@ npm run experiment:calibrate-levels:detached -- \
 模型和运行参数不变，用同一 `--label` 加 `--resume` 继续；已经写入检查点的阶段不会
 重跑。
 
-思维和代码难度标定中的深度推理可能明显超过 90 秒。模型开始输出后，每收到一段新数据都会重新
-计算等待时间；默认连续 10 分钟没有新数据才停止。等待第一段输出默认最多 30 分钟，每次向模型
-服务发出请求另有 4 小时的最终保护。实验可分别用 `LEVELS_LLM_OUTPUT_IDLE_MS`、
+思维和代码难度标定中的深度推理可能明显超过 90 秒。模型开始输出后，每收到一个通过
+格式检查的非空白 content/reasoning 事件都会重新计算等待时间；心跳、用量和只含角色的事件
+不会续时。默认连续 10 分钟没有新有效内容才停止。等待第一个有效事件默认最多 30 分钟，在它之前
+（包括 429 重试等待）另有 4 小时的最终保护；有效输出开始后这不是绝对总时限。实验可分别用 `LEVELS_LLM_OUTPUT_IDLE_MS`、
 `LEVELS_LLM_FIRST_OUTPUT_MS` 和 `LEVELS_LLM_MAX_DURATION_MS` 覆盖这三项。它们只接受整数，
 安全下限依次是 600000、1800000 和 14400000 毫秒，上限都是 86400000 毫秒；最长时间不能小于
 另外两项等待时间。旧的 `LEVELS_LLM_TIMEOUT_MS` 已不再支持，设置后会明确报错。
