@@ -242,11 +242,12 @@ npm run experiment:calibrate-levels:detached -- \
 
 正式服务已有的 `settings.json` 会保留上次保存的 `experimentVersion`，不会因为替换
 `models.yaml` 自动改变。当前配置版本是
-`experiment-2026-08-difficulty-candidate-c-restored-v2`。部署后必须先保持
+`experiment-2026-08-difficulty-candidate-c-provider-v1-v3`。部署后必须先保持
 `enabled=false`；只有在没有在途任务、逐项核对整个所选档位的协议和准确性证据后，才能通过
 Urmotiv 的 Fermata 设置页或管理接口显式写入当前版本并开启。worker 还会在每轮 claim 前重新
 比较版本和生产资格证据，旧值即使同时保存了 `enabled=true` 也不会领取任务。由于当前
-`review-balanced` 内仍有已知不可用的 pro 请求，这个实验版本还被代码级固定封锁：即使操作员把
+`review-balanced` 内的 pro 请求尚未在 provider-v1 配置下完成独立协议预检，这个实验版本还被
+代码级固定封锁：即使操作员把
 settings 改成当前版本并开启，或手工放入一份声称合格的当前版本证据，也不会调用 claim。当前提交
 实际上对所有版本恒关闭；未来版本也必须等可信源证据聚合器另行实现、审阅并替换这道门。
 
@@ -291,22 +292,27 @@ Candidate C 锚点以及当前 provider/baseUrl/apiKey 的安全摘要；只在 
 `private/difficulty-connectivity-probe-results/` 保存 `0600` 检查点和最终 completion，不保存题面、
 模型原文、地址或密钥，也不得复用旧标签。
 
-该固定标签已在提交 `3a442caa898ba9743c4d3d3a4d003c15c4070903` 上实际运行：expected=1、
+旧的 a 固定标签已在提交 `3a442caa898ba9743c4d3d3a4d003c15c4070903` 上实际运行：expected=1、
 succeeded=0、failed=1、complete=false。唯一一次 fetch 收到 HTTP 404，固定结果码为
 `LLM_HTTP_ERROR`，没有观察到正常 HTTP EOF，也没有进入结构化输出校验；标签锁已安全释放。私有
 completion 的 SHA-256 为 `b63f08ea270b0459a4140706996b7b936bdc5f869db49afc4a1f7aac46490590`，
 原始私有证据继续只保存在 Git 忽略目录且权限为 `0600`。这个标签已经占用，不能删除证据或重跑。
-在确认当前服务实际支持的模型标识并登记新的实验版本前，不得启动新的 83 题付费实验。
+只读定位确认旧配置的 base URL 位于站点根路径，因此客户端实际请求了缺少 `/v1` 的
+`/chat/completions`。随后对同一服务身份精确执行了一次非生成式 `GET /v1/models`：响应为 2xx、
+正文到达真实 EOF、标准 JSON `data` 数组内有 22 个安全模型 id，并且精确包含
+`deepseek-v4-flash` 与 `deepseek-v4-pro`。这只能证明模型目录声明存在这些 id，不能替代任何生成
+请求的协议预检。当前 v3 只把 provider base URL pathname 修正为 `/v1`，请求体中的模型、温度、
+thinking 和输出上限保持不变；新的 b 固定标签尚未运行，不得据此启动 83 题付费实验。
 
 这个 connectivity 结果无论成功与否都只回答“difficulty 的这一种 flash 请求能否完成一次协议
 往返”，不能证明 `review-balanced` 整条 reviewer 可运行。尤其 `thinking.solver` 与 `verdict`
-仍使用 Candidate D 已在当前 provider 上出现 404 的 pro 型号。后续必须为 difficulty、
+仍使用 pro 型号；旧根路径下的 Candidate D 404 不能证明修正路径后的协议可用。后续必须为 difficulty、
 `thinking.solver`、`thinking.analyst`、coding、verdict 的每一种实际请求配置分别预登记唯一标签并完成
 协议预检，再使用相应完整人工标准集保留修改前/修改后准确性报告；至少 solver、verdict、difficulty
 三项必须单独留证。任何一项未通过时都不得把整档位写成可用，也不得开启生产领取。
 
-该固定标签一旦留下检查点、completion 或锁就不能重跑覆盖。若异常退出留下
-`difficulty-candidate-c-connectivity-probe-20260801-a.lock.private`，只能在同时核对记录中的 PID、
+每个固定标签一旦留下检查点、completion 或锁就不能重跑覆盖。旧 a 的失败证据必须永久保留，新的
+b 标签不能读取或复用它。若 b 异常退出留下同标签锁，只能在同时核对记录中的 PID、
 进程启动时刻、完整命令和工作目录，确认该进程已不存在且确属本项目后，人工移除这一把锁；不得按
 进程名批量结束 Node.js，也不得删除同标签检查点或 completion 来制造一次“干净重跑”。
 
@@ -393,7 +399,7 @@ completion marker 表示这条执行链已完整收束并阻止重放，不等�
 
 | 流水线 | 状态 | 说明 |
 | --- | --- | --- |
-| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；Candidate D 与恢复后的 flash 连通性均因 404 失败** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate B 在 2048、4096 两档协议探针均因高难题长度停止而淘汰。Candidate D 的 pro 探针首个合成请求返回 404；恢复后的 Candidate C flash 单合成题也在唯一请求收到 404。两份报告都不完整，标签均已占用，且没有启动新的 83 题。当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
+| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；旧连通性请求因缺 `/v1` 返回 404，新 b 尚未运行** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate B 在 2048、4096 两档协议探针均因高难题长度停止而淘汰。Candidate D 与恢复后的 Candidate C 请求都在旧根路径配置下返回 404；一次只读 `/v1/models` 已确认目录声明包含 flash/pro，但新的 provider-v1 单请求 b 探针尚未运行。旧失败证据均保留，且没有启动新的 83 题。当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
 | 思维难度（thinking.ts） | **旧实验均不可作基线** | 两份早期报告无法证明完整；后两份明确只完成 6/24、9/24，而且都缺高分段。 |
 | 代码难度（coding.ts） | **旧实验均不可作基线** | 与思维难度共用的旧实验不完整；小样本曾出现难度分段升高但代码难度均值下降，需要在完整基线上复核。 |
 | 查重判断（verdict.ts） | **旧设计不可作准确性基线** | 旧实验只有 3 个正常样本和 3 个人工重复样本；正常组只验证“不是不通过”，没有区分通过与需要修改。 |

@@ -108,11 +108,11 @@ describe("loadConfig：正常路径", () => {
     expect(config.server.port).toBe(8720);
   });
 
-  it("正式 YAML 恢复 Candidate C 的 flash 档位并显式关闭深度思考", () => {
+  it("正式 YAML 登记 provider /v1 的 Candidate C flash 档位", () => {
     const source = readFileSync(new URL("../config/models.yaml", import.meta.url), "utf8");
     const config = loadConfig({ env: validEnv, modelsYamlSource: source });
     expect(config.models.experimentVersion).toBe(
-      "experiment-2026-08-difficulty-candidate-c-restored-v2"
+      "experiment-2026-08-difficulty-candidate-c-provider-v1-v3"
     );
     expect(config.models.experimentVersion).toBe(currentBlockedProductionExperimentVersion);
     expect(config.models.profiles["review-balanced"]?.difficulty).toEqual({

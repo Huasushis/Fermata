@@ -22,10 +22,14 @@ import {
   assertDifficultyConnectivityLabelNamespaceUnused,
   assertDifficultyConnectivityRepositoryStatus,
   buildDifficultyConnectivityCompletion,
+  difficultyConnectivityExpectedModelsConfigSha256,
+  difficultyConnectivityExpectedProviderIdentitySha256,
   difficultyConnectivityProbeCompletionFileName,
+  difficultyConnectivityProbeExperimentVersion,
   difficultyConnectivityProbeLabel,
   difficultyConnectivityProbeLockRecordSchema,
   difficultyConnectivityProbeRequestBodySchema,
+  difficultyConnectivityPreviousProbeLabel,
   executeDifficultyConnectivityProbe,
   isCompleteDifficultyConnectivityResult,
   publishDifficultyConnectivityArtifactExclusive,
@@ -133,6 +137,32 @@ function setupPrivateDirectory() {
 }
 
 describe("Candidate C 连通性请求契约", () => {
+  it("新版本与 provider /v1 身份固定，不能沿用旧 a 标签", () => {
+    expect(difficultyConnectivityProbeExperimentVersion).toBe(
+      "experiment-2026-08-difficulty-candidate-c-provider-v1-v3"
+    );
+    expect(
+      sha256ConnectivityProbe(
+        readFileSync(new URL("../config/models.yaml", import.meta.url))
+      )
+    ).toBe(difficultyConnectivityExpectedModelsConfigSha256);
+    expect(difficultyConnectivityProbeLabel).toBe(
+      "difficulty-candidate-c-connectivity-probe-20260801-b"
+    );
+    expect(difficultyConnectivityPreviousProbeLabel).toBe(
+      "difficulty-candidate-c-connectivity-probe-20260801-a"
+    );
+    expect(difficultyConnectivityProbeCompletionFileName).not.toContain(
+      `${difficultyConnectivityPreviousProbeLabel}.`
+    );
+    expect(difficultyConnectivityExpectedProviderIdentitySha256).toBe(
+      "6e913442f0833b7950c9ae934e46f437dad6ffd72bf847fbe3acee058256050c"
+    );
+    expect(difficultyConnectivityExpectedProviderIdentitySha256).not.toBe(
+      "630b4c6feb6b32c4bbcacaad0fca69938a2cf503b4cb63569ff94fc6d62b53d6"
+    );
+  });
+
   it("只接受 flash、thinking false 对应的 disabled 请求且没有 reasoning_effort", () => {
     expect(difficultyConnectivityProbeRequestBodySchema.parse(validRequestBody)).toEqual(
       validRequestBody
@@ -320,6 +350,33 @@ describe("Candidate C 单请求与真实 EOF", () => {
 });
 
 describe("Candidate C 私有检查点、completion 与标签锁", () => {
+  it("保留旧 a 产物，但 b 只认自己的独立命名空间", () => {
+    const fixture = setupPrivateDirectory();
+    try {
+      publishDifficultyConnectivityArtifactExclusive(
+        fixture.handle,
+        `${difficultyConnectivityPreviousProbeLabel}.completion.private.json`,
+        "previous-label-test",
+        { complete: false }
+      );
+      expect(() =>
+        assertDifficultyConnectivityLabelNamespaceUnused(fixture.handle)
+      ).not.toThrow();
+
+      publishDifficultyConnectivityArtifactExclusive(
+        fixture.handle,
+        `${difficultyConnectivityProbeLabel}.checkpoint.private.json`,
+        "current-label-test",
+        { complete: false }
+      );
+      expect(() =>
+        assertDifficultyConnectivityLabelNamespaceUnused(fixture.handle)
+      ).toThrow("CONNECTIVITY_PROBE_LABEL_ALREADY_USED");
+    } finally {
+      closePrivateDirectory(fixture.handle);
+    }
+  });
+
   it("标签锁排他且记录安全进程身份；旧证据使标签永久不可重用", () => {
     const fixture = setupPrivateDirectory();
     try {

@@ -50,9 +50,11 @@ import { loadDifficultyAnchorsStrict } from "./lib/difficulty-anchors-strict";
 import { hasUnknownPrefixedEnvironmentKeys } from "./lib/evaluation-integrity";
 
 export const difficultyConnectivityProbeExperimentVersion =
-  "experiment-2026-08-difficulty-candidate-c-restored-v2";
-export const difficultyConnectivityProbeLabel =
+  "experiment-2026-08-difficulty-candidate-c-provider-v1-v3";
+export const difficultyConnectivityPreviousProbeLabel =
   "difficulty-candidate-c-connectivity-probe-20260801-a";
+export const difficultyConnectivityProbeLabel =
+  "difficulty-candidate-c-connectivity-probe-20260801-b";
 export const difficultyConnectivityProbeMaxOutputTokens = 2_048;
 
 const repositoryDirectory = fileURLToPath(new URL("../", import.meta.url));
@@ -66,14 +68,14 @@ const checkpointFileName = `${difficultyConnectivityProbeLabel}.checkpoint.priva
 const lockFileName = `${difficultyConnectivityProbeLabel}.lock.private`;
 export const difficultyConnectivityProbeCompletionFileName =
   `${difficultyConnectivityProbeLabel}.completion.private.json`;
-const expectedModelsConfigSha256 =
-  "10a911d24d3c281240248a2fb129cf54a363c34f44a0ac9d4b887ac2bb51e383";
+export const difficultyConnectivityExpectedModelsConfigSha256 =
+  "18aa2eaf2c99482b0946f7257f5367bab77d1edeb33eccf174850c32607fdf81";
 const expectedCandidateCAnchorsSha256 =
   "48b4c5f95732347b2a0a48f4143f50dbc6bc6706f427aa75179def45988b9a7f";
-// 由已经登记并实际运行过 Candidate D 探针的当前 Aether baseUrl + apiKey 身份
-// 计算；只保存单向摘要，不保存或输出地址、密钥本身。
-const expectedCurrentProviderIdentitySha256 =
-  "630b4c6feb6b32c4bbcacaad0fca69938a2cf503b4cb63569ff94fc6d62b53d6";
+// 旧 a 探针确认根路径配置会命中不存在的 chat/completions；当前身份只把
+// baseUrl pathname 修正为 /v1，密钥及其它环境变量不变。这里只保存单向摘要。
+export const difficultyConnectivityExpectedProviderIdentitySha256 =
+  "6e913442f0833b7950c9ae934e46f437dad6ffd72bf847fbe3acee058256050c";
 
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/u);
 const gitCommitSchema = z.string().regex(/^[0-9a-f]{40}$/u);
@@ -822,7 +824,10 @@ async function main(): Promise<void> {
 
   const modelsConfigDocument = readFileSync(modelsConfigUrl);
   const modelsConfigSha256 = sha256ConnectivityProbe(modelsConfigDocument);
-  if (modelsConfigSha256 !== expectedModelsConfigSha256) {
+  if (
+    modelsConfigSha256 !==
+    difficultyConnectivityExpectedModelsConfigSha256
+  ) {
     throw new Error("CONNECTIVITY_PROBE_CONFIGURATION_INVALID");
   }
   const config = loadConfig();
@@ -836,7 +841,10 @@ async function main(): Promise<void> {
     throw new Error("CONNECTIVITY_PROBE_CONFIGURATION_INVALID");
   }
   const providerIdentitySha256 = providerIdentityFingerprint("aether", credentials);
-  if (providerIdentitySha256 !== expectedCurrentProviderIdentitySha256) {
+  if (
+    providerIdentitySha256 !==
+    difficultyConnectivityExpectedProviderIdentitySha256
+  ) {
     throw new Error("CONNECTIVITY_PROBE_PROVIDER_IDENTITY_MISMATCH");
   }
 
