@@ -6,7 +6,6 @@
  * finish_reason=stop、HTTP 正常 EOF、dispatcher 关闭和标签锁安全释放。
  * 任何失败都只保存固定码与计数，不保存题面、模型内容、地址或密钥。
  */
-import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
@@ -33,6 +32,10 @@ import {
   preparePrivateDirectory,
   type PrivateDirectoryHandle
 } from "../scripts/private-runtime.mjs";
+import {
+  assertSafeCallerGitEnvironment,
+  withTrustedGitSnapshot
+} from "../scripts/trusted-git-state.mjs";
 import {
   getProviderCredentials,
   loadConfig,
@@ -459,6 +462,16 @@ export function assertDifficultyConnectivityRepositoryStatus(input: {
     !input.privatePathIgnored
   ) {
     throw new Error("CONNECTIVITY_PROBE_REPOSITORY_NOT_CLEAN");
+  }
+}
+
+export function assertDifficultyConnectivityInvocationEnvironment(
+  environment: NodeJS.ProcessEnv
+): void {
+  try {
+    assertSafeCallerGitEnvironment(environment);
+  } catch {
+    throw new Error("CONNECTIVITY_PROBE_CONFIGURATION_INVALID");
   }
 }
 
@@ -1085,48 +1098,46 @@ function assertBoundGitState(evalCodeVersion: string | undefined): {
   readonly codeVersion: string;
   readonly runnerSha256: string;
 } {
-  const headCodeVersion = execFileSync("git", ["rev-parse", "HEAD"], {
-    cwd: repositoryDirectory,
-    encoding: "utf8",
-    stdio: "pipe"
-  }).trim();
-  const trackedRunner = execFileSync("git", ["show", `HEAD:${runnerRepositoryPath}`], {
-    cwd: repositoryDirectory,
-    stdio: ["ignore", "pipe", "ignore"]
-  });
-  const currentRunner = readFileSync(fileURLToPath(import.meta.url));
-  const binding = assertDifficultyConnectivityCodeBinding({
-    headCodeVersion,
-    evalCodeVersion,
-    currentRunner,
-    trackedRunner
-  });
-  const porcelain = execFileSync(
-    "git",
-    ["status", "--porcelain=v1", "--untracked-files=all"],
-    { cwd: repositoryDirectory, encoding: "utf8", stdio: "pipe" }
-  );
-  const trackedPrivatePaths = execFileSync("git", ["ls-files", "private"], {
-    cwd: repositoryDirectory,
-    encoding: "utf8",
-    stdio: "pipe"
-  });
-  let privatePathIgnored = false;
-  try {
-    execFileSync("git", ["check-ignore", "-q", "private/.probe-ignore-check"], {
-      cwd: repositoryDirectory,
-      stdio: "ignore"
+  return withTrustedGitSnapshot(repositoryDirectory, (git) => {
+    const trackedRunner = git.run(
+      ["show", `HEAD:${runnerRepositoryPath}`]
+    );
+    const currentRunner = readFileSync(fileURLToPath(import.meta.url));
+    const binding = assertDifficultyConnectivityCodeBinding({
+      headCodeVersion: git.headCodeVersion,
+      evalCodeVersion,
+      currentRunner,
+      trackedRunner
     });
-    privatePathIgnored = true;
-  } catch {
-    privatePathIgnored = false;
-  }
-  assertDifficultyConnectivityRepositoryStatus({
-    porcelain,
-    trackedPrivatePaths,
-    privatePathIgnored
+    const porcelain = git.run(
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      { encoding: "utf8" }
+    );
+    const trackedPrivatePaths = git.run(
+      ["ls-files", "private"],
+      { encoding: "utf8" }
+    );
+    let privatePathIgnored = false;
+    try {
+      git.run(["check-ignore", "-q", "private/.probe-ignore-check"]);
+      privatePathIgnored = true;
+    } catch {
+      privatePathIgnored = false;
+    }
+    const porcelainAfterChecks = git.run(
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      { encoding: "utf8" }
+    );
+    if (porcelainAfterChecks !== porcelain) {
+      throw new Error("CONNECTIVITY_PROBE_REPOSITORY_NOT_CLEAN");
+    }
+    assertDifficultyConnectivityRepositoryStatus({
+      porcelain,
+      trackedPrivatePaths,
+      privatePathIgnored
+    });
+    return binding;
   });
-  return binding;
 }
 
 function syntheticProblem(): ReviewTaskProblem {
@@ -1146,6 +1157,7 @@ function syntheticProblem(): ReviewTaskProblem {
 }
 
 async function main(): Promise<void> {
+  assertDifficultyConnectivityInvocationEnvironment(process.env);
   if (
     process.argv.slice(2).length !== 0 ||
     hasUnknownPrefixedEnvironmentKeys(process.env, "EVAL_", ["EVAL_CODE_VERSION"])

@@ -153,6 +153,8 @@ node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:eval-diffic
 # 才能在单独人工核对中运行恰好一次；提交前、EVAL_CODE_VERSION 不匹配或有任意 tracked/untracked
 # 改动都会在读取私有运行目录和发起请求前失败。a/b/c 已永久占用，禁止删除、重跑或复用 completion。
 # FERMATA_CONNECTIVITY_ENV_FILE=/home/ubuntu/codex-urmotiv/Fermata/private/fermata-connectivity-probe.env
+# 提交并推送后，用专用工具从干净 HEAD 安全更新 env 中既有的 EVAL_CODE_VERSION；不要手改或 source：
+# npm run experiment:update-connectivity-code-version -- --environment-file=/home/ubuntu/codex-urmotiv/Fermata/private/fermata-connectivity-probe.env
 # 经上述核对后仅执行一次：
 # node scripts/run-with-env.mjs "$FERMATA_CONNECTIVITY_ENV_FILE" npm run experiment:probe-difficulty-connectivity
 
@@ -337,6 +339,17 @@ failed=1、complete=false，request/fetch 都精确为 1，HTTP 200，正文到�
 锁/checkpoint/completion 时，都会在请求前失败关闭。a/b/c 明确是历史不可重跑身份，d 不读取或
 复用它们的 completion；登记本身没有发起付费请求，也没有创建或改写实验产物。
 
+探针与 env 更新工具不从调用者 `PATH` 查找 Git，而是固定使用经系统路径权限检查的
+`/usr/bin/git`。每次仓库检查都会新建一个 `0700` 临时 Git 元数据目录；Git 只读取其中固定生成的
+HEAD、config 和 info 文件，正式 `.git/config`、config include 与 `.git/info/attributes` 不在其读取
+路径中。正式 HEAD/引用会独立解析，索引经稳定读取后复制为临时 `0400` 文件，正式索引描述符不交给
+Git；对象目录与工作树通过显式继承的只读描述符绑定。检查结束后再次逐字节核对正式索引，并确认
+HEAD、引用和这些目录未并发变化，再清理唯一临时目录。临时 info/exclude 只
+精确排除工作树根的 `.git/`，不会替 private 放宽忽略规则。Git 子进程使用最小环境，丢弃调用者的
+`GIT_*`、代理、加载器及配置注入，并关闭系统/全局 Git 配置、replace objects、hooks、fsmonitor、
+外部 diff、子模块递归和可选索引写入。直接入口还会在读取私有 env 或创建探针目录前拒绝
+`GIT_DIR`、`GIT_WORK_TREE`、`GIT_INDEX_FILE` 等调用者注入。
+
 这个 connectivity 结果无论成功与否都只回答“difficulty 的这一种 flash 请求能否完成一次协议
 往返”，不能证明 `review-balanced` 整条 reviewer 可运行。尤其 `thinking.solver` 与 `verdict`
 仍使用 pro 型号；旧根路径下的 Candidate D 404 不能证明修正路径后的协议可用。后续必须为 difficulty、
@@ -432,7 +445,7 @@ completion marker 表示这条执行链已完整收束并阻止重放，不等�
 
 | 流水线 | 状态 | 说明 |
 | --- | --- | --- |
-| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；provider-v1 的 c 请求已读到 EOF，但协议仍未通过** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate D 与恢复后的 Candidate C 请求都在旧根路径配置下返回 404；一次只读 `/v1/models` 已确认目录声明包含 flash/pro。修正 `/v1` 后的 b 单请求得到 HTTP 200，但客户端取消正文、未观察 EOF；v4 的 c 单请求同样是 HTTP 200，已安全排空并观察到真实 EOF，固定失败阶段为 `trailing_data`，仍未通过完整协议。v5 已加入封闭子阶段诊断但没有登记或运行新标签。a/b/c 证据均保留，没有启动新的 83 题。当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
+| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；provider-v1 的 c 请求已读到 EOF，但协议仍未通过** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate D 与恢复后的 Candidate C 请求都在旧根路径配置下返回 404；一次只读 `/v1/models` 已确认目录声明包含 flash/pro。修正 `/v1` 后的 b 单请求得到 HTTP 200，但客户端取消正文、未观察 EOF；v4 的 c 单请求同样是 HTTP 200，已安全排空并观察到真实 EOF，固定失败阶段为 `trailing_data`，仍未通过完整协议。v5 已加入封闭子阶段诊断并登记了唯一 d 标签，但尚未运行。a/b/c 证据均保留，没有启动新的 83 题。当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
 | 思维难度（thinking.ts） | **旧实验均不可作基线** | 两份早期报告无法证明完整；后两份明确只完成 6/24、9/24，而且都缺高分段。 |
 | 代码难度（coding.ts） | **旧实验均不可作基线** | 与思维难度共用的旧实验不完整；小样本曾出现难度分段升高但代码难度均值下降，需要在完整基线上复核。 |
 | 查重判断（verdict.ts） | **旧设计不可作准确性基线** | 旧实验只有 3 个正常样本和 3 个人工重复样本；正常组只验证“不是不通过”，没有区分通过与需要修改。 |

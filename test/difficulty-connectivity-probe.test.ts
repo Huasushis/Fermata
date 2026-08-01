@@ -21,6 +21,7 @@ import type { ReviewTaskProblem } from "../src/pipelines/types";
 import {
   acquireDifficultyConnectivityLabelLock,
   assertDifficultyConnectivityCodeBinding,
+  assertDifficultyConnectivityInvocationEnvironment,
   assertDifficultyConnectivityLabelNamespaceUnused,
   assertDifficultyConnectivityRepositoryStatus,
   buildDifficultyConnectivityCheckpoint,
@@ -276,6 +277,26 @@ describe("Candidate C 连通性请求契约", () => {
       trackedPrivatePaths: "",
       privatePathIgnored: true
     })).toThrow("CONNECTIVITY_PROBE_REPOSITORY_NOT_CLEAN");
+  });
+
+  it("调用者的 Git 仓库与索引注入在接触私有目录前固定拒绝", () => {
+    for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]) {
+      const marker = `synthetic-${key.toLowerCase()}-must-not-appear`;
+      let caught: unknown;
+      try {
+        assertDifficultyConnectivityInvocationEnvironment({
+          PATH: "/untrusted",
+          [key]: marker
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toBe(
+        "CONNECTIVITY_PROBE_CONFIGURATION_INVALID"
+      );
+      expect(String(caught)).not.toContain(marker);
+    }
   });
 });
 
