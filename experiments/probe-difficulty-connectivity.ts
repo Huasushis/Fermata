@@ -44,6 +44,7 @@ import {
   type FetchLike,
   type LlmRequestError,
   type LlmResponseFormatFailureStage,
+  type LlmResponseFormatFailureSubstage,
   type LlmRuntimeOptions
 } from "../src/llm";
 import { describeError } from "../src/logger";
@@ -78,7 +79,7 @@ export const difficultyConnectivityProbeCompletionFileName =
   `${difficultyConnectivityProbeLabel}.completion.private.json`;
 export const difficultyConnectivityExpectedModelsConfigSha256 =
   "fcc7f9f8805c2c8bec3c909dc66b85c025363cb14c2c6e053d8e36313f826703";
-const expectedCandidateCAnchorsSha256 =
+export const difficultyConnectivityExpectedCandidateCAnchorsSha256 =
   "48b4c5f95732347b2a0a48f4143f50dbc6bc6706f427aa75179def45988b9a7f";
 // 旧 a 探针确认根路径配置会命中不存在的 chat/completions；当前身份只把
 // baseUrl pathname 修正为 /v1，密钥及其它环境变量不变。这里只保存单向摘要。
@@ -129,6 +130,7 @@ export interface DifficultyConnectivityProbeResult {
   readonly schemaValidated: true | null;
   readonly stopAndHttpEofVerified: true | null;
   readonly formatFailureStage: LlmResponseFormatFailureStage | null;
+  readonly formatFailureSubstage: LlmResponseFormatFailureSubstage | null;
   readonly code: string;
 }
 
@@ -168,7 +170,7 @@ const safeLlmFailureCodes = new Set([
   "LLM_RESPONSE_FORMAT_INVALID",
   "LLM_JSON_OUTPUT_INVALID"
 ]);
-const safeFormatFailureStages = new Set<LlmResponseFormatFailureStage>([
+const safeFormatFailureStageValues = [
   "missing_body",
   "content_type",
   "json_utf8",
@@ -180,7 +182,204 @@ const safeFormatFailureStages = new Set<LlmResponseFormatFailureStage>([
   "delta_shape",
   "finish_shape",
   "trailing_data"
+] as const satisfies readonly LlmResponseFormatFailureStage[];
+const safeFormatFailureSubstageValues = [
+  "duplicate_done",
+  "data_after_done",
+  "choice_after_stop"
+] as const satisfies readonly LlmResponseFormatFailureSubstage[];
+const safeFormatFailureStages = new Set<LlmResponseFormatFailureStage>(
+  safeFormatFailureStageValues
+);
+const safeFormatFailureSubstages = new Set<LlmResponseFormatFailureSubstage>(
+  safeFormatFailureSubstageValues
+);
+const safeConnectivityProbeResultCodes = new Set([
+  "CONNECTIVITY_PROBE_MULTIPLE_REQUEST_BLOCKED",
+  "CONNECTIVITY_PROBE_REQUEST_CONTRACT_INVALID",
+  "CONNECTIVITY_PROBE_RESULT_CONTRACT_INVALID",
+  "CONNECTIVITY_PROBE_UNCLASSIFIED_FAILURE",
+  "CONNECTIVITY_PROBE_SUCCEEDED",
+  "CONNECTIVITY_PROBE_TRANSPORT_SETUP_FAILED",
+  "CONNECTIVITY_PROBE_RESULT_MISSING"
 ]);
+
+export const difficultyConnectivityProbeResultSchema: z.ZodType<
+  DifficultyConnectivityProbeResult
+> = z
+  .object({
+    sampleId: z.literal("synthetic-connectivity-sum"),
+    status: z.enum(["succeeded", "failed"]),
+    requestCount: z.number().int().nonnegative(),
+    fetchInvocationCount: z.number().int().nonnegative(),
+    httpStatus: z.number().int().min(100).max(599).nullable(),
+    httpEofObserved: z.boolean(),
+    responseBodyCancelled: z.boolean(),
+    schemaValidated: z.literal(true).nullable(),
+    stopAndHttpEofVerified: z.literal(true).nullable(),
+    formatFailureStage: z.enum(safeFormatFailureStageValues).nullable(),
+    formatFailureSubstage: z.enum(safeFormatFailureSubstageValues).nullable(),
+    code: z.string().refine((code) =>
+      safeLlmFailureCodes.has(code) || safeConnectivityProbeResultCodes.has(code)
+    )
+  })
+  .strict()
+  .superRefine((result, context) => {
+    const substageMatches = result.formatFailureStage === "trailing_data"
+      ? result.formatFailureSubstage !== null
+      : result.formatFailureSubstage === null;
+    if (!substageMatches) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "格式失败主阶段与子阶段不匹配。",
+        path: ["formatFailureSubstage"]
+      });
+    }
+  });
+
+export const difficultyConnectivityProbeGlobalFailureCodeSchema = z.enum([
+  "CONNECTIVITY_PROBE_TRANSPORT_SETUP_FAILED",
+  "CONNECTIVITY_PROBE_DISPATCHER_CLOSE_FAILED",
+  "CONNECTIVITY_PROBE_RESULT_MISSING",
+  "CONNECTIVITY_PROBE_LABEL_LOCK_RELEASE_FAILED"
+]);
+export type DifficultyConnectivityProbeGlobalFailureCode = z.infer<
+  typeof difficultyConnectivityProbeGlobalFailureCodeSchema
+>;
+
+export const difficultyConnectivityCommonEvidenceSchema = z
+  .object({
+    // 新增终止序列子阶段后，后续探针产物必须使用第 2 版；历史 c 的第 1 版
+    // completion 保持原字节与哈希，不由当前 schema 重新解释。
+    schemaVersion: z.literal(2),
+    label: z.literal(difficultyConnectivityProbeLabel),
+    experimentVersion: z.literal(difficultyConnectivityProbeExperimentVersion),
+    codeVersion: gitCommitSchema,
+    runnerSha256: sha256Schema,
+    modelsConfigSha256: z.literal(
+      difficultyConnectivityExpectedModelsConfigSha256
+    ),
+    candidateCAnchorsSha256: z.literal(
+      difficultyConnectivityExpectedCandidateCAnchorsSha256
+    ),
+    providerIdentitySha256: z.literal(
+      difficultyConnectivityExpectedProviderIdentitySha256
+    ),
+    model: z.literal("deepseek-v4-flash"),
+    thinking: z.literal(false),
+    thinkingRequest: z.literal("disabled"),
+    maxOutputTokens: z.literal(difficultyConnectivityProbeMaxOutputTokens),
+    maximumPaidRequests: z.literal(1),
+    expected: z.literal(1),
+    completionAuthorityFileName: z.literal(
+      difficultyConnectivityProbeCompletionFileName
+    )
+  })
+  .strict();
+export type DifficultyConnectivityCommonEvidence = z.infer<
+  typeof difficultyConnectivityCommonEvidenceSchema
+>;
+
+const difficultyConnectivityCheckpointStateSchema = z.enum([
+  "ready",
+  "active",
+  "succeeded",
+  "failed",
+  "completion_pending"
+]);
+const nullableGlobalFailureCodeSchema =
+  difficultyConnectivityProbeGlobalFailureCodeSchema.nullable();
+
+export const difficultyConnectivityCheckpointSchema =
+  difficultyConnectivityCommonEvidenceSchema
+    .extend({
+      revision: z.number().int().nonnegative(),
+      state: difficultyConnectivityCheckpointStateSchema,
+      activeSampleId: z.literal("synthetic-connectivity-sum").nullable(),
+      complete: z.literal(false),
+      globalFailureCode: nullableGlobalFailureCodeSchema,
+      labelLockReleased: z.boolean(),
+      result: difficultyConnectivityProbeResultSchema.nullable()
+    })
+    .strict();
+
+export const difficultyConnectivityCompletionSchema =
+  difficultyConnectivityCommonEvidenceSchema
+    .extend({
+      kind: z.literal("difficulty-connectivity-probe-completion"),
+      complete: z.boolean(),
+      expected: z.literal(1),
+      succeeded: z.union([z.literal(0), z.literal(1)]),
+      failed: z.union([z.literal(0), z.literal(1)]),
+      globalFailureCode: nullableGlobalFailureCodeSchema,
+      labelLockReleased: z.boolean(),
+      result: difficultyConnectivityProbeResultSchema,
+      artifacts: z
+        .object({
+          checkpoint: z
+            .object({
+              fileName: z.literal(checkpointFileName),
+              sha256: sha256Schema
+            })
+            .strict()
+        })
+        .strict()
+    })
+    .strict()
+    .superRefine((completion, context) => {
+      const expectedComplete =
+        isCompleteDifficultyConnectivityResult(completion.result) &&
+        completion.globalFailureCode === null &&
+        completion.labelLockReleased;
+      if (
+        completion.complete !== expectedComplete ||
+        completion.succeeded !== (expectedComplete ? 1 : 0) ||
+        completion.failed !== (expectedComplete ? 0 : 1)
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "连通性探针完成状态不一致。",
+          path: ["complete"]
+        });
+      }
+    });
+
+function parseConnectivityArtifact<T>(
+  schema: z.ZodType<T>,
+  value: unknown
+): T {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) {
+    // Zod 的详细错误可能包含未知键名；产物边界只抛固定码。
+    throw new Error("CONNECTIVITY_PROBE_RESULT_CONTRACT_INVALID");
+  }
+  return parsed.data;
+}
+
+export function buildDifficultyConnectivityCheckpoint(input: {
+  readonly commonEvidence: unknown;
+  readonly revision: unknown;
+  readonly state: unknown;
+  readonly activeSampleId: unknown;
+  readonly globalFailureCode: unknown;
+  readonly labelLockReleased: unknown;
+  readonly result: unknown;
+}): z.infer<typeof difficultyConnectivityCheckpointSchema> {
+  const commonEvidence = parseConnectivityArtifact(
+    difficultyConnectivityCommonEvidenceSchema,
+    input.commonEvidence
+  );
+  return parseConnectivityArtifact(difficultyConnectivityCheckpointSchema, {
+    ...commonEvidence,
+    revision: input.revision,
+    state: input.state,
+    activeSampleId: input.activeSampleId,
+    complete: false,
+    globalFailureCode: input.globalFailureCode,
+    labelLockReleased: input.labelLockReleased,
+    result: input.result
+  });
+}
 
 const expectedCandidateCAnchors = [
   [1993, "A", 800],
@@ -393,9 +592,10 @@ function failedResult(
     | "responseBodyCancelled"
   >,
   code: string,
-  formatFailureStage: LlmResponseFormatFailureStage | null = null
+  formatFailureStage: LlmResponseFormatFailureStage | null = null,
+  formatFailureSubstage: LlmResponseFormatFailureSubstage | null = null
 ): DifficultyConnectivityProbeResult {
-  return {
+  return parseConnectivityArtifact(difficultyConnectivityProbeResultSchema, {
     sampleId: "synthetic-connectivity-sum",
     status: "failed",
     requestCount: snapshot.requestCount,
@@ -406,8 +606,9 @@ function failedResult(
     schemaValidated: null,
     stopAndHttpEofVerified: null,
     formatFailureStage,
+    formatFailureSubstage,
     code
-  };
+  });
 }
 
 function safeFailureCode(error: unknown, snapshot: RequestGuardSnapshot): string {
@@ -423,17 +624,45 @@ function safeFailureCode(error: unknown, snapshot: RequestGuardSnapshot): string
     : "CONNECTIVITY_PROBE_UNCLASSIFIED_FAILURE";
 }
 
-function safeFormatFailureStage(
+function safeFormatFailureClassification(
   error: unknown
-): LlmResponseFormatFailureStage | null {
-  if (typeof error !== "object" || error === null) return null;
-  const stage = (error as Partial<LlmRequestError> & {
+): {
+  readonly formatFailureStage: LlmResponseFormatFailureStage | null;
+  readonly formatFailureSubstage: LlmResponseFormatFailureSubstage | null;
+} {
+  if (typeof error !== "object" || error === null) {
+    return { formatFailureStage: null, formatFailureSubstage: null };
+  }
+  const failure = error as Partial<LlmRequestError> & {
     readonly formatFailureStage?: unknown;
-  }).formatFailureStage;
-  return typeof stage === "string" &&
-    safeFormatFailureStages.has(stage as LlmResponseFormatFailureStage)
-    ? stage as LlmResponseFormatFailureStage
-    : null;
+    readonly formatFailureSubstage?: unknown;
+  };
+  const stage = failure.formatFailureStage;
+  if (
+    typeof stage !== "string" ||
+    !safeFormatFailureStages.has(stage as LlmResponseFormatFailureStage)
+  ) {
+    return { formatFailureStage: null, formatFailureSubstage: null };
+  }
+  if (stage !== "trailing_data") {
+    return {
+      formatFailureStage: stage as LlmResponseFormatFailureStage,
+      formatFailureSubstage: null
+    };
+  }
+  const substage = failure.formatFailureSubstage;
+  if (
+    typeof substage !== "string" ||
+    !safeFormatFailureSubstages.has(
+      substage as LlmResponseFormatFailureSubstage
+    )
+  ) {
+    return { formatFailureStage: null, formatFailureSubstage: null };
+  }
+  return {
+    formatFailureStage: "trailing_data",
+    formatFailureSubstage: substage as LlmResponseFormatFailureSubstage
+  };
 }
 
 export async function executeDifficultyConnectivityProbe(input: {
@@ -475,7 +704,7 @@ export async function executeDifficultyConnectivityProbe(input: {
     ) {
       return failedResult(snapshot, "CONNECTIVITY_PROBE_RESULT_CONTRACT_INVALID");
     }
-    return {
+    return parseConnectivityArtifact(difficultyConnectivityProbeResultSchema, {
       sampleId: "synthetic-connectivity-sum",
       status: "succeeded",
       requestCount: 1,
@@ -486,14 +715,17 @@ export async function executeDifficultyConnectivityProbe(input: {
       schemaValidated: true,
       stopAndHttpEofVerified: true,
       formatFailureStage: null,
+      formatFailureSubstage: null,
       code: "CONNECTIVITY_PROBE_SUCCEEDED"
-    };
+    });
   } catch (error) {
     const snapshot = guard.snapshot();
+    const failure = safeFormatFailureClassification(error);
     return failedResult(
       snapshot,
       safeFailureCode(error, snapshot),
-      safeFormatFailureStage(error)
+      failure.formatFailureStage,
+      failure.formatFailureSubstage
     );
   }
 }
@@ -512,6 +744,7 @@ export function isCompleteDifficultyConnectivityResult(
     result.schemaValidated === true &&
     result.stopAndHttpEofVerified === true &&
     result.formatFailureStage === null &&
+    result.formatFailureSubstage === null &&
     result.code === "CONNECTIVITY_PROBE_SUCCEEDED"
   );
 }
@@ -534,6 +767,15 @@ export async function runSingleDifficultyConnectivitySequence(input: {
       "CONNECTIVITY_PROBE_UNCLASSIFIED_FAILURE"
     );
   }
+  const parsedResult = difficultyConnectivityProbeResultSchema.safeParse(result);
+  if (!parsedResult.success) {
+    result = failedResult(
+      emptyGuardSnapshot(),
+      "CONNECTIVITY_PROBE_RESULT_CONTRACT_INVALID"
+    );
+  } else {
+    result = parsedResult.data;
+  }
   if (
     result.sampleId !== "synthetic-connectivity-sum" ||
     (result.status === "succeeded" && !isCompleteDifficultyConnectivityResult(result))
@@ -545,33 +787,48 @@ export async function runSingleDifficultyConnectivitySequence(input: {
 }
 
 export function buildDifficultyConnectivityCompletion(input: {
-  readonly commonEvidence: Readonly<Record<string, unknown>>;
+  readonly commonEvidence: unknown;
   readonly result: DifficultyConnectivityProbeResult;
-  readonly globalFailureCode: string | null;
+  readonly globalFailureCode: unknown;
   readonly labelLockReleased: boolean;
   readonly checkpointSha256: string;
-}): Readonly<Record<string, unknown>> & { readonly complete: boolean } {
+}): z.infer<typeof difficultyConnectivityCompletionSchema> {
+  const commonEvidence = parseConnectivityArtifact(
+    difficultyConnectivityCommonEvidenceSchema,
+    input.commonEvidence
+  );
+  const result = parseConnectivityArtifact(
+    difficultyConnectivityProbeResultSchema,
+    input.result
+  );
+  const globalFailureCode = parseConnectivityArtifact(
+    nullableGlobalFailureCodeSchema,
+    input.globalFailureCode
+  );
   const complete =
-    isCompleteDifficultyConnectivityResult(input.result) &&
-    input.globalFailureCode === null &&
+    isCompleteDifficultyConnectivityResult(result) &&
+    globalFailureCode === null &&
     input.labelLockReleased;
-  return {
-    ...input.commonEvidence,
+  return parseConnectivityArtifact(difficultyConnectivityCompletionSchema, {
+    ...commonEvidence,
     kind: "difficulty-connectivity-probe-completion",
     complete,
     expected: 1,
     succeeded: complete ? 1 : 0,
     failed: complete ? 0 : 1,
-    globalFailureCode: input.globalFailureCode,
+    globalFailureCode,
     labelLockReleased: input.labelLockReleased,
-    result: input.result,
+    result,
     artifacts: {
       checkpoint: {
         fileName: checkpointFileName,
-        sha256: sha256Schema.parse(input.checkpointSha256)
+        sha256: parseConnectivityArtifact(
+          sha256Schema,
+          input.checkpointSha256
+        )
       }
     }
-  };
+  });
 }
 
 function writeCompleteDocument(descriptor: number, document: Uint8Array): void {
@@ -616,7 +873,12 @@ export function publishDifficultyConnectivityArtifactExclusive(
   temporaryKind: string,
   value: unknown
 ): string {
-  const document = `${JSON.stringify(value, null, 2)}\n`;
+  const validatedValue = finalFileName === checkpointFileName
+    ? parseConnectivityArtifact(difficultyConnectivityCheckpointSchema, value)
+    : finalFileName === difficultyConnectivityProbeCompletionFileName
+      ? parseConnectivityArtifact(difficultyConnectivityCompletionSchema, value)
+      : value;
+  const document = `${JSON.stringify(validatedValue, null, 2)}\n`;
   const temporaryFileName =
     `${difficultyConnectivityProbeLabel}.${temporaryKind}.next.private.json`;
   writeDurableTemporary(directory, temporaryFileName, document);
@@ -637,7 +899,11 @@ function replaceCheckpoint(
 ): void {
   const temporaryFileName =
     `${difficultyConnectivityProbeLabel}.checkpoint.${String(revision).padStart(4, "0")}.next.private.json`;
-  const document = `${JSON.stringify(value, null, 2)}\n`;
+  const validatedValue = parseConnectivityArtifact(
+    difficultyConnectivityCheckpointSchema,
+    value
+  );
+  const document = `${JSON.stringify(validatedValue, null, 2)}\n`;
   writeDurableTemporary(directory, temporaryFileName, document);
   renameSync(
     anchoredPrivatePath(directory, temporaryFileName),
@@ -896,47 +1162,53 @@ async function main(): Promise<void> {
     strictAnchors.anchors,
     strictAnchors.provisional
   );
-  if (strictAnchors.fingerprint !== expectedCandidateCAnchorsSha256) {
+  if (
+    strictAnchors.fingerprint !==
+    difficultyConnectivityExpectedCandidateCAnchorsSha256
+  ) {
     throw new Error("CONNECTIVITY_PROBE_CONFIGURATION_INVALID");
   }
 
-  const commonEvidence = {
-    schemaVersion: 1,
-    label: difficultyConnectivityProbeLabel,
-    experimentVersion: difficultyConnectivityProbeExperimentVersion,
-    codeVersion,
-    runnerSha256,
-    modelsConfigSha256,
-    candidateCAnchorsSha256: strictAnchors.fingerprint,
-    providerIdentitySha256,
-    model: "deepseek-v4-flash",
-    thinking: false,
-    thinkingRequest: "disabled",
-    maxOutputTokens: difficultyConnectivityProbeMaxOutputTokens,
-    maximumPaidRequests: 1,
-    expected: 1,
-    completionAuthorityFileName: difficultyConnectivityProbeCompletionFileName
-  } as const;
+  const commonEvidence = parseConnectivityArtifact(
+    difficultyConnectivityCommonEvidenceSchema,
+    {
+      schemaVersion: 2,
+      label: difficultyConnectivityProbeLabel,
+      experimentVersion: difficultyConnectivityProbeExperimentVersion,
+      codeVersion,
+      runnerSha256,
+      modelsConfigSha256,
+      candidateCAnchorsSha256: strictAnchors.fingerprint,
+      providerIdentitySha256,
+      model: "deepseek-v4-flash",
+      thinking: false,
+      thinkingRequest: "disabled",
+      maxOutputTokens: difficultyConnectivityProbeMaxOutputTokens,
+      maximumPaidRequests: 1,
+      expected: 1,
+      completionAuthorityFileName: difficultyConnectivityProbeCompletionFileName
+    }
+  );
   const privateDirectory = preparePrivateDirectory(resultsDirectory);
   let labelLock: ProbeLabelLock | undefined;
   let labelLockReleaseAttempted = false;
   let labelLockReleased = false;
   let checkpointRevision = 0;
   let result: DifficultyConnectivityProbeResult | null = null;
-  let globalFailureCode: string | null = null;
+  let globalFailureCode: DifficultyConnectivityProbeGlobalFailureCode | null = null;
   const checkpointDocument = (
     state: DifficultyConnectivityCheckpointState,
     activeSampleId: string | null
-  ): Record<string, unknown> => ({
-    ...commonEvidence,
-    revision: checkpointRevision,
-    state,
-    activeSampleId,
-    complete: false,
-    globalFailureCode,
-    labelLockReleased,
-    result
-  });
+  ): z.infer<typeof difficultyConnectivityCheckpointSchema> =>
+    buildDifficultyConnectivityCheckpoint({
+      commonEvidence,
+      revision: checkpointRevision,
+      state,
+      activeSampleId,
+      globalFailureCode,
+      labelLockReleased,
+      result
+    });
   const persistCheckpoint = (
     state: DifficultyConnectivityCheckpointState,
     activeSampleId: string | null = null,

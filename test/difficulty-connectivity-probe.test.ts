@@ -21,7 +21,11 @@ import {
   acquireDifficultyConnectivityLabelLock,
   assertDifficultyConnectivityLabelNamespaceUnused,
   assertDifficultyConnectivityRepositoryStatus,
+  buildDifficultyConnectivityCheckpoint,
   buildDifficultyConnectivityCompletion,
+  difficultyConnectivityCheckpointSchema,
+  difficultyConnectivityCommonEvidenceSchema,
+  difficultyConnectivityExpectedCandidateCAnchorsSha256,
   difficultyConnectivityExpectedModelsConfigSha256,
   difficultyConnectivityExpectedProviderIdentitySha256,
   difficultyConnectivityProbeCompletionFileName,
@@ -29,6 +33,7 @@ import {
   difficultyConnectivityProbeLabel,
   difficultyConnectivityProbeLockRecordSchema,
   difficultyConnectivityProbeRequestBodySchema,
+  difficultyConnectivityProbeResultSchema,
   difficultyConnectivityPreviousProbeLabels,
   executeDifficultyConnectivityProbe,
   isCompleteDifficultyConnectivityResult,
@@ -98,7 +103,31 @@ function validResult(): DifficultyConnectivityProbeResult {
     schemaValidated: true,
     stopAndHttpEofVerified: true,
     formatFailureStage: null,
+    formatFailureSubstage: null,
     code: "CONNECTIVITY_PROBE_SUCCEEDED"
+  };
+}
+
+function validCommonEvidence() {
+  return {
+    schemaVersion: 2 as const,
+    label: difficultyConnectivityProbeLabel,
+    experimentVersion: difficultyConnectivityProbeExperimentVersion,
+    codeVersion: "b".repeat(40),
+    runnerSha256: "c".repeat(64),
+    modelsConfigSha256: difficultyConnectivityExpectedModelsConfigSha256,
+    candidateCAnchorsSha256:
+      difficultyConnectivityExpectedCandidateCAnchorsSha256,
+    providerIdentitySha256:
+      difficultyConnectivityExpectedProviderIdentitySha256,
+    model: "deepseek-v4-flash" as const,
+    thinking: false as const,
+    thinkingRequest: "disabled" as const,
+    maxOutputTokens: 2_048 as const,
+    maximumPaidRequests: 1 as const,
+    expected: 1 as const,
+    completionAuthorityFileName:
+      difficultyConnectivityProbeCompletionFileName
   };
 }
 
@@ -138,15 +167,16 @@ function setupPrivateDirectory() {
 }
 
 describe("Candidate C 连通性请求契约", () => {
-  it("新版本与 provider /v1 身份固定，不能沿用旧 a/b 标签", () => {
+  it("历史 c 继续绑定 v4 与旧配置哈希，当前 v5 不得复用它", () => {
     expect(difficultyConnectivityProbeExperimentVersion).toBe(
       "experiment-2026-08-difficulty-candidate-c-provider-v1-drain-v4"
     );
-    expect(
-      sha256ConnectivityProbe(
-        readFileSync(new URL("../config/models.yaml", import.meta.url))
-      )
-    ).toBe(difficultyConnectivityExpectedModelsConfigSha256);
+    expect(difficultyConnectivityExpectedModelsConfigSha256).toBe(
+      "fcc7f9f8805c2c8bec3c909dc66b85c025363cb14c2c6e053d8e36313f826703"
+    );
+    expect(sha256ConnectivityProbe(
+      readFileSync(new URL("../config/models.yaml", import.meta.url))
+    )).not.toBe(difficultyConnectivityExpectedModelsConfigSha256);
     expect(difficultyConnectivityProbeLabel).toBe(
       "difficulty-candidate-c-connectivity-probe-20260801-c"
     );
@@ -316,6 +346,119 @@ describe("Candidate C 单请求与真实 EOF", () => {
     });
   });
 
+  it.each([
+    {
+      substage: "duplicate_done",
+      invalidEvents: ["data: [DONE]", "", "data: [DONE]", "", ""].join("\n")
+    },
+    {
+      substage: "data_after_done",
+      invalidEvents: [
+        "data: [DONE]",
+        "",
+        'data: {"private_provider_payload":"不应落盘"}',
+        "",
+        ""
+      ].join("\n")
+    },
+    {
+      substage: "choice_after_stop",
+      invalidEvents: [
+        'data: {"choices":[{"delta":{"content":"不应采用"}}]}',
+        "",
+        ""
+      ].join("\n")
+    }
+  ] as const)(
+    "报告只保留封闭终止子阶段且等待真实 EOF：$substage",
+    async ({ substage, invalidEvents }) => {
+      const encoder = new TextEncoder();
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      let cancelled = false;
+      const validContent = JSON.stringify({
+        rating: 800,
+        confidence: 0.9,
+        rationale: "合成样本"
+      });
+      const baseFetch = vi.fn(async () => new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            streamController = controller;
+          },
+          cancel() {
+            cancelled = true;
+          }
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } }
+      ));
+      let settled = false;
+      const pending = executeDifficultyConnectivityProbe({
+        problem,
+        anchors: [],
+        spec,
+        credentials,
+        runtime,
+        baseFetch
+      }).finally(() => {
+        settled = true;
+      });
+      await vi.waitFor(() => expect(baseFetch).toHaveBeenCalledTimes(1));
+      streamController.enqueue(encoder.encode([
+        `data: ${JSON.stringify({
+          choices: [{
+            delta: { content: validContent },
+            finish_reason: "stop"
+          }]
+        })}`,
+        "",
+        invalidEvents
+      ].join("\n")));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+      expect(cancelled).toBe(false);
+      streamController.enqueue(encoder.encode("不应落盘的排空尾部"));
+      streamController.close();
+
+      const result = await pending;
+      expect(result).toMatchObject({
+        status: "failed",
+        requestCount: 1,
+        fetchInvocationCount: 1,
+        httpStatus: 200,
+        httpEofObserved: true,
+        responseBodyCancelled: false,
+        formatFailureStage: "trailing_data",
+        formatFailureSubstage: substage,
+        code: "LLM_RESPONSE_FORMAT_INVALID"
+      });
+      const serialized = JSON.stringify(result);
+      expect(serialized).not.toContain("private_provider_payload");
+      expect(serialized).not.toContain("不应落盘");
+      expect(serialized).not.toContain("排空尾部");
+    }
+  );
+
+  it("结果 schema 拒绝未知子阶段、主子阶段错配、外部错误码和额外字段", () => {
+    const failed = {
+      ...validResult(),
+      status: "failed" as const,
+      schemaValidated: null,
+      stopAndHttpEofVerified: null,
+      formatFailureStage: "trailing_data" as const,
+      formatFailureSubstage: "duplicate_done" as const,
+      code: "LLM_RESPONSE_FORMAT_INVALID"
+    };
+    expect(difficultyConnectivityProbeResultSchema.parse(failed)).toEqual(failed);
+    for (const invalid of [
+      { ...failed, formatFailureSubstage: "provider_private_value" },
+      { ...failed, formatFailureStage: "event_json" },
+      { ...failed, code: "PRIVATE_PROVIDER_ERROR_TEXT" },
+      { ...failed, private_provider_payload: "不应落盘" }
+    ]) {
+      expect(() => difficultyConnectivityProbeResultSchema.parse(invalid)).toThrow();
+    }
+  });
+
   it("HTTP 499、取消和缺少 stop 都是 complete=false", async () => {
     const http499 = await executeDifficultyConnectivityProbe({
       problem,
@@ -372,7 +515,7 @@ describe("Candidate C 单请求与真实 EOF", () => {
     for (const failed of [http499, cancelled, missingStop]) {
       expect(isCompleteDifficultyConnectivityResult(failed)).toBe(false);
       expect(buildDifficultyConnectivityCompletion({
-        commonEvidence: { label: difficultyConnectivityProbeLabel },
+        commonEvidence: validCommonEvidence(),
         result: failed,
         globalFailureCode: null,
         labelLockReleased: true,
@@ -421,7 +564,7 @@ describe("Candidate C 私有检查点、completion 与标签锁", () => {
 
       publishDifficultyConnectivityArtifactExclusive(
         fixture.handle,
-        `${difficultyConnectivityProbeLabel}.checkpoint.private.json`,
+        `${difficultyConnectivityProbeLabel}.evidence.private.json`,
         "current-label-test",
         { complete: false }
       );
@@ -460,12 +603,20 @@ describe("Candidate C 私有检查点、completion 与标签锁", () => {
       )).toThrow("CONNECTIVITY_PROBE_LABEL_LOCKED_OR_UNAVAILABLE");
       expect(() => assertDifficultyConnectivityLabelNamespaceUnused(fixture.handle)).not.toThrow();
 
-      const checkpointDocument = "checkpoint-safe-document\n";
+      const checkpointDocument = buildDifficultyConnectivityCheckpoint({
+        commonEvidence: validCommonEvidence(),
+        revision: 0,
+        state: "ready",
+        activeSampleId: null,
+        globalFailureCode: null,
+        labelLockReleased: false,
+        result: null
+      });
       publishDifficultyConnectivityArtifactExclusive(
         fixture.handle,
         `${difficultyConnectivityProbeLabel}.checkpoint.private.json`,
         "checkpoint-test",
-        { value: checkpointDocument }
+        checkpointDocument
       );
       expect(() => assertDifficultyConnectivityLabelNamespaceUnused(fixture.handle)).toThrow(
         "CONNECTIVITY_PROBE_LABEL_ALREADY_USED"
@@ -485,10 +636,136 @@ describe("Candidate C 私有检查点、completion 与标签锁", () => {
     }
   });
 
+  it("公共证据与 checkpoint 只接受精确字段和固定全局错误码", () => {
+    const commonEvidence = validCommonEvidence();
+    expect(difficultyConnectivityCommonEvidenceSchema.parse(commonEvidence))
+      .toEqual(commonEvidence);
+    const checkpoint = buildDifficultyConnectivityCheckpoint({
+      commonEvidence,
+      revision: 1,
+      state: "failed",
+      activeSampleId: null,
+      globalFailureCode: "CONNECTIVITY_PROBE_RESULT_MISSING",
+      labelLockReleased: false,
+      result: null
+    });
+    expect(difficultyConnectivityCheckpointSchema.parse(checkpoint)).toEqual(
+      checkpoint
+    );
+
+    const sensitiveText = "不应进入产物或固定错误信息的服务商原文";
+    for (const invalid of [
+      {
+        commonEvidence,
+        globalFailureCode: sensitiveText
+      },
+      {
+        commonEvidence: {
+          ...commonEvidence,
+          privateProviderPayload: sensitiveText
+        },
+        globalFailureCode: null
+      }
+    ]) {
+      const error = (() => {
+        try {
+          buildDifficultyConnectivityCheckpoint({
+            commonEvidence: invalid.commonEvidence,
+            revision: 2,
+            state: "failed",
+            activeSampleId: null,
+            globalFailureCode: invalid.globalFailureCode,
+            labelLockReleased: false,
+            result: null
+          });
+          return null;
+        } catch (caught) {
+          return caught;
+        }
+      })();
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        "CONNECTIVITY_PROBE_RESULT_CONTRACT_INVALID"
+      );
+      expect((error as Error).message).not.toContain(sensitiveText);
+    }
+  });
+
+  it("completion 拒绝未知全局码和公共证据额外字段且只抛固定错误", () => {
+    const sensitiveText = "不应进入 completion 或错误信息的外部原文";
+    const invalidInputs = [
+      {
+        commonEvidence: validCommonEvidence(),
+        globalFailureCode: sensitiveText
+      },
+      {
+        commonEvidence: {
+          ...validCommonEvidence(),
+          privateProviderPayload: sensitiveText
+        },
+        globalFailureCode: null
+      }
+    ];
+    for (const invalid of invalidInputs) {
+      const error = (() => {
+        try {
+          buildDifficultyConnectivityCompletion({
+            ...invalid,
+            result: validResult(),
+            labelLockReleased: true,
+            checkpointSha256: "a".repeat(64)
+          });
+          return null;
+        } catch (caught) {
+          return caught;
+        }
+      })();
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        "CONNECTIVITY_PROBE_RESULT_CONTRACT_INVALID"
+      );
+      expect((error as Error).message).not.toContain(sensitiveText);
+    }
+  });
+
+  it("当前 checkpoint/completion 文件在写盘前再次执行严格 schema", () => {
+    const fixture = setupPrivateDirectory();
+    try {
+      for (const [fileName, invalid] of [
+        [
+          `${difficultyConnectivityProbeLabel}.checkpoint.private.json`,
+          { privateProviderPayload: "不应写盘" }
+        ],
+        [
+          difficultyConnectivityProbeCompletionFileName,
+          { globalFailureCode: "不应写盘" }
+        ]
+      ] as const) {
+        expect(() => publishDifficultyConnectivityArtifactExclusive(
+          fixture.handle,
+          fileName,
+          "invalid-artifact-test",
+          invalid
+        )).toThrow("CONNECTIVITY_PROBE_RESULT_CONTRACT_INVALID");
+        expect(() => lstatSync(join(fixture.output, fileName))).toThrow();
+      }
+    } finally {
+      closePrivateDirectory(fixture.handle);
+    }
+  });
+
   it("completion 最后排他发布、绑定 checkpoint 哈希且绝不覆盖旧证据", () => {
     const fixture = setupPrivateDirectory();
     try {
-      const checkpoint = `${JSON.stringify({ state: "completion_pending", complete: false })}\n`;
+      const checkpoint = buildDifficultyConnectivityCheckpoint({
+        commonEvidence: validCommonEvidence(),
+        revision: 1,
+        state: "completion_pending",
+        activeSampleId: null,
+        globalFailureCode: null,
+        labelLockReleased: true,
+        result: validResult()
+      });
       const checkpointPath = anchoredPrivatePath(
         fixture.handle,
         `${difficultyConnectivityProbeLabel}.checkpoint.private.json`
@@ -497,16 +774,11 @@ describe("Candidate C 私有检查点、completion 与标签锁", () => {
         fixture.handle,
         `${difficultyConnectivityProbeLabel}.checkpoint.private.json`,
         "checkpoint-final",
-        JSON.parse(checkpoint) as unknown
+        checkpoint
       );
       expect(sha256ConnectivityProbe(readFileSync(checkpointPath))).toBe(checkpointSha);
       const completion = buildDifficultyConnectivityCompletion({
-        commonEvidence: {
-          label: difficultyConnectivityProbeLabel,
-          codeVersion: "b".repeat(40),
-          modelsConfigSha256: "c".repeat(64),
-          providerIdentitySha256: "d".repeat(64)
-        },
+        commonEvidence: validCommonEvidence(),
         result: validResult(),
         globalFailureCode: null,
         labelLockReleased: true,
@@ -535,14 +807,14 @@ describe("Candidate C 私有检查点、completion 与标签锁", () => {
       )).toBe(original);
 
       expect(buildDifficultyConnectivityCompletion({
-        commonEvidence: {},
+        commonEvidence: validCommonEvidence(),
         result: validResult(),
         globalFailureCode: "CONNECTIVITY_PROBE_DISPATCHER_CLOSE_FAILED",
         labelLockReleased: true,
         checkpointSha256: "a".repeat(64)
       }).complete).toBe(false);
       expect(buildDifficultyConnectivityCompletion({
-        commonEvidence: {},
+        commonEvidence: validCommonEvidence(),
         result: validResult(),
         globalFailureCode: null,
         labelLockReleased: false,

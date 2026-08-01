@@ -437,26 +437,195 @@ describe("chatComplete：正常路径", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("DONE 后继续出现非空事件时拒绝损坏的响应次序", async () => {
-    const fetchMock = vi.fn(
-      async () =>
-        new Response(
-          [
-            'data: {"choices":[{"delta":{"content":"前半段"}}]}',
-            "",
-            "data: [DONE]",
-            "",
-            'data: {"choices":[{"delta":{"content":"不应出现"}}]}',
-            ""
-          ].join("\n"),
-          { status: 200, headers: { "Content-Type": "text/event-stream" } }
-        )
-    );
+  it.each([
+    {
+      substage: "duplicate_done",
+      invalidEvents: ["data: [DONE]", "", "data: [DONE]", "", ""].join("\n")
+    },
+    {
+      substage: "data_after_done",
+      invalidEvents: [
+        "data: [DONE]",
+        "",
+        'data: {"private_provider_payload":"不应泄露"}',
+        "",
+        ""
+      ].join("\n")
+    },
+    {
+      substage: "choice_after_stop",
+      invalidEvents: [
+        'data: {"choices":[{"delta":{"content":"不应采用"}}]}',
+        "",
+        ""
+      ].join("\n")
+    }
+  ] as const)(
+    "严格拒绝并安全排空终止序列异常：$substage",
+    async ({ substage, invalidEvents }) => {
+      const encoder = new TextEncoder();
+      const sensitiveTail = "不应进入错误或分类的尾部原文";
+      let cancelled = false;
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamController = controller;
+        },
+        cancel() {
+          cancelled = true;
+        }
+      });
+      const fetchMock = vi.fn(async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      }));
+      let settled = false;
+      const resultPromise = chatComplete(provider, spec, [], {
+        ...runtime,
+        fetch: fetchMock
+      });
+      void resultPromise.finally(() => {
+        settled = true;
+      }).catch(() => undefined);
 
-    await expect(
-      chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock })
-    ).rejects.toMatchObject({ code: "LLM_RESPONSE_FORMAT_INVALID" });
+      streamController.enqueue(encoder.encode([
+        'data: {"choices":[{"delta":{"content":"前半段"},"finish_reason":"stop"}]}',
+        "",
+        invalidEvents
+      ].join("\n")));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(settled).toBe(false);
+      expect(cancelled).toBe(false);
+
+      streamController.enqueue(encoder.encode(sensitiveTail));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(settled).toBe(false);
+      expect(cancelled).toBe(false);
+      streamController.close();
+
+      const error = await resultPromise.catch((caught: unknown) => caught);
+      expect(error).toMatchObject({
+        code: "LLM_RESPONSE_FORMAT_INVALID",
+        formatFailureStage: "trailing_data",
+        formatFailureSubstage: substage
+      });
+      expect((error as Error).message).not.toContain(sensitiveTail);
+      expect((error as Error).message).not.toContain("private_provider_payload");
+      expect(cancelled).toBe(false);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it("终止序列子阶段在运行时也是闭集，非法值不会进入错误对象", () => {
+    const sensitiveValue = "服务商原始尾部文本";
+    const invalidConstructors = [
+      () => new LlmResponseFormatError(
+        "trailing_data",
+        sensitiveValue as "duplicate_done"
+      ),
+      () => new LlmResponseFormatError("trailing_data"),
+      () => new LlmResponseFormatError("event_json", "duplicate_done"),
+      () => new LlmRequestError(
+        "LLM_STREAM_INTERRUPTED",
+        undefined,
+        "trailing_data",
+        sensitiveValue as "duplicate_done"
+      ),
+      () => new LlmResponseBodyTooLargeError(
+        "trailing_data",
+        sensitiveValue as "duplicate_done"
+      )
+    ];
+    for (const construct of invalidConstructors) {
+      const error = (() => {
+        try {
+          construct();
+          return null;
+        } catch (caught) {
+          return caught;
+        }
+      })();
+      expect(error).toBeInstanceOf(TypeError);
+      expect((error as Error).message).not.toContain(sensitiveValue);
+    }
+    expect(() => new LlmResponseFormatError(
+      "trailing_data",
+      "duplicate_done"
+    )).not.toThrow();
   });
+
+  it.each([
+    {
+      mode: "stream_interrupted",
+      expectedCode: "LLM_STREAM_INTERRUPTED",
+      expectedCancelled: false
+    },
+    {
+      mode: "cancelled",
+      expectedCode: "LLM_CANCELLED",
+      expectedCancelled: true
+    },
+    {
+      mode: "body_too_large",
+      expectedCode: "LLM_RESPONSE_BODY_TOO_LARGE",
+      expectedCancelled: true
+    }
+  ] as const)(
+    "终止序列首错在排空异常后仍保留封闭子阶段：$mode",
+    async ({ mode, expectedCode, expectedCancelled }) => {
+      const encoder = new TextEncoder();
+      const sensitiveTransportText = "不应进入错误的排空传输细节";
+      const taskController = new AbortController();
+      let cancelled = false;
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamController = controller;
+        },
+        cancel() {
+          cancelled = true;
+        }
+      });
+      const fetchMock = vi.fn(async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      }));
+      const resultPromise = chatComplete(provider, spec, [], {
+        ...runtime,
+        signal: taskController.signal,
+        fetch: fetchMock
+      });
+      streamController.enqueue(encoder.encode([
+        'data: {"choices":[{"delta":{"content":"前半段"},"finish_reason":"stop"}]}',
+        "",
+        "data: [DONE]",
+        "",
+        "data: [DONE]",
+        "",
+        ""
+      ].join("\n")));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(cancelled).toBe(false);
+
+      if (mode === "stream_interrupted") {
+        streamController.error(new Error(sensitiveTransportText));
+      } else if (mode === "cancelled") {
+        taskController.abort();
+      } else {
+        streamController.enqueue(new Uint8Array(maximumLlmResponseBodyBytes));
+      }
+
+      const error = await resultPromise.catch((caught: unknown) => caught);
+      expect(error).toMatchObject({
+        code: expectedCode,
+        formatFailureStage: "trailing_data",
+        formatFailureSubstage: "duplicate_done"
+      });
+      expect((error as Error).message).not.toContain(sensitiveTransportText);
+      expect(cancelled).toBe(expectedCancelled);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+  );
 
   it("流中出现服务商错误对象时拒绝残缺答案，且不泄漏错误正文", async () => {
     const sensitiveError = "不应进入异常或日志的服务商原文";
@@ -988,7 +1157,7 @@ describe("chatComplete：按输出活动判断是否停住", () => {
     }
   });
 
-  it("格式首错后的排空分块刷新既有 idle 边界，停住后按 idle 中止而不伪称 EOF", async () => {
+  it("终止序列首错后的排空分块刷新 idle 边界，超时仍保留封闭子阶段", async () => {
     vi.useFakeTimers();
     try {
       let cancelled = false;
@@ -1017,7 +1186,15 @@ describe("chatComplete：按输出活动判断是否停住", () => {
         fetch: fetchMock
       });
       await vi.advanceTimersByTimeAsync(0);
-      streamController.enqueue(encoder.encode("data: {not-json}\n\n"));
+      streamController.enqueue(encoder.encode([
+        'data: {"choices":[{"delta":{"content":"前半段"},"finish_reason":"stop"}]}',
+        "",
+        "data: [DONE]",
+        "",
+        "data: [DONE]",
+        "",
+        ""
+      ].join("\n")));
       await vi.advanceTimersByTimeAsync(0);
 
       await vi.advanceTimersByTimeAsync(900);
@@ -1025,7 +1202,8 @@ describe("chatComplete：按输出活动判断是否停住", () => {
       await vi.advanceTimersByTimeAsync(0);
       const rejection = expect(resultPromise).rejects.toMatchObject({
         code: "LLM_OUTPUT_IDLE_TIMEOUT",
-        formatFailureStage: "event_json"
+        formatFailureStage: "trailing_data",
+        formatFailureSubstage: "duplicate_done"
       });
       await vi.advanceTimersByTimeAsync(1_001);
       await rejection;

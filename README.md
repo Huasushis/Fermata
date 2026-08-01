@@ -149,11 +149,11 @@ node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:calibrate-a
 # 真实 HEAD、Git 可见的干净工作树，以及 runner 与登记依赖的实际字节。
 node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:eval-difficulty -- --label=calibrated
 
-# 只验证当前 difficulty flash 请求是否能与当前模型服务完成一次合成题协议往返。
-# 它固定唯一标签且不接受参数；使用专用私有 env，不能混入 EVAL_CONCURRENCY 等其它实验变量。
-# 运行前其中唯一的 EVAL_* 键 EVAL_CODE_VERSION 必须等于干净 HEAD。
-FERMATA_CONNECTIVITY_ENV_FILE=/home/ubuntu/codex-urmotiv/Fermata/private/fermata-connectivity-probe.env
-node scripts/run-with-env.mjs "$FERMATA_CONNECTIVITY_ENV_FILE" npm run experiment:probe-difficulty-connectivity
+# 这个历史入口仍固定到已经占用的 c 标签与 v4 配置，仅为保留旧证据链；禁止重跑。
+# 下一次预检必须在独立提交中先登记新的唯一标签和当前版本，再使用专用私有 env。
+# 不得删除 c 的私有产物、改写旧标签或复用旧 completion 来再次发起请求。
+# FERMATA_CONNECTIVITY_ENV_FILE=/home/ubuntu/codex-urmotiv/Fermata/private/fermata-connectivity-probe.env
+# 禁止执行：node scripts/run-with-env.mjs "$FERMATA_CONNECTIVITY_ENV_FILE" npm run experiment:probe-difficulty-connectivity
 
 # 4. 思维/代码难度标定：检验 rating 越高等级是否单调上升。
 # 首次运行不加 --resume。
@@ -242,7 +242,7 @@ npm run experiment:calibrate-levels:detached -- \
 
 正式服务已有的 `settings.json` 会保留上次保存的 `experimentVersion`，不会因为替换
 `models.yaml` 自动改变。当前配置版本是
-`experiment-2026-08-difficulty-candidate-c-provider-v1-drain-v4`。部署后必须先保持
+`experiment-2026-08-difficulty-candidate-c-provider-v1-drain-v5`。部署后必须先保持
 `enabled=false`；只有在没有在途任务、逐项核对整个所选档位的协议和准确性证据后，才能通过
 Urmotiv 的 Fermata 设置页或管理接口显式写入当前版本并开启。worker 还会在每轮 claim 前重新
 比较版本和生产资格证据，旧值即使同时保存了 `enabled=true` 也不会领取任务。由于当前
@@ -320,6 +320,14 @@ failed=1、complete=false，request/fetch 都精确为 1，HTTP 200，正文到�
 据此启动 83 题付费实验。格式错误后的排空沿用配置中的 10 分钟连续停顿与 4 小时总保护，不会恢复
 120 秒总时限；传输中断、停顿超时或任务取消都不会伪装成 EOF。私有 completion 只保存固定枚举的
 失败阶段，不保存原始事件、响应字段、正文、长度明细或服务商错误。
+
+当前 v5 在不放宽任何接受条件的前提下，把 `trailing_data` 细分为三个固定子阶段：
+重复终止标记、终止标记后仍有数据，以及 `finish_reason=stop` 后仍有非空候选事件。
+子阶段会随首错排空保留到真实 HTTP EOF；排空中断、取消、停顿超时或正文超限也只携带这一固定
+枚举，不保存或记录原始事件、服务商响应字段名、字段值、文本或长度。历史 c completion 没有这个新增字段，
+继续以其原始哈希为准。后续产物格式已升为第 2 版，公共证据、checkpoint 和 completion 都在写盘前
+经过精确字段与固定全局错误码校验；未知字段或错误码只产生固定本地失败码。本次代码没有登记新的
+探针标签，也没有发起付费请求。在新提交及新配置哈希固定前，不得运行下一次连通性探针。
 
 这个 connectivity 结果无论成功与否都只回答“difficulty 的这一种 flash 请求能否完成一次协议
 往返”，不能证明 `review-balanced` 整条 reviewer 可运行。尤其 `thinking.solver` 与 `verdict`
@@ -416,7 +424,7 @@ completion marker 表示这条执行链已完整收束并阻止重放，不等�
 
 | 流水线 | 状态 | 说明 |
 | --- | --- | --- |
-| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；provider-v1 的 c 请求已读到 EOF，但协议仍未通过** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate D 与恢复后的 Candidate C 请求都在旧根路径配置下返回 404；一次只读 `/v1/models` 已确认目录声明包含 flash/pro。修正 `/v1` 后的 b 单请求得到 HTTP 200，但客户端取消正文、未观察 EOF；v4 的 c 单请求同样是 HTTP 200，已安全排空并观察到真实 EOF，固定失败阶段为 `trailing_data`，仍未通过完整协议。a/b/c 证据均保留，没有启动新的 83 题。当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
+| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；provider-v1 的 c 请求已读到 EOF，但协议仍未通过** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate D 与恢复后的 Candidate C 请求都在旧根路径配置下返回 404；一次只读 `/v1/models` 已确认目录声明包含 flash/pro。修正 `/v1` 后的 b 单请求得到 HTTP 200，但客户端取消正文、未观察 EOF；v4 的 c 单请求同样是 HTTP 200，已安全排空并观察到真实 EOF，固定失败阶段为 `trailing_data`，仍未通过完整协议。v5 已加入封闭子阶段诊断但没有登记或运行新标签。a/b/c 证据均保留，没有启动新的 83 题。当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
 | 思维难度（thinking.ts） | **旧实验均不可作基线** | 两份早期报告无法证明完整；后两份明确只完成 6/24、9/24，而且都缺高分段。 |
 | 代码难度（coding.ts） | **旧实验均不可作基线** | 与思维难度共用的旧实验不完整；小样本曾出现难度分段升高但代码难度均值下降，需要在完整基线上复核。 |
 | 查重判断（verdict.ts） | **旧设计不可作准确性基线** | 旧实验只有 3 个正常样本和 3 个人工重复样本；正常组只验证“不是不通过”，没有区分通过与需要修改。 |

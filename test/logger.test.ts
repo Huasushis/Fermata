@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { LlmResponseFormatError } from "../src/llm";
 import { describeError, logError } from "../src/logger";
 
 afterEach(() => {
@@ -55,6 +56,20 @@ describe("安全错误码", () => {
     logError("模型请求失败", new Error(sensitiveText));
     const output = write.mock.calls.map(([value]) => String(value)).join("");
     expect(output).toContain('errorCode="UNEXPECTED_ERROR"');
+    expect(output).not.toContain(sensitiveText);
+  });
+
+  it("终止序列子阶段仍只按固定错误码记日志，不带响应字段或正文", () => {
+    const sensitiveText = "不应进入日志的服务商尾部原文";
+    const error = Object.assign(
+      new LlmResponseFormatError("trailing_data", "data_after_done"),
+      { privateProviderPayload: sensitiveText }
+    );
+    const write = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    logError("模型响应终止序列异常", error);
+    const output = write.mock.calls.map(([value]) => String(value)).join("");
+    expect(output).toContain('errorCode="LLM_RESPONSE_FORMAT_INVALID"');
+    expect(output).not.toContain("privateProviderPayload");
     expect(output).not.toContain(sensitiveText);
   });
 

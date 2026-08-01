@@ -112,7 +112,7 @@ describe("loadConfig：正常路径", () => {
     const source = readFileSync(new URL("../config/models.yaml", import.meta.url), "utf8");
     const config = loadConfig({ env: validEnv, modelsYamlSource: source });
     expect(config.models.experimentVersion).toBe(
-      "experiment-2026-08-difficulty-candidate-c-provider-v1-drain-v4"
+      "experiment-2026-08-difficulty-candidate-c-provider-v1-drain-v5"
     );
     expect(config.models.experimentVersion).toBe(currentBlockedProductionExperimentVersion);
     expect(config.models.profiles["review-balanced"]?.difficulty).toEqual({

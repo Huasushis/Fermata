@@ -211,12 +211,21 @@ export class LlmRequestError extends Error {
   public readonly status: number | undefined;
   /** 排空格式首错时若被超时、取消或断流覆盖，保留安全的最初协议阶段。 */
   public readonly formatFailureStage: LlmResponseFormatFailureStage | undefined;
+  /** `trailing_data` 的封闭分类；不包含响应正文、字段名、长度或其它服务商数据。 */
+  public readonly formatFailureSubstage:
+    | LlmResponseFormatFailureSubstage
+    | undefined;
 
   public constructor(
     code: LlmRequestError["code"],
     status?: number,
-    formatFailureStage?: LlmResponseFormatFailureStage
+    formatFailureStage?: LlmResponseFormatFailureStage,
+    formatFailureSubstage?: LlmResponseFormatFailureSubstage
   ) {
+    assertSafeFormatFailureSubstage(
+      formatFailureStage,
+      formatFailureSubstage
+    );
     const messages: Record<LlmRequestError["code"], string> = {
       LLM_HTTP_ERROR: "模型服务返回了错误状态。",
       LLM_NETWORK_FAILED: "模型服务连接未能完成。",
@@ -233,6 +242,7 @@ export class LlmRequestError extends Error {
     this.code = code;
     this.status = status;
     this.formatFailureStage = formatFailureStage;
+    this.formatFailureSubstage = formatFailureSubstage;
   }
 }
 
@@ -240,11 +250,22 @@ export class LlmRequestError extends Error {
 export class LlmResponseBodyTooLargeError extends Error {
   public readonly code = "LLM_RESPONSE_BODY_TOO_LARGE";
   public readonly formatFailureStage: LlmResponseFormatFailureStage | undefined;
+  public readonly formatFailureSubstage:
+    | LlmResponseFormatFailureSubstage
+    | undefined;
 
-  public constructor(formatFailureStage?: LlmResponseFormatFailureStage) {
+  public constructor(
+    formatFailureStage?: LlmResponseFormatFailureStage,
+    formatFailureSubstage?: LlmResponseFormatFailureSubstage
+  ) {
     super("模型服务响应正文超过大小限制。");
     this.name = "LlmResponseBodyTooLargeError";
+    assertSafeFormatFailureSubstage(
+      formatFailureStage,
+      formatFailureSubstage
+    );
     this.formatFailureStage = formatFailureStage;
+    this.formatFailureSubstage = formatFailureSubstage;
   }
 }
 
@@ -265,15 +286,51 @@ export type LlmResponseFormatFailureStage =
   | "finish_shape"
   | "trailing_data";
 
+/**
+ * `trailing_data` 的安全子阶段。闭集只说明终止状态机的分支，不记录事件
+ * 正文、字段名、字段值、字节数或文本摘要。
+ */
+export type LlmResponseFormatFailureSubstage =
+  | "duplicate_done"
+  | "data_after_done"
+  | "choice_after_stop";
+
+function assertSafeFormatFailureSubstage(
+  formatFailureStage?: LlmResponseFormatFailureStage,
+  formatFailureSubstage?: LlmResponseFormatFailureSubstage
+): void {
+  const knownSubstage =
+    formatFailureSubstage === "duplicate_done" ||
+    formatFailureSubstage === "data_after_done" ||
+    formatFailureSubstage === "choice_after_stop";
+  if (
+    (formatFailureStage === "trailing_data" && !knownSubstage) ||
+    (formatFailureStage !== "trailing_data" && formatFailureSubstage !== undefined)
+  ) {
+    throw new TypeError("模型服务响应格式失败分类不完整。");
+  }
+}
+
 /** 拿到了 2xx 响应，但结构不符合 OpenAI 兼容格式的基本假设。 */
 export class LlmResponseFormatError extends Error {
   public readonly code = "LLM_RESPONSE_FORMAT_INVALID";
   public readonly formatFailureStage: LlmResponseFormatFailureStage;
+  public readonly formatFailureSubstage:
+    | LlmResponseFormatFailureSubstage
+    | undefined;
 
-  public constructor(formatFailureStage: LlmResponseFormatFailureStage) {
+  public constructor(
+    formatFailureStage: LlmResponseFormatFailureStage,
+    formatFailureSubstage?: LlmResponseFormatFailureSubstage
+  ) {
     super("模型服务响应格式不正确。");
     this.name = "LlmResponseFormatError";
+    assertSafeFormatFailureSubstage(
+      formatFailureStage,
+      formatFailureSubstage
+    );
     this.formatFailureStage = formatFailureStage;
+    this.formatFailureSubstage = formatFailureSubstage;
   }
 }
 
@@ -525,8 +582,14 @@ async function requestWithRetry(
           onValidOutput: () => {
             watchdog.receivedValidOutput();
           },
-          onInvalidResponseDrainStarted: (formatFailureStage) => {
-            watchdog.invalidResponseDrainStarted(formatFailureStage);
+          onInvalidResponseDrainStarted: (
+            formatFailureStage,
+            formatFailureSubstage
+          ) => {
+            watchdog.invalidResponseDrainStarted(
+              formatFailureStage,
+              formatFailureSubstage
+            );
           },
           onInvalidResponseDrainActivity: () => {
             watchdog.receivedInvalidResponseDrainActivity();
@@ -549,7 +612,8 @@ async function requestWithRetry(
         throw new LlmRequestError(
           "LLM_CANCELLED",
           undefined,
-          watchdog.formatFailureStage()
+          watchdog.formatFailureStage(),
+          watchdog.formatFailureSubstage()
         );
       }
       if (
@@ -564,7 +628,8 @@ async function requestWithRetry(
       throw new LlmRequestError(
         responseReceived ? "LLM_STREAM_INTERRUPTED" : "LLM_NETWORK_FAILED",
         undefined,
-        watchdog.formatFailureStage()
+        watchdog.formatFailureStage(),
+        watchdog.formatFailureSubstage()
       );
     } finally {
       runtime.signal?.removeEventListener("abort", cancelForTaskState);
@@ -617,6 +682,7 @@ class LlmRequestWatchdog {
   #receivedValidOutput = false;
   #drainingInvalidResponse = false;
   #formatFailureStage: LlmResponseFormatFailureStage | undefined;
+  #formatFailureSubstage: LlmResponseFormatFailureSubstage | undefined;
 
   public constructor(
     controller: AbortController,
@@ -665,11 +731,13 @@ class LlmRequestWatchdog {
    * 的隐藏短时限，也不会因持续收到分块而无限延长。
    */
   public invalidResponseDrainStarted(
-    formatFailureStage?: LlmResponseFormatFailureStage
+    formatFailureStage?: LlmResponseFormatFailureStage,
+    formatFailureSubstage?: LlmResponseFormatFailureSubstage
   ): void {
     if (this.#timeoutCode !== null || this.#drainingInvalidResponse) return;
     this.#drainingInvalidResponse = true;
     this.#formatFailureStage = formatFailureStage;
+    this.#formatFailureSubstage = formatFailureSubstage;
     if (this.#firstOutputTimer !== null) {
       clearTimeout(this.#firstOutputTimer);
       this.#firstOutputTimer = null;
@@ -698,12 +766,19 @@ class LlmRequestWatchdog {
       : new LlmRequestError(
         this.#timeoutCode,
         undefined,
-        this.#formatFailureStage
+        this.#formatFailureStage,
+        this.#formatFailureSubstage
       );
   }
 
   public formatFailureStage(): LlmResponseFormatFailureStage | undefined {
     return this.#formatFailureStage;
+  }
+
+  public formatFailureSubstage():
+    | LlmResponseFormatFailureSubstage
+    | undefined {
+    return this.#formatFailureSubstage;
   }
 
   public close(): void {
@@ -858,7 +933,8 @@ async function delayBeforeRetry(
 interface ResponseBodyActivityObserver {
   readonly onValidOutput: () => void;
   readonly onInvalidResponseDrainStarted: (
-    formatFailureStage?: LlmResponseFormatFailureStage
+    formatFailureStage?: LlmResponseFormatFailureStage,
+    formatFailureSubstage?: LlmResponseFormatFailureSubstage
   ) => void;
   readonly onInvalidResponseDrainActivity: () => void;
 }
@@ -950,7 +1026,8 @@ async function readResponseTextWithLimit(
       totalBytes = addResponseChunkSize(
         totalBytes,
         chunk.value.byteLength,
-        firstProtocolError?.formatFailureStage
+        firstProtocolError?.formatFailureStage,
+        firstProtocolError?.formatFailureSubstage
       );
       if (firstProtocolError !== undefined) {
         if (chunk.value.byteLength > 0) {
@@ -965,7 +1042,8 @@ async function readResponseTextWithLimit(
         // 首错后的正文不再解码或拼接；清除已收内容，只保留固定阶段。
         text = "";
         observer.onInvalidResponseDrainStarted(
-          firstProtocolError.formatFailureStage
+          firstProtocolError.formatFailureStage,
+          firstProtocolError.formatFailureSubstage
         );
       }
     }
@@ -994,7 +1072,8 @@ async function drainResponseAfterProtocolError(
   let readerErrored = false;
   let totalBytes = 0;
   observer.onInvalidResponseDrainStarted(
-    firstProtocolError.formatFailureStage
+    firstProtocolError.formatFailureStage,
+    firstProtocolError.formatFailureSubstage
   );
   try {
     for (;;) {
@@ -1012,7 +1091,8 @@ async function drainResponseAfterProtocolError(
       totalBytes = addResponseChunkSize(
         totalBytes,
         chunk.value.byteLength,
-        firstProtocolError.formatFailureStage
+        firstProtocolError.formatFailureStage,
+        firstProtocolError.formatFailureSubstage
       );
       // 排空阶段不解码、不拼接、不解析，也不保留任何响应字节。
       if (chunk.value.byteLength > 0) {
@@ -1113,6 +1193,9 @@ async function readChatCompletionEventStream(
         chunk.value.byteLength,
         firstProtocolError instanceof LlmResponseFormatError
           ? firstProtocolError.formatFailureStage
+          : undefined,
+        firstProtocolError instanceof LlmResponseFormatError
+          ? firstProtocolError.formatFailureSubstage
           : undefined
       );
       if (firstProtocolError !== undefined) {
@@ -1149,6 +1232,9 @@ async function readChatCompletionEventStream(
         observer.onInvalidResponseDrainStarted(
           error instanceof LlmResponseFormatError
             ? error.formatFailureStage
+            : undefined,
+          error instanceof LlmResponseFormatError
+            ? error.formatFailureSubstage
             : undefined
         );
       }
@@ -1230,7 +1316,10 @@ function consumeChatCompletionEvent(
   if (data.length === 0) return false;
   if (state.sawDone) {
     // [DONE] 后只能是 HTTP 正常收尾；继续出现非空事件说明响应次序损坏。
-    throw new LlmResponseFormatError("trailing_data");
+    throw new LlmResponseFormatError(
+      "trailing_data",
+      data === "[DONE]" ? "duplicate_done" : "data_after_done"
+    );
   }
   if (data === "[DONE]") {
     state.sawDone = true;
@@ -1261,7 +1350,7 @@ function consumeChatCompletionEvent(
   if (state.sawStop) {
     // finish_reason=stop 之后只允许用量事件或 [DONE]。继续出现答案片段说明
     // 服务端的流不完整或次序异常，不能把前半段误当成完整结果。
-    throw new LlmResponseFormatError("trailing_data");
+    throw new LlmResponseFormatError("trailing_data", "choice_after_stop");
   }
   const choice = choices[0];
   if (typeof choice !== "object" || choice === null) {
@@ -1342,10 +1431,14 @@ function chatCompletionStreamResult(state: ChatCompletionStreamState): unknown {
 function addResponseChunkSize(
   totalBytes: number,
   nextBytes: number,
-  formatFailureStage?: LlmResponseFormatFailureStage
+  formatFailureStage?: LlmResponseFormatFailureStage,
+  formatFailureSubstage?: LlmResponseFormatFailureSubstage
 ): number {
   if (nextBytes > maximumLlmResponseBodyBytes - totalBytes) {
-    throw new LlmResponseBodyTooLargeError(formatFailureStage);
+    throw new LlmResponseBodyTooLargeError(
+      formatFailureStage,
+      formatFailureSubstage
+    );
   }
   return totalBytes + nextBytes;
 }

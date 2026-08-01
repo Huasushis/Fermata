@@ -152,7 +152,7 @@ describe("parseYamlLite：解析真实的 config/models.yaml", () => {
       llmMaximumDurationMs: 14_400_000
     });
     expect(parsed.experimentVersion).toBe(
-      "experiment-2026-08-difficulty-candidate-c-provider-v1-drain-v4"
+      "experiment-2026-08-difficulty-candidate-c-provider-v1-drain-v5"
     );
   });
 });
