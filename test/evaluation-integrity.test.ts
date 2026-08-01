@@ -10,9 +10,11 @@ import {
   createEvaluationRunId,
   completedEvaluationChainMarkerExists,
   evaluationConfigurationFingerprint,
+  evaluationConfigurationFingerprintWithCodeVersion,
   executionFailure,
   hasUnknownPrefixedEnvironmentKeys,
   parseBoundedPositiveInteger,
+  parseEvaluationCodeVersion,
   parseEvaluationLabel,
   preflightJsonDataset,
   reconcileEvaluation,
@@ -153,10 +155,15 @@ describe("实验身份与配置指纹", () => {
   });
 
   it("未知 EVAL_* 变量会 fail closed，变量值不进入结果", () => {
-    const allowed = ["EVAL_CONCURRENCY", "EVAL_DATASET_MANIFEST_PATH"];
+    const allowed = ["EVAL_CODE_VERSION", "EVAL_CONCURRENCY", "EVAL_DATASET_MANIFEST_PATH"];
     expect(
       hasUnknownPrefixedEnvironmentKeys(
-        { EVAL_CONCURRENCY: "2", EVAL_DATASET_MANIFEST_PATH: "/private/manifest", PATH: "/bin" },
+        {
+          EVAL_CODE_VERSION: "1234567890abcdef1234567890abcdef12345678",
+          EVAL_CONCURRENCY: "2",
+          EVAL_DATASET_MANIFEST_PATH: "/private/manifest",
+          PATH: "/bin"
+        },
         "EVAL_",
         allowed
       )
@@ -168,6 +175,43 @@ describe("实验身份与配置指纹", () => {
         allowed
       )
     ).toBe(true);
+  });
+
+  it("代码版本必须是非全零的 40 位小写提交 SHA", () => {
+    const valid = "1234567890abcdef1234567890abcdef12345678";
+    expect(parseEvaluationCodeVersion(valid)).toBe(valid);
+    expect(() => parseEvaluationCodeVersion(undefined)).toThrow(
+      "EVALUATION_CODE_VERSION_REQUIRED"
+    );
+    for (const invalid of [
+      "",
+      "1234567",
+      "1234567890ABCDEF1234567890ABCDEF12345678",
+      "g".repeat(40),
+      "0".repeat(40),
+      `${valid}x`,
+      ` ${valid}`
+    ]) {
+      expect(() => parseEvaluationCodeVersion(invalid)).toThrow(
+        "EVALUATION_CODE_VERSION_INVALID"
+      );
+    }
+  });
+
+  it("代码版本是配置指纹的强制组成部分", () => {
+    const configuration = { experimentVersion: "v1", model: "synthetic" };
+    const first = evaluationConfigurationFingerprintWithCodeVersion(
+      "1234567890abcdef1234567890abcdef12345678",
+      configuration
+    );
+    const second = evaluationConfigurationFingerprintWithCodeVersion(
+      "2234567890abcdef1234567890abcdef12345678",
+      configuration
+    );
+    expect(first).not.toBe(second);
+    expect(() =>
+      evaluationConfigurationFingerprintWithCodeVersion("invalid", configuration)
+    ).toThrow("EVALUATION_CODE_VERSION_INVALID");
   });
 
   it("标签不能携带路径，运行 id 包含时间和唯一后缀", () => {

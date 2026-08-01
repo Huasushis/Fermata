@@ -128,7 +128,8 @@ node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:calibrate-a
 
 # 3. CF 难度评测：输出平均绝对误差（预测与实际平均相差多少，报告中记作 MAE）、
 # ±200 命中率和分档统计；脚本会排除参照题，避免提前见过答案影响结果。
-# 当前 env 文件登记 EVAL_CONCURRENCY=6。
+# 当前 env 文件登记 EVAL_CONCURRENCY=6，并且必须登记 EVAL_CODE_VERSION，值为本次
+# 实验代码对应的完整 40 位小写 Git 提交 SHA。脚本不会自行调用 Git，也不接受分支名或缩写。
 node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:eval-difficulty -- --label=calibrated
 
 # 4. 思维/代码难度标定：检验 rating 越高等级是否单调上升。

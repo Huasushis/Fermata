@@ -83,6 +83,7 @@ describe("run-with-env 的受控环境与同步启动异常", () => {
   it("保留代理与已知实验变量，文件覆盖父值并丢弃任意父变量", () => {
     const environment = buildRunEnvironment(
       "EVAL_CONCURRENCY=2\n" +
+        "EVAL_CODE_VERSION=1234567890abcdef1234567890abcdef12345678\n" +
         "EVAL_DATASET_MANIFEST_PATH=/project/private/manifest.json\n" +
         "EVAL_REQUIRE_DATASET_MANIFEST=1\n" +
         "AETHER_API_KEY=file-value\n",
@@ -98,6 +99,7 @@ describe("run-with-env 的受控环境与同步启动异常", () => {
       PATH: "/safe/bin",
       http_proxy: "http://127.0.0.1:10808",
       EVAL_CONCURRENCY: "2",
+      EVAL_CODE_VERSION: "1234567890abcdef1234567890abcdef12345678",
       EVAL_DATASET_MANIFEST_PATH: "/project/private/manifest.json",
       EVAL_REQUIRE_DATASET_MANIFEST: "1",
       AETHER_API_KEY: "file-value"

@@ -91,6 +91,20 @@ export function parseBoundedPositiveInteger(
   return value;
 }
 
+/**
+ * 评测代码版本由启动者显式提供，脚本不自行调用 Git，也不接受分支名或缩写。
+ * 只允许完整的 40 位小写提交 SHA；全零值不是有效的提交身份。
+ */
+export function parseEvaluationCodeVersion(raw: string | undefined): string {
+  if (raw === undefined) {
+    throw new Error("EVALUATION_CODE_VERSION_REQUIRED");
+  }
+  if (!/^(?!0{40}$)[0-9a-f]{40}$/.test(raw)) {
+    throw new Error("EVALUATION_CODE_VERSION_INVALID");
+  }
+  return raw;
+}
+
 /** 调用方只应记录布尔结果，不记录未知变量的名称或值。 */
 export function hasUnknownPrefixedEnvironmentKeys(
   environment: NodeJS.ProcessEnv | Readonly<Record<string, string | undefined>>,
@@ -495,6 +509,17 @@ export function reconcileEvaluation(input: {
 /** 对不含密钥/题面的配置快照做稳定哈希，用于实验报告溯源。 */
 export function evaluationConfigurationFingerprint(value: unknown): string {
   return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
+}
+
+/** 让代码提交成为配置身份的必需部分，避免调用方只把它写进展示字段。 */
+export function evaluationConfigurationFingerprintWithCodeVersion(
+  codeVersion: string,
+  configuration: unknown
+): string {
+  return evaluationConfigurationFingerprint({
+    codeVersion: parseEvaluationCodeVersion(codeVersion),
+    configuration
+  });
 }
 
 /**

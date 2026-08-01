@@ -31,10 +31,11 @@ import {
 import {
   createEvaluationRunId,
   completedEvaluationChainMarkerExists,
-  evaluationConfigurationFingerprint,
+  evaluationConfigurationFingerprintWithCodeVersion,
   executionFailure,
   hasUnknownPrefixedEnvironmentKeys,
   parseBoundedPositiveInteger,
+  parseEvaluationCodeVersion,
   parseEvaluationLabel,
   preflightJsonDataset,
   reconcileEvaluation,
@@ -78,10 +79,11 @@ interface PersistedEvalRow extends EvalRow {
 }
 
 interface DifficultyReport {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly runId: string;
   readonly label: string;
   readonly generatedAt: string;
+  readonly codeVersion: string | null;
   readonly configurationFingerprint: string | null;
   readonly chain: {
     readonly chainRunId: string | null;
@@ -164,6 +166,7 @@ function renderMarkdown(report: DifficultyReport): string {
     `- 原始报告标识：${report.chain.originalReportRunId ?? "预检阶段尚未建立"}`,
     `- 执行性质：${report.chain.executionKind}`,
     `- 生成时间：${report.generatedAt}`,
+    `- 代码版本：${report.codeVersion ?? "未验证"}`,
     `- expected：${report.integrity.expected}`,
     `- succeeded：${report.integrity.succeeded}`,
     `- failed：${report.integrity.failed}`,
@@ -235,6 +238,7 @@ function incompleteBeforeCalls(input: {
   readonly fileCount: number;
   readonly expectedIds: readonly string[];
   readonly failures: readonly EvaluationFailure[];
+  readonly codeVersion?: string | null;
   readonly manifest?: DifficultyReport["dataset"]["manifest"];
   readonly configurationFingerprint?: string | null;
   readonly excludedAnchors?: number;
@@ -260,10 +264,11 @@ function incompleteBeforeCalls(input: {
     ({ sampleId: _sampleId, ...row }) => row
   );
   const report: DifficultyReport = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     runId: input.runId,
     label: input.label,
     generatedAt: input.generatedAt,
+    codeVersion: input.codeVersion ?? null,
     configurationFingerprint: input.configurationFingerprint ?? null,
     chain: input.chain ?? {
       chainRunId: null,
@@ -293,11 +298,36 @@ async function main(): Promise<void> {
   const label = parseLabelArg();
   const runId = createEvaluationRunId(label);
   const generatedAt = new Date().toISOString();
+  const rawCodeVersion = process.env.EVAL_CODE_VERSION;
+  let codeVersion: string | null = null;
+  try {
+    codeVersion = parseEvaluationCodeVersion(rawCodeVersion);
+  } catch {
+    // 固定失败码在完成数据目录的安全计数后写入报告；非法原值永不进入报告。
+  }
   const preflight = preflightJsonDataset(DATA_DIR, datasetItemSchema);
   const allSourceIds = [
     ...preflight.sources.map((source) => source.sourceId),
     ...preflight.failures.filter((failure) => failure.phase === "dataset").map((failure) => failure.sampleId)
   ];
+  if (codeVersion === null) {
+    incompleteBeforeCalls({
+      runId,
+      label,
+      generatedAt,
+      fileCount: preflight.fileCount,
+      expectedIds: allSourceIds,
+      failures: [{
+        sampleId: "evaluation-code-version",
+        phase: "setup",
+        code: rawCodeVersion === undefined
+          ? "EVALUATION_CODE_VERSION_REQUIRED"
+          : "EVALUATION_CODE_VERSION_INVALID"
+      }],
+      codeVersion: null
+    });
+    return;
+  }
   if (preflight.failures.length > 0 || preflight.fileCount === 0) {
     const failures = preflight.fileCount === 0 && preflight.failures.length === 0
       ? [{ sampleId: "dataset-empty", phase: "setup" as const, code: "DATASET_EMPTY" }]
@@ -306,6 +336,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
+      codeVersion,
       fileCount: preflight.fileCount,
       expectedIds: allSourceIds,
       failures
@@ -315,6 +346,7 @@ async function main(): Promise<void> {
 
   if (
     hasUnknownPrefixedEnvironmentKeys(process.env, "EVAL_", [
+      "EVAL_CODE_VERSION",
       "EVAL_CONCURRENCY",
       "EVAL_DATASET_MANIFEST_PATH",
       "EVAL_REQUIRE_DATASET_MANIFEST"
@@ -324,6 +356,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
+      codeVersion,
       fileCount: preflight.fileCount,
       expectedIds: preflight.sources.map((source) => source.sourceId),
       failures: [{
@@ -346,6 +379,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
+      codeVersion,
       fileCount: preflight.fileCount,
       expectedIds: preflight.sources.map((source) => source.sourceId),
       failures: [{
@@ -362,6 +396,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
+      codeVersion,
       fileCount: preflight.fileCount,
       expectedIds: preflight.sources.map((source) => source.sourceId),
       failures: [{
@@ -386,6 +421,7 @@ async function main(): Promise<void> {
         runId,
         label,
         generatedAt,
+        codeVersion,
         fileCount: preflight.fileCount,
         expectedIds: preflight.sources.map((source) => source.sourceId),
         failures: loadedManifest.failures,
@@ -417,6 +453,7 @@ async function main(): Promise<void> {
         runId,
         label,
         generatedAt,
+        codeVersion,
         fileCount: preflight.fileCount,
         expectedIds: verification.expectedSampleIds,
         failures: [...verification.failures, ...profileFailures],
@@ -435,6 +472,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
+      codeVersion,
       fileCount: preflight.fileCount,
       expectedIds: preflight.sources.map((source) => source.sourceId),
       failures: [{ sampleId: "difficulty-anchors", phase: "setup", code: "DIFFICULTY_ANCHORS_INVALID" }],
@@ -456,6 +494,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
+      codeVersion,
       fileCount: preflight.fileCount,
       expectedIds: preflight.sources.map((source) => source.sourceId),
       failures: excludedAnchorSources.map((source) => ({
@@ -493,6 +532,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
+      codeVersion,
       fileCount: preflight.fileCount,
       expectedIds: dataset.map((source) => source.sourceId),
       failures:
@@ -517,6 +557,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
+      codeVersion,
       fileCount: preflight.fileCount,
       expectedIds: dataset.map((source) => source.sourceId),
       failures: [{
@@ -538,6 +579,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
+      codeVersion,
       fileCount: preflight.fileCount,
       expectedIds: dataset.map((source) => source.sourceId),
       failures: [{ sampleId: "evaluation-config", phase: "setup", code: "EVALUATION_CONFIG_INVALID" }],
@@ -553,6 +595,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
+      codeVersion,
       fileCount: preflight.fileCount,
       expectedIds: dataset.map((source) => source.sourceId),
       failures: [{ sampleId: "evaluation-profile", phase: "setup", code: "EVALUATION_PROFILE_MISSING" }],
@@ -566,6 +609,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
+      codeVersion,
       fileCount: preflight.fileCount,
       expectedIds: dataset.map((source) => source.sourceId),
       failures: [{ sampleId: "evaluation-provider", phase: "setup", code: "EVALUATION_PROVIDER_MISSING" }],
@@ -573,7 +617,7 @@ async function main(): Promise<void> {
     });
     return;
   }
-  const configurationFingerprint = evaluationConfigurationFingerprint({
+  const configurationFingerprint = evaluationConfigurationFingerprintWithCodeVersion(codeVersion, {
     experimentVersion: config.models.experimentVersion,
     modelProfileName: profileName,
     model: profile.difficulty,
@@ -588,6 +632,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
+      codeVersion,
       fileCount: preflight.fileCount,
       expectedIds: dataset.map((source) => source.sourceId),
       failures: [{
@@ -629,6 +674,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
+      codeVersion,
       fileCount: preflight.fileCount,
       expectedIds: expectedSampleIds,
       failures: [{
@@ -666,6 +712,7 @@ async function main(): Promise<void> {
         runId,
         label,
         generatedAt,
+        codeVersion,
         fileCount: preflight.fileCount,
         expectedIds: expectedSampleIds,
         failures: [{
@@ -759,10 +806,11 @@ async function main(): Promise<void> {
     });
     const rows: EvalRow[] = persistedRows.map(({ sampleId: _sampleId, ...row }) => row);
     const report: DifficultyReport = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       runId,
       label,
       generatedAt,
+      codeVersion,
       configurationFingerprint,
       chain,
       dataset: { discoveredFiles: preflight.fileCount, excludedAnchors, manifest: manifestReport },
