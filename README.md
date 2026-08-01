@@ -227,11 +227,11 @@ npm run experiment:calibrate-levels:detached -- \
 正式服务已有的 `settings.json` 会保留上次保存的 `experimentVersion`，不会因为替换
 `models.yaml` 自动改变。部署当前版本后，应在没有在途任务时，通过 Urmotiv 的 Fermata 设置页
 或管理接口把 `experimentVersion` 明确更新为
-`experiment-2026-08-difficulty-rubric-thinking-low-cap4096-v1`，再恢复领取任务；这样提交的审核结果才能准确说明使用了
-哪一版请求规则和难度量尺。这个 Candidate B 版本号只标识实现版本，尚未进行
-准确性标定，不表示难度准确性已经通过标定门槛。
+`experiment-2026-08-difficulty-rubric-restored-v1`，再恢复领取任务；这样提交的审核结果才能准确说明使用了
+哪一版请求规则和难度量尺。当前默认已恢复到显式关闭深度思考和 2048 输出上限；这只是撤回未通过
+协议探针的 Candidate B，不表示 Candidate A 的难度准确性已经通过标定门槛。
 
-在 Candidate B 启动 83 题正式实验前，先运行
+Candidate B 的协议验证使用
 `npm run experiment:probe-difficulty-thinking`。这个入口只依次检查一个人工合成的短题和三个与
 83 题清单不重叠的公开高难题；每题最多向模型服务发送一次请求，任何第二次修复请求都会在进入
 网络前被拒绝。它要求模型明确报告正常结束，并继续读取到 HTTP 响应真正结束；四题任一失败就停止
@@ -241,9 +241,9 @@ npm run experiment:calibrate-levels:detached -- \
 配置，而不把服务地址或密钥写入报告。
 
 2048 输出上限的第一轮探针在第一道公开高难题上明确得到
-`LLM_OUTPUT_LENGTH_LIMIT`，所以完整性为假，也没有启动 83 题实验。当前 4096 上限只依据这项预先
-登记的升级条件设置；它不是准确性提升结论。必须先用新标签把同一组四题全部跑完且零失败，才允许
-启动正式实验；4096 探针再出现长度上限或任何其它失败时，不继续自动提高上限。
+`LLM_OUTPUT_LENGTH_LIMIT`，所以完整性为假，也没有启动 83 题实验。按预先登记的唯一升级条件，
+第二轮只把上限改为 4096，但同一道公开题仍得到相同失败码；因此没有继续提高上限，Candidate B 已
+停止。两份不完整报告都已保留，后续候选不得把它们改写成成功结果。
 
 思维/代码标定必须先在 `experiments/data/levels/manifest.private.json` 登记私有数据集清单。
 清单逐项绑定安全编号、文件名和文件原始字节的 SHA-256 校验值；目录里漏文件、多文件、改后缀、
@@ -303,7 +303,7 @@ npm run experiment:calibrate-levels:detached -- \
 
 | 流水线 | 状态 | 说明 |
 | --- | --- | --- |
-| CF 难度（difficulty.ts） | **Candidate A 完整但未达标；Candidate B 尚未标定** | 修改前 public83 v4 的 83/83 完整报告为 MAE 302.4、±200 命中率 56.6%；加入 800–3500 完整量尺的 Candidate A 独立 83/83 报告为 MAE 289.2、命中率 55.4%。MAE 改善 13.3，但命中率下降 1.2 个百分点，低、中档退化且高档 MAE 仍为 387.8；没有达到 MAE ≤ 200、命中率 ≥ 75% 的门槛。当前 Candidate B 仅把 difficulty 请求改为有界的 low-thinking，尚未产出准确性报告，不能用 Candidate A 报告代替验收，也不能宣称准确性通过。`config/anchors/difficulty.json` 仍只有 2 条手工种子且标记为 `provisional: true`。 |
+| CF 难度（difficulty.ts） | **Candidate A 完整但未达标；Candidate B 已在探针阶段淘汰** | 修改前 public83 v4 的 83/83 完整报告为 MAE 302.4、±200 命中率 56.6%；加入 800–3500 完整量尺的 Candidate A 独立 83/83 报告为 MAE 289.2、命中率 55.4%。MAE 改善 13.3，但命中率下降 1.2 个百分点，低、中档退化且高档 MAE 仍为 387.8；没有达到 MAE ≤ 200、命中率 ≥ 75% 的门槛。Candidate B 在 2048、4096 两档都无法让同一道公开高难题完成输出，未运行 83 题；默认配置已恢复 Candidate A 的非思考请求。`config/anchors/difficulty.json` 仍只有 2 条手工种子且标记为 `provisional: true`。 |
 | 思维难度（thinking.ts） | **旧实验均不可作基线** | 两份早期报告无法证明完整；后两份明确只完成 6/24、9/24，而且都缺高分段。 |
 | 代码难度（coding.ts） | **旧实验均不可作基线** | 与思维难度共用的旧实验不完整；小样本曾出现难度分段升高但代码难度均值下降，需要在完整基线上复核。 |
 | 查重判断（verdict.ts） | **旧设计不可作准确性基线** | 旧实验只有 3 个正常样本和 3 个人工重复样本；正常组只验证“不是不通过”，没有区分通过与需要修改。 |
