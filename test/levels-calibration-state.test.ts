@@ -1326,6 +1326,8 @@ describe("实验校验摘要与续跑", () => {
       "LLM_TOTAL_TIMEOUT",
       "LLM_STREAM_INTERRUPTED",
       "LLM_CANCELLED",
+      "LLM_OUTPUT_LENGTH_LIMIT",
+      "LLM_OUTPUT_CONTENT_FILTERED",
       "HISTORICAL_SKIP",
       "STALE_IN_FLIGHT"
     ].map(

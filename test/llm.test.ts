@@ -354,18 +354,70 @@ describe("chatComplete：正常路径", () => {
     expect((error as Error).message).not.toContain(sensitiveError);
   });
 
-  it("输出被长度或内容过滤截断时不当作完整结果", async () => {
-    for (const finishReason of ["length", "content_filter"]) {
+  it.each([
+    ["length", "LLM_OUTPUT_LENGTH_LIMIT"],
+    ["content_filter", "LLM_OUTPUT_CONTENT_FILTERED"]
+  ] as const)(
+    "SSE finish_reason=%s 映射为固定错误码且不重试或泄漏正文",
+    async (finishReason, expectedCode) => {
+      const sensitiveContent = "不应进入异常的模型残缺输出";
       const fetchMock = vi.fn(
         async () =>
           new Response(
-            `data: {"choices":[{"delta":{"content":"残缺"},"finish_reason":"${finishReason}"}]}\n\n`,
+            `data: ${JSON.stringify({
+              choices: [{
+                delta: { content: sensitiveContent },
+                finish_reason: finishReason
+              }]
+            })}\n\n`,
             { status: 200, headers: { "Content-Type": "text/event-stream" } }
           )
       );
-      await expect(
-        chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock })
-      ).rejects.toMatchObject({ code: "LLM_RESPONSE_FORMAT_INVALID" });
+      const error = await chatComplete(provider, spec, [], {
+        ...runtime,
+        fetch: fetchMock
+      }).catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code: expectedCode });
+      expect((error as Error).message).not.toContain(finishReason);
+      expect((error as Error).message).not.toContain(sensitiveContent);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it("SSE 未知终止原因和工具调用仍是固定格式错误且不泄漏服务商字段", async () => {
+    const sensitiveContent = "不应进入异常的服务商响应内容";
+    const cases = [
+      {
+        delta: { content: sensitiveContent },
+        finish_reason: "provider_private_finish_reason"
+      },
+      {
+        delta: {
+          tool_calls: [{
+            function: {
+              name: "provider_private_tool",
+              arguments: sensitiveContent
+            }
+          }]
+        },
+        finish_reason: "tool_calls"
+      }
+    ];
+    for (const choice of cases) {
+      const fetchMock = vi.fn(
+        async () =>
+          new Response(
+            `data: ${JSON.stringify({ choices: [choice] })}\n\n`,
+            { status: 200, headers: { "Content-Type": "text/event-stream" } }
+          )
+      );
+      const error = await chatComplete(provider, spec, [], {
+        ...runtime,
+        fetch: fetchMock
+      }).catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code: "LLM_RESPONSE_FORMAT_INVALID" });
+      expect((error as Error).message).not.toContain(choice.finish_reason);
+      expect((error as Error).message).not.toContain(sensitiveContent);
       expect(fetchMock).toHaveBeenCalledTimes(1);
     }
   });
@@ -1127,21 +1179,75 @@ describe("chatComplete：响应结构异常", () => {
     );
   });
 
-  it("JSON 回退必须明确以 finish_reason=stop 完成", async () => {
-    for (const finishReason of [undefined, null, "length"]) {
-      const choice: Record<string, unknown> = {
-        message: { role: "assistant", content: "不应采用" }
-      };
-      if (finishReason !== undefined) choice.finish_reason = finishReason;
+  it.each([
+    ["length", "LLM_OUTPUT_LENGTH_LIMIT"],
+    ["content_filter", "LLM_OUTPUT_CONTENT_FILTERED"]
+  ] as const)(
+    "JSON 回退 finish_reason=%s 映射为固定错误码且不重试或泄漏正文",
+    async (finishReason, expectedCode) => {
+      const sensitiveContent = "不应进入异常的模型残缺输出";
+      const fetchMock = vi.fn(
+        async () => new Response(JSON.stringify({
+          choices: [{
+            message: { role: "assistant", content: sensitiveContent },
+            finish_reason: finishReason
+          }]
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        })
+      );
+      const error = await chatComplete(provider, spec, [], {
+        ...runtime,
+        fetch: fetchMock
+      }).catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code: expectedCode });
+      expect((error as Error).message).not.toContain(finishReason);
+      expect((error as Error).message).not.toContain(sensitiveContent);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it("JSON 回退必须明确以 finish_reason=stop 完成，未知值和工具调用仍是格式错误", async () => {
+    const sensitiveContent = "不应进入异常的服务商响应内容";
+    const choices: Array<Record<string, unknown>> = [
+      { message: { role: "assistant", content: sensitiveContent } },
+      {
+        message: { role: "assistant", content: sensitiveContent },
+        finish_reason: null
+      },
+      {
+        message: { role: "assistant", content: sensitiveContent },
+        finish_reason: "provider_private_finish_reason"
+      },
+      {
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            function: {
+              name: "provider_private_tool",
+              arguments: sensitiveContent
+            }
+          }]
+        },
+        finish_reason: "tool_calls"
+      }
+    ];
+    for (const choice of choices) {
       const fetchMock = vi.fn(
         async () => new Response(JSON.stringify({ choices: [choice] }), {
           status: 200,
           headers: { "Content-Type": "application/json" }
         })
       );
-      await expect(
-        chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock })
-      ).rejects.toBeInstanceOf(LlmResponseFormatError);
+      const error = await chatComplete(provider, spec, [], {
+        ...runtime,
+        fetch: fetchMock
+      }).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(LlmResponseFormatError);
+      expect(error).toMatchObject({ code: "LLM_RESPONSE_FORMAT_INVALID" });
+      expect((error as Error).message).not.toContain(sensitiveContent);
       expect(fetchMock).toHaveBeenCalledTimes(1);
     }
   });

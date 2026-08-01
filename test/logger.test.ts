@@ -22,7 +22,9 @@ describe("安全错误码", () => {
       "LLM_OUTPUT_IDLE_TIMEOUT",
       "LLM_TOTAL_TIMEOUT",
       "LLM_STREAM_INTERRUPTED",
-      "LLM_CANCELLED"
+      "LLM_CANCELLED",
+      "LLM_OUTPUT_LENGTH_LIMIT",
+      "LLM_OUTPUT_CONTENT_FILTERED"
     ]) {
       expect(describeError({ code, message: "外部原文" })).toBe(code);
     }

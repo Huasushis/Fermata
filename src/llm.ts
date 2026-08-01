@@ -201,7 +201,9 @@ export class LlmRequestError extends Error {
     | "LLM_OUTPUT_IDLE_TIMEOUT"
     | "LLM_TOTAL_TIMEOUT"
     | "LLM_STREAM_INTERRUPTED"
-    | "LLM_CANCELLED";
+    | "LLM_CANCELLED"
+    | "LLM_OUTPUT_LENGTH_LIMIT"
+    | "LLM_OUTPUT_CONTENT_FILTERED";
   public readonly status: number | undefined;
 
   public constructor(
@@ -215,7 +217,9 @@ export class LlmRequestError extends Error {
       LLM_OUTPUT_IDLE_TIMEOUT: "模型服务的输出长时间没有继续。",
       LLM_TOTAL_TIMEOUT: "模型服务在有效输出前超过最终保护时长。",
       LLM_STREAM_INTERRUPTED: "模型服务的输出在完成前中断。",
-      LLM_CANCELLED: "模型请求已按任务状态停止。"
+      LLM_CANCELLED: "模型请求已按任务状态停止。",
+      LLM_OUTPUT_LENGTH_LIMIT: "模型服务因输出长度限制而停止。",
+      LLM_OUTPUT_CONTENT_FILTERED: "模型服务因内容过滤而停止。"
     };
     super(messages[code]);
     this.name = "LlmRequestError";
@@ -1009,6 +1013,7 @@ function consumeChatCompletionEvent(
   }
   state.sawChoice = true;
   const choiceRecord = choice as Record<string, unknown>;
+  assertSafeFinishReason(choiceRecord.finish_reason);
   const deltaOrMessage =
     typeof choiceRecord.delta === "object" && choiceRecord.delta !== null
       ? choiceRecord.delta
@@ -1035,13 +1040,29 @@ function consumeChatCompletionEvent(
     state.content += part.content;
     hasValidOutput ||= /\S/u.test(part.content);
   }
-  if (choiceRecord.finish_reason !== undefined && choiceRecord.finish_reason !== null) {
-    if (choiceRecord.finish_reason !== "stop") {
-      throw new LlmResponseFormatError();
-    }
+  if (choiceRecord.finish_reason === "stop") {
     state.sawStop = true;
   }
   return hasValidOutput;
+}
+
+function assertSafeFinishReason(finishReason: unknown): void {
+  if (
+    finishReason === undefined ||
+    finishReason === null ||
+    finishReason === "stop"
+  ) {
+    return;
+  }
+  if (finishReason === "length") {
+    throw new LlmRequestError("LLM_OUTPUT_LENGTH_LIMIT");
+  }
+  if (finishReason === "content_filter") {
+    throw new LlmRequestError("LLM_OUTPUT_CONTENT_FILTERED");
+  }
+  // 未知终止原因（包括工具调用）不能被当作完整文本，也不能把服务商
+  // 返回的原始字符串放进异常或日志。
+  throw new LlmResponseFormatError();
 }
 
 function chatCompletionStreamResult(state: ChatCompletionStreamState): unknown {
@@ -1104,8 +1125,11 @@ function extractChatCompletion(
     throw new LlmResponseFormatError();
   }
   const firstRecord = first as Record<string, unknown>;
-  if (requireStop && firstRecord.finish_reason !== "stop") {
-    throw new LlmResponseFormatError();
+  if (requireStop) {
+    assertSafeFinishReason(firstRecord.finish_reason);
+    if (firstRecord.finish_reason !== "stop") {
+      throw new LlmResponseFormatError();
+    }
   }
   const message = firstRecord.message;
   if (typeof message !== "object" || message === null) {

@@ -215,7 +215,9 @@ describe("思维和代码标定的分阶段执行", () => {
       "LLM_OUTPUT_IDLE_TIMEOUT",
       "LLM_TOTAL_TIMEOUT",
       "LLM_STREAM_INTERRUPTED",
-      "LLM_CANCELLED"
+      "LLM_CANCELLED",
+      "LLM_OUTPUT_LENGTH_LIMIT",
+      "LLM_OUTPUT_CONTENT_FILTERED"
     ] satisfies readonly CalibrationFailureCode[]
   )("保留当前模型错误码 %s，且不保存外部错误正文", async (errorCode) => {
     const secret = "MODEL_PROVIDER_ERROR_BODY_MUST_NOT_PERSIST";

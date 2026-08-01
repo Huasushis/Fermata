@@ -108,6 +108,24 @@ describe("preflightJsonDataset", () => {
 });
 
 describe("reconcileEvaluation", () => {
+  it.each([
+    "LLM_OUTPUT_LENGTH_LIMIT",
+    "LLM_OUTPUT_CONTENT_FILTERED"
+  ] as const)("保留固定输出终止错误码 %s，且不保存服务商原始字段", (code) => {
+    const sensitiveProviderValue = "PROVIDER_RAW_FINISH_REASON_MUST_NOT_PERSIST";
+    const error = Object.assign(new LlmRequestError(code), {
+      providerFinishReason: sensitiveProviderValue,
+      responseBody: sensitiveProviderValue
+    });
+    const failure = executionFailure("safe-sample", error);
+    expect(failure).toEqual({
+      sampleId: "safe-sample",
+      phase: "execution",
+      code
+    });
+    expect(JSON.stringify(failure)).not.toContain(sensitiveProviderValue);
+  });
+
   it("没有结果的 expected 样本被判为缺失，报告不完整", () => {
     const result = reconcileEvaluation({
       expectedSampleIds: ["a", "b"],
