@@ -1,12 +1,4 @@
 import { spawnSync } from "node:child_process";
-import {
-  mkdtempSync,
-  rmdirSync,
-  unlinkSync,
-  writeFileSync
-} from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -14,67 +6,47 @@ const runnerPath = fileURLToPath(
   new URL("../scripts/run-with-env.mjs", import.meta.url)
 );
 
-describe("run-with-env：启动前的密钥保护", () => {
-  for (const debugVariable of ["NODE_DEBUG", "NODE_DEBUG_NATIVE"] as const) {
-    it(`设置 ${debugVariable} 时在读取 env 文件前拒绝启动`, () => {
-      const marker = "test-secret-must-not-appear";
+describe("run-with-env：命令行边界", () => {
+  it("缺少参数时只输出固定用法，不读取文件或启动命令", () => {
+    const result = spawnSync(process.execPath, [runnerPath], {
+      encoding: "utf8"
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(2);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe(
+      "用法：node scripts/run-with-env.mjs <env文件> <命令> [参数...]\n"
+    );
+  });
+
+  for (const [key, value] of [
+    ["NODE_DEBUG", "child_process"],
+    ["NODE_DEBUG_NATIVE", "http"],
+    ["NODE_TLS_REJECT_UNAUTHORIZED", "0"]
+  ] as const) {
+    it(`危险父变量 ${key} 在读取 env 文件前固定拒绝`, () => {
+      const marker = "parent-secret-must-not-appear";
+      const missingPath = "/definitely/missing/private/fermata.env";
       const result = spawnSync(
         process.execPath,
-        [
-          runnerPath,
-          "/definitely/missing/fermata.env",
-          process.execPath,
-          "-e",
-          "process.exit(0)"
-        ],
+        [runnerPath, missingPath, process.execPath, "--version"],
         {
           encoding: "utf8",
           env: {
             ...process.env,
-            [debugVariable]: "child_process",
+            [key]: value,
             FERMATA_TEST_SECRET: marker
           }
         }
       );
 
+      expect(result.error).toBeUndefined();
       expect(result.status).toBe(2);
-      expect(result.stderr).toContain("启动前必须清除");
-      expect(result.stderr).not.toContain("无法读取指定的 env 文件");
-      expect(`${result.stdout}${result.stderr}`).not.toContain(marker);
-    });
-
-    it(`env 文件包含 ${debugVariable} 时不把它传给子进程`, () => {
-      const marker = "env-file-secret-must-not-appear";
-      const temporaryDirectory = mkdtempSync(
-        join(tmpdir(), "fermata-run-with-env-")
-      );
-      const envPath = join(temporaryDirectory, "fermata.env");
-      writeFileSync(
-        envPath,
-        `${debugVariable}=child_process\nFERMATA_TEST_SECRET=${marker}\n`,
-        "utf8"
-      );
-      const parentEnvironment = { ...process.env };
-      delete parentEnvironment.NODE_DEBUG;
-      delete parentEnvironment.NODE_DEBUG_NATIVE;
-
-      try {
-        const result = spawnSync(
-          process.execPath,
-          [runnerPath, envPath, process.execPath, "-e", "process.exit(0)"],
-          {
-            encoding: "utf8",
-            env: parentEnvironment
-          }
-        );
-
-        expect(result.status).toBe(2);
-        expect(result.stderr).toContain("env 文件不能设置");
-        expect(`${result.stdout}${result.stderr}`).not.toContain(marker);
-      } finally {
-        unlinkSync(envPath);
-        rmdirSync(temporaryDirectory);
-      }
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe("无法安全启动指定命令。\n");
+      expect(result.stderr).not.toContain(marker);
+      expect(result.stderr).not.toContain(missingPath);
     });
   }
 });

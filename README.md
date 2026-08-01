@@ -58,11 +58,11 @@ Fermata 不是 Urmotiv 里的一个插件、不共享数据库、不共享代码
 ```bash
 npm install
 
-# 参照 .env.example，在仓库外的私有目录创建 fermata.env 并填写必需变量。
-# USTC 服务器约定使用下面这个位置；不要把真实密钥文件放进仓库。
-node scripts/run-with-env.mjs /home/ubuntu/urmotiv-codex/private/fermata.env npm run dev
+# 参照 .env.example，在被 Git 整体忽略的 Fermata/private/ 中创建 fermata.env。
+# USTC 服务器约定使用下面这个位置；不要把真实密钥文件放进跟踪文件。
+node scripts/run-with-env.mjs /home/ubuntu/codex-urmotiv/Fermata/private/fermata.env npm run dev
 # 上一行是 tsx watch 模式；或者单次启动：
-node scripts/run-with-env.mjs /home/ubuntu/urmotiv-codex/private/fermata.env npm start
+node scripts/run-with-env.mjs /home/ubuntu/codex-urmotiv/Fermata/private/fermata.env npm start
 # 或者
 npm run typecheck   # tsc --noEmit
 npm test            # vitest run
@@ -73,10 +73,14 @@ npm test            # vitest run
 跑起来。
 
 Fermata 本身不解析 `.env` 文件，只读取进程已经收到的环境变量。上面的
-`run-with-env.mjs` 会逐行读取指定文件，再直接启动命令；它不会让 shell 解释密钥中的
-特殊字符，也不会在出错时打印密钥内容。如果当前终端设置了 `NODE_DEBUG` 或
-`NODE_DEBUG_NATIVE`，它会在读取密钥前拒绝启动；env 文件本身包含这两个设置时也会
-拒绝启动，避免 Node 把子进程环境写到终端。
+`run-with-env.mjs` 只接受 `Fermata/private/` 内的绝对路径，并沿已经打开的目录描述符
+读取文件；路径中的符号链接、权限过宽的目录、非普通文件、读取中变化、超限内容或非法
+UTF-8 都会失败关闭。它只向子进程传递明确登记的 Fermata、实验、基本运行时和代理变量，
+不会让 shell 解释密钥中的特殊字符，也不会在出错时打印密钥内容。env 文件里的 Fermata
+和实验变量明确覆盖父进程中的同名值；代理、`PATH` 和临时目录只从父进程继承，不能写进
+env 文件。未知键、重复键、危险 Node/OpenSSL 设置或关闭 TLS 校验的设置都会在启动前被
+拒绝。需要改变一次实验参数时，应使用内容已登记的专用私有 env 文件，不能依赖命令前的
+同名临时变量覆盖它。
 不要用 shell 的 `source` 或 `.` 加载密钥文件，
 因为特殊字符可能导致命令失败并把密钥回显到终端。生产环境也可以由部署平台直接把变量
 传给进程，不需要改 Fermata 的代码。
@@ -107,26 +111,32 @@ Cloudflare 拦截）；`fetch-hf-dataset` 从公开数据集 open-r1/codeforces�
 控制并发（默认 6/4），大幅缩短总时长。
 
 ```bash
-# 下列命令都通过安全脚本读取仓库外的环境文件。
-FERMATA_ENV_FILE=/home/ubuntu/urmotiv-codex/private/fermata.env
+# 下列命令都通过安全脚本读取 Fermata/private/ 中的专用环境文件。
+# 并发数、数据子目录等实验参数也要写入对应文件；文件值优先于父环境。
+FERMATA_ENV_FILE=/home/ubuntu/codex-urmotiv/Fermata/private/fermata-experiment.env
 
 # 1. 取数据集：评估集放默认 cf/ 子目录
-SAMPLE_SIZE_PER_BUCKET=2 node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:fetch-hf-dataset
+# 当前 env 文件登记 SAMPLE_SIZE_PER_BUCKET=2，且不登记 DATA_SUBDIR。
+node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:fetch-hf-dataset
 # 标定集（带题解，供思维/代码难度实验）放 levels/ 子目录
-DATA_SUBDIR=levels SAMPLE_SIZE_PER_BUCKET=1 node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:fetch-hf-dataset
+# 运行前改用另一份已登记 DATA_SUBDIR=levels、SAMPLE_SIZE_PER_BUCKET=1 的私有 env 文件。
+node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:fetch-hf-dataset
 
 # 2. 选一批锚点题（已有官方难度、供模型对照的参照题），覆盖 config/anchors/difficulty.json
-DATA_SUBDIR=levels ANCHOR_COUNT=8 node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:calibrate-anchors
+# 当前 env 文件登记 DATA_SUBDIR=levels、ANCHOR_COUNT=8。
+node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:calibrate-anchors
 
 # 3. CF 难度评测：输出平均绝对误差（预测与实际平均相差多少，报告中记作 MAE）、
 # ±200 命中率和分档统计；脚本会排除参照题，避免提前见过答案影响结果。
-EVAL_CONCURRENCY=6 node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:eval-difficulty -- --label=calibrated
+# 当前 env 文件登记 EVAL_CONCURRENCY=6。
+node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:eval-difficulty -- --label=calibrated
 
 # 4. 思维/代码难度标定：检验 rating 越高等级是否单调上升。
 # 首次运行不加 --resume。
-EVAL_CONCURRENCY=2 node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:calibrate-levels -- --label=v1
+# 当前 env 文件登记 EVAL_CONCURRENCY=2。
+node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:calibrate-levels -- --label=v1
 # 中断后保持原参数不变，并用相同 label 加 --resume，只补跑没有完成的题。
-EVAL_CONCURRENCY=2 node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:calibrate-levels -- --label=v1 --resume
+node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:calibrate-levels -- --label=v1 --resume
 
 # 5. 综合评审判定：正常题不误拦 + 构造原题触发强制不通过
 node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:eval-verdict -- --label=v1
@@ -144,8 +154,8 @@ shell 的 `source` 或 `.`。
 该服务器的 systemd 服务或其它长期任务管理方式。
 
 ```bash
-FERMATA_ENV_FILE=/home/ubuntu/urmotiv-codex/private/fermata.env
-FERMATA_CALIBRATION_RUN_DIR=/home/ubuntu/urmotiv-codex/private/fermata-calibration-runs
+FERMATA_ENV_FILE=/home/ubuntu/codex-urmotiv/Fermata/private/fermata.env
+FERMATA_CALIBRATION_RUN_DIR=/home/ubuntu/codex-urmotiv/Fermata/private/fermata-calibration-runs
 
 # 新实验
 npm run experiment:calibrate-levels:detached -- \
@@ -163,8 +173,9 @@ npm run experiment:calibrate-levels:detached -- \
 ```
 
 这个后台入口只支持 Linux 服务器。`--environment-file` 和 `--private-dir` 都必须是服务器
-绝对路径，并且都必须位于 Fermata 仓库之外。env 文件不能是符号链接，必须属于启动
-标定的当前用户，而且不能给同组用户或其他用户任何权限；通常应使用 `0600`。后台
+绝对路径，并且都必须位于被 Git 忽略的 `Fermata/private/` 内。私有根和中间目录必须属于
+启动标定的当前用户且为 `0700`；env 文件不能是符号链接，必须属于当前用户，而且不能给
+同组用户或其他用户任何权限，通常应使用 `0600`。后台
 入口和 `run-with-env.mjs` 共用同一套 env 解析规则，但只从文件接收 Fermata 配置、
 模型服务配置和本标定支持的有界运行参数，忽略 `NODE_OPTIONS` 等能改变 Node 启动
 行为的变量。如果启动终端设置了 `NODE_DEBUG` 或 `NODE_DEBUG_NATIVE`，入口会在读取
@@ -176,8 +187,11 @@ npm run experiment:calibrate-levels:detached -- \
 每次启动会写一个唯一的 `0600` 日志和一个通过临时文件原子替换的 `0600` JSON 元数据
 文件。元数据只含固定格式版本、任务类型、任务编号、实际标定进程及进程组 ID、标签、
 续跑方式、启动时间、启动状态和日志文件名，不保存环境变量、env 文件路径、完整命令
-或模型服务地址。命令启动后会打印任务编号、进程及进程组 ID 和两个文件名；“已脱离”
-只表示后台进程已经创建，最终是否成功仍应以日志和标定报告为准。
+或模型服务地址。`ready` 会在含 PID 的元数据同步落盘后、发送 `START` 前写入，并保持为
+最终启动状态；它表示启动门可能已经送达，不代表实验完成。此后如果启动器报告授权结果
+不确定，不得重复启动，也不得结束该 PID，应先按登记的完整进程信息和私有日志核对。只有
+授权前失败才会尝试清理子进程；`cleanup-unconfirmed` 表示清理结果无法确认，同样必须先
+核对 PID。命令打印的“已脱离”只表示后台进程已经创建，最终结果仍以日志和标定报告为准。
 
 这个入口固定运行 `calibrate-levels`，启动器自身使用参数数组和 `shell: false` 创建
 后台进程，不把用户输入拼成 shell 命令，也不接受任意命令。除两个路径参数外，只允许
@@ -301,7 +315,8 @@ config/
   anchors/difficulty.json  CF 难度评估的参照题（当前发布的是 2 条临时数据，见"当前校准状态"）
 scripts/
   env-file.mjs             run-with-env 和后台启动器共用的简单 env 解析规则
-  run-with-env.mjs         从仓库外安全读取 env 文件后，不经 shell 运行参数数组
+  private-runtime.mjs      从 Fermata/private/ 的目录描述符安全读取或创建私有运行文件
+  run-with-env.mjs         从 Git 忽略的私有目录安全读取 env 文件，不经 shell 运行参数数组
   detached-calibration-worker.mjs
                            等 PID 元数据写盘后，在同一进程载入标定入口
   start-detached-calibration.mjs

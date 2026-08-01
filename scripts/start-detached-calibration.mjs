@@ -10,30 +10,35 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
   closeSync,
-  chmodSync,
   constants,
   fchmodSync,
-  fstatSync,
   fsyncSync,
-  lstatSync,
-  mkdirSync,
   openSync,
-  readFileSync,
-  realpathSync,
   renameSync,
-  statSync,
   unlinkSync,
   writeSync
 } from "node:fs";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
-import { mergeEnvFile } from "./env-file.mjs";
+import { isAbsolute, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  assertNoUnknownPrefixedEnvironmentKeys,
+  assertSafeNodeEnvironment,
+  parseEnvFile,
+  selectEnvironment
+} from "./env-file.mjs";
+import {
+  anchoredPrivatePath,
+  closePrivateDirectory,
+  preparePrivateDirectory as prepareProtectedPrivateDirectory,
+  readProtectedEnvFile,
+  repositoryRoot
+} from "./private-runtime.mjs";
 
 const usage =
   "用法：npm run experiment:calibrate-levels:detached -- " +
   "--environment-file=<服务器私有 env 文件绝对路径> " +
   "--private-dir=<服务器私有运行目录绝对路径> " +
-  "--label=<标签> [--resume | --resume-from=<旧标签>]\n";
+  "--label=<标签> [--resume]\n";
 const safeLabelPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 const allowedCalibrationEnvironmentKeys = [
   "AETHER_API_KEY",
@@ -54,9 +59,38 @@ const allowedCalibrationEnvironmentKeys = [
   "URMOTIV_BASE_URL",
   "URMOTIV_ROBOT_TOKEN"
 ];
-const repositoryRoot = realpathSync(
-  resolve(dirname(fileURLToPath(import.meta.url)), "..")
-);
+const allowedInheritedEnvironmentKeys = [
+  ...allowedCalibrationEnvironmentKeys,
+  "ALL_PROXY",
+  "HOME",
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "LOGNAME",
+  "NO_COLOR",
+  "NO_PROXY",
+  "PATH",
+  "TEMP",
+  "TMP",
+  "TMPDIR",
+  "TZ",
+  "USER",
+  "all_proxy",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+];
+const protectedCalibrationEnvironmentPrefixes = [
+  "AETHER_",
+  "CODEFORCES_",
+  "DASHSCOPE_",
+  "EVAL_",
+  "FERMATA_",
+  "LEVELS_",
+  "URMOTIV_"
+];
 const calibrationWorkerPath = resolve(
   repositoryRoot,
   "scripts",
@@ -69,7 +103,7 @@ function failInput(message) {
   throw new LauncherInputError(message);
 }
 
-function parseArguments(argv) {
+export function parseArguments(argv) {
   const values = new Map();
   let resume = false;
 
@@ -92,8 +126,7 @@ function parseArguments(argv) {
       ![
         "--environment-file",
         "--private-dir",
-        "--label",
-        "--resume-from"
+        "--label"
       ].includes(name) ||
       value === "" ||
       values.has(name)
@@ -106,7 +139,6 @@ function parseArguments(argv) {
   const envFile = values.get("--environment-file");
   const privateDirectory = values.get("--private-dir");
   const label = values.get("--label");
-  const resumeFrom = values.get("--resume-from") ?? null;
   if (
     envFile === undefined ||
     privateDirectory === undefined ||
@@ -122,139 +154,41 @@ function parseArguments(argv) {
       "--label 只能包含字母、数字、点、下划线和短横线，且不能超过 80 个字符。"
     );
   }
-  if (resumeFrom !== null && !safeLabelPattern.test(resumeFrom)) {
-    failInput("--resume-from 只能填写已有报告的安全标签。");
-  }
-  if (resume && resumeFrom !== null) {
-    failInput("--resume 和 --resume-from 不能同时使用。");
-  }
-  if (resumeFrom === label) {
-    failInput("--resume-from 不能和 --label 相同；续跑当前标签请使用 --resume。");
-  }
-
   return {
     envFile: resolve(envFile),
     privateDirectory: resolve(privateDirectory),
     label,
-    resume,
-    resumeFrom
+    resume
   };
 }
 
-function isInside(parent, candidate) {
-  const pathFromParent = relative(parent, candidate);
-  return (
-    pathFromParent === "" ||
-    (pathFromParent !== ".." &&
-      !pathFromParent.startsWith(`..${sep}`) &&
-      !isAbsolute(pathFromParent))
-  );
-}
-
-function preparePrivateDirectory(privateDirectory) {
-  if (isInside(repositoryRoot, privateDirectory)) {
-    failInput("私有运行目录必须位于 Fermata 仓库之外。");
-  }
-
+export function preparePrivateDirectory(privateDirectory, options) {
   try {
-    let directoryAlreadyExisted = true;
-    try {
-      lstatSync(privateDirectory);
-    } catch (error) {
-      if (
-        typeof error !== "object" ||
-        error === null ||
-        !("code" in error) ||
-        error.code !== "ENOENT"
-      ) {
-        throw error;
-      }
-      directoryAlreadyExisted = false;
-    }
-    if (!directoryAlreadyExisted) {
-      // 只创建最后一级；父目录必须预先存在，避免异常 umask 在递归创建的中间
-      // 目录上去掉 owner execute 后留下无法进入的残缺目录。
-      mkdirSync(privateDirectory, { recursive: false, mode: 0o700 });
-      // mkdir 的 mode 会受 umask 影响；新建目录由本进程立即收紧到准确的 0700。
-      chmodSync(privateDirectory, 0o700);
-    }
-    const linkStatus = lstatSync(privateDirectory);
-    if (!linkStatus.isDirectory() || linkStatus.isSymbolicLink()) {
-      failInput("私有运行目录必须是普通目录，不能是符号链接。");
-    }
-    const canonicalDirectory = realpathSync(privateDirectory);
-    if (isInside(repositoryRoot, canonicalDirectory)) {
-      failInput("私有运行目录必须位于 Fermata 仓库之外。");
-    }
-    const status = statSync(canonicalDirectory);
-    if ((status.mode & 0o777) !== 0o700) {
-      failInput("私有运行目录的权限必须已经是 0700。");
-    }
-    if (
-      typeof process.getuid === "function" &&
-      status.uid !== process.getuid()
-    ) {
-      failInput("私有运行目录必须属于启动标定的当前用户。");
-    }
-    return canonicalDirectory;
+    return prepareProtectedPrivateDirectory(privateDirectory, options);
   } catch (error) {
     if (error instanceof LauncherInputError) {
       throw error;
     }
-    failInput("无法创建或保护指定的私有运行目录。");
-  }
-}
-
-function readPrivateEnvFile(envFile) {
-  if (isInside(repositoryRoot, envFile)) {
-    failInput("env 文件必须位于 Fermata 仓库之外。");
-  }
-
-  let descriptor;
-  try {
-    const linkStatus = lstatSync(envFile);
-    if (linkStatus.isSymbolicLink()) {
-      failInput("env 文件不能是符号链接。");
-    }
-    const canonicalEnvFile = realpathSync(envFile);
-    if (isInside(repositoryRoot, canonicalEnvFile)) {
-      failInput("env 文件必须位于 Fermata 仓库之外。");
-    }
-    descriptor = openSync(
-      canonicalEnvFile,
-      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)
+    failInput(
+      "私有运行目录必须位于 Fermata/private 内，且目录链均为当前用户所有的 0700 普通目录。"
     );
-    const status = fstatSync(descriptor);
-    if (!status.isFile()) {
-      failInput("指定的 env 路径不是普通文件。");
-    }
-    if ((status.mode & 0o077) !== 0) {
-      failInput("env 文件不能向同组用户或其他用户开放任何权限。");
-    }
-    if (
-      typeof process.getuid === "function" &&
-      status.uid !== process.getuid()
-    ) {
-      failInput("env 文件必须属于启动标定的当前用户。");
-    }
-    return readFileSync(descriptor, "utf8");
+  }
+}
+
+export function readPrivateEnvFile(envFile, options) {
+  try {
+    return readProtectedEnvFile(envFile, options);
   } catch (error) {
     if (error instanceof LauncherInputError) {
       throw error;
     }
-    failInput("无法读取指定的 env 文件。");
-  } finally {
-    if (descriptor !== undefined) {
-      try {
-        closeSync(descriptor);
-      } catch {
-        // 不输出可能包含服务器私有路径的底层错误。
-      }
-    }
+    failInput(
+      "env 文件必须位于 Fermata/private 内，且是当前用户所有、没有组或其他用户权限的普通文件。"
+    );
   }
 }
 
-function openPrivateFile(path) {
+export function openPrivateFile(path) {
   const descriptor = openSync(
     path,
     constants.O_CREAT |
@@ -285,7 +219,11 @@ function writeAll(descriptor, text, position = null) {
   }
 }
 
-function syncPrivateDirectory(privateDirectory) {
+function syncPrivateDirectory(privateDirectory, privateDirectoryHandle) {
+  if (privateDirectoryHandle !== undefined) {
+    fsyncSync(privateDirectoryHandle.descriptor);
+    return;
+  }
   let descriptor;
   try {
     descriptor = openSync(
@@ -300,12 +238,22 @@ function syncPrivateDirectory(privateDirectory) {
   }
 }
 
-function writePrivateJsonAtomically(privateDirectory, fileName, value) {
-  const targetPath = resolve(privateDirectory, fileName);
-  const temporaryPath = resolve(
-    privateDirectory,
-    `.${fileName}.tmp-${randomBytes(8).toString("hex")}`
-  );
+export function writePrivateJsonAtomically(
+  privateDirectory,
+  fileName,
+  value,
+  privateDirectoryHandle
+) {
+  const temporaryFileName =
+    `.${fileName}.tmp-${randomBytes(8).toString("hex")}`;
+  const targetPath =
+    privateDirectoryHandle === undefined
+      ? resolve(privateDirectory, fileName)
+      : anchoredPrivatePath(privateDirectoryHandle, fileName);
+  const temporaryPath =
+    privateDirectoryHandle === undefined
+      ? resolve(privateDirectory, temporaryFileName)
+      : anchoredPrivatePath(privateDirectoryHandle, temporaryFileName);
   let descriptor;
   try {
     descriptor = openPrivateFile(temporaryPath);
@@ -314,7 +262,7 @@ function writePrivateJsonAtomically(privateDirectory, fileName, value) {
     closeSync(descriptor);
     descriptor = undefined;
     renameSync(temporaryPath, targetPath);
-    syncPrivateDirectory(privateDirectory);
+    syncPrivateDirectory(privateDirectory, privateDirectoryHandle);
   } catch {
     if (descriptor !== undefined) {
       try {
@@ -332,7 +280,7 @@ function writePrivateJsonAtomically(privateDirectory, fileName, value) {
   }
 }
 
-function waitUntilSpawned(child) {
+export function waitUntilSpawned(child) {
   return new Promise((resolvePromise, rejectPromise) => {
     const handleSpawn = () => {
       child.off("error", handleError);
@@ -347,42 +295,156 @@ function waitUntilSpawned(child) {
   });
 }
 
-function authorizeCalibrationStart(child) {
+export function authorizeCalibrationStart(child) {
   const gate = child.stdin;
   if (gate === null || typeof gate.end !== "function") {
     return Promise.reject(new Error("DETACHED_PROCESS_GATE_MISSING"));
   }
   return new Promise((resolvePromise, rejectPromise) => {
+    let settled = false;
     const handleError = () => {
-      rejectPromise(new Error("DETACHED_PROCESS_GATE_FAILED"));
+      if (!settled) {
+        settled = true;
+        rejectPromise(new Error("DETACHED_PROCESS_GATE_FAILED"));
+      }
     };
-    gate.once("error", handleError);
-    gate.end("START\n", () => {
+    const handleClose = () => {
       gate.off("error", handleError);
-      resolvePromise();
-    });
+    };
+    gate.on("error", handleError);
+    gate.once("close", handleClose);
+    try {
+      gate.end("START\n", () => {
+        if (!settled) {
+          settled = true;
+          resolvePromise();
+        }
+      });
+    } catch {
+      gate.off("error", handleError);
+      gate.off("close", handleClose);
+      settled = true;
+      rejectPromise(new Error("DETACHED_PROCESS_GATE_FAILED"));
+    }
   });
 }
 
-function terminateDetachedChild(child) {
+export function terminateDetachedChild(child, killProcessGroup = process.kill) {
+  // 生产调用只接受本启动器刚用固定 executable/worker/cwd 创建的 ChildProcess；
+  // 不接收外部 PID，也不按 node/python 等进程名做批量终止。
   if (!Number.isSafeInteger(child.pid) || child.pid <= 0) {
     return;
   }
   try {
-    process.kill(-child.pid, "SIGTERM");
+    killProcessGroup(-child.pid, "SIGTERM");
   } catch {
     // 进程可能已经自行退出；这里不能把底层错误或命令信息写到终端。
   }
 }
 
-function buildChildEnvironment(envFileContent) {
-  const fileEnvironment = mergeEnvFile(envFileContent, {});
-  const environment = { ...process.env };
-  for (const key of allowedCalibrationEnvironmentKeys) {
-    if (!(key in environment) && key in fileEnvironment) {
-      environment[key] = fileEnvironment[key];
-    }
+function createChildExitWaiter(child) {
+  let exited =
+    Number.isInteger(child.exitCode) || typeof child.signalCode === "string";
+  let resolveExit;
+  const exitPromise = new Promise((resolvePromise) => {
+    resolveExit = resolvePromise;
+  });
+  const handleExit = () => {
+    exited = true;
+    resolveExit(true);
+  };
+  if (!exited && typeof child.once === "function") {
+    child.once("exit", handleExit);
+    child.once("close", handleExit);
   }
+  return {
+    hasExited: () => exited,
+    async wait(timeoutMs) {
+      if (exited) {
+        return true;
+      }
+      let timeout;
+      try {
+        return await Promise.race([
+          exitPromise,
+          new Promise((resolvePromise) => {
+            timeout = setTimeout(() => resolvePromise(false), timeoutMs);
+          })
+        ]);
+      } finally {
+        if (timeout !== undefined) {
+          clearTimeout(timeout);
+        }
+      }
+    },
+    dispose() {
+      if (typeof child.off === "function") {
+        child.off("exit", handleExit);
+        child.off("close", handleExit);
+      }
+    }
+  };
+}
+
+export async function cleanupFailedDetachedChild(
+  child,
+  {
+    killProcessGroup = process.kill,
+    terminationGraceMs = 5_000,
+    forceKillGraceMs = 1_000
+  } = {}
+) {
+  const exitWaiter = createChildExitWaiter(child);
+  try {
+    child.stdin?.destroy();
+  } catch {
+    // 关闭启动门失败也不能回显底层管道信息；下面仍尝试终止进程组。
+  }
+  if (!exitWaiter.hasExited()) {
+    terminateDetachedChild(child, killProcessGroup);
+  }
+  let exited = await exitWaiter.wait(terminationGraceMs);
+  if (!exited && Number.isSafeInteger(child.pid) && child.pid > 0) {
+    try {
+      killProcessGroup(-child.pid, "SIGKILL");
+    } catch {
+      // 后续仍会把清理状态记为未确认，不能回显底层进程信息。
+    }
+    exited = await exitWaiter.wait(forceKillGraceMs);
+  }
+  exitWaiter.dispose();
+  try {
+    child.unref();
+  } catch {
+    // 清理路径必须保持固定错误输出。
+  }
+  return exited || !Number.isSafeInteger(child.pid) || child.pid <= 0;
+}
+
+export function buildChildEnvironment(
+  envFileContent,
+  parentEnvironment = process.env
+) {
+  assertSafeNodeEnvironment(parentEnvironment);
+  const fileEnvironment = parseEnvFile(envFileContent);
+  assertSafeNodeEnvironment(fileEnvironment);
+  assertNoUnknownPrefixedEnvironmentKeys(
+    parentEnvironment,
+    allowedInheritedEnvironmentKeys,
+    protectedCalibrationEnvironmentPrefixes
+  );
+  assertNoUnknownPrefixedEnvironmentKeys(
+    fileEnvironment,
+    allowedCalibrationEnvironmentKeys,
+    [""]
+  );
+  // 父环境只继承明确列出的基本运行时、代理和 Fermata 变量；env 文件随后覆盖
+  // 同名项。这样既保留服务器代理，也不会把 LD_PRELOAD、任意 Node 参数或一次
+  // 旧实验的同名值整包带入后台进程。
+  const environment = {
+    ...selectEnvironment(parentEnvironment, allowedInheritedEnvironmentKeys),
+    ...selectEnvironment(fileEnvironment, allowedCalibrationEnvironmentKeys)
+  };
   return {
     ...environment,
     NODE_DEBUG: "",
@@ -395,38 +457,56 @@ function buildChildEnvironment(envFileContent) {
   };
 }
 
-async function main() {
-  const options = parseArguments(process.argv.slice(2));
-  if (process.platform !== "linux") {
-    failInput("长期标定后台启动器只支持 Linux 服务器。");
-  }
-  if (
-    process.env.NODE_DEBUG?.trim() ||
-    process.env.NODE_DEBUG_NATIVE?.trim()
-  ) {
-    failInput(
-      "启动长期标定前必须清除 NODE_DEBUG 和 NODE_DEBUG_NATIVE，防止 Node 把子进程环境写到终端。"
-    );
-  }
-  const privateDirectory = preparePrivateDirectory(options.privateDirectory);
-
-  let tsxLoaderPath;
+export function spawnDetachedWorker(
+  executable,
+  argumentsList,
+  options,
+  spawnProcess = spawn
+) {
   try {
-    tsxLoaderPath = fileURLToPath(import.meta.resolve("tsx"));
+    return spawnProcess(executable, argumentsList, options);
   } catch {
-    failInput("找不到标定脚本所需的 tsx，请先在服务器安装项目依赖。");
+    throw new Error("DETACHED_PROCESS_SPAWN_THROWN");
   }
-  const envFileContent = readPrivateEnvFile(options.envFile);
+}
 
-  const startedAt = new Date().toISOString();
+export async function launchDetachedCalibration(
+  options,
+  {
+    privateDirectoryHandle,
+    tsxLoaderPath,
+    childEnvironment,
+    spawnProcess = spawn,
+    waitForSpawn = waitUntilSpawned,
+    authorizeStart = authorizeCalibrationStart,
+    cleanupChild = cleanupFailedDetachedChild,
+    writeMetadata = writePrivateJsonAtomically,
+    now = () => new Date(),
+    randomRunSuffix = () => randomBytes(6).toString("hex")
+  }
+) {
+  const privateDirectory = privateDirectoryHandle.path;
+  const startedAt = now().toISOString();
   const timestamp = startedAt.replace(/[:.]/g, "-");
-  const runId = `${timestamp}-${randomBytes(6).toString("hex")}`;
+  const runId = `${timestamp}-${randomRunSuffix()}`;
   const logFileName = `levels-${options.label}-${runId}.log`;
   const metadataFileName = `levels-${options.label}-${runId}.json`;
-  const logPath = resolve(privateDirectory, logFileName);
+  const logPath = anchoredPrivatePath(
+    privateDirectoryHandle,
+    logFileName
+  );
   let logDescriptor;
   let child;
   let spawnedPid = null;
+  let startMayHaveBeenAuthorized = false;
+
+  const persistMetadata = (value) =>
+    writeMetadata(
+      privateDirectory,
+      metadataFileName,
+      value,
+      privateDirectoryHandle
+    );
 
   try {
     logDescriptor = openPrivateFile(logPath);
@@ -436,16 +516,11 @@ async function main() {
       runId,
       label: options.label,
       resume: options.resume,
-      resumeFrom: options.resumeFrom,
       startedAt,
       logFile: logFileName,
       launchState: "starting"
     };
-    writePrivateJsonAtomically(
-      privateDirectory,
-      metadataFileName,
-      safeMetadata
-    );
+    persistMetadata(safeMetadata);
     writeAll(
       logDescriptor,
       `[${startedAt}] 长期标定任务正在启动；标签=${options.label}。\n`
@@ -455,11 +530,9 @@ async function main() {
     const calibrationArguments = [`--label=${options.label}`];
     if (options.resume) {
       calibrationArguments.push("--resume");
-    } else if (options.resumeFrom !== null) {
-      calibrationArguments.push(`--resume-from=${options.resumeFrom}`);
     }
 
-    child = spawn(
+    child = spawnDetachedWorker(
       process.execPath,
       [
         "--import",
@@ -470,53 +543,63 @@ async function main() {
       {
         cwd: repositoryRoot,
         detached: true,
-        env: buildChildEnvironment(envFileContent),
+        env: childEnvironment,
         shell: false,
         stdio: ["pipe", logDescriptor, logDescriptor]
-      }
+      },
+      spawnProcess
     );
-    await waitUntilSpawned(child);
+    await waitForSpawn(child);
     if (!Number.isSafeInteger(child.pid) || child.pid <= 0) {
       throw new Error("DETACHED_PROCESS_PID_MISSING");
     }
     spawnedPid = child.pid;
-    writePrivateJsonAtomically(privateDirectory, metadataFileName, {
+    persistMetadata({
       ...safeMetadata,
       pid: spawnedPid,
       processGroupId: spawnedPid,
       launchState: "ready"
     });
-    await authorizeCalibrationStart(child);
-    writePrivateJsonAtomically(privateDirectory, metadataFileName, {
-      ...safeMetadata,
-      pid: spawnedPid,
-      processGroupId: spawnedPid,
-      launchState: "detached"
-    });
-    child.unref();
-  } catch {
-    if (child !== undefined && spawnedPid !== null) {
-      terminateDetachedChild(child);
-    }
+    // `ready`（含 PID/进程组）已经持久化后才触碰启动门。从这一刻起 START
+    // 可能已经完整送达，任何后续错误都不得再发送信号取消潜在付费请求。
+    startMayHaveBeenAuthorized = true;
+    await authorizeStart(child);
     try {
-      writePrivateJsonAtomically(privateDirectory, metadataFileName, {
+      child.unref();
+    } catch {
+      // START 后只允许固定的非破坏性收尾；不能因此取消已经开始的请求。
+    }
+  } catch {
+    if (child !== undefined && startMayHaveBeenAuthorized) {
+      try {
+        child.stdin?.destroy();
+      } catch {
+        // START 可能已送达，只关闭父侧句柄，不向子进程发送终止信号。
+      }
+      try {
+        child.unref();
+      } catch {
+        // 同上。
+      }
+      throw new Error("DETACHED_CALIBRATION_AUTHORIZATION_UNCERTAIN");
+    }
+    const cleanupConfirmed =
+      child === undefined ? true : await cleanupChild(child);
+    try {
+      persistMetadata({
         schemaVersion: 1,
         kind: "levels-calibration",
         runId,
         label: options.label,
         resume: options.resume,
-        resumeFrom: options.resumeFrom,
         startedAt,
         logFile: logFileName,
         pid: spawnedPid ?? undefined,
         processGroupId: spawnedPid ?? undefined,
-        launchState: "failed"
+        launchState: cleanupConfirmed ? "failed" : "cleanup-unconfirmed"
       });
     } catch {
       // 不能输出底层错误；最后一个完整元数据版本仍会保留。
-    }
-    if (child !== undefined) {
-      child.unref();
     }
     throw new Error("DETACHED_CALIBRATION_LAUNCH_FAILED");
   } finally {
@@ -529,25 +612,97 @@ async function main() {
     }
   }
 
+  return {
+    runId,
+    spawnedPid,
+    logFileName,
+    metadataFileName
+  };
+}
+
+export async function main(argv = process.argv.slice(2)) {
+  const options = parseArguments(argv);
+  if (process.platform !== "linux") {
+    failInput("长期标定后台启动器只支持 Linux 服务器。");
+  }
+  try {
+    assertSafeNodeEnvironment(process.env);
+  } catch {
+    failInput(
+      "启动长期标定前必须清除危险的 Node 调试、注入或 TLS 关闭变量。"
+    );
+  }
+
+  let tsxLoaderPath;
+  try {
+    tsxLoaderPath = fileURLToPath(import.meta.resolve("tsx"));
+  } catch {
+    failInput("找不到标定脚本所需的 tsx，请先在服务器安装项目依赖。");
+  }
+  const envFileContent = readPrivateEnvFile(options.envFile);
+  let childEnvironment;
+  try {
+    childEnvironment = buildChildEnvironment(envFileContent);
+  } catch {
+    failInput(
+      "env 文件含有不安全、重复、未知或无法安全传递的变量。"
+    );
+  }
+
+  const privateDirectoryHandle = preparePrivateDirectory(
+    options.privateDirectory
+  );
+  let launchResult;
+  try {
+    launchResult = await launchDetachedCalibration(options, {
+      privateDirectoryHandle,
+      tsxLoaderPath,
+      childEnvironment
+    });
+  } finally {
+    closePrivateDirectory(privateDirectoryHandle);
+  }
+
   process.stdout.write(
     `长期标定任务已脱离当前 SSH 会话。\n` +
-      `任务编号：${runId}\n` +
-      `进程 ID：${spawnedPid}\n` +
-      `进程组 ID：${spawnedPid}\n` +
-      `日志文件：${logFileName}\n` +
-      `元数据文件：${metadataFileName}\n` +
+      `任务编号：${launchResult.runId}\n` +
+      `进程 ID：${launchResult.spawnedPid}\n` +
+      `进程组 ID：${launchResult.spawnedPid}\n` +
+      `日志文件：${launchResult.logFileName}\n` +
+      `元数据文件：${launchResult.metadataFileName}\n` +
       "日志和元数据均位于传入的私有运行目录。\n"
   );
 }
 
-main().catch((error) => {
-  if (error instanceof LauncherInputError) {
-    process.stderr.write(`${error.message}\n${usage}`);
-    process.exitCode = 2;
-  } else {
-    process.stderr.write(
-      "长期标定任务启动失败；请检查传入的私有目录中的 0600 日志和元数据文件。\n"
-    );
-    process.exitCode = 1;
+function isDirectEntry() {
+  if (process.argv[1] === undefined) {
+    return false;
   }
-});
+  try {
+    return pathToFileURL(resolve(process.argv[1])).href === import.meta.url;
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectEntry()) {
+  main().catch((error) => {
+    if (error instanceof LauncherInputError) {
+      process.stderr.write(`${error.message}\n${usage}`);
+      process.exitCode = 2;
+    } else if (
+      error instanceof Error &&
+      error.message === "DETACHED_CALIBRATION_AUTHORIZATION_UNCERTAIN"
+    ) {
+      process.stderr.write(
+        "长期标定启动门结果不确定；不得重复启动，请先按已登记 PID 核对进程和日志。\n"
+      );
+      process.exitCode = 1;
+    } else {
+      process.stderr.write(
+        "长期标定任务启动失败；请检查传入的私有目录中的 0600 日志和元数据文件。\n"
+      );
+      process.exitCode = 1;
+    }
+  });
+}
