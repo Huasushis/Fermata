@@ -292,7 +292,7 @@ describe("chatComplete：正常路径", () => {
     });
   });
 
-  it("收到 DONE 后继续读到 HTTP 正常结尾，且不主动取消响应体", async () => {
+  it("收到 stop 和 DONE 后继续读到 HTTP 正常结尾，且不主动取消响应体", async () => {
     const encoder = new TextEncoder();
     let cancelled = false;
     let streamController!: ReadableStreamDefaultController<Uint8Array>;
@@ -301,7 +301,7 @@ describe("chatComplete：正常路径", () => {
         streamController = controller;
         controller.enqueue(
           encoder.encode(
-            'data: {"choices":[{"delta":{"content":"已经完成"}}]}\n\n' +
+            'data: {"choices":[{"delta":{"content":"已经完成"},"finish_reason":"stop"}]}\n\n' +
               "data: [DONE]\n\n"
           )
         );
@@ -412,12 +412,15 @@ describe("chatComplete：正常路径", () => {
     ).resolves.toEqual({ content: "完整答案", reasoning: null });
   });
 
-  it("服务端用独立的 DONE 标记结束时也能返回完整结果", async () => {
+  it("正文和 DONE 到达 HTTP 结尾但没有 stop 时固定失败且不重试或泄漏正文", async () => {
+    const sensitiveContent = "不应进入异常的无终止正文";
     const fetchMock = vi.fn(
       async () =>
         new Response(
           [
-            'data: {"choices":[{"delta":{"content":"完整答案"}}]}',
+            `data: ${JSON.stringify({
+              choices: [{ delta: { content: sensitiveContent } }]
+            })}`,
             "",
             "data: [DONE]",
             ""
@@ -425,9 +428,13 @@ describe("chatComplete：正常路径", () => {
           { status: 200, headers: { "Content-Type": "text/event-stream" } }
         )
     );
-    await expect(
-      chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock })
-    ).resolves.toEqual({ content: "完整答案", reasoning: null });
+    const error = await chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "LLM_STREAM_INTERRUPTED" });
+    expect((error as Error).message).not.toContain(sensitiveContent);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("DONE 后继续出现非空事件时拒绝损坏的响应次序", async () => {

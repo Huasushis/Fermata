@@ -921,7 +921,7 @@ async function readChatCompletionEventStream(
         if (pending.trim().length > 0) {
           if (consumeChatCompletionEvent(pending, state)) onValidOutput();
         }
-        if (!state.sawChoice || (!state.sawStop && !state.sawDone)) {
+        if (!state.sawChoice || !state.sawStop) {
           throw new LlmRequestError("LLM_STREAM_INTERRUPTED");
         }
         const raw = chatCompletionStreamResult(state);
