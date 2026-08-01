@@ -73,10 +73,10 @@ describe("思维和代码难度标定参数", () => {
     });
   });
 
-  it("允许分别覆盖三项等待时间、尝试次数并开启续跑", () => {
+  it("允许分别覆盖三项等待时间、尝试次数并开启同标签续跑", () => {
     expect(
       resolve({
-        argv: ["--label=v3.1", "--resume-from=baseline-24"],
+        argv: ["--label=v3.1", "--resume"],
         env: {
           LEVELS_LLM_OUTPUT_IDLE_MS: "720000",
           LEVELS_LLM_FIRST_OUTPUT_MS: "2400000",
@@ -87,7 +87,7 @@ describe("思维和代码难度标定参数", () => {
       })
     ).toEqual({
       label: "v3.1",
-      resumeFromLabel: "baseline-24",
+      resumeFromLabel: "v3.1",
       outputIdleTimeoutMs: 720_000,
       firstOutputTimeoutMs: 2_400_000,
       maximumDurationMs: 18_000_000,
@@ -106,29 +106,21 @@ describe("思维和代码难度标定参数", () => {
     }
   });
 
-  it("--resume 只指向当前标签，且不能和 --resume-from 同时使用", () => {
+  it("--resume 只指向当前标签，跨标签续跑参数直接视为不支持", () => {
     expect(
       resolve({ argv: ["--label=current", "--resume"] }).resumeFromLabel
     ).toBe("current");
     expect(() =>
       resolve({
-        argv: ["--label=current", "--resume", "--resume-from=old"]
+        argv: ["--label=current", "--resume-from=old"]
       })
-    ).toThrow("--resume 和 --resume-from 不能同时使用");
-    expect(() =>
-      resolve({
-        argv: ["--label=current", "--resume-from=current"]
-      })
-    ).toThrow("--resume-from 不能和 --label 相同");
+    ).toThrow("不支持的标定参数");
   });
 
   it("拒绝可能写出目录外文件的标签", () => {
     expect(() => resolve({ argv: ["--label=../outside"] })).toThrow(
       "--label 只能包含"
     );
-    expect(() =>
-      resolve({ argv: ["--label=safe", "--resume-from=../outside"] })
-    ).toThrow("--resume-from");
   });
 
   it("拒绝未知或重复参数，避免拼错后意外启动付费实验", () => {
@@ -145,7 +137,7 @@ describe("思维和代码难度标定参数", () => {
       resolve({
         argv: ["--resume-from=first", "--resume-from=second"]
       })
-    ).toThrow("--resume-from 不能重复");
+    ).toThrow("不支持的标定参数");
   });
 
   it("拒绝低于安全下限、超过一天或彼此矛盾的等待时间", () => {

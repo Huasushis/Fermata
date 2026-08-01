@@ -40,21 +40,7 @@ export function resolveLevelsCalibrationOptions(
     throw new Error("--label 只能包含字母、数字、点、下划线和短横线，且不能超过 80 个字符。");
   }
 
-  const resumeFromArgument = argumentsResult.resumeFrom;
-  if (argumentsResult.resume && resumeFromArgument !== undefined) {
-    throw new Error("--resume 和 --resume-from 不能同时使用。");
-  }
-  const resumeFromLabel =
-    resumeFromArgument ?? (argumentsResult.resume ? rawLabel : null);
-  if (
-    resumeFromLabel !== null &&
-    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(resumeFromLabel)
-  ) {
-    throw new Error("--resume-from 只能填写已有报告的安全标签。");
-  }
-  if (resumeFromArgument === rawLabel) {
-    throw new Error("--resume-from 不能和 --label 相同；续跑当前标签请使用 --resume。");
-  }
+  const resumeFromLabel = argumentsResult.resume ? rawLabel : null;
 
   const outputIdleTimeoutMs = parseBoundedInteger(
     input.env.LEVELS_LLM_OUTPUT_IDLE_MS,
@@ -121,11 +107,9 @@ export function resolveLevelsCalibrationOptions(
 function parseCalibrationArguments(argv: readonly string[]): {
   readonly label: string | undefined;
   readonly resume: boolean;
-  readonly resumeFrom: string | undefined;
 } {
   let label: string | undefined;
   let resume = false;
-  let resumeFrom: string | undefined;
   for (const argument of argv) {
     if (argument === "--resume") {
       if (resume) {
@@ -141,16 +125,9 @@ function parseCalibrationArguments(argv: readonly string[]): {
       label = argument.slice("--label=".length);
       continue;
     }
-    if (argument.startsWith("--resume-from=")) {
-      if (resumeFrom !== undefined) {
-        throw new Error("--resume-from 不能重复填写。");
-      }
-      resumeFrom = argument.slice("--resume-from=".length);
-      continue;
-    }
     throw new Error("存在不支持的标定参数。");
   }
-  return { label, resume, resumeFrom };
+  return { label, resume };
 }
 
 function parseBoundedInteger(
