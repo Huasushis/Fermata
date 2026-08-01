@@ -49,7 +49,10 @@ function completionResponse(content: string): Response {
 
 describe("runDifficultyPipeline：整体接线", () => {
   it("把 LLM 的原始 rating 夹到整百范围内再返回", async () => {
-    const fetchMock = vi.fn(async () => completionResponse('{"rating": 1730, "confidence": 0.8, "rationale": "中等题"}'));
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      expect(JSON.parse(String(init?.body))).toMatchObject({ max_tokens: 2_048 });
+      return completionResponse('{"rating": 1730, "confidence": 0.8, "rationale": "中等题"}');
+    });
     const result = await runDifficultyPipeline({
       problem,
       anchors: [{ contestId: 4, index: "A", rating: 800, summary: "入门题" }],
@@ -67,6 +70,7 @@ describe("runDifficultyPipeline：整体接线", () => {
   it("没有锚点时也能正常工作（只是提示词里不带锚点）", async () => {
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body));
+      expect(body.max_tokens).toBe(2_048);
       const joined = body.messages.map((m: { content: string }) => m.content).join("\n");
       expect(joined).not.toContain("参考锚点");
       return completionResponse('{"rating": 900, "confidence": 0.5, "rationale": "简单"}');
@@ -81,5 +85,31 @@ describe("runDifficultyPipeline：整体接线", () => {
       }
     });
     expect(result.rating).toBe(900);
+  });
+
+  it("JSON 首轮失败后的修复轮仍使用同一个 difficulty 输出上限", async () => {
+    const requestBodies: Record<string, unknown>[] = [];
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return completionResponse(
+        requestBodies.length === 1
+          ? "不是 JSON"
+          : '{"rating": 2100, "confidence": 0.7, "rationale": "修复成功"}'
+      );
+    });
+
+    const result = await runDifficultyPipeline({
+      problem,
+      anchors: [],
+      model: {
+        spec: { provider: "aether" as const, model: "test-model", temperature: 0.2, thinking: false },
+        credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
+        runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
+      }
+    });
+
+    expect(result.rating).toBe(2_100);
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies.map((body) => body.max_tokens)).toEqual([2_048, 2_048]);
   });
 });

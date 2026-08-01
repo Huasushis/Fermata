@@ -65,8 +65,24 @@ export interface LlmRuntimeOptions {
   readonly signal?: AbortSignal;
 }
 
+export interface ChatCompletionOptions {
+  readonly requestJson?: boolean;
+  /**
+   * 交给 OpenAI compatible 接口的输出 token 硬上限。未设置时不发送
+   * `max_tokens`，保持既有调用行为。
+   */
+  readonly maxOutputTokens?: number;
+}
+
+export interface ChatCompletionJsonOptions {
+  /** 首轮和唯一一次 JSON 修复轮共用同一个输出 token 硬上限。 */
+  readonly maxOutputTokens?: number;
+}
+
 /** 模型响应正文的固定上限，按 UTF-8 原始字节计算。 */
 export const maximumLlmResponseBodyBytes = 4 * 1024 * 1024;
+/** 显式输出 token 上限本身也必须有界，避免错误配置变成近似无限输出。 */
+export const maximumExplicitLlmOutputTokens = 131_072;
 export const defaultLlmFirstOutputTimeoutMs = 30 * 60 * 1_000;
 export const defaultLlmMaximumDurationMs = 4 * 60 * 60 * 1_000;
 
@@ -239,7 +255,7 @@ export async function chatComplete(
   spec: ModelCallSpec,
   messages: ChatMessage[],
   runtime: LlmRuntimeOptions,
-  options: { readonly requestJson?: boolean } = {}
+  options: ChatCompletionOptions = {}
 ): Promise<ChatCompletionResult> {
   const fetchImpl = runtime.fetch ?? productionLlmFetch;
   const url = new URL("chat/completions", ensureTrailingSlash(provider.baseUrl));
@@ -251,6 +267,9 @@ export async function chatComplete(
   };
   if (options.requestJson === true) {
     body.response_format = { type: "json_object" };
+  }
+  if (options.maxOutputTokens !== undefined) {
+    body.max_tokens = validateMaxOutputTokens(options.maxOutputTokens);
   }
 
   const response = await requestWithRetry(
@@ -290,7 +309,8 @@ export async function chatCompleteJson<T>(
   spec: ModelCallSpec,
   messages: ChatMessage[],
   schema: z.ZodType<T>,
-  runtime: LlmRuntimeOptions
+  runtime: LlmRuntimeOptions,
+  options: ChatCompletionJsonOptions = {}
 ): Promise<{ data: T; reasoning: string | null }> {
   const jsonInstruction: ChatMessage = {
     role: "system",
@@ -300,7 +320,8 @@ export async function chatCompleteJson<T>(
   // 当前接入的网关并不都正确支持 response_format。直接用提示词约束 JSON，
   // 避免先付费生成一次空 content，再为了探测兼容性重复发送完整题目。
   const first = await chatComplete(provider, spec, firstMessages, runtime, {
-    requestJson: false
+    requestJson: false,
+    maxOutputTokens: options.maxOutputTokens
   });
   const firstAttempt = tryParseAndValidate(first.content, schema);
   if (firstAttempt.success) {
@@ -316,7 +337,10 @@ export async function chatCompleteJson<T>(
     }
   ];
   // 修复轮固定用纯提示词方式，避免再次踩到 response_format 的空内容问题。
-  const second = await chatComplete(provider, spec, repairMessages, runtime, { requestJson: false });
+  const second = await chatComplete(provider, spec, repairMessages, runtime, {
+    requestJson: false,
+    maxOutputTokens: options.maxOutputTokens
+  });
   const secondAttempt = tryParseAndValidate(second.content, schema);
   if (secondAttempt.success) {
     return { data: secondAttempt.data, reasoning: second.reasoning ?? first.reasoning };
@@ -603,6 +627,19 @@ function resolveLlmRequestDurations(
 function positiveDuration(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value < 1 || value > 24 * 60 * 60 * 1_000) {
     throw new TypeError(`${name} 必须是 1 到 86400000 之间的整数。`);
+  }
+  return value;
+}
+
+function validateMaxOutputTokens(value: number): number {
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 1 ||
+    value > maximumExplicitLlmOutputTokens
+  ) {
+    throw new RangeError(
+      `maxOutputTokens 必须是 1 到 ${maximumExplicitLlmOutputTokens} 之间的整数。`
+    );
   }
   return value;
 }

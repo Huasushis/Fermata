@@ -79,6 +79,8 @@ const rawDifficultyOutputSchema = z.object({
   rationale: z.string().trim().min(1).max(2_000)
 });
 
+const difficultyMaxOutputTokens = 2_048;
+
 export async function runDifficultyPipeline(input: DifficultyPipelineInput): Promise<DifficultyResult> {
   const messages = buildDifficultyMessages(input.problem, input.anchors);
   const { data } = await chatCompleteJson(
@@ -86,7 +88,8 @@ export async function runDifficultyPipeline(input: DifficultyPipelineInput): Pro
     input.model.spec,
     messages,
     rawDifficultyOutputSchema,
-    input.model.runtime
+    input.model.runtime,
+    { maxOutputTokens: difficultyMaxOutputTokens }
   );
   return {
     rating: clampAndRoundDifficultyRating(data.rating),

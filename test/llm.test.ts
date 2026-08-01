@@ -7,6 +7,7 @@ import {
   LlmRequestError,
   LlmResponseBodyTooLargeError,
   LlmResponseFormatError,
+  maximumExplicitLlmOutputTokens,
   maximumLlmResponseBodyBytes
 } from "../src/llm";
 import { logError } from "../src/logger";
@@ -73,6 +74,37 @@ describe("chatComplete：正常路径", () => {
     });
     await chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock }, { requestJson: true });
   });
+
+  it("显式输出 token 上限按 OpenAI compatible 字段发送，未传时保持字段缺失", async () => {
+    const requestBodies: Record<string, unknown>[] = [];
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return completionResponse("答案");
+    });
+
+    await chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock }, { maxOutputTokens: 2_048 });
+    await chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock });
+
+    expect(requestBodies[0]?.max_tokens).toBe(2_048);
+    expect(requestBodies[1]).not.toHaveProperty("max_tokens");
+  });
+
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, maximumExplicitLlmOutputTokens + 1])(
+    "输出 token 上限 %s 非法时在发请求前拒绝",
+    async (maxOutputTokens) => {
+      const fetchMock = vi.fn(async () => completionResponse("不应调用"));
+      await expect(
+        chatComplete(
+          provider,
+          spec,
+          [],
+          { ...runtime, fetch: fetchMock },
+          { maxOutputTokens }
+        )
+      ).rejects.toBeInstanceOf(RangeError);
+      expect(fetchMock).not.toHaveBeenCalled();
+    }
+  );
 
   it("逐段读取 SSE，并正确拼接跨字节块的推理和最终答案", async () => {
     const encoded = new TextEncoder().encode(
@@ -1169,19 +1201,42 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
   it("第一次不合法时会带着错误信息重试一次，第二次成功就返回", async () => {
     let calls = 0;
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      expect(body.max_tokens).toBe(2_048);
       calls += 1;
       if (calls === 1) {
         return completionResponse("抱歉，我不知道怎么用 JSON 回答");
       }
-      const body = JSON.parse(String(init?.body));
       // 第二次请求应该包含第一次的坏输出和纠正提示，让模型知道错在哪。
       const joined = body.messages.map((m: { content: string }) => m.content).join("\n");
       expect(joined).toContain("不知道怎么用 JSON 回答");
       return completionResponse('{"rating": 1400}');
     });
-    const result = await chatCompleteJson(provider, spec, [], resultSchema, { ...runtime, fetch: fetchMock });
+    const result = await chatCompleteJson(
+      provider,
+      spec,
+      [],
+      resultSchema,
+      { ...runtime, fetch: fetchMock },
+      { maxOutputTokens: 2_048 }
+    );
     expect(result.data).toEqual({ rating: 1400 });
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("非法输出 token 上限不会发出 JSON 首轮或修复轮请求", async () => {
+    const fetchMock = vi.fn(async () => completionResponse('{"rating": 1500}'));
+    await expect(
+      chatCompleteJson(
+        provider,
+        spec,
+        [],
+        resultSchema,
+        { ...runtime, fetch: fetchMock },
+        { maxOutputTokens: 0 }
+      )
+    ).rejects.toBeInstanceOf(RangeError);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("两次都不合法时抛出 LlmJsonOutputError", async () => {
