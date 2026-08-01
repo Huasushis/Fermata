@@ -16,10 +16,11 @@ defaults:
 profiles:
   test-profile:
     difficulty:
-      provider: dashscope
-      model: qwen-plus
+      provider: aether
+      model: deepseek-v4-flash
       temperature: 0.2
       thinking: false
+      thinkingRequest: disabled
     thinking:
       solver:
         provider: aether
@@ -86,6 +87,7 @@ describe("loadConfig：正常路径", () => {
     expect(config.codeforces).toEqual({ key: "cf-key", secret: "cf-secret" });
     expect(config.models.defaults.modelProfileName).toBe("test-profile");
     expect(config.models.thresholds.duplicateSimilarityReject).toBe(0.9);
+    expect(config.models.profiles["test-profile"]?.difficulty.thinkingRequest).toBe("disabled");
   });
 
   it("CODEFORCES_KEY/SECRET 都留空时 codeforces 为 null（可选凭据）", () => {
@@ -156,6 +158,26 @@ profiles:
       temperature: 0.2
 `;
     expect(() => loadConfig({ env: validEnv, modelsYamlSource: brokenYaml })).toThrow(ConfigError);
+  });
+
+  it("thinkingRequest 可以留空，但拒绝未定义的模式", () => {
+    const withoutMode = validYaml.replace("      thinkingRequest: disabled\n", "");
+    const config = loadConfig({ env: validEnv, modelsYamlSource: withoutMode });
+    expect(config.models.profiles["test-profile"]?.difficulty.thinkingRequest).toBeUndefined();
+
+    const invalidMode = validYaml.replace("thinkingRequest: disabled", "thinkingRequest: enabled");
+    expect(() => loadConfig({ env: validEnv, modelsYamlSource: invalidMode })).toThrow(ConfigError);
+  });
+
+  it("thinkingRequest 只允许 Aether deepseek-v4-flash 使用", () => {
+    const wrongProvider = validYaml.replace(
+      "provider: aether\n      model: deepseek-v4-flash",
+      "provider: dashscope\n      model: deepseek-v4-flash"
+    );
+    expect(() => loadConfig({ env: validEnv, modelsYamlSource: wrongProvider })).toThrow(ConfigError);
+
+    const wrongModel = validYaml.replace("model: deepseek-v4-flash", "model: deepseek-v4-pro");
+    expect(() => loadConfig({ env: validEnv, modelsYamlSource: wrongModel })).toThrow(ConfigError);
   });
 
   it("查重强制拒绝阈值必须在 0-1 内", () => {

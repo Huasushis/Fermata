@@ -50,14 +50,23 @@ function completionResponse(content: string): Response {
 describe("runDifficultyPipeline：整体接线", () => {
   it("把 LLM 的原始 rating 夹到整百范围内再返回", async () => {
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      expect(JSON.parse(String(init?.body))).toMatchObject({ max_tokens: 2_048 });
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        max_tokens: 2_048,
+        thinking: { type: "disabled" }
+      });
       return completionResponse('{"rating": 1730, "confidence": 0.8, "rationale": "中等题"}');
     });
     const result = await runDifficultyPipeline({
       problem,
       anchors: [{ contestId: 4, index: "A", rating: 800, summary: "入门题" }],
       model: {
-        spec: { provider: "aether" as const, model: "test-model", temperature: 0.2, thinking: false },
+        spec: {
+          provider: "aether" as const,
+          model: "deepseek-v4-flash",
+          temperature: 0.2,
+          thinking: false,
+          thinkingRequest: "disabled" as const
+        },
         credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
         runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
       }
@@ -79,7 +88,13 @@ describe("runDifficultyPipeline：整体接线", () => {
       problem,
       anchors: [],
       model: {
-        spec: { provider: "aether" as const, model: "test-model", temperature: 0.2, thinking: false },
+        spec: {
+          provider: "aether" as const,
+          model: "deepseek-v4-flash",
+          temperature: 0.2,
+          thinking: false,
+          thinkingRequest: "disabled" as const
+        },
         credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
         runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
       }
@@ -102,7 +117,13 @@ describe("runDifficultyPipeline：整体接线", () => {
       problem,
       anchors: [],
       model: {
-        spec: { provider: "aether" as const, model: "test-model", temperature: 0.2, thinking: false },
+        spec: {
+          provider: "aether" as const,
+          model: "deepseek-v4-flash",
+          temperature: 0.2,
+          thinking: false,
+          thinkingRequest: "disabled" as const
+        },
         credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
         runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
       }
@@ -111,5 +132,9 @@ describe("runDifficultyPipeline：整体接线", () => {
     expect(result.rating).toBe(2_100);
     expect(requestBodies).toHaveLength(2);
     expect(requestBodies.map((body) => body.max_tokens)).toEqual([2_048, 2_048]);
+    expect(requestBodies.map((body) => body.thinking)).toEqual([
+      { type: "disabled" },
+      { type: "disabled" }
+    ]);
   });
 });

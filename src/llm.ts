@@ -42,10 +42,14 @@ export interface ModelCallSpec {
   readonly model: string;
   readonly temperature: number;
   /**
-   * 是否保留响应里的思考过程。具体怎样开启思考由所选模型和网关约定，
-   * 这里不猜测或发送服务商专有参数。
+   * 是否保留响应里的思考过程；它不控制模型是否进行深度思考。
    */
   readonly thinking: boolean;
+  /**
+   * 显式发送经配置层限定的深度思考请求。当前只放行关闭。
+   * 未配置时不发送 `thinking` 请求字段，保持原有请求行为。
+   */
+  readonly thinkingRequest?: "disabled";
 }
 
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
@@ -267,6 +271,9 @@ export async function chatComplete(
   };
   if (options.requestJson === true) {
     body.response_format = { type: "json_object" };
+  }
+  if (spec.thinkingRequest !== undefined) {
+    body.thinking = { type: spec.thinkingRequest };
   }
   if (options.maxOutputTokens !== undefined) {
     body.max_tokens = validateMaxOutputTokens(options.maxOutputTokens);

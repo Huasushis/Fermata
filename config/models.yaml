@@ -23,9 +23,11 @@ defaults:
 # profiles 下每个 key 是一个"模型档位"的名字，供 modelProfileName 引用。
 # 每个档位为四条流水线（difficulty / thinking / coding / verdict）分别指定
 # provider、model、temperature，以及是否保留模型返回的思考过程。`thinking: true`
-# 只表示读取响应里的 reasoning_content，不会猜测或发送某个服务商专有的开启参数；
-# 是否进行深度思考由所选模型和网关配置决定。thinking 流水线本身分两步，所以下面
-# 有 solver 和 analyst 两个子配置。
+# 只表示读取响应里的 reasoning_content，不控制模型是否进行深度思考。当前只允许
+# Aether 的 deepseek-v4-flash 配置 `thinkingRequest: disabled`；它会按 DeepSeek
+# 当前 OpenAI-compatible 格式发送 `thinking: {type: "disabled"}`。未配置时完全不发送
+# 该请求字段，沿用模型或网关的原有行为。thinking 流水线本身分两步，所以
+# 下面有 solver 和 analyst 两个子配置。
 #
 # 下面这些具体模型名只是示例默认值，请按实际网关上可用的模型调整，不代表
 # 硬性要求。
@@ -36,6 +38,7 @@ profiles:
       model: deepseek-v4-flash
       temperature: 0.2
       thinking: false
+      thinkingRequest: disabled
     thinking:
       solver:
         provider: aether

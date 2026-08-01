@@ -96,9 +96,26 @@ export const modelSpecSchema = z
     provider: providerNameSchema,
     model: z.string().trim().min(1).max(200),
     temperature: z.number().min(0).max(2),
-    thinking: z.boolean()
+    thinking: z.boolean(),
+    // thinking 只决定是否保留响应中的 reasoning_content；thinkingRequest
+    // 才是显式发给经过配置层限定的模型/网关的推理请求配置。当前只放行
+    // Aether deepseek-v4-flash 的 disabled，不向其它组合猜测能力。
+    // 留空时不发送对应请求字段，保持原有服务商行为。
+    thinkingRequest: z.literal("disabled").optional()
   })
-  .strict();
+  .strict()
+  .superRefine((spec, context) => {
+    if (
+      spec.thinkingRequest !== undefined &&
+      (spec.provider !== "aether" || spec.model !== "deepseek-v4-flash")
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["thinkingRequest"],
+        message: "当前只允许 Aether deepseek-v4-flash 显式关闭深度思考。"
+      });
+    }
+  });
 export type ModelSpec = z.infer<typeof modelSpecSchema>;
 
 export const profileConfigSchema = z

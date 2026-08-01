@@ -66,6 +66,34 @@ describe("chatComplete：正常路径", () => {
     expect(result).toEqual({ content: "答案", reasoning: null });
   });
 
+  it("thinkingRequest 只在显式配置时发送，且与是否保留推理文本解耦", async () => {
+    const requestBodies: Record<string, unknown>[] = [];
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return completionResponse("答案", "推理过程");
+    });
+
+    const retained = await chatComplete(
+      provider,
+      { ...spec, thinking: true, thinkingRequest: "disabled" },
+      [],
+      { ...runtime, fetch: fetchMock }
+    );
+    const discarded = await chatComplete(
+      provider,
+      { ...spec, thinking: false, thinkingRequest: "disabled" },
+      [],
+      { ...runtime, fetch: fetchMock }
+    );
+    await chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock });
+
+    expect(requestBodies[0]?.thinking).toEqual({ type: "disabled" });
+    expect(requestBodies[1]?.thinking).toEqual({ type: "disabled" });
+    expect(requestBodies[2]).not.toHaveProperty("thinking");
+    expect(retained.reasoning).toBe("推理过程");
+    expect(discarded.reasoning).toBeNull();
+  });
+
   it("requestJson 时请求体带 response_format", async () => {
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body));
@@ -1203,6 +1231,7 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body));
       expect(body.max_tokens).toBe(2_048);
+      expect(body.thinking).toEqual({ type: "disabled" });
       calls += 1;
       if (calls === 1) {
         return completionResponse("抱歉，我不知道怎么用 JSON 回答");
@@ -1214,7 +1243,7 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
     });
     const result = await chatCompleteJson(
       provider,
-      spec,
+      { ...spec, thinkingRequest: "disabled" },
       [],
       resultSchema,
       { ...runtime, fetch: fetchMock },

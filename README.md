@@ -72,6 +72,11 @@ npm test            # vitest run
 默认模型档位缺少对应服务商的密钥，都会在启动时直接报错退出，不会带着残缺配置
 跑起来。
 
+模型配置中的 `thinking` 只决定是否把响应里的推理过程保留给下游；可选的
+`thinkingRequest: disabled` 才会为当前 Aether `deepseek-v4-flash` 显式关闭
+深度思考。当前不允许其它值或模型/服务商组合；未配置 `thinkingRequest`
+时请求体不带这个开关，继续使用模型服务原有的默认行为。
+
 Fermata 本身不解析 `.env` 文件，只读取进程已经收到的环境变量。上面的
 `run-with-env.mjs` 只接受 `Fermata/private/` 内的绝对路径，并沿已经打开的目录描述符
 读取文件；路径中的符号链接、权限过宽的目录、非普通文件、读取中变化、超限内容或非法

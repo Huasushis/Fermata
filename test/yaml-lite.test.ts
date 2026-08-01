@@ -132,6 +132,7 @@ describe("parseYamlLite：解析真实的 config/models.yaml", () => {
     const defaultProfile = profiles[defaultProfileName] as Record<string, unknown>;
     expect(defaultProfile).toBeTruthy();
     expect(defaultProfile.difficulty).toBeTruthy();
+    expect(defaultProfile.difficulty).toMatchObject({ thinkingRequest: "disabled" });
     expect(defaultProfile.thinking).toMatchObject({
       solver: expect.any(Object),
       analyst: expect.any(Object)
