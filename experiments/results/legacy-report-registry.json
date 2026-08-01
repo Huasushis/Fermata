@@ -62,7 +62,7 @@
       "sampleCount": 24,
       "metrics": { "mae": 283.33, "within200Percent": 54.17 },
       "completeness": "legacy-unverifiable",
-      "reasons": ["旧格式没有 expected、失败或跳过计数。"],
+      "reasons": ["旧格式没有 expected、失败或跳过计数。", "样本数少于当前最低要求 60。"],
       "sourceCopies": ["A", "C"],
       "artifacts": [
         { "format": "json", "sha256": "594bc5869aed4e625224f67bea324fd3a6c8d530f959a5c7804cb6e12aa00e28" },
@@ -103,7 +103,7 @@
     },
     {
       "kind": "thinking-coding-levels",
-      "label": "v3-baseline",
+      "label": "v3-baseline-24-20260730b",
       "generatedAt": "2026-07-30T07:49:47.725Z",
       "sampleCount": 5,
       "expectedSampleCount": null,
@@ -119,12 +119,14 @@
     },
     {
       "kind": "thinking-coding-levels",
-      "label": "v3-timeout-fixed",
+      "label": "v3-baseline-24-20260730c-timeout-fixed",
       "generatedAt": "2026-07-30T12:04:04.533Z",
       "sampleCount": 6,
       "expectedSampleCount": 24,
+      "bandCounts": { "low": 3, "medium": 3, "high": 0 },
+      "missingBandCount": 1,
       "completeness": "incomplete",
-      "reasons": ["只完成 6/24，缺少 18 个样本。"],
+      "reasons": ["只完成 6/24，缺少 18 个样本。", "缺少高分段。"],
       "sourceCopies": ["A", "C"],
       "artifacts": [
         { "format": "json", "sha256": "d026afafdec3fd0734b8f662e5bf95cfa1ab89e015addfcd0190a6a28eabf1bb" },
@@ -149,7 +151,7 @@
     },
     {
       "kind": "thinking-coding-levels",
-      "label": "v4b-safety-fixed",
+      "label": "v4b-baseline-24-20260731-safety-fixed",
       "generatedAt": "2026-07-30T21:00:09.879Z",
       "sampleCount": 9,
       "expectedSampleCount": 24,
