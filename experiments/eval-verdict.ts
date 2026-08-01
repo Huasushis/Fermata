@@ -1,71 +1,98 @@
 /**
  * 综合评审（verdict）流水线的判定实验。
  *
- * 覆盖两类场景，对应产品要求“用通过/不通过的样本检验判定标准”：
- *   1. 正常题：没有任何相似度警告，期望结论不是 reject（approve 或 request_changes 都算合理）；
- *   2. 疑似原题：注入一条**人工构造的原题机（Anklang）审核条目**（相似度 0.95、
- *      候选说明写明题面几乎一致），期望触发“相似度超阈值 + 模型确认同题”的强制
- *      不通过规则（forcedDuplicateReject）。
+ * 正常组不注入相似度警告，期望结论不是 reject；构造原题组注入一条高于
+ * config/models.yaml#thresholds.duplicateSimilarityReject 的合成 Anklang 记录，
+ * 期望“模型确认同题 + 超阈值”强制不通过。
  *
- * 难度输入直接用数据集的官方 rating 构造（本实验只检验 verdict 的判断与阈值规则，
- * 不重复评上游三条流水线）。
- *
- * 用法：
- *   npm run experiment:eval-verdict -- --label=v1
+ * 所有数据文件先严格预检，再固定两组 expected 样本。任一数据文件损坏、
+ * 499、取消、请求失败或结果缺失都会使 complete=false；执行完整但任一合成
+ * 预期不满足则 diagnosticPassed=false。两种失败都非零退出，且互不混淆。
+ * 报告使用唯一 runId 排他创建，绝不覆盖旧实验。
  */
-import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { z } from "zod";
-import { getProviderCredentials, loadConfig, type ProfileConfig } from "../src/config";
-import { logError, logInfo, logWarn } from "../src/logger";
+import { createHash } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { getProviderCredentials, loadConfig, type AppConfig, type ProfileConfig } from "../src/config";
+import { logError, logInfo } from "../src/logger";
 import { runVerdictPipeline } from "../src/pipelines/verdict";
-import type { PipelineModelConfig, ReviewTaskItem, ReviewTaskProblem } from "../src/pipelines/types";
+import type { PipelineModelConfig, ReviewTaskProblem } from "../src/pipelines/types";
 import { mapWithConcurrency } from "./lib/concurrency";
+import {
+  createEvaluationRunId,
+  evaluationConfigurationFingerprint,
+  executionFailure,
+  hasUnknownPrefixedEnvironmentKeys,
+  parseBoundedPositiveInteger,
+  parseEvaluationLabel,
+  reconcileEvaluation,
+  writeNewEvaluationFile,
+  type EvaluationCompleteness,
+  type EvaluationFailure
+} from "./lib/evaluation-integrity";
+import {
+  LevelsCalibrationStateError,
+  loadCalibrationDatasetDirectory,
+  type CalibrationDatasetBundle,
+  type CalibrationDatasetItem
+} from "./lib/levels-calibration-state";
+import {
+  assessVerdictSyntheticDiagnostic,
+  buildFabricatedSimilarityItem,
+  buildPairedVerdictCasePlan,
+  type PairedVerdictCase,
+  type VerdictDiagnosticCaseKind
+} from "./lib/verdict-evaluation-design";
 
 const DATA_DIR = new URL("./data/levels/", import.meta.url);
 const RESULTS_DIR = new URL("./results/", import.meta.url);
 const RAW_DIR = new URL("./results/raw/", import.meta.url);
-const CASES_PER_GROUP = Number.parseInt(process.env.VERDICT_CASES_PER_GROUP ?? "3", 10);
 
-const datasetItemSchema = z.object({
-  contestId: z.number().int(),
-  index: z.string().min(1),
-  rating: z.number().int(),
-  statement: z.string().min(1),
-  editorial: z.string().min(1).nullable()
-});
+interface CaseResult {
+  readonly sampleId: string;
+  readonly caseKind: VerdictDiagnosticCaseKind;
+  readonly problemLabel: string;
+  readonly rating: number;
+  readonly verdict: string;
+  readonly forcedDuplicateReject: boolean;
+  readonly highestKnownSimilarity: number;
+  readonly appliedDuplicateSimilarityRejectThreshold: number;
+  readonly expectationMet: boolean;
+}
 
-type DatasetItem = z.infer<typeof datasetItemSchema>;
+interface VerdictReport {
+  readonly schemaVersion: 1;
+  readonly runId: string;
+  readonly label: string;
+  readonly generatedAt: string;
+  readonly configuration: null | {
+    readonly experimentVersion: string;
+    readonly modelProfileName: string;
+    readonly duplicateSimilarityRejectThreshold: number;
+    readonly fabricatedSimilarity: number;
+    readonly fingerprint: string;
+  };
+  readonly dataset: {
+    readonly verifiedFiles: number;
+    readonly manifestFingerprint: string | null;
+    readonly selectedPairedProblems: number;
+  };
+  readonly integrity: EvaluationCompleteness;
+  /** 与执行完整性分开：只有两组全部按预期贯通才为 true。 */
+  readonly diagnosticPassed: boolean;
+  /** 这里只验证合成审核条目是否按预期贯通，不是阈值或模型准确性标定。 */
+  readonly syntheticDiagnostics: {
+    readonly normal: { readonly total: number; readonly metExpectation: number };
+    readonly fabricatedDuplicate: { readonly total: number; readonly metExpectation: number };
+  };
+  readonly results: readonly Omit<CaseResult, "sampleId">[];
+}
 
 function parseLabelArg(): string {
   const arg = process.argv.find((value) => value.startsWith("--label="));
-  return arg?.slice("--label=".length) ?? "v1";
+  return parseEvaluationLabel(arg?.slice("--label=".length) ?? "", "v1");
 }
 
-function loadDataset(): DatasetItem[] {
-  let fileNames: string[] = [];
-  try {
-    fileNames = readdirSync(DATA_DIR).filter((name) => name.endsWith(".json"));
-  } catch {
-    // 目录不存在时按空集处理。
-  }
-  const items: DatasetItem[] = [];
-  for (const fileName of fileNames) {
-    try {
-      const parsed = datasetItemSchema.parse(
-        JSON.parse(readFileSync(new URL(fileName, DATA_DIR), "utf8"))
-      );
-      if (parsed.editorial !== null) {
-        items.push(parsed);
-      }
-    } catch (error) {
-      logError("跳过无法解析的数据文件", error);
-    }
-  }
-  return items.sort((left, right) => left.rating - right.rating);
-}
-
-function toProblem(item: DatasetItem): ReviewTaskProblem {
+function toProblem(item: CalibrationDatasetItem): ReviewTaskProblem {
   return {
     id: `verdict-${item.contestId}${item.index}`,
     revision: 1,
@@ -79,65 +106,319 @@ function toProblem(item: DatasetItem): ReviewTaskProblem {
   };
 }
 
-/** 人工构造的原题机审核条目：相似度超过阈值，候选说明明确指向“同一道题”。 */
-function fabricatedSimilarityItem(problem: ReviewTaskProblem): ReviewTaskItem {
+function emptyDiagnostics(): VerdictReport["syntheticDiagnostics"] {
   return {
-    id: randomUUID(),
-    type: "org.ustc.urmotiv.anklang.similarity",
-    summary: "发现 1 道候选题，最高相似度为 95%。",
-    data: {
-      apiVersion: "1",
-      contentHash: problem.contentHash,
-      checkedAt: new Date().toISOString(),
-      candidates: [
-        {
-          source: "yuantiji",
-          externalId: "public-archive-001",
-          title: problem.title,
-          url: "https://example.test/problem/public-archive-001",
-          similarity: 0.95,
-          sameProblemSuggestion: true,
-          explanation: "题面叙述、输入输出格式与数据范围与该公开题完全一致，仅变量命名不同。"
-        }
-      ],
-      recommendation: {
-        blockSubmission: true,
-        message: "候选题与本题几乎完全一致，疑似同一道公开题。"
-      }
-    },
-    contentHash: problem.contentHash,
-    createdAt: new Date().toISOString()
+    normal: { total: 0, metExpectation: 0 },
+    fabricatedDuplicate: { total: 0, metExpectation: 0 }
   };
 }
 
-interface CaseResult {
-  readonly caseKind: "normal" | "fabricated_duplicate";
-  readonly problemLabel: string;
-  readonly rating: number;
-  readonly verdict: string;
-  readonly forcedDuplicateReject: boolean;
-  readonly highestKnownSimilarity: number;
-  readonly expectationMet: boolean;
+function renderMarkdown(report: VerdictReport): string {
+  const threshold = report.configuration?.duplicateSimilarityRejectThreshold;
+  const fabricatedSimilarity = report.configuration?.fabricatedSimilarity;
+  const lines = [
+    `# 综合评审合成接线诊断（${report.label}）`,
+    "",
+    `- 运行标识：${report.runId}`,
+    `- 生成时间：${report.generatedAt}`,
+    `- expected：${report.integrity.expected}`,
+    `- succeeded：${report.integrity.succeeded}`,
+    `- failed：${report.integrity.failed}`,
+    `- complete：${report.integrity.complete ? "true" : "false"}`,
+    `- diagnosticPassed：${report.diagnosticPassed ? "true" : "false"}`,
+    `- 查重强制拒绝阈值：${threshold ?? "未能建立"}`,
+    `- 构造相似度：${fabricatedSimilarity ?? "未能建立"}`,
+    `- 配置指纹：${report.configuration?.fingerprint ?? "未能建立"}`,
+    `- 数据清单指纹：${report.dataset.manifestFingerprint ?? "未能建立"}`,
+    `- 正常组：${report.syntheticDiagnostics.normal.metExpectation}/${report.syntheticDiagnostics.normal.total} 符合预期`,
+    `- 构造原题组：${report.syntheticDiagnostics.fabricatedDuplicate.metExpectation}/${report.syntheticDiagnostics.fabricatedDuplicate.total} 符合预期`,
+    ""
+  ];
+  lines.push(
+    "> 这是同一批题在“无审核条目/注入合成同题证据”两种输入下的接线诊断，只能验证证据可见性和强制拒绝链路；不能证明真实查重阈值或模型准确率。",
+    ""
+  );
+  if (!report.integrity.complete) {
+    lines.push(
+      "> 本次运行不完整，不得用它宣布阈值或模型的准确率。固定错误码见同 runId 的 JSON 报告。",
+      ""
+    );
+  }
+  if (!report.diagnosticPassed) {
+    lines.push(
+      "> 合成接线诊断未通过：至少一组数量不完整或有样本不符合预期；即使 complete=true，也必须失败退出，不能宣布接线可靠。",
+      ""
+    );
+  }
+  lines.push(
+    "| 组别 | 题目 | rating | 结论 | 强制不通过 | 已知相似度 | 符合预期 |",
+    "| --- | --- | --- | --- | --- | --- | --- |"
+  );
+  for (const row of report.results) {
+    lines.push(
+      `| ${row.caseKind === "normal" ? "正常" : "构造原题"} | ${row.problemLabel} | ${row.rating} | ${row.verdict} | ${row.forcedDuplicateReject ? "是" : "否"} | ${row.highestKnownSimilarity.toFixed(3)} | ${row.expectationMet ? "✓" : "✗"} |`
+    );
+  }
+  return lines.join("\n");
+}
+
+function writeReports(report: VerdictReport, rawResults: readonly CaseResult[]): void {
+  mkdirSync(RESULTS_DIR, { recursive: true });
+  mkdirSync(RAW_DIR, { recursive: true });
+  writeNewEvaluationFile(
+    new URL(`verdict-${report.runId}-raw.json`, RAW_DIR),
+    JSON.stringify({ report, rawResults }, null, 2)
+  );
+  writeNewEvaluationFile(
+    new URL(`verdict-${report.runId}-summary.json`, RESULTS_DIR),
+    JSON.stringify(report, null, 2)
+  );
+  writeNewEvaluationFile(
+    new URL(`verdict-${report.runId}.md`, RESULTS_DIR),
+    renderMarkdown(report)
+  );
+}
+
+function writePreflightFailure(input: {
+  readonly runId: string;
+  readonly label: string;
+  readonly generatedAt: string;
+  readonly verifiedFiles: number;
+  readonly manifestFingerprint: string | null;
+  readonly selectedPairedProblems?: number;
+  readonly expectedIds: readonly string[];
+  readonly failures: readonly EvaluationFailure[];
+}): void {
+  const failureIds = new Set(input.failures.map((failure) => failure.sampleId));
+  const blocked = input.expectedIds
+    .filter((sampleId) => !failureIds.has(sampleId))
+    .map((sampleId): EvaluationFailure => ({
+      sampleId,
+      phase: "setup",
+      code: "EVALUATION_BLOCKED_BY_PREFLIGHT"
+    }));
+  const integrity = reconcileEvaluation({
+    expectedSampleIds: input.expectedIds,
+    succeededSampleIds: [],
+    failures: [...input.failures, ...blocked]
+  });
+  writeReports(
+    {
+      schemaVersion: 1,
+      runId: input.runId,
+      label: input.label,
+      generatedAt: input.generatedAt,
+      configuration: null,
+      dataset: {
+        verifiedFiles: input.verifiedFiles,
+        manifestFingerprint: input.manifestFingerprint,
+        selectedPairedProblems: input.selectedPairedProblems ?? 0
+      },
+      integrity,
+      diagnosticPassed: false,
+      syntheticDiagnostics: emptyDiagnostics(),
+      results: []
+    },
+    []
+  );
+  process.exitCode = 1;
 }
 
 async function main(): Promise<void> {
   const label = parseLabelArg();
-  const config = loadConfig({ env: process.env });
-  const profiles: Record<string, ProfileConfig | undefined> = config.models.profiles;
-  const profile = profiles[config.models.defaults.modelProfileName];
-  if (profile === undefined) {
-    logError("默认模型档位不存在", undefined, {
-      profileName: config.models.defaults.modelProfileName
+  const runId = createEvaluationRunId(label);
+  const generatedAt = new Date().toISOString();
+  if (
+    hasUnknownPrefixedEnvironmentKeys(process.env, "EVAL_", ["EVAL_CONCURRENCY"]) ||
+    hasUnknownPrefixedEnvironmentKeys(process.env, "VERDICT_", ["VERDICT_CASES_PER_GROUP"])
+  ) {
+    writePreflightFailure({
+      runId,
+      label,
+      generatedAt,
+      verifiedFiles: 0,
+      manifestFingerprint: null,
+      expectedIds: ["evaluation-environment"],
+      failures: [{
+        sampleId: "evaluation-environment",
+        phase: "setup",
+        code: "EVALUATION_UNKNOWN_ENVIRONMENT_KEY"
+      }]
     });
-    process.exitCode = 1;
+    return;
+  }
+
+  let calibrationBundle: CalibrationDatasetBundle;
+  try {
+    // 复用 levels v4 的清单绑定和目录描述符预检。manifest.private.json 不是
+    // 样本文件；目录缺失/多出文件、题解缺失或逐字节哈希不符都会整体失败。
+    calibrationBundle = loadCalibrationDatasetDirectory(DATA_DIR);
+  } catch (error) {
+    logError("verdict 诊断数据集预检失败，不发起模型请求", error);
+    writePreflightFailure({
+      runId,
+      label,
+      generatedAt,
+      verifiedFiles: 0,
+      manifestFingerprint: null,
+      expectedIds: ["levels-dataset"],
+      failures: [{
+        sampleId: "levels-dataset",
+        phase: "dataset",
+        code: error instanceof LevelsCalibrationStateError
+          ? error.code
+          : "LEVELS_DATA_PRECHECK_FAILED"
+      }]
+    });
+    return;
+  }
+  const eligible = [...calibrationBundle.items]
+    .sort((left, right) => left.rating - right.rating || left.safeId.localeCompare(right.safeId));
+
+  let casesPerGroup: number;
+  let concurrency: number;
+  try {
+    casesPerGroup = parseBoundedPositiveInteger(
+      process.env.VERDICT_CASES_PER_GROUP,
+      3,
+      100,
+      "VERDICT_CASES_PER_GROUP"
+    );
+    concurrency = parseBoundedPositiveInteger(
+      process.env.EVAL_CONCURRENCY,
+      4,
+      32,
+      "EVAL_CONCURRENCY"
+    );
+  } catch {
+    writePreflightFailure({
+      runId,
+      label,
+      generatedAt,
+      verifiedFiles: eligible.length,
+      manifestFingerprint: calibrationBundle.manifestHash,
+      expectedIds: ["evaluation-numeric-settings"],
+      failures: [{
+        sampleId: "evaluation-numeric-settings",
+        phase: "setup",
+        code: "EVALUATION_NUMERIC_SETTING_INVALID"
+      }]
+    });
+    return;
+  }
+
+  if (eligible.length < casesPerGroup) {
+    const expectedIds = Array.from(
+      { length: casesPerGroup },
+      (_, index) => `unbound-pair-${index + 1}`
+    );
+    writePreflightFailure({
+      runId,
+      label,
+      generatedAt,
+      verifiedFiles: eligible.length,
+      manifestFingerprint: calibrationBundle.manifestHash,
+      expectedIds,
+      failures: expectedIds.map((sampleId) => ({
+        sampleId,
+        phase: "dataset",
+        code: "DATASET_EXPECTED_SAMPLE_UNAVAILABLE"
+      }))
+    });
+    return;
+  }
+
+  // 同一道可信题分别跑 normal 与 fabricated_duplicate，才能把差异归因于
+  // 注入的合成审核条目，而不是两个题目本身不同。
+  const casePlan = buildPairedVerdictCasePlan(eligible, casesPerGroup);
+  const pairedCases = casePlan.selectedItems;
+  const expectedIds = casePlan.expectedSampleIds;
+
+  let config: AppConfig;
+  try {
+    config = loadConfig({ env: process.env });
+  } catch (error) {
+    logError("实验配置校验失败，不发起模型请求", error);
+    writePreflightFailure({
+      runId,
+      label,
+      generatedAt,
+      verifiedFiles: eligible.length,
+      manifestFingerprint: calibrationBundle.manifestHash,
+      selectedPairedProblems: pairedCases.length,
+      expectedIds,
+      failures: [{ sampleId: "evaluation-config", phase: "setup", code: "EVALUATION_CONFIG_INVALID" }]
+    });
+    return;
+  }
+  const profileName = config.models.defaults.modelProfileName;
+  const profiles: Record<string, ProfileConfig | undefined> = config.models.profiles;
+  const profile = profiles[profileName];
+  if (profile === undefined) {
+    writePreflightFailure({
+      runId,
+      label,
+      generatedAt,
+      verifiedFiles: eligible.length,
+      manifestFingerprint: calibrationBundle.manifestHash,
+      selectedPairedProblems: pairedCases.length,
+      expectedIds,
+      failures: [{ sampleId: "evaluation-profile", phase: "setup", code: "EVALUATION_PROFILE_MISSING" }]
+    });
     return;
   }
   const credentials = getProviderCredentials(config, profile.verdict.provider);
   if (credentials === undefined) {
-    logError("verdict 流水线的服务商没有配置密钥", undefined, { provider: profile.verdict.provider });
-    process.exitCode = 1;
+    writePreflightFailure({
+      runId,
+      label,
+      generatedAt,
+      verifiedFiles: eligible.length,
+      manifestFingerprint: calibrationBundle.manifestHash,
+      selectedPairedProblems: pairedCases.length,
+      expectedIds,
+      failures: [{ sampleId: "evaluation-provider", phase: "setup", code: "EVALUATION_PROVIDER_MISSING" }]
+    });
     return;
   }
+  const threshold = config.models.thresholds.duplicateSimilarityReject;
+  if (threshold >= 1) {
+    writePreflightFailure({
+      runId,
+      label,
+      generatedAt,
+      verifiedFiles: eligible.length,
+      manifestFingerprint: calibrationBundle.manifestHash,
+      selectedPairedProblems: pairedCases.length,
+      expectedIds,
+      failures: expectedIds.map((sampleId) => ({
+        sampleId,
+        phase: "setup",
+        code: "DUPLICATE_THRESHOLD_NOT_TESTABLE"
+      }))
+    });
+    return;
+  }
+  const fabricatedSimilarity = threshold + (1 - threshold) / 2;
+  const configurationSnapshot = {
+    experimentVersion: config.models.experimentVersion,
+    modelProfileName: profileName,
+    model: profile.verdict,
+    retry: config.models.retry,
+    timeouts: config.models.timeouts,
+    duplicateSimilarityRejectThreshold: threshold,
+    fabricatedSimilarity,
+    datasetManifestFingerprint: calibrationBundle.manifestHash,
+    selectedSafeIds: pairedCases.map((item) => item.safeId),
+    caseConstructionVersion: "paired-synthetic-visible-summary-v1"
+  };
+  const configuration = {
+    experimentVersion: config.models.experimentVersion,
+    modelProfileName: profileName,
+    duplicateSimilarityRejectThreshold: threshold,
+    fabricatedSimilarity,
+    fingerprint: evaluationConfigurationFingerprint(configurationSnapshot)
+  };
   const model: PipelineModelConfig = {
     spec: profile.verdict,
     credentials,
@@ -150,33 +431,26 @@ async function main(): Promise<void> {
     }
   };
 
-  const dataset = loadDataset();
-  if (dataset.length < CASES_PER_GROUP * 2) {
-    logError("数据集不足以抽取两组样本", undefined, {
-      available: dataset.length,
-      required: CASES_PER_GROUP * 2
-    });
-    process.exitCode = 1;
-    return;
-  }
-  // 均匀取样：正常组取偶数位、构造组取奇数位，保证两组难度分布相近。
-  const normalCases = dataset.filter((_, index) => index % 2 === 0).slice(0, CASES_PER_GROUP);
-  const duplicateCases = dataset.filter((_, index) => index % 2 === 1).slice(0, CASES_PER_GROUP);
   logInfo("开始 verdict 判定实验", {
     label,
-    normal: normalCases.length,
-    fabricatedDuplicate: duplicateCases.length
+    expected: expectedIds.length,
+    normal: pairedCases.length,
+    fabricatedDuplicate: pairedCases.length,
+    duplicateSimilarityRejectThreshold: threshold
   });
 
-  const concurrency = Number.parseInt(process.env.EVAL_CONCURRENCY ?? "4", 10);
   const results: CaseResult[] = [];
+  const failures: EvaluationFailure[] = [];
   const runCase = async (
-    item: DatasetItem,
-    caseKind: CaseResult["caseKind"],
+    diagnosticCase: PairedVerdictCase<CalibrationDatasetItem>,
     caseNumber: number
   ): Promise<void> => {
+    const { sampleId, caseKind, item } = diagnosticCase;
     const problem = toProblem(item);
-    const reviewItems = caseKind === "fabricated_duplicate" ? [fabricatedSimilarityItem(problem)] : [];
+    const reviewItems =
+      caseKind === "fabricated_duplicate"
+        ? [buildFabricatedSimilarityItem(problem, fabricatedSimilarity)]
+        : [];
     try {
       const output = await runVerdictPipeline({
         problem,
@@ -203,6 +477,7 @@ async function main(): Promise<void> {
           referenceCodeLength: 1500
         },
         expectedRound: 1,
+        duplicateSimilarityRejectThreshold: threshold,
         model
       });
       const expectationMet =
@@ -210,12 +485,14 @@ async function main(): Promise<void> {
           ? output.forcedDuplicateReject && output.review.verdict === "reject"
           : output.review.verdict !== "reject";
       results.push({
+        sampleId,
         caseKind,
         problemLabel: problem.title,
         rating: item.rating,
         verdict: output.review.verdict,
         forcedDuplicateReject: output.forcedDuplicateReject,
         highestKnownSimilarity: output.highestKnownSimilarity,
+        appliedDuplicateSimilarityRejectThreshold: output.duplicateSimilarityRejectThreshold,
         expectationMet
       });
       logInfo("完成一例", {
@@ -226,72 +503,59 @@ async function main(): Promise<void> {
         expectationMet
       });
     } catch (error) {
-      logError("这一例判定失败，跳过", error, { caseKind, caseNumber });
+      failures.push(executionFailure(sampleId, error));
+      logError("这一例判定失败", error, { caseKind, caseNumber });
     }
   };
 
-  await mapWithConcurrency(normalCases, concurrency, (item, index) =>
-    runCase(item, "normal", index + 1)
+  await mapWithConcurrency(casePlan.normal, concurrency, (diagnosticCase, index) =>
+    runCase(diagnosticCase, index + 1)
   );
-  await mapWithConcurrency(duplicateCases, concurrency, (item, index) =>
-    runCase(item, "fabricated_duplicate", index + 1)
+  await mapWithConcurrency(casePlan.fabricatedDuplicate, concurrency, (diagnosticCase, index) =>
+    runCase(diagnosticCase, index + 1)
   );
 
-  const byKind = (kind: CaseResult["caseKind"]) => results.filter((row) => row.caseKind === kind);
-  const summary = {
-    label,
-    generatedAt: new Date().toISOString(),
-    normal: {
-      total: byKind("normal").length,
-      metExpectation: byKind("normal").filter((row) => row.expectationMet).length
-    },
-    fabricatedDuplicate: {
-      total: byKind("fabricated_duplicate").length,
-      metExpectation: byKind("fabricated_duplicate").filter((row) => row.expectationMet).length
-    }
-  };
-
-  mkdirSync(RESULTS_DIR, { recursive: true });
-  mkdirSync(RAW_DIR, { recursive: true });
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  writeFileSync(
-    new URL(`verdict-${label}-${stamp}.json`, RAW_DIR),
-    JSON.stringify({ summary, results }, null, 2),
-    "utf8"
-  );
-  const markdown = [
-    `# 综合评审判定实验（${label}）`,
-    "",
-    `- 生成时间：${summary.generatedAt}`,
-    `- 正常组：${summary.normal.metExpectation}/${summary.normal.total} 符合预期（结论不是不通过）`,
-    `- 构造原题组：${summary.fabricatedDuplicate.metExpectation}/${summary.fabricatedDuplicate.total} 符合预期（触发强制不通过）`,
-    "",
-    "构造原题组的做法：给题目注入一条人工构造的原题机审核条目（相似度 0.95、说明指向同一道",
-    "公开题），检验“相似度超过阈值且模型确认同题即强制不通过”的规则是否可靠。",
-    "",
-    "| 组别 | 题目 | rating | 结论 | 强制不通过 | 已知相似度 | 符合预期 |",
-    "| --- | --- | --- | --- | --- | --- | --- |",
-    ...results.map(
-      (row) =>
-        `| ${row.caseKind === "normal" ? "正常" : "构造原题"} | ${row.problemLabel} | ${row.rating} | ${row.verdict} | ${row.forcedDuplicateReject ? "是" : "否"} | ${row.highestKnownSimilarity.toFixed(2)} | ${row.expectationMet ? "✓" : "✗"} |`
-    ),
-    "",
-    "## 结论",
-    "",
-    summary.fabricatedDuplicate.metExpectation === summary.fabricatedDuplicate.total &&
-    summary.normal.metExpectation === summary.normal.total
-      ? "- 两组全部符合预期：阈值规则与模型判断在本样本上可靠。扩大样本后复核。"
-      : "- 存在不符合预期的用例，启用前需要检查 verdict 提示词或阈值（config/models.yaml 的 thresholds）。"
-  ].join("\n");
-  writeFileSync(new URL(`verdict-${label}-report.md`, RESULTS_DIR), markdown, "utf8");
-  logInfo("verdict 实验完成", {
-    label,
-    normalMet: `${summary.normal.metExpectation}/${summary.normal.total}`,
-    duplicateMet: `${summary.fabricatedDuplicate.metExpectation}/${summary.fabricatedDuplicate.total}`
+  const integrity = reconcileEvaluation({
+    expectedSampleIds: expectedIds,
+    succeededSampleIds: results.map((result) => result.sampleId),
+    failures
   });
+  const { syntheticDiagnostics, diagnosticPassed } =
+    assessVerdictSyntheticDiagnostic(results, casesPerGroup);
+  const publicResults = results.map(({ sampleId: _sampleId, ...result }) => result);
+  const report: VerdictReport = {
+    schemaVersion: 1,
+    runId,
+    label,
+    generatedAt,
+    configuration,
+    dataset: {
+      verifiedFiles: eligible.length,
+      manifestFingerprint: calibrationBundle.manifestHash,
+      selectedPairedProblems: pairedCases.length
+    },
+    integrity,
+    diagnosticPassed,
+    syntheticDiagnostics,
+    results: publicResults
+  };
+  writeReports(report, results);
+  logInfo("verdict 实验收束", {
+    label,
+    expected: integrity.expected,
+    succeeded: integrity.succeeded,
+    failed: integrity.failed,
+    complete: integrity.complete,
+    diagnosticPassed,
+    normalMet: `${syntheticDiagnostics.normal.metExpectation}/${syntheticDiagnostics.normal.total}`,
+    duplicateMet: `${syntheticDiagnostics.fabricatedDuplicate.metExpectation}/${syntheticDiagnostics.fabricatedDuplicate.total}`
+  });
+  if (!integrity.complete || !diagnosticPassed) {
+    process.exitCode = 1;
+  }
 }
 
-main().catch((error) => {
+main().catch((error: unknown) => {
   logError("experiments/eval-verdict.ts 执行失败", error);
   process.exitCode = 1;
 });
