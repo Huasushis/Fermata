@@ -39,7 +39,12 @@ const problem: ReviewTaskProblem = {
 };
 
 function completionResponse(content: string): Response {
-  return new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content } }] }), { status: 200 });
+  return new Response(
+    JSON.stringify({
+      choices: [{ finish_reason: "stop", message: { role: "assistant", content } }]
+    }),
+    { status: 200 }
+  );
 }
 
 describe("runDifficultyPipeline：整体接线", () => {

@@ -60,7 +60,16 @@ const problem: ReviewTaskProblem = {
 function textResponse(content: string, reasoning?: string): Response {
   return new Response(
     JSON.stringify({
-      choices: [{ message: { role: "assistant", content, ...(reasoning === undefined ? {} : { reasoning_content: reasoning }) } }]
+      choices: [
+        {
+          finish_reason: "stop",
+          message: {
+            role: "assistant",
+            content,
+            ...(reasoning === undefined ? {} : { reasoning_content: reasoning })
+          }
+        }
+      ]
     }),
     { status: 200 }
   );

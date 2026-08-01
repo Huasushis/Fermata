@@ -110,7 +110,14 @@ const FULL_MODEL_REPLY = ["这是参考实现：", "```cpp", CODE_INSIDE_FENCE, 
 describe("runCodingPipeline：整体接线", () => {
   it("从代码块里提取代码（不包含代码块外的说明文字）并统计信号", async () => {
     const fetchMock = vi.fn(async () => {
-      const body = { choices: [{ message: { role: "assistant", content: FULL_MODEL_REPLY } }] };
+      const body = {
+        choices: [
+          {
+            finish_reason: "stop",
+            message: { role: "assistant", content: FULL_MODEL_REPLY }
+          }
+        ]
+      };
       return new Response(JSON.stringify(body), { status: 200 });
     });
     const result = await runCodingPipeline({
