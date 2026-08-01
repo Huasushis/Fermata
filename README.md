@@ -70,16 +70,23 @@ npm test            # vitest run
 
 启动会先校验环境变量和 `config/models.yaml`；任何必填项缺失、格式不对，或者
 默认模型档位缺少对应服务商的密钥，都会在启动时直接报错退出，不会带着残缺配置
-跑起来。
+跑起来。首次创建 `settings.json` 时 `enabled` 固定为 `false`，不会因为 YAML 里
+存在默认档位就自动领取题目。已有设置不会被新部署自动改写；只有操作员明确保存
+`enabled=true`，且其中的 `experimentVersion` 与本次 `models.yaml` 精确一致、所选
+档位仍然存在，并且服务端生产资格证据完整通过时，worker 才会调用 claim。旧版本或
+缺字段的设置一律关闭失败：旧版本原样保留等待人工核对，缺字段或损坏文件则拒绝启动。
+`enabled` 和版本一致只是必要条件，不是生产资格证书。
 
 模型配置中的 `thinking` 只决定是否把响应里的推理过程保留给下游；可选的
 `thinkingRequest` 才会为当前 Aether `deepseek-v4-flash` 显式开启或关闭
 深度思考。`enabled` 必须同时配置 `reasoningEffort: low`；`disabled` 不允许带
 推理强度，未配置 `thinkingRequest` 时两个请求字段都不发送。当
 `thinkingRequest: enabled` 时仍保留 `temperature` 配置以维持档位形状，但当前
-服务端会忽略这个字段。当前 difficulty 候选改用 `deepseek-v4-pro` 的默认请求，
-因此既不配置 `thinkingRequest`，也不发送 `thinking` 或 `reasoning_effort`；pro
-若误配任一显式思考请求会在网络调用前被拒绝。
+服务端会忽略这个字段。当前 difficulty 已恢复 Candidate C 的
+`deepseek-v4-flash`、`thinkingRequest: disabled` 请求；它会发送
+`thinking: {type: "disabled"}`，不会发送 `reasoning_effort`。同一档位的
+`thinking.solver` 和 `verdict` 仍是 `deepseek-v4-pro` 默认请求，这次恢复没有
+静默改变它们。
 
 Fermata 本身不解析 `.env` 文件，只读取进程已经收到的环境变量。上面的
 `run-with-env.mjs` 只接受 `Fermata/private/` 内的绝对路径，并沿已经打开的目录描述符
@@ -138,8 +145,15 @@ node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:calibrate-a
 # 3. CF 难度评测：输出平均绝对误差（预测与实际平均相差多少，报告中记作 MAE）、
 # ±200 命中率和分档统计；脚本会排除参照题，避免提前见过答案影响结果。
 # 当前 env 文件登记 EVAL_CONCURRENCY=6，并且必须登记 EVAL_CODE_VERSION，值为本次
-# 实验代码对应的完整 40 位小写 Git 提交 SHA。脚本不会自行调用 Git，也不接受分支名或缩写。
+# 实验代码对应的完整 40 位小写 Git 提交 SHA；不接受分支名或缩写。脚本会自行核对
+# 真实 HEAD、Git 可见的干净工作树，以及 runner 与登记依赖的实际字节。
 node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:eval-difficulty -- --label=calibrated
+
+# 只验证当前 difficulty flash 请求是否能与当前模型服务完成一次合成题协议往返。
+# 它固定唯一标签且不接受参数；使用专用私有 env，不能混入 EVAL_CONCURRENCY 等其它实验变量。
+# 运行前其中唯一的 EVAL_* 键 EVAL_CODE_VERSION 必须等于干净 HEAD。
+FERMATA_CONNECTIVITY_ENV_FILE=/home/ubuntu/codex-urmotiv/Fermata/private/fermata-connectivity-probe.env
+node scripts/run-with-env.mjs "$FERMATA_CONNECTIVITY_ENV_FILE" npm run experiment:probe-difficulty-connectivity
 
 # 4. 思维/代码难度标定：检验 rating 越高等级是否单调上升。
 # 首次运行不加 --resume。
@@ -227,11 +241,14 @@ npm run experiment:calibrate-levels:detached -- \
 计算，固定最多读取 4 MiB（约 4 MB）；超过后立即停止读取，并且错误和日志都不会包含响应正文。
 
 正式服务已有的 `settings.json` 会保留上次保存的 `experimentVersion`，不会因为替换
-`models.yaml` 自动改变。部署当前版本后，应在没有在途任务时，通过 Urmotiv 的 Fermata 设置页
-或管理接口把 `experimentVersion` 明确更新为当前配置版本，再恢复领取任务；这样提交的审核结果才能
-准确说明使用了哪一版请求规则和难度量尺。Candidate D 当前登记为
-`experiment-2026-08-difficulty-pro-default-request-v1`，但必须先通过下面的两题协议探针和全新 83 题
-准确性实验；探针或准确性未通过时不能仅因配置文件已经切换就投入正式领取任务。
+`models.yaml` 自动改变。当前配置版本是
+`experiment-2026-08-difficulty-candidate-c-restored-v2`。部署后必须先保持
+`enabled=false`；只有在没有在途任务、逐项核对整个所选档位的协议和准确性证据后，才能通过
+Urmotiv 的 Fermata 设置页或管理接口显式写入当前版本并开启。worker 还会在每轮 claim 前重新
+比较版本和生产资格证据，旧值即使同时保存了 `enabled=true` 也不会领取任务。由于当前
+`review-balanced` 内仍有已知不可用的 pro 请求，这个实验版本还被代码级固定封锁：即使操作员把
+settings 改成当前版本并开启，或手工放入一份声称合格的当前版本证据，也不会调用 claim。当前提交
+实际上对所有版本恒关闭；未来版本也必须等可信源证据聚合器另行实现、审阅并替换这道门。
 
 Candidate B 的协议验证使用
 `npm run experiment:probe-difficulty-thinking`。这个入口只依次检查一个人工合成的短题和三个与
@@ -264,6 +281,40 @@ CF 2006E 快照复用既有只读公开材料目录中的 `difficulty-thinking-p
 才可声明 `complete: true`，并逐一绑定检查点、报告和汇总哈希。崩溃、关闭 dispatcher 失败或任一
 不完整状态都会占用该标签，不能重跑洗掉。
 
+Candidate D 已实际在第一个合成请求收到 HTTP 404，因此报告不完整、候选已失败；没有发送第二题，
+也没有启动新的 83 题实验。当前配置只把 difficulty 恢复到 Candidate C 的 flash 请求，不改动
+同档位其它流水线。新的 `npm run experiment:probe-difficulty-connectivity` 是一次独立、固定标签的
+单合成题预检：只允许一个真实 fetch，付费前同步落盘 active 检查点，必须验证结构化输出、
+`finish_reason=stop` 并持续读取到真实 HTTP EOF；499、取消、流中断、缺结果、第二次修复请求或锁
+释放失败都会使 completion 的 `complete=false`。它同时绑定干净 Git HEAD、runner、models.yaml、
+Candidate C 锚点以及当前 provider/baseUrl/apiKey 的安全摘要；只在 Git 忽略的
+`private/difficulty-connectivity-probe-results/` 保存 `0600` 检查点和最终 completion，不保存题面、
+模型原文、地址或密钥，也不得复用旧标签。
+
+这个 connectivity 结果无论成功与否都只回答“difficulty 的这一种 flash 请求能否完成一次协议
+往返”，不能证明 `review-balanced` 整条 reviewer 可运行。尤其 `thinking.solver` 与 `verdict`
+仍使用 Candidate D 已在当前 provider 上出现 404 的 pro 型号。后续必须为 difficulty、
+`thinking.solver`、`thinking.analyst`、coding、verdict 的每一种实际请求配置分别预登记唯一标签并完成
+协议预检，再使用相应完整人工标准集保留修改前/修改后准确性报告；至少 solver、verdict、difficulty
+三项必须单独留证。任何一项未通过时都不得把整档位写成可用，也不得开启生产领取。
+
+该固定标签一旦留下检查点、completion 或锁就不能重跑覆盖。若异常退出留下
+`difficulty-candidate-c-connectivity-probe-20260801-a.lock.private`，只能在同时核对记录中的 PID、
+进程启动时刻、完整命令和工作目录，确认该进程已不存在且确属本项目后，人工移除这一把锁；不得按
+进程名批量结束 Node.js，也不得删除同标签检查点或 completion 来制造一次“干净重跑”。
+
+正式领取还有一道独立于 settings 的生产资格证据门，实现在
+`src/production-eligibility.ts`。当前可信聚合器尚未实现，因此所有实验版本都固定返回
+`production_evidence_verifier_unimplemented`，并且不会读取或信任任何私有自述 JSON；即使操作员
+同时修改 settings、实验版本或放入手写“合格证书”，也不会调用 claim。日志只记录这个固定原因码。
+
+真正的生产证据聚合器必须作为后续独立工作：它要回读原始协议 probe completion 和准确性
+summary/completion，验证文件权限、排他标签、完整哈希链、当前 `experimentVersion`、profile、
+`models.yaml`、provider 身份和实际请求配置，不能只相信另一份 JSON 里的 `complete=true`。
+协议验证可以按完全相同的 distinct model spec 去重；准确性证据不能这样共用，必须按 difficulty、
+thinking solver、thinking analyst、coding、verdict 五个 pipeline slot 分别验证相应人工标准、完整性和
+门槛。该聚合器及其源证据测试通过并经单独审阅前，生产资格总门保持恒关闭。
+
 思维/代码标定必须先在 `experiments/data/levels/manifest.private.json` 登记私有数据集清单。
 清单逐项绑定安全编号、文件名和文件原始字节的 SHA-256 校验值；目录里漏文件、多文件、改后缀、
 出现符号链接或文件内容变化都会在任何付费模型请求前整体失败。标定集至少 60 题，每题 JSON 都要有
@@ -294,6 +345,19 @@ CF 2006E 快照复用既有只读公开材料目录中的 `difficulty-thinking-p
 分别计算完全一致率、相差不超过 1 级的比例和平均绝对误差；两类都必须达到完全一致至少 60%、
 相差不超过 1 级至少 90%、平均绝对误差不超过 0.6，并满足至少 60 题，`accuracyPassed` 才为真。
 
+CF public83 难度报告从 schema 第 3 版起同样把 `executionComplete`、`accuracyPassed`、
+`anchorsEligible` 和 `eligible` 分开记录。只有 expected 与结果数都精确为 83、83 题全部成功且没有
+499、取消、失败或缺失时，才可能按 MAE ≤ 200、±200 命中率 ≥ 75% 判断 `accuracyPassed`。这个指标
+判断可在临时锚点上保留，但 `provisional: true` 会固定令 `anchorsEligible=false`，因此最终
+`eligible=false`；只有执行完整、准确性达标、数据 manifest 已验证且锚点非 provisional 时才可用。
+报告另存当前 provider/baseUrl/apiKey 的安全摘要，并把该摘要纳入带 Git 提交的配置
+指纹；更换网关或密钥不能沿用旧实验链。脚本还会在打开检查点或发起付费请求前，核对
+`EVAL_CODE_VERSION` 与真实 HEAD 完全一致、Git 可见的工作树干净、runner 及其登记的直接/传递
+运行依赖与 HEAD 字节一致，并把 runner SHA-256、依赖代码组合 SHA-256/文件数和 `models.yaml`
+原始字节 SHA-256 一起绑定进配置指纹、检查点和报告。换代码、依赖清单或模型配置都不能续用旧链。
+completion marker 表示这条执行链已完整收束并阻止重放，不等于准确性达标，最终是否可用只看
+`eligible`。
+
 每次执行使用新的执行 UUID，分别写出
 `levels-<标签>-<执行UUID>-report.md`、`levels-<标签>-<执行UUID>-summary.json` 和最后落盘的
 `levels-<标签>-<执行UUID>-completion.json`。完成文件绑定报告与汇总各自的 SHA-256；同标签续跑不会
@@ -322,13 +386,13 @@ CF 2006E 快照复用既有只读公开材料目录中的 `difficulty-thinking-p
 
 | 流水线 | 状态 | 说明 |
 | --- | --- | --- |
-| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；Candidate D 待协议探针** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate B 在 2048、4096 两档协议探针均因高难题长度停止而淘汰。Candidate D 只把 difficulty 改为 `deepseek-v4-pro` 默认请求，尚未运行两题协议探针，更未运行新的 83 题准确性实验。 |
+| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；Candidate D 已因 404 失败；flash 单步预检待运行** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate B 在 2048、4096 两档协议探针均因高难题长度停止而淘汰。Candidate D 的 pro 探针首个合成请求返回 404，报告不完整，未发送第二题也未启动 83 题。当前已恢复 Candidate C flash 请求，但本提交没有调用模型；固定标签的单合成题 connectivity 预检仍待干净提交后运行，且即使通过也不代表整条 reviewer 可用。当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
 | 思维难度（thinking.ts） | **旧实验均不可作基线** | 两份早期报告无法证明完整；后两份明确只完成 6/24、9/24，而且都缺高分段。 |
 | 代码难度（coding.ts） | **旧实验均不可作基线** | 与思维难度共用的旧实验不完整；小样本曾出现难度分段升高但代码难度均值下降，需要在完整基线上复核。 |
 | 查重判断（verdict.ts） | **旧设计不可作准确性基线** | 旧实验只有 3 个正常样本和 3 个人工重复样本；正常组只验证“不是不通过”，没有区分通过与需要修改。 |
 
-这张表应该随每一次真正跑过评测脚本之后更新。只有当前代码生成、完整性字段为真且
-对应脱敏汇总报告存在时，才能把结果写成合格基线。
+这张表应该随每一次真正跑过评测脚本之后更新。只有当前代码生成、对应脱敏汇总与完成证据存在，
+并且报告明确 `eligible=true` 时，才能把结果写成合格候选；仅有完整性为真不代表准确性达标。
 
 ## 待确认 / 待对齐的点
 
@@ -372,6 +436,8 @@ src/
   llm.ts                   OpenAI 兼容 chat 客户端（重试、JSON 结构化输出）
   codeforces.ts            CF API 客户端 + 题面抓取
   settings-store.ts        运行期设置，内存 + 文件持久化，乐观锁
+  production-eligibility.ts
+                           正式领取总门；可信源证据聚合器完成前所有版本恒关闭
   reviewer.ts              主循环：轮询、并发、续租、优雅停机
   server.ts                管理端口
   index.ts                 入口

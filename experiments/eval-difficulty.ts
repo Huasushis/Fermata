@@ -9,6 +9,9 @@
  * 损坏文件、499、取消、请求失败或缺失结果都会使 complete=false 且进程非零退出。
  * 每次运行使用唯一 runId 和排他创建，不覆盖旧报告。
  */
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { getProviderCredentials, loadConfig, type AppConfig, type ProfileConfig } from "../src/config";
 import { logError, logInfo } from "../src/logger";
@@ -20,6 +23,12 @@ import type { ReviewTaskProblem } from "../src/pipelines/types";
 import { mapWithConcurrency } from "./lib/concurrency";
 import { loadDifficultyAnchorsStrict } from "./lib/difficulty-anchors-strict";
 import {
+  assessDifficultyEvaluationEligibility,
+  difficultyAccuracyThresholds,
+  difficultyEvaluationConfigurationFingerprint,
+  difficultyProviderIdentityFingerprint
+} from "./lib/difficulty-evaluation-eligibility";
+import {
   loadDifficultyDatasetManifest,
   verifyDifficultyDatasetManifest,
   verifyKnownPublicDifficultyArchiveProfile
@@ -30,9 +39,13 @@ import {
   type DifficultyCheckpointRow
 } from "./lib/difficulty-evaluation-checkpoint";
 import {
+  difficultyEvaluationCodePaths,
+  loadEvaluationCodeIdentity,
+  type EvaluationCodeIdentity
+} from "./lib/evaluation-code-identity";
+import {
   createEvaluationRunId,
   completedEvaluationChainMarkerExists,
-  evaluationConfigurationFingerprintWithCodeVersion,
   executionFailure,
   hasUnknownPrefixedEnvironmentKeys,
   parseBoundedPositiveInteger,
@@ -50,6 +63,9 @@ const DATA_DIR = new URL("./data/cf/", import.meta.url);
 const RESULTS_DIR = new URL("./results/", import.meta.url);
 const RAW_RESULTS_DIR = new URL("./results/raw/", import.meta.url);
 const ANCHORS_FILE = new URL("../config/anchors/difficulty.json", import.meta.url);
+const MODELS_CONFIG_FILE = new URL("../config/models.yaml", import.meta.url);
+const REPOSITORY_DIRECTORY = fileURLToPath(new URL("../", import.meta.url));
+const RUNNER_REPOSITORY_PATH = "experiments/eval-difficulty.ts";
 
 const NO_SOLUTION_PLACEHOLDER =
   "（实验数据集没有单独抓取官方题解——Codeforces 编辑注解通常是独立论坛帖子，没有稳定的结构化格式可抓。" +
@@ -80,12 +96,23 @@ interface PersistedEvalRow extends EvalRow {
 }
 
 interface DifficultyReport {
-  readonly schemaVersion: 2;
+  readonly schemaVersion: 3;
   readonly runId: string;
   readonly label: string;
   readonly generatedAt: string;
   readonly codeVersion: string | null;
+  readonly runnerSha256: string | null;
+  readonly dependencyCodeSha256: string | null;
+  readonly dependencyFileCount: number | null;
+  readonly modelsConfigSha256: string | null;
   readonly configurationFingerprint: string | null;
+  /** 只保存 provider/baseUrl/apiKey 的不可逆摘要，不保存任何原值。 */
+  readonly providerIdentityFingerprint: string | null;
+  readonly executionComplete: boolean;
+  readonly accuracyPassed: boolean;
+  readonly anchorsProvisional: boolean | null;
+  readonly anchorsEligible: boolean;
+  readonly eligible: boolean;
   readonly chain: {
     readonly chainRunId: string | null;
     readonly originalReportRunId: string | null;
@@ -168,16 +195,26 @@ function renderMarkdown(report: DifficultyReport): string {
     `- 执行性质：${report.chain.executionKind}`,
     `- 生成时间：${report.generatedAt}`,
     `- 代码版本：${report.codeVersion ?? "未验证"}`,
+    `- runner 指纹：${report.runnerSha256 ?? "未验证"}`,
+    `- 依赖代码指纹：${report.dependencyCodeSha256 ?? "未验证"}`,
+    `- 依赖文件数：${report.dependencyFileCount ?? "未验证"}`,
+    `- models.yaml 原始字节指纹：${report.modelsConfigSha256 ?? "未验证"}`,
     `- expected：${report.integrity.expected}`,
     `- succeeded：${report.integrity.succeeded}`,
     `- failed：${report.integrity.failed}`,
-    `- complete：${report.integrity.complete ? "true" : "false"}`,
+    `- executionComplete：${report.executionComplete ? "true" : "false"}`,
+    `- accuracyPassed：${report.accuracyPassed ? "true" : "false"}`,
+    `- anchorsProvisional：${report.anchorsProvisional === null ? "未验证" : String(report.anchorsProvisional)}`,
+    `- anchorsEligible：${report.anchorsEligible ? "true" : "false"}`,
+    `- eligible：${report.eligible ? "true" : "false"}`,
     `- 配置指纹：${report.configurationFingerprint ?? "未能建立"}`,
+    `- 模型服务身份指纹：${report.providerIdentityFingerprint ?? "未能建立"}`,
     `- MAE（平均绝对误差）：${report.summary.meanAbsoluteError.toFixed(1)}`,
     `- ±200 命中率：${(report.summary.hitRateWithin200 * 100).toFixed(1)}%`,
+    `- 准确性门槛：MAE ≤ ${difficultyAccuracyThresholds.maximumMeanAbsoluteError}，±200 命中率 ≥ ${(difficultyAccuracyThresholds.minimumHitRateWithin200 * 100).toFixed(0)}%`,
     ""
   ];
-  if (!report.integrity.complete) {
+  if (!report.executionComplete) {
     lines.push(
       "> 本次运行不完整，不得用它宣布准确率或调优提升。固定错误码见同 runId 的 JSON 报告。",
       ""
@@ -224,7 +261,7 @@ function writeReports(
     prefix: "difficulty",
     executionRunId: report.runId,
     chainRunId: report.chain.chainRunId,
-    experimentComplete: report.integrity.complete,
+    experimentComplete: report.executionComplete,
     // 只保存可复核的数值结果；模型原始理由不进入报告或检查点。
     rawJson: `${JSON.stringify({ report, rows: persistedRows }, null, 2)}\n`,
     summaryJson: `${JSON.stringify(report, null, 2)}\n`,
@@ -240,8 +277,12 @@ function incompleteBeforeCalls(input: {
   readonly expectedIds: readonly string[];
   readonly failures: readonly EvaluationFailure[];
   readonly codeVersion?: string | null;
+  readonly codeIdentity?: EvaluationCodeIdentity | null;
+  readonly modelsConfigSha256?: string | null;
   readonly manifest?: DifficultyReport["dataset"]["manifest"];
   readonly configurationFingerprint?: string | null;
+  readonly providerIdentityFingerprint?: string | null;
+  readonly anchorsProvisional?: boolean;
   readonly excludedAnchors?: number;
   readonly persistedRows?: readonly PersistedEvalRow[];
   readonly chain?: DifficultyReport["chain"];
@@ -264,13 +305,30 @@ function incompleteBeforeCalls(input: {
   const rows: EvalRow[] = (input.persistedRows ?? []).map(
     ({ sampleId: _sampleId, ...row }) => row
   );
+  const summary = summarize(rows);
+  const eligibility = assessDifficultyEvaluationEligibility({
+    integrityComplete: integrity.complete,
+    expected: integrity.expected,
+    summaryCount: summary.count,
+    meanAbsoluteError: summary.meanAbsoluteError,
+    hitRateWithin200: summary.hitRateWithin200,
+    manifestVerified: input.manifest?.verified ?? false,
+    anchorsProvisional: input.anchorsProvisional ?? true
+  });
   const report: DifficultyReport = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     runId: input.runId,
     label: input.label,
     generatedAt: input.generatedAt,
     codeVersion: input.codeVersion ?? null,
+    runnerSha256: input.codeIdentity?.runnerSha256 ?? null,
+    dependencyCodeSha256: input.codeIdentity?.dependencyCodeSha256 ?? null,
+    dependencyFileCount: input.codeIdentity?.dependencyFileCount ?? null,
+    modelsConfigSha256: input.modelsConfigSha256 ?? null,
     configurationFingerprint: input.configurationFingerprint ?? null,
+    providerIdentityFingerprint: input.providerIdentityFingerprint ?? null,
+    anchorsProvisional: input.anchorsProvisional ?? null,
+    ...eligibility,
     chain: input.chain ?? {
       chainRunId: null,
       originalReportRunId: null,
@@ -288,7 +346,7 @@ function incompleteBeforeCalls(input: {
       }
     },
     integrity,
-    summary: summarize(rows),
+    summary,
     rows
   };
   writeReports(report, input.persistedRows ?? []);
@@ -329,6 +387,31 @@ async function main(): Promise<void> {
     });
     return;
   }
+  let codeIdentity: EvaluationCodeIdentity;
+  try {
+    codeIdentity = loadEvaluationCodeIdentity({
+      repositoryDirectory: REPOSITORY_DIRECTORY,
+      expectedCodeVersion: codeVersion,
+      runnerPath: RUNNER_REPOSITORY_PATH,
+      dependencyPaths: difficultyEvaluationCodePaths
+    });
+  } catch {
+    incompleteBeforeCalls({
+      runId,
+      label,
+      generatedAt,
+      fileCount: preflight.fileCount,
+      expectedIds: allSourceIds,
+      failures: [{
+        sampleId: "evaluation-code-identity",
+        phase: "setup",
+        code: "EVALUATION_CODE_IDENTITY_INVALID"
+      }],
+      codeVersion
+    });
+    return;
+  }
+  const codeEvidence = { codeVersion, codeIdentity } as const;
   if (preflight.failures.length > 0 || preflight.fileCount === 0) {
     const failures = preflight.fileCount === 0 && preflight.failures.length === 0
       ? [{ sampleId: "dataset-empty", phase: "setup" as const, code: "DATASET_EMPTY" }]
@@ -337,7 +420,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
-      codeVersion,
+      ...codeEvidence,
       fileCount: preflight.fileCount,
       expectedIds: allSourceIds,
       failures
@@ -357,7 +440,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
-      codeVersion,
+      ...codeEvidence,
       fileCount: preflight.fileCount,
       expectedIds: preflight.sources.map((source) => source.sourceId),
       failures: [{
@@ -380,7 +463,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
-      codeVersion,
+      ...codeEvidence,
       fileCount: preflight.fileCount,
       expectedIds: preflight.sources.map((source) => source.sourceId),
       failures: [{
@@ -397,7 +480,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
-      codeVersion,
+      ...codeEvidence,
       fileCount: preflight.fileCount,
       expectedIds: preflight.sources.map((source) => source.sourceId),
       failures: [{
@@ -422,7 +505,7 @@ async function main(): Promise<void> {
         runId,
         label,
         generatedAt,
-        codeVersion,
+        ...codeEvidence,
         fileCount: preflight.fileCount,
         expectedIds: preflight.sources.map((source) => source.sourceId),
         failures: loadedManifest.failures,
@@ -454,7 +537,7 @@ async function main(): Promise<void> {
         runId,
         label,
         generatedAt,
-        codeVersion,
+        ...codeEvidence,
         fileCount: preflight.fileCount,
         expectedIds: verification.expectedSampleIds,
         failures: [...verification.failures, ...profileFailures],
@@ -473,7 +556,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
-      codeVersion,
+      ...codeEvidence,
       fileCount: preflight.fileCount,
       expectedIds: preflight.sources.map((source) => source.sourceId),
       failures: [{ sampleId: "difficulty-anchors", phase: "setup", code: "DIFFICULTY_ANCHORS_INVALID" }],
@@ -495,7 +578,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
-      codeVersion,
+      ...codeEvidence,
       fileCount: preflight.fileCount,
       expectedIds: preflight.sources.map((source) => source.sourceId),
       failures: excludedAnchorSources.map((source) => ({
@@ -504,6 +587,7 @@ async function main(): Promise<void> {
         code: "DATASET_PROFILE_OVERLAPS_DIFFICULTY_ANCHORS"
       })),
       manifest: manifestReport,
+      anchorsProvisional: strictAnchors.provisional,
       excludedAnchors
     });
     return;
@@ -533,14 +617,15 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
-      codeVersion,
+      ...codeEvidence,
       fileCount: preflight.fileCount,
       expectedIds: dataset.map((source) => source.sourceId),
       failures:
         dataset.length === 0
           ? [{ sampleId: "dataset-after-anchor-exclusion", phase: "setup", code: "DATASET_EMPTY" }]
           : duplicateFailures,
-      manifest: manifestReport
+      manifest: manifestReport,
+      anchorsProvisional: strictAnchors.provisional
     });
     return;
   }
@@ -558,7 +643,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
-      codeVersion,
+      ...codeEvidence,
       fileCount: preflight.fileCount,
       expectedIds: dataset.map((source) => source.sourceId),
       failures: [{
@@ -566,25 +651,31 @@ async function main(): Promise<void> {
         phase: "setup",
         code: "EVALUATION_CONCURRENCY_INVALID"
       }],
-      manifest: manifestReport
+      manifest: manifestReport,
+      anchorsProvisional: strictAnchors.provisional
     });
     return;
   }
 
   let config: AppConfig;
+  let modelsConfigSha256: string | null = null;
   try {
-    config = loadConfig();
+    const modelsConfigBytes = readFileSync(MODELS_CONFIG_FILE);
+    modelsConfigSha256 = createHash("sha256").update(modelsConfigBytes).digest("hex");
+    config = loadConfig({ modelsYamlSource: modelsConfigBytes.toString("utf8") });
   } catch (error) {
     logError("实验配置校验失败，不发起模型请求", error);
     incompleteBeforeCalls({
       runId,
       label,
       generatedAt,
-      codeVersion,
+      ...codeEvidence,
       fileCount: preflight.fileCount,
       expectedIds: dataset.map((source) => source.sourceId),
       failures: [{ sampleId: "evaluation-config", phase: "setup", code: "EVALUATION_CONFIG_INVALID" }],
-      manifest: manifestReport
+      manifest: manifestReport,
+      modelsConfigSha256,
+      anchorsProvisional: strictAnchors.provisional
     });
     return;
   }
@@ -596,11 +687,13 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
-      codeVersion,
+      ...codeEvidence,
       fileCount: preflight.fileCount,
       expectedIds: dataset.map((source) => source.sourceId),
       failures: [{ sampleId: "evaluation-profile", phase: "setup", code: "EVALUATION_PROFILE_MISSING" }],
-      manifest: manifestReport
+      manifest: manifestReport,
+      modelsConfigSha256,
+      anchorsProvisional: strictAnchors.provisional
     });
     return;
   }
@@ -610,15 +703,25 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
-      codeVersion,
+      ...codeEvidence,
       fileCount: preflight.fileCount,
       expectedIds: dataset.map((source) => source.sourceId),
       failures: [{ sampleId: "evaluation-provider", phase: "setup", code: "EVALUATION_PROVIDER_MISSING" }],
-      manifest: manifestReport
+      manifest: manifestReport,
+      modelsConfigSha256,
+      anchorsProvisional: strictAnchors.provisional
     });
     return;
   }
-  const configurationFingerprint = evaluationConfigurationFingerprintWithCodeVersion(codeVersion, {
+  const providerIdentityFingerprint = difficultyProviderIdentityFingerprint(
+    profile.difficulty.provider,
+    credentials
+  );
+  const configurationFingerprint = difficultyEvaluationConfigurationFingerprint(codeVersion, {
+    modelsConfigSha256,
+    runnerSha256: codeIdentity.runnerSha256,
+    dependencyCodeSha256: codeIdentity.dependencyCodeSha256,
+    dependencyFileCount: codeIdentity.dependencyFileCount,
     experimentVersion: config.models.experimentVersion,
     modelProfileName: profileName,
     model: profile.difficulty,
@@ -627,13 +730,13 @@ async function main(): Promise<void> {
     anchorsFingerprint: strictAnchors.fingerprint,
     anchorsProvisional: strictAnchors.provisional,
     datasetManifestFingerprint: manifestReport.fingerprint
-  });
+  }, providerIdentityFingerprint);
   if (!manifestReport.verified || manifestReport.fingerprint === null) {
     incompleteBeforeCalls({
       runId,
       label,
       generatedAt,
-      codeVersion,
+      ...codeEvidence,
       fileCount: preflight.fileCount,
       expectedIds: dataset.map((source) => source.sourceId),
       failures: [{
@@ -642,7 +745,10 @@ async function main(): Promise<void> {
         code: "DATASET_MANIFEST_NOT_VERIFIED"
       }],
       manifest: manifestReport,
+      modelsConfigSha256,
       configurationFingerprint,
+      providerIdentityFingerprint,
+      anchorsProvisional: strictAnchors.provisional,
       excludedAnchors
     });
     return;
@@ -675,7 +781,7 @@ async function main(): Promise<void> {
       runId,
       label,
       generatedAt,
-      codeVersion,
+      ...codeEvidence,
       fileCount: preflight.fileCount,
       expectedIds: expectedSampleIds,
       failures: [{
@@ -684,7 +790,10 @@ async function main(): Promise<void> {
         code: "DIFFICULTY_CHECKPOINT_UNAVAILABLE"
       }],
       manifest: manifestReport,
+      modelsConfigSha256,
       configurationFingerprint,
+      providerIdentityFingerprint,
+      anchorsProvisional: strictAnchors.provisional,
       excludedAnchors
     });
     return;
@@ -713,7 +822,7 @@ async function main(): Promise<void> {
         runId,
         label,
         generatedAt,
-        codeVersion,
+        ...codeEvidence,
         fileCount: preflight.fileCount,
         expectedIds: expectedSampleIds,
         failures: [{
@@ -722,7 +831,10 @@ async function main(): Promise<void> {
           code: "EVALUATION_COMPLETE_CHAIN_REPLAY_BLOCKED"
         }],
         manifest: manifestReport,
+        modelsConfigSha256,
         configurationFingerprint,
+        providerIdentityFingerprint,
+        anchorsProvisional: strictAnchors.provisional,
         excludedAnchors,
         persistedRows: checkpoint.succeededRows(),
         chain: { ...chain, executionKind: "replay_blocked" }
@@ -817,21 +929,38 @@ async function main(): Promise<void> {
       });
     }
     const rows: EvalRow[] = persistedRows.map(({ sampleId: _sampleId, ...row }) => row);
+    const summary = summarize(rows);
+    const eligibility = assessDifficultyEvaluationEligibility({
+      integrityComplete: integrity.complete,
+      expected: integrity.expected,
+      summaryCount: summary.count,
+      meanAbsoluteError: summary.meanAbsoluteError,
+      hitRateWithin200: summary.hitRateWithin200,
+      manifestVerified: manifestReport.verified,
+      anchorsProvisional: strictAnchors.provisional
+    });
     const report: DifficultyReport = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       runId,
       label,
       generatedAt,
       codeVersion,
+      runnerSha256: codeIdentity.runnerSha256,
+      dependencyCodeSha256: codeIdentity.dependencyCodeSha256,
+      dependencyFileCount: codeIdentity.dependencyFileCount,
+      modelsConfigSha256,
       configurationFingerprint,
+      providerIdentityFingerprint,
+      anchorsProvisional: strictAnchors.provisional,
+      ...eligibility,
       chain,
       dataset: { discoveredFiles: preflight.fileCount, excludedAnchors, manifest: manifestReport },
       integrity,
-      summary: summarize(rows),
+      summary,
       rows
     };
     const artifacts = writeReports(report, persistedRows);
-    if (integrity.complete) {
+    if (report.executionComplete) {
       // completion marker 已最后落盘；再把其哈希封存进私有检查点。两者任一存在
       // 都会阻止完整链被零调用重复发布。
       checkpoint.markCompleteReportPublished(runId, artifacts.completionFingerprint);
@@ -843,10 +972,12 @@ async function main(): Promise<void> {
       succeeded: integrity.succeeded,
       failed: integrity.failed,
       complete: integrity.complete,
+      accuracyPassed: report.accuracyPassed,
+      eligible: report.eligible,
       meanAbsoluteError: report.summary.meanAbsoluteError,
       hitRateWithin200: report.summary.hitRateWithin200
     });
-    if (!integrity.complete) {
+    if (!report.eligible) {
       process.exitCode = 1;
     }
   } finally {
