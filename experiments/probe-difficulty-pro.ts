@@ -86,7 +86,7 @@ const expectedPublic83ManifestFingerprint =
 const expectedRegisteredSourceManifestSha256 =
   "edd286b5511ea7887e685c1cf7ee2b8aba75bf58f2ef5c914617807c3d6dc68e";
 const expectedProviderIdentitySha256 =
-  "6e913442f0833b7950c9ae934e46f437dad6ffd72bf847fbe3acee058256050c";
+  "630b4c6feb6b32c4bbcacaad0fca69938a2cf503b4cb63569ff94fc6d62b53d6";
 
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/u);
 const gitCommitSchema = z.string().regex(/^[0-9a-f]{40}$/u);
