@@ -291,6 +291,13 @@ Candidate C 锚点以及当前 provider/baseUrl/apiKey 的安全摘要；只在 
 `private/difficulty-connectivity-probe-results/` 保存 `0600` 检查点和最终 completion，不保存题面、
 模型原文、地址或密钥，也不得复用旧标签。
 
+该固定标签已在提交 `3a442caa898ba9743c4d3d3a4d003c15c4070903` 上实际运行：expected=1、
+succeeded=0、failed=1、complete=false。唯一一次 fetch 收到 HTTP 404，固定结果码为
+`LLM_HTTP_ERROR`，没有观察到正常 HTTP EOF，也没有进入结构化输出校验；标签锁已安全释放。私有
+completion 的 SHA-256 为 `b63f08ea270b0459a4140706996b7b936bdc5f869db49afc4a1f7aac46490590`，
+原始私有证据继续只保存在 Git 忽略目录且权限为 `0600`。这个标签已经占用，不能删除证据或重跑。
+在确认当前服务实际支持的模型标识并登记新的实验版本前，不得启动新的 83 题付费实验。
+
 这个 connectivity 结果无论成功与否都只回答“difficulty 的这一种 flash 请求能否完成一次协议
 往返”，不能证明 `review-balanced` 整条 reviewer 可运行。尤其 `thinking.solver` 与 `verdict`
 仍使用 Candidate D 已在当前 provider 上出现 404 的 pro 型号。后续必须为 difficulty、
@@ -386,7 +393,7 @@ completion marker 表示这条执行链已完整收束并阻止重放，不等�
 
 | 流水线 | 状态 | 说明 |
 | --- | --- | --- |
-| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；Candidate D 已因 404 失败；flash 单步预检待运行** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate B 在 2048、4096 两档协议探针均因高难题长度停止而淘汰。Candidate D 的 pro 探针首个合成请求返回 404，报告不完整，未发送第二题也未启动 83 题。当前已恢复 Candidate C flash 请求，但本提交没有调用模型；固定标签的单合成题 connectivity 预检仍待干净提交后运行，且即使通过也不代表整条 reviewer 可用。当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
+| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；Candidate D 与恢复后的 flash 连通性均因 404 失败** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate B 在 2048、4096 两档协议探针均因高难题长度停止而淘汰。Candidate D 的 pro 探针首个合成请求返回 404；恢复后的 Candidate C flash 单合成题也在唯一请求收到 404。两份报告都不完整，标签均已占用，且没有启动新的 83 题。当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
 | 思维难度（thinking.ts） | **旧实验均不可作基线** | 两份早期报告无法证明完整；后两份明确只完成 6/24、9/24，而且都缺高分段。 |
 | 代码难度（coding.ts） | **旧实验均不可作基线** | 与思维难度共用的旧实验不完整；小样本曾出现难度分段升高但代码难度均值下降，需要在完整基线上复核。 |
 | 查重判断（verdict.ts） | **旧设计不可作准确性基线** | 旧实验只有 3 个正常样本和 3 个人工重复样本；正常组只验证“不是不通过”，没有区分通过与需要修改。 |
