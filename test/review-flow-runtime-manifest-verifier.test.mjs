@@ -15,6 +15,7 @@ import {
   assertReviewFlowNodeArchiveBytes,
   assertReviewFlowRuntimeCommitIdentity,
   assertReviewFlowRuntimeWorkingBytes,
+  buildReviewFlowRuntimeGitEnvironment,
   buildFreshDependencyIdentity,
   normalizeReviewFlowEsbuildBinary,
   parseReviewFlowRuntimeSourceDocuments,
@@ -51,6 +52,23 @@ function sourceDocuments(manifest, lock) {
 }
 
 describe("review-flow runtime manifest 独立来源复核", () => {
+  it("固定 Git 子进程的 HOME 与全部临时目录都留在受保护运行根", () => {
+    const environment = buildReviewFlowRuntimeGitEnvironment({
+      HOME: "/private/root/home",
+      TEMP: "/private/root/tmp",
+      TMP: "/private/root/tmp",
+      TMPDIR: "/private/root/tmp",
+      TZ: "UTC"
+    });
+    expect(environment).toMatchObject({
+      HOME: "/private/root/home",
+      TEMP: "/private/root/tmp",
+      TMP: "/private/root/tmp",
+      TMPDIR: "/private/root/tmp",
+      TZ: "UTC"
+    });
+  });
+
   it("正式 manifest 的 Node 官方归档与五个 npm source binding 全部可独立解析", () => {
     const parsed = parseReviewFlowRuntimeSourceDocuments(
       manifestBytes,

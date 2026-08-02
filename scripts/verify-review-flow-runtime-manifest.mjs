@@ -351,6 +351,7 @@ function buildChildEnvironment(home, temporaryDirectory, npmCache) {
     TMPDIR: temporaryDirectory,
     LANG: "C.UTF-8",
     LC_ALL: "C.UTF-8",
+    TZ: "UTC",
     NODE_OPTIONS: "",
     NODE_PATH: "",
     NPM_CONFIG_AUDIT: "false",
@@ -370,12 +371,16 @@ function buildChildEnvironment(home, temporaryDirectory, npmCache) {
   return environment;
 }
 
-function buildGitEnvironment(childEnvironment) {
+export function buildReviewFlowRuntimeGitEnvironment(childEnvironment) {
   return {
     PATH: "/usr/bin:/bin",
     HOME: childEnvironment.HOME,
+    TEMP: childEnvironment.TEMP,
+    TMP: childEnvironment.TMP,
+    TMPDIR: childEnvironment.TMPDIR,
     LANG: "C.UTF-8",
     LC_ALL: "C.UTF-8",
+    TZ: childEnvironment.TZ,
     GIT_ATTR_NOSYSTEM: "1",
     GIT_CONFIG_GLOBAL: "/dev/null",
     GIT_CONFIG_NOSYSTEM: "1",
@@ -868,7 +873,9 @@ async function runCli(argv) {
       temporaryDirectory,
       npmCache
     );
-    const gitEnvironment = buildGitEnvironment(childEnvironment);
+    const gitEnvironment = buildReviewFlowRuntimeGitEnvironment(
+      childEnvironment
+    );
     const repositoryIdentity = readRepositoryIdentity(gitEnvironment);
     const verifierBinding = assertVerifierHeadBinding(
       repositoryIdentity,
