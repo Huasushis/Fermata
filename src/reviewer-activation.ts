@@ -7,11 +7,21 @@
  * 并通过服务端生产资格证据门。
  */
 import type { ModelsConfig, ProfileConfig } from "./config";
-import type { ProductionEligibilityDecision } from "./production-eligibility";
+import {
+  inspectProductionReviewGrant,
+  type ProductionEligibilityDecision,
+  type ProductionReviewGrant,
+  type ProductionReviewGrantClaims
+} from "./production-eligibility";
 import type { FermataPublicSettings } from "./urmotiv-schemas";
 
 export type ReviewerActivationDecision =
-  | { readonly active: true; readonly profile: ProfileConfig }
+  | {
+      readonly active: true;
+      readonly profile: ProfileConfig;
+      readonly productionGrant: ProductionReviewGrant;
+      readonly productionClaims: ProductionReviewGrantClaims;
+    }
   | {
       readonly active: false;
       readonly reason:
@@ -52,8 +62,21 @@ export function resolveReviewerActivation(
   if (profile === undefined) {
     return { active: false, reason: "profile_missing" };
   }
-  if (!productionEligibility().eligible) {
+  const eligibility = productionEligibility();
+  if (!eligibility.eligible) {
     return { active: false, reason: "production_evidence_rejected" };
   }
-  return { active: true, profile };
+  const claims = inspectProductionReviewGrant(eligibility.grant, {
+    profileName: settings.modelProfileName,
+    experimentVersion: settings.experimentVersion
+  });
+  if (claims === null) {
+    return { active: false, reason: "production_evidence_rejected" };
+  }
+  return {
+    active: true,
+    profile,
+    productionGrant: eligibility.grant,
+    productionClaims: claims
+  };
 }

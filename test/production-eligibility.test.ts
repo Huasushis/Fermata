@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { AppConfig } from "../src/config";
 import {
   createProductionEligibilityVerifier,
+  inspectProductionReviewGrant,
   productionEligibilityBlocked
 } from "../src/production-eligibility";
 
@@ -30,5 +31,18 @@ describe("正式审题资格总门", () => {
       eligible: false,
       reason: "production_evidence_verifier_unimplemented"
     });
+  });
+
+  it("裸对象、同形对象和任意摘要都不能仿造进程内生产能力", () => {
+    const expected = {
+      profileName: "review-balanced",
+      experimentVersion: "experiment-current"
+    };
+    expect(inspectProductionReviewGrant({}, expected)).toBeNull();
+    expect(inspectProductionReviewGrant({
+      evidenceFingerprint: "a".repeat(64),
+      expectedRunnerIdentity: "b".repeat(64),
+      engineBuildFingerprint: "c".repeat(64)
+    }, expected)).toBeNull();
   });
 });
