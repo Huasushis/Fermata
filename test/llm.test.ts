@@ -3179,6 +3179,49 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
     expect(getLlmFailureAudit(caught)?.completedResponses).toHaveLength(1);
   });
 
+  it("JSON 修复轮缺少 SSE DONE 时保留首轮完成证据并判定整体不完整", async () => {
+    let calls = 0;
+    let caught: unknown;
+    try {
+      await chatCompleteJsonWithReceipt(
+        provider,
+        spec,
+        [],
+        resultSchema,
+        {
+          ...runtime,
+          fetch: vi.fn(async () => {
+            calls += 1;
+            return calls === 1
+              ? completionResponse("不是 JSON")
+              : new Response(
+                  'data: {"choices":[{"delta":{"content":"{\\"rating\\":1500}"},"finish_reason":"stop"}]}\n\n',
+                  { status: 200, headers: { "Content-Type": "text/event-stream" } }
+                );
+          })
+        }
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({ code: "LLM_RESPONSE_FORMAT_INVALID" });
+    expect(getLlmFailureAudit(caught)).toMatchObject({
+      schemaVersion: 1,
+      requestCount: 2,
+      transportAttemptCount: 2,
+      jsonSchemaValidated: false,
+      terminal: {
+        status: 200,
+        responseMode: "sse",
+        eofObserved: true,
+        finishReasonStopObserved: true,
+        sseDoneObserved: false
+      }
+    });
+    expect(getLlmFailureAudit(caught)?.completedResponses).toHaveLength(1);
+  });
+
   it("结构化可信调用拒绝缺少 SSE DONE 的 stop+EOF，并保留真实终态", async () => {
     let caught: unknown;
     try {
