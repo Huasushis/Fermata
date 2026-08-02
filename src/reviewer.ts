@@ -251,8 +251,29 @@ export class ReviewerWorker {
       return;
     }
 
+    const claimedAssignmentIds = new Set<string>();
     for (const task of claimed.items) {
-      const promise = this.processTask(
+      if (
+        claimedAssignmentIds.has(task.assignmentId)
+        || this.#inFlight.has(task.assignmentId)
+        || this.#taskPromises.has(task.assignmentId)
+      ) {
+        logWarn("领取响应包含重复或仍在途的任务，跳过重复启动", {
+          assignmentId: task.assignmentId
+        });
+        continue;
+      }
+      claimedAssignmentIds.add(task.assignmentId);
+
+      const leaseExpiresAtMs = Date.parse(task.leaseExpiresAt);
+      if (!Number.isFinite(leaseExpiresAtMs) || leaseExpiresAtMs <= Date.now()) {
+        logWarn("领取到的任务租约已经失效，拒绝启动处理流程", {
+          assignmentId: task.assignmentId
+        });
+        continue;
+      }
+
+      const promise: Promise<void> = this.processTask(
         task,
         settings.modelProfileName,
         settings.experimentVersion,
@@ -261,7 +282,11 @@ export class ReviewerWorker {
         activation.productionClaims
       ).finally(
         () => {
-          this.#taskPromises.delete(task.assignmentId);
+          // 只清理自己登记的 promise；即使以后启动策略变化，也不能让旧任务的
+          // finally 误删同一 assignmentId 下较新的任务记录。
+          if (this.#taskPromises.get(task.assignmentId) === promise) {
+            this.#taskPromises.delete(task.assignmentId);
+          }
         }
       );
       this.#taskPromises.set(task.assignmentId, promise);
@@ -357,6 +382,7 @@ export class ReviewerWorker {
       }
 
       const review = consumeReviewFlowSubmission(outcome.decision, {
+        taskSource,
         assignmentId: task.assignmentId,
         problemContentHash: task.problem.contentHash,
         problemRevision: task.problem.revision,
@@ -386,7 +412,11 @@ export class ReviewerWorker {
       }
     } finally {
       this.clearRenewal(inFlight);
-      this.#inFlight.delete(task.assignmentId);
+      // 与 #taskPromises 的清理一样按对象身份删除，避免旧流程的 finally 清掉
+      // 同一 assignmentId 下后来登记的续租状态。
+      if (this.#inFlight.get(task.assignmentId) === inFlight) {
+        this.#inFlight.delete(task.assignmentId);
+      }
     }
   }
 

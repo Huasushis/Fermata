@@ -463,6 +463,134 @@ describe("ReviewerWorker：基本轮询与处理", () => {
     expect(worker.getStatus().activeTasks).toBe(0);
   });
 
+  it("claim 返回已过期或恰在当前时刻到期的租约时不启动模型、续租或提交", async () => {
+    const client = createFakeUrmotivClient();
+    client.claimMock.mockResolvedValueOnce({
+      items: [
+        {
+          ...sampleTask("3fa85f64-5717-4562-b3fc-2c963f66afa6"),
+          leaseExpiresAt: "2026-07-25T23:59:59.999Z"
+        },
+        {
+          ...sampleTask("3fa85f64-5717-4562-b3fc-2c963f66afa7"),
+          leaseExpiresAt: "2026-07-26T00:00:00.000Z"
+        }
+      ]
+    });
+    const settingsStore = createFakeSettingsStore({
+      enabled: true,
+      pollingIntervalSeconds: 30,
+      maximumConcurrentTasks: 2,
+      modelProfileName: "test-profile",
+      experimentVersion: "exp-test"
+    });
+    const fetchMock = vi.fn(async () => llmSuccessResponse());
+    worker = createReviewer({
+      urmotivClient: client,
+      settingsStore,
+      appConfig,
+      anchors: [],
+      fetch: fetchMock
+    });
+
+    worker.start();
+    await flushAsync();
+
+    expect(client.claimMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(client.renewMock).not.toHaveBeenCalled();
+    expect(client.completeMock).not.toHaveBeenCalled();
+    expect(worker.getStatus().activeTasks).toBe(0);
+  });
+
+  it("同一 claim 批次重复 assignmentId 时只启动并提交一条流程", async () => {
+    const client = createFakeUrmotivClient();
+    const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
+    const task = sampleTask(assignmentId);
+    client.claimMock.mockResolvedValueOnce({ items: [task, { ...task }] });
+    const releaseRequests = createDeferred<void>();
+    const fetchMock = vi.fn(async () => {
+      await releaseRequests.promise;
+      return llmSuccessResponse();
+    });
+    const settingsStore = createFakeSettingsStore({
+      enabled: true,
+      pollingIntervalSeconds: 30,
+      maximumConcurrentTasks: 2,
+      modelProfileName: "test-profile",
+      experimentVersion: "exp-test"
+    });
+    worker = createReviewer({
+      urmotivClient: client,
+      settingsStore,
+      appConfig,
+      anchors: [],
+      fetch: fetchMock
+    });
+
+    worker.start();
+    await flushAsync();
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(worker.getStatus().activeTasks).toBe(1);
+
+    releaseRequests.resolve(undefined);
+    await flushAsync(100);
+
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(client.completeMock).toHaveBeenCalledTimes(1);
+    expect(client.completeMock).toHaveBeenCalledWith(assignmentId, expect.any(Object));
+    expect(worker.getStatus().activeTasks).toBe(0);
+  });
+
+  it("后续轮询再次返回仍在途 assignmentId 时不启动第二条流程", async () => {
+    const client = createFakeUrmotivClient();
+    const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
+    const task = sampleTask(assignmentId);
+    client.claimMock
+      .mockResolvedValueOnce({ items: [task] })
+      .mockResolvedValueOnce({ items: [{ ...task }] });
+    const releaseRequests = createDeferred<void>();
+    const fetchMock = vi.fn(async () => {
+      await releaseRequests.promise;
+      return llmSuccessResponse();
+    });
+    const settingsStore = createFakeSettingsStore({
+      enabled: true,
+      pollingIntervalSeconds: 3_600,
+      maximumConcurrentTasks: 2,
+      modelProfileName: "test-profile",
+      experimentVersion: "exp-test"
+    });
+    worker = createReviewer({
+      urmotivClient: client,
+      settingsStore,
+      appConfig,
+      anchors: [],
+      fetch: fetchMock
+    });
+
+    worker.start();
+    await flushAsync();
+    expect(client.claimMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    worker.wake();
+    await flushAsync();
+
+    expect(client.claimMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(worker.getStatus().activeTasks).toBe(1);
+
+    releaseRequests.resolve(undefined);
+    await flushAsync(100);
+
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(client.completeMock).toHaveBeenCalledTimes(1);
+    expect(client.completeMock).toHaveBeenCalledWith(assignmentId, expect.any(Object));
+    expect(worker.getStatus().activeTasks).toBe(0);
+  });
+
   it("不同任务的完成操作生成不同 UUID", async () => {
     const client = createFakeUrmotivClient();
     client.claimMock.mockResolvedValueOnce({
