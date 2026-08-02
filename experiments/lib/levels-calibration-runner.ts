@@ -1,4 +1,14 @@
+import { createHash } from "node:crypto";
 import { describeError } from "../../src/logger";
+import {
+  assertBlindContentDataset,
+  buildBlindContentDataset,
+  buildBlindGoldDataset,
+  type BlindContentDataset,
+  type BlindDatasetPurpose,
+  type BlindGoldDataset,
+  type BlindProblemContentSample
+} from "./blind-evaluation";
 import { mapWithConcurrency } from "./concurrency";
 import {
   LevelsCalibrationStateError,
@@ -7,25 +17,23 @@ import {
   calibrationFailureCodeSchema,
   calibrationFailureCountKey,
   calibrationFailureCountSchema,
-  calibrationProgressSchema,
-  calibrationRowKey,
+  blindCalibrationProgressSchema,
+  calibrationBlindGoldSchema,
   calibrationThinkingResultSchema,
-  completeCalibrationRows,
   type CalibrationCheckpointState,
   type CalibrationActiveStage,
+  type CalibrationBlindGold,
   type CalibrationCodingResult,
   type CalibrationDatasetItem,
   type CalibrationFailureCode,
   type CalibrationFailureCount,
   type CalibrationFailureStage,
-  type CalibrationProgress,
-  type CalibrationRow,
+  type BlindCalibrationProgress,
   type CalibrationThinkingResult
 } from "./levels-calibration-state";
 
 export interface CalibrationItemIdentity {
   readonly safeId: string;
-  readonly rating: number;
 }
 
 export interface CalibrationStageCompletedEvent
@@ -45,14 +53,14 @@ export interface CalibrationStageFailedEvent extends CalibrationItemIdentity {
 }
 
 export interface LevelsCalibrationRunnerInput {
-  readonly items: readonly CalibrationDatasetItem[];
+  readonly blindContent: BlindContentDataset;
   readonly concurrency: number;
   readonly initialState?: CalibrationCheckpointState;
   readonly runThinking: (
-    item: CalibrationDatasetItem
+    item: Readonly<BlindProblemContentSample>
   ) => Promise<unknown>;
   readonly runCoding: (
-    item: CalibrationDatasetItem
+    item: Readonly<BlindProblemContentSample>
   ) => Promise<unknown>;
   readonly saveCheckpoint: (
     state: CalibrationCheckpointState
@@ -65,7 +73,6 @@ export interface LevelsCalibrationRunnerInput {
 
 export interface LevelsCalibrationRunnerResult
   extends CalibrationCheckpointState {
-  readonly rows: readonly CalibrationRow[];
   readonly thinkingCompletedThisRun: number;
   readonly codingCompletedThisRun: number;
   readonly completedProblemsThisRun: number;
@@ -91,6 +98,91 @@ export function selectCodingCalibrationResult(input: {
   });
 }
 
+/** 把标定源一次性投影成不含 rating、人工等级和预期结论的推理内容。 */
+export function buildLevelsBlindContent(input: {
+  readonly datasetId: string;
+  readonly purpose: BlindDatasetPurpose;
+  readonly items: readonly CalibrationDatasetItem[];
+}): BlindContentDataset {
+  return buildBlindContentDataset({
+    datasetId: input.datasetId,
+    purpose: input.purpose,
+    samples: input.items.map((item) => {
+      const contentHash = createHash("sha256")
+        .update(item.statement, "utf8")
+        .update("\0", "utf8")
+        .update(item.editorial, "utf8")
+        .digest("hex");
+      const opaqueIdentity = createHash("sha256")
+        .update("levels-blind-problem-v1", "utf8")
+        .update("\0", "utf8")
+        .update(item.safeId, "utf8")
+        .update("\0", "utf8")
+        .update(contentHash, "utf8")
+        .digest("hex")
+        .slice(0, 24);
+      return {
+        safeId: item.safeId,
+        problem: {
+          id: `calibration-${opaqueIdentity}`,
+          revision: 1,
+          reviewRound: 1,
+          contentHash,
+          title: `标定样本-${opaqueIdentity}`,
+          type: "traditional",
+          tagIds: ["calibration.sample"],
+          basicStatement: item.statement,
+          basicSolution: item.editorial
+        }
+      };
+    })
+  });
+}
+
+export function buildLevelsBlindGold(input: {
+  readonly content: BlindContentDataset;
+  readonly items: readonly CalibrationDatasetItem[];
+}): BlindGoldDataset<CalibrationBlindGold> {
+  let content: BlindContentDataset;
+  try {
+    content = assertBlindContentDataset(input.content);
+    const independentlyProjected = buildLevelsBlindContent({
+      datasetId: content.datasetId,
+      purpose: content.purpose,
+      items: input.items
+    });
+    if (independentlyProjected.contentFingerprint !== content.contentFingerprint) {
+      throw new Error("content-changed");
+    }
+  } catch {
+    throw new LevelsCalibrationStateError("LEVELS_BLIND_GOLD_MISMATCH");
+  }
+  const contentBySafeId = new Map(
+    content.samples.map((sample) => [sample.safeId, sample] as const)
+  );
+  return buildBlindGoldDataset({
+    content,
+    goldSchema: calibrationBlindGoldSchema,
+    samples: input.items.map((item) => {
+      const content = contentBySafeId.get(item.safeId);
+      if (content === undefined) {
+        throw new LevelsCalibrationStateError("LEVELS_BLIND_GOLD_MISMATCH");
+      }
+      return {
+        safeId: item.safeId,
+        contentHash: content.problem.contentHash,
+        gold: {
+          contestId: item.contestId,
+          index: item.index,
+          rating: item.rating,
+          humanThinkingLevel: item.humanThinkingLevel,
+          humanCodingLevel: item.humanCodingLevel
+        }
+      };
+    })
+  });
+}
+
 /**
  * 每道题各自依次运行两个阶段。阶段结果只在结构校验通过后写入共享
  * 进度表；所有检查点按调用顺序逐次写入，因此多个并发任务不会拿旧快照互相覆盖。
@@ -98,15 +190,21 @@ export function selectCodingCalibrationResult(input: {
 export async function runLevelsCalibrationStages(
   input: LevelsCalibrationRunnerInput
 ): Promise<LevelsCalibrationRunnerResult> {
+  let blindContent: BlindContentDataset;
+  try {
+    blindContent = assertBlindContentDataset(input.blindContent);
+  } catch {
+    throw new LevelsCalibrationStateError("LEVELS_BLIND_CONTENT_MISMATCH");
+  }
   const progressByKey = validateInitialProgress(
-    input.items,
+    blindContent,
     input.initialState?.progress ?? []
   );
   const failureCountsByKey = validateInitialFailureCounts(
     input.initialState?.failureCounts ?? []
   );
   const activeStagesByKey = validateInitialActiveStages(
-    input.items,
+    blindContent,
     input.initialState?.activeStages ?? []
   );
   for (const active of activeStagesByKey.values()) {
@@ -119,7 +217,11 @@ export async function runLevelsCalibrationStages(
   }
   activeStagesByKey.clear();
   const initialCompletedKeys = new Set(
-    completeCalibrationRows([...progressByKey.values()]).map(calibrationRowKey)
+    [...progressByKey.values()]
+      .filter((progress) =>
+        progress.thinking !== undefined && progress.coding !== undefined
+      )
+      .map((progress) => progress.safeId)
   );
   let thinkingCompletedThisRun = 0;
   let codingCompletedThisRun = 0;
@@ -145,7 +247,7 @@ export async function runLevelsCalibrationStages(
     }
   };
   const runPaidStage = async <T>(stageInput: {
-    readonly item: CalibrationDatasetItem;
+    readonly safeId: string;
     readonly stage: CalibrationFailureStage;
     readonly execute: () => Promise<unknown>;
     readonly schema: {
@@ -166,16 +268,16 @@ export async function runLevelsCalibrationStages(
       return { started: false };
     }
     activeStagesByKey.set(
-      activeStageKey(stageInput.item.safeId, stageInput.stage),
+      activeStageKey(stageInput.safeId, stageInput.stage),
       {
-        safeId: stageInput.item.safeId,
+        safeId: stageInput.safeId,
         stage: stageInput.stage
       }
     );
     await saveCheckpoint();
     if (stopStartingStages) {
       activeStagesByKey.delete(
-        activeStageKey(stageInput.item.safeId, stageInput.stage)
+        activeStageKey(stageInput.safeId, stageInput.stage)
       );
       await saveCheckpoint();
       return { started: false };
@@ -197,31 +299,31 @@ export async function runLevelsCalibrationStages(
         progress.thinking !== undefined && progress.coding !== undefined
     ).length;
 
-  await mapWithConcurrency(input.items, input.concurrency, async (item) => {
+  await mapWithConcurrency(blindContent.samples, input.concurrency, async (blindItem) => {
     try {
       if (stopStartingStages) {
         return;
       }
-      const key = calibrationRowKey(item);
+      const key = blindItem.safeId;
       let progress = progressByKey.get(key);
       if (progress?.thinking === undefined) {
         const thinkingStage = await runPaidStage({
-          item,
+          safeId: blindItem.safeId,
           stage: "thinking",
-          execute: () => input.runThinking(item),
+          execute: () => input.runThinking(blindItem),
           schema: calibrationThinkingResultSchema,
           onFailure: async (failure) => {
             stopStartingStages = true;
             mergeFailureCount(failureCountsByKey, failure);
-            activeStagesByKey.delete(activeStageKey(item.safeId, "thinking"));
+            activeStagesByKey.delete(activeStageKey(blindItem.safeId, "thinking"));
             await saveCheckpoint();
             input.onStageFailed?.({
-              ...identityOf(item),
+              safeId: blindItem.safeId,
               stage: failure.stage,
               errorCode: failure.errorCode,
               status: failure.status,
               fullyCompletedProblemCount: fullyCompletedProblemCount(),
-              expectedProblemCount: input.items.length
+              expectedProblemCount: blindContent.samples.length
             });
           }
         });
@@ -230,24 +332,20 @@ export async function runLevelsCalibrationStages(
         }
         const thinking = thinkingStage.result;
         progress = {
-          safeId: item.safeId,
-          contestId: item.contestId,
-          index: item.index,
-          rating: item.rating,
-          humanThinkingLevel: item.humanThinkingLevel,
-          humanCodingLevel: item.humanCodingLevel,
+          safeId: blindItem.safeId,
+          contentHash: blindItem.problem.contentHash,
           thinking
         };
         progressByKey.set(key, progress);
-        activeStagesByKey.delete(activeStageKey(item.safeId, "thinking"));
+        activeStagesByKey.delete(activeStageKey(blindItem.safeId, "thinking"));
         await saveCheckpoint();
         thinkingCompletedThisRun += 1;
         input.onStageCompleted?.({
-          ...identityOf(item),
+          safeId: blindItem.safeId,
           stage: "thinking",
           level: thinking.level,
           fullyCompletedProblemCount: fullyCompletedProblemCount(),
-          expectedProblemCount: input.items.length
+          expectedProblemCount: blindContent.samples.length
         });
       }
 
@@ -258,22 +356,22 @@ export async function runLevelsCalibrationStages(
         return;
       }
       const codingStage = await runPaidStage({
-        item,
+        safeId: blindItem.safeId,
         stage: "coding",
-        execute: () => input.runCoding(item),
+        execute: () => input.runCoding(blindItem),
         schema: calibrationCodingResultSchema,
         onFailure: async (failure) => {
           stopStartingStages = true;
           mergeFailureCount(failureCountsByKey, failure);
-          activeStagesByKey.delete(activeStageKey(item.safeId, "coding"));
+          activeStagesByKey.delete(activeStageKey(blindItem.safeId, "coding"));
           await saveCheckpoint();
           input.onStageFailed?.({
-            ...identityOf(item),
+            safeId: blindItem.safeId,
             stage: failure.stage,
             errorCode: failure.errorCode,
             status: failure.status,
             fullyCompletedProblemCount: fullyCompletedProblemCount(),
-            expectedProblemCount: input.items.length
+            expectedProblemCount: blindContent.samples.length
           });
         }
       });
@@ -286,15 +384,15 @@ export async function runLevelsCalibrationStages(
         coding
       };
       progressByKey.set(key, progress);
-      activeStagesByKey.delete(activeStageKey(item.safeId, "coding"));
+      activeStagesByKey.delete(activeStageKey(blindItem.safeId, "coding"));
       await saveCheckpoint();
       codingCompletedThisRun += 1;
       input.onStageCompleted?.({
-        ...identityOf(item),
+        safeId: blindItem.safeId,
         stage: "coding",
         level: coding.level,
         fullyCompletedProblemCount: fullyCompletedProblemCount(),
-        expectedProblemCount: input.items.length
+        expectedProblemCount: blindContent.samples.length
       });
     } catch (error) {
       stopStartingStages = true;
@@ -303,13 +401,14 @@ export async function runLevelsCalibrationStages(
   });
 
   const finalState = snapshot();
-  const rows = completeCalibrationRows(finalState.progress).sort(compareRows);
-  const completedProblemsThisRun = rows.filter(
-    (row) => !initialCompletedKeys.has(calibrationRowKey(row))
+  const completedProblemsThisRun = finalState.progress.filter(
+    (progress) =>
+      progress.thinking !== undefined &&
+      progress.coding !== undefined &&
+      !initialCompletedKeys.has(progress.safeId)
   ).length;
   return {
     ...finalState,
-    rows,
     thinkingCompletedThisRun,
     codingCompletedThisRun,
     completedProblemsThisRun
@@ -407,42 +506,29 @@ function mergeFailureCount(
 }
 
 function validateInitialProgress(
-  items: readonly CalibrationDatasetItem[],
-  initialProgress: readonly CalibrationProgress[]
-): Map<string, CalibrationProgress> {
-  const expectedMetadata = new Map(
-    items.map((item) => [
-      calibrationRowKey(item),
-      {
-        safeId: item.safeId,
-        contestId: item.contestId,
-        index: item.index,
-        rating: item.rating,
-        humanThinkingLevel: item.humanThinkingLevel,
-        humanCodingLevel: item.humanCodingLevel
-      }
-    ] as const)
+  content: BlindContentDataset,
+  initialProgress: readonly BlindCalibrationProgress[]
+): Map<string, BlindCalibrationProgress> {
+  const expectedContentHashes = new Map(
+    content.samples.map(
+      (sample) => [sample.safeId, sample.problem.contentHash] as const
+    )
   );
-  if (expectedMetadata.size !== items.length) {
+  if (expectedContentHashes.size !== content.samples.length) {
     throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
   }
-  const progressByKey = new Map<string, CalibrationProgress>();
+  const progressByKey = new Map<string, BlindCalibrationProgress>();
   for (const candidate of initialProgress) {
-    const parsed = calibrationProgressSchema.safeParse(candidate);
+    const parsed = blindCalibrationProgressSchema.safeParse(candidate);
     if (!parsed.success) {
       throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
     }
-    const key = calibrationRowKey(parsed.data);
-    const expected = expectedMetadata.get(key);
+    const key = parsed.data.safeId;
+    const expectedContentHash = expectedContentHashes.get(key);
     if (
       progressByKey.has(key) ||
-      expected === undefined ||
-      expected.safeId !== parsed.data.safeId ||
-      expected.contestId !== parsed.data.contestId ||
-      expected.index !== parsed.data.index ||
-      expected.rating !== parsed.data.rating ||
-      expected.humanThinkingLevel !== parsed.data.humanThinkingLevel ||
-      expected.humanCodingLevel !== parsed.data.humanCodingLevel
+      expectedContentHash === undefined ||
+      expectedContentHash !== parsed.data.contentHash
     ) {
       throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
     }
@@ -452,11 +538,11 @@ function validateInitialProgress(
 }
 
 function validateInitialActiveStages(
-  items: readonly CalibrationDatasetItem[],
+  content: BlindContentDataset,
   initialActiveStages: readonly CalibrationActiveStage[]
 ): Map<string, CalibrationActiveStage> {
-  const expectedSafeIds = new Set(items.map((item) => item.safeId));
-  if (expectedSafeIds.size !== items.length) {
+  const expectedSafeIds = new Set(content.samples.map((item) => item.safeId));
+  if (expectedSafeIds.size !== content.samples.length) {
     throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
   }
   const activeStagesByKey = new Map<string, CalibrationActiveStage>();
@@ -492,13 +578,6 @@ function validateInitialFailureCounts(
   return failureCountsByKey;
 }
 
-function identityOf(item: CalibrationDatasetItem): CalibrationItemIdentity {
-  return {
-    safeId: item.safeId,
-    rating: item.rating
-  };
-}
-
 function activeStageKey(
   safeId: string,
   stage: CalibrationFailureStage
@@ -516,22 +595,10 @@ function compareActiveStages(
 }
 
 function compareProgress(
-  left: CalibrationProgress,
-  right: CalibrationProgress
+  left: BlindCalibrationProgress,
+  right: BlindCalibrationProgress
 ): number {
-  return (
-    left.rating - right.rating ||
-    left.contestId - right.contestId ||
-    left.index.localeCompare(right.index)
-  );
-}
-
-function compareRows(left: CalibrationRow, right: CalibrationRow): number {
-  return (
-    left.rating - right.rating ||
-    left.contestId - right.contestId ||
-    left.index.localeCompare(right.index)
-  );
+  return left.safeId.localeCompare(right.safeId);
 }
 
 function compareFailureCounts(

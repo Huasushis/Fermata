@@ -21,6 +21,12 @@ import {
   mapCodingSignalsToLevel
 } from "../../src/pipelines/coding";
 import { mapThinkingSignalsToLevel } from "../../src/pipelines/thinking";
+import {
+  assertBlindContentDataset,
+  assertBlindContentGoldBinding,
+  type BlindContentDataset,
+  type BlindGoldDataset
+} from "./blind-evaluation";
 
 export const LEVEL_BAND_BOUNDARIES = [1400, 2200] as const;
 export type LevelBand = "低" | "中" | "高";
@@ -57,6 +63,17 @@ export const calibrationDatasetItemSchema = z
   })
   .strict();
 export type CalibrationDatasetItem = z.infer<typeof calibrationDatasetItemSchema>;
+
+export const calibrationBlindGoldSchema = z
+  .object({
+    contestId: z.number().int().positive(),
+    index: codeforcesProblemIndexSchema,
+    rating: z.number().int().positive(),
+    humanThinkingLevel: humanLevelSchema,
+    humanCodingLevel: humanLevelSchema
+  })
+  .strict();
+export type CalibrationBlindGold = z.infer<typeof calibrationBlindGoldSchema>;
 
 const calibrationDatasetCandidateSchema = z
   .object({
@@ -236,6 +253,32 @@ export type CalibrationCodingResult = z.infer<
   typeof calibrationCodingResultSchema
 >;
 
+export const blindCalibrationProgressSchema = z
+  .object({
+    safeId: calibrationSafeIdSchema,
+    contentHash: digestSchema,
+    thinking: calibrationThinkingResultSchema.optional(),
+    coding: calibrationCodingResultSchema.optional()
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.thinking === undefined && value.coding === undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "盲标定检查点只保存至少完成一个阶段的题目。"
+      });
+    }
+    if (value.coding !== undefined && value.thinking === undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "代码阶段结果不能脱离思维阶段结果保存。"
+      });
+    }
+  });
+export type BlindCalibrationProgress = z.infer<
+  typeof blindCalibrationProgressSchema
+>;
+
 export const calibrationProgressSchema = z
   .object({
     safeId: calibrationSafeIdSchema,
@@ -365,7 +408,7 @@ export type CalibrationActiveStage = z.infer<
 >;
 
 export interface CalibrationCheckpointState {
-  readonly progress: readonly CalibrationProgress[];
+  readonly progress: readonly BlindCalibrationProgress[];
   readonly failureCounts: readonly CalibrationFailureCount[];
   readonly activeStages: readonly CalibrationActiveStage[];
 }
@@ -429,12 +472,12 @@ export interface LevelsReportRunConfiguration {
 
 const savedCheckpointSchema = z
   .object({
-    schemaVersion: z.literal(4),
+    schemaVersion: z.literal(5),
     label: calibrationLabelSchema,
     profileName: calibrationProfileNameSchema,
     chainRunId: calibrationRunIdSchema,
     fingerprint: levelsExperimentFingerprintSchema,
-    progress: z.array(calibrationProgressSchema),
+    progress: z.array(blindCalibrationProgressSchema),
     activeStages: z.array(calibrationActiveStageSchema),
     failureCounts: z.array(calibrationFailureCountSchema)
   })
@@ -461,6 +504,8 @@ export type LevelsCalibrationStateErrorCode =
   | "LEVELS_DATA_READ_FAILED"
   | "LEVELS_DATASET_EMPTY"
   | "LEVELS_DATA_PRECHECK_FAILED"
+  | "LEVELS_BLIND_CONTENT_MISMATCH"
+  | "LEVELS_BLIND_GOLD_MISMATCH"
   | "LEVELS_FINGERPRINT_BUILD_FAILED"
   | "LEVELS_PIPELINE_SOURCE_READ_FAILED"
   | "LEVELS_CHECKPOINT_MISSING"
@@ -484,6 +529,8 @@ const safeErrorMessages: Readonly<Record<LevelsCalibrationStateErrorCode, string
   LEVELS_DATA_READ_FAILED: "无法读取标定集文件。",
   LEVELS_DATASET_EMPTY: "标定集为空。",
   LEVELS_DATA_PRECHECK_FAILED: "标定集预检失败。",
+  LEVELS_BLIND_CONTENT_MISMATCH: "标定推理内容与评分样本身份不一致。",
+  LEVELS_BLIND_GOLD_MISMATCH: "标定推理结果与独立评分答案不一致。",
   LEVELS_FINGERPRINT_BUILD_FAILED: "无法生成本次实验的校验摘要。",
   LEVELS_PIPELINE_SOURCE_READ_FAILED: "无法读取标定所需的流水线代码。",
   LEVELS_CHECKPOINT_MISSING: "没有找到指定的标定检查点。",
@@ -1023,7 +1070,7 @@ export function loadCalibrationCheckpoint(input: {
   readonly expectedLabel: string;
   readonly expectedProfileName: string;
   readonly expectedFingerprint: LevelsExperimentFingerprint;
-  readonly expectedItems: readonly CalibrationDatasetItem[];
+  readonly expectedContent: BlindContentDataset;
 }): LoadedCalibrationCheckpoint {
   let sourceText: string;
   try {
@@ -1051,7 +1098,7 @@ export function loadCalibrationCheckpoint(input: {
   if (
     typeof parsedSchemaVersion === "number" &&
     Number.isInteger(parsedSchemaVersion) &&
-    parsedSchemaVersion !== 4
+    parsedSchemaVersion !== 5
   ) {
     throw new LevelsCalibrationStateError(
       "LEVELS_CHECKPOINT_VERSION_UNSUPPORTED"
@@ -1071,35 +1118,28 @@ export function loadCalibrationCheckpoint(input: {
     throw new LevelsCalibrationStateError("LEVELS_FINGERPRINT_MISMATCH");
   }
 
-  const expectedMetadata = new Map(
-    input.expectedItems.map(
-      (item) => [
-        calibrationRowKey(item),
-        {
-          contestId: item.contestId,
-          index: item.index,
-          rating: item.rating,
-          humanThinkingLevel: item.humanThinkingLevel,
-          humanCodingLevel: item.humanCodingLevel
-        }
-      ] as const
+  let expectedContent: BlindContentDataset;
+  try {
+    expectedContent = assertBlindContentDataset(input.expectedContent);
+  } catch {
+    throw new LevelsCalibrationStateError("LEVELS_BLIND_CONTENT_MISMATCH");
+  }
+  const expectedContentHashes = new Map(
+    expectedContent.samples.map(
+      (sample) => [sample.safeId, sample.problem.contentHash] as const
     )
   );
-  if (expectedMetadata.size !== input.expectedItems.length) {
+  if (expectedContentHashes.size !== expectedContent.samples.length) {
     throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
   }
   const seenKeys = new Set<string>();
   for (const progress of parsed.data.progress) {
-    const key = calibrationRowKey(progress);
-    const expected = expectedMetadata.get(key);
+    const key = progress.safeId;
+    const expectedContentHash = expectedContentHashes.get(key);
     if (
       seenKeys.has(key) ||
-      expected === undefined ||
-      expected.contestId !== progress.contestId ||
-      expected.index !== progress.index ||
-      expected.rating !== progress.rating ||
-      expected.humanThinkingLevel !== progress.humanThinkingLevel ||
-      expected.humanCodingLevel !== progress.humanCodingLevel
+      expectedContentHash === undefined ||
+      expectedContentHash !== progress.contentHash
     ) {
       throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
     }
@@ -1113,7 +1153,7 @@ export function loadCalibrationCheckpoint(input: {
     )
   );
   for (const active of parsed.data.activeStages) {
-    if (!input.expectedItems.some((item) => item.safeId === active.safeId)) {
+    if (!expectedContentHashes.has(active.safeId)) {
       throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
     }
     const stale: CalibrationFailureCount = {
@@ -1152,12 +1192,12 @@ export function writeCalibrationCheckpoint(input: {
   readonly profileName: string;
   readonly chainRunId: string;
   readonly fingerprint: LevelsExperimentFingerprint;
-  readonly progress: readonly CalibrationProgress[];
+  readonly progress: readonly BlindCalibrationProgress[];
   readonly activeStages: readonly CalibrationActiveStage[];
   readonly failureCounts: readonly CalibrationFailureCount[];
 }): void {
   const candidate = {
-    schemaVersion: 4,
+    schemaVersion: 5,
     label: input.label,
     profileName: input.profileName,
     chainRunId: input.chainRunId,
@@ -1200,6 +1240,61 @@ export function completeCalibrationRows(
     );
   }
   return rows;
+}
+
+/**
+ * 只有整批推理已经收束后，调用方才可用这个函数把盲检查点与 gold 连接成
+ * 旧报告所需的评分进度。检查点、阶段事件和在途日志永远不接触返回值。
+ */
+export function joinBlindCalibrationProgressWithGold(input: {
+  readonly content: BlindContentDataset;
+  readonly gold: BlindGoldDataset<CalibrationBlindGold>;
+  readonly progress: readonly BlindCalibrationProgress[];
+}): CalibrationProgress[] {
+  let content: BlindContentDataset;
+  try {
+    content = assertBlindContentGoldBinding(input.content, input.gold);
+  } catch {
+    throw new LevelsCalibrationStateError("LEVELS_BLIND_GOLD_MISMATCH");
+  }
+  const contentHashes = new Map(
+    content.samples.map(
+      (sample) => [sample.safeId, sample.problem.contentHash] as const
+    )
+  );
+  const goldBySafeId = new Map(
+    input.gold.samples.map((sample) => [sample.safeId, sample.gold] as const)
+  );
+  const seen = new Set<string>();
+  return input.progress.map((entry) => {
+    const parsed = blindCalibrationProgressSchema.safeParse(entry);
+    const expectedContentHash = contentHashes.get(entry.safeId);
+    const gold = goldBySafeId.get(entry.safeId);
+    if (
+      !parsed.success ||
+      seen.has(entry.safeId) ||
+      expectedContentHash === undefined ||
+      expectedContentHash !== entry.contentHash ||
+      gold === undefined
+    ) {
+      throw new LevelsCalibrationStateError("LEVELS_BLIND_GOLD_MISMATCH");
+    }
+    seen.add(entry.safeId);
+    return calibrationProgressSchema.parse({
+      safeId: entry.safeId,
+      ...gold,
+      thinking: entry.thinking,
+      coding: entry.coding
+    });
+  });
+}
+
+export function countCompleteBlindCalibrationProgress(
+  progress: readonly BlindCalibrationProgress[]
+): number {
+  return progress.filter(
+    (entry) => entry.thinking !== undefined && entry.coding !== undefined
+  ).length;
 }
 
 export function writeJsonAtomically(target: URL, value: unknown): void {
@@ -1441,11 +1536,11 @@ export function assessCalibrationCompleteness(
 }
 
 function assertUniqueProgress(
-  progressEntries: readonly CalibrationProgress[]
+  progressEntries: readonly BlindCalibrationProgress[]
 ): void {
   const seenKeys = new Set<string>();
   for (const progress of progressEntries) {
-    const key = calibrationRowKey(progress);
+    const key = progress.safeId;
     if (seenKeys.has(key)) {
       throw new LevelsCalibrationStateError("LEVELS_CHECKPOINT_INVALID");
     }

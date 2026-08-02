@@ -16,19 +16,21 @@
  * 用法：
  *   npm run experiment:calibrate-levels -- --label=v1
  */
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { getProviderCredentials, loadConfig, type ProfileConfig } from "../src/config";
 import { logError, logInfo, logWarn } from "../src/logger";
 import { runCodingPipeline } from "../src/pipelines/coding";
 import { runThinkingPipeline } from "../src/pipelines/thinking";
-import type { PipelineModelConfig, ReviewTaskProblem } from "../src/pipelines/types";
+import type { PipelineModelConfig } from "../src/pipelines/types";
 import { resolveLevelsCalibrationOptions } from "./lib/levels-calibration-options";
 import {
   buildLevelsCalibrationReport,
   levelAnchorDefinitions
 } from "./lib/levels-calibration-report";
 import {
+  buildLevelsBlindGold,
+  buildLevelsBlindContent,
   runLevelsCalibrationStages,
   selectCodingCalibrationResult,
   selectThinkingCalibrationResult
@@ -43,14 +45,14 @@ import {
   buildLevelsReportRunConfiguration,
   buildLevelsRunConfiguration,
   checkpointUrl,
-  completeCalibrationRows,
+  countCompleteBlindCalibrationProgress,
+  joinBlindCalibrationProgressWithGold,
   loadCalibrationDatasetDirectory,
   loadCalibrationCheckpoint,
   writeCalibrationCheckpoint,
   writeCalibrationReportArtifacts,
   type CalibrationCheckpointState,
   type CalibrationDatasetBundle,
-  type CalibrationDatasetItem,
   type LevelsExperimentFingerprint
 } from "./lib/levels-calibration-state";
 
@@ -64,9 +66,11 @@ const PIPELINE_SOURCE_FILES = {
   thinking: new URL("../src/pipelines/thinking.ts", import.meta.url),
   coding: new URL("../src/pipelines/coding.ts", import.meta.url),
   sharedTypes: new URL("../src/pipelines/types.ts", import.meta.url),
+  urmotivSchemas: new URL("../src/urmotiv-schemas.ts", import.meta.url),
   llmClient: new URL("../src/llm.ts", import.meta.url),
   logger: new URL("../src/logger.ts", import.meta.url),
   concurrency: new URL("./lib/concurrency.ts", import.meta.url),
+  blindEvaluation: new URL("./lib/blind-evaluation.ts", import.meta.url),
   calibrationOptions: new URL("./lib/levels-calibration-options.ts", import.meta.url),
   calibrationState: new URL("./lib/levels-calibration-state.ts", import.meta.url),
   calibrationRunner: new URL(
@@ -81,20 +85,6 @@ const PIPELINE_SOURCE_FILES = {
 
 function loadCalibrationSet(): CalibrationDatasetBundle {
   return loadCalibrationDatasetDirectory(DATA_DIR);
-}
-
-function toProblem(item: CalibrationDatasetItem): ReviewTaskProblem {
-  return {
-    id: `calibration-${item.safeId}`,
-    revision: 1,
-    reviewRound: 1,
-    contentHash: createHash("sha256").update(item.statement, "utf8").digest("hex"),
-    title: `标定题-${item.safeId}`,
-    type: "traditional",
-    tagIds: ["calibration.sample"],
-    basicStatement: item.statement,
-    basicSolution: item.editorial
-  };
 }
 
 function writeCheckpoint(
@@ -192,6 +182,17 @@ async function main(): Promise<void> {
 
   const calibrationBundle = loadCalibrationSet();
   const calibrationSet = calibrationBundle.items;
+  // 当前 levels 集已经参与过调参，只能作为 development 使用。先投影成内容侧，
+  // 后续 runThinking/runCoding 的函数参数不再含 rating 或人工等级。
+  const blindContent = buildLevelsBlindContent({
+    datasetId: calibrationBundle.datasetId,
+    purpose: "development",
+    items: calibrationSet
+  });
+  const blindGold = buildLevelsBlindGold({
+    content: blindContent,
+    items: calibrationSet
+  });
   let pipelineSources: Record<string, string>;
   try {
     pipelineSources = Object.fromEntries(
@@ -212,6 +213,8 @@ async function main(): Promise<void> {
     runConfiguration,
     pipelineSources,
     calibrationProtocol: {
+      datasetPurpose: blindContent.purpose,
+      blindContentFingerprint: blindContent.contentFingerprint,
       bandBoundaries: LEVEL_BAND_BOUNDARIES,
       levelAnchorDefinitions
     }
@@ -245,14 +248,16 @@ async function main(): Promise<void> {
             expectedLabel: options.resumeFromLabel,
             expectedProfileName: profileName,
             expectedFingerprint: fingerprint,
-            expectedItems: calibrationSet
+            expectedContent: blindContent
           });
-    const resumedRows = completeCalibrationRows(resumedState.progress);
+    const resumedCompleteProblemCount = countCompleteBlindCalibrationProgress(
+      resumedState.progress
+    );
     const resumedThinkingProblemCount = resumedState.progress.filter(
       (progress) => progress.thinking !== undefined
     ).length;
     const pendingProblemCount =
-      calibrationSet.length - resumedRows.length;
+      calibrationSet.length - resumedCompleteProblemCount;
     writeCheckpoint(
       label,
       profileName,
@@ -264,7 +269,7 @@ async function main(): Promise<void> {
     logInfo("开始标定", {
       label,
       problems: calibrationSet.length,
-      reusedProblems: resumedRows.length,
+      reusedProblems: resumedCompleteProblemCount,
       reusedThinkingProblems: resumedThinkingProblemCount,
       pendingProblems: pendingProblemCount,
       profileName,
@@ -277,22 +282,20 @@ async function main(): Promise<void> {
     });
 
     const runResult = await runLevelsCalibrationStages({
-      items: calibrationSet,
+      blindContent,
       concurrency: runConfiguration.concurrency,
       initialState: resumedState,
       runThinking: async (item) => {
-        const problem = toProblem(item);
         const thinking = await runThinkingPipeline({
-          problem,
+          problem: item.problem,
           solverModel,
           analystModel
         });
         return selectThinkingCalibrationResult(thinking);
       },
       runCoding: async (item) => {
-        const problem = toProblem(item);
         const coding = await runCodingPipeline({
-          problem,
+          problem: item.problem,
           model: codingModel
         });
         return selectCodingCalibrationResult(coding);
@@ -309,7 +312,6 @@ async function main(): Promise<void> {
       onStageCompleted: (event) => {
         logInfo("标定阶段完成", {
           safeId: event.safeId,
-          rating: event.rating,
           stage: event.stage,
           level: event.level,
           progress: `${event.fullyCompletedProblemCount}/${event.expectedProblemCount}`
@@ -318,7 +320,6 @@ async function main(): Promise<void> {
       onStageFailed: (event) => {
         logWarn("标定阶段失败，本链停止发起新的付费阶段", {
           safeId: event.safeId,
-          rating: event.rating,
           stage: event.stage,
           errorCode: event.errorCode,
           status: event.status,
@@ -342,6 +343,12 @@ async function main(): Promise<void> {
       activeStages: runResult.activeStages,
       failureCounts: runResult.failureCounts
     });
+    // runLevelsCalibrationStages 已等待全部在途阶段收束；从这一行开始才允许连接 gold。
+    const scoredProgress = joinBlindCalibrationProgressWithGold({
+      content: blindContent,
+      gold: blindGold,
+      progress: runResult.progress
+    });
     const report = buildLevelsCalibrationReport({
       label,
       datasetId: calibrationBundle.datasetId,
@@ -350,12 +357,12 @@ async function main(): Promise<void> {
       profileName,
       fingerprint,
       runConfiguration: reportRunConfiguration,
-      progress: runResult.progress,
+      progress: scoredProgress,
       failureCounts: runResult.failureCounts,
       activeStages: runResult.activeStages,
       expectedProblemCount: calibrationSet.length,
       resumedThinkingProblemCount,
-      resumedCompleteProblemCount: resumedRows.length,
+      resumedCompleteProblemCount,
       completedProblemsThisRun: runResult.completedProblemsThisRun,
       generatedAt
     });

@@ -1,5 +1,5 @@
 /**
- * 从带私有 manifest 的 levels v4 标定集里，按难度均匀挑一批锚点题，
+ * 从带私有 manifest 的 levels v5 标定集里，按难度均匀挑一批锚点题，
  * 用 LLM 生成简短摘要（不逐字照抄题面），写出 config/anchors/difficulty.json，
  * 供 difficulty 流水线做少样本参照。
  *
@@ -183,7 +183,7 @@ async function main(): Promise<void> {
   const anchorCount = parseAnchorCount();
   let calibrationBundle: CalibrationDatasetBundle;
   try {
-    // 与 levels v4 共用逐文件哈希清单和严格目录读取；manifest.private.json
+    // 与 levels v5 共用逐文件哈希清单和严格目录读取；manifest.private.json
     // 不会被误当成题目，缺题解、目录多文件或内容变化都会整体失败。
     calibrationBundle = loadCalibrationDatasetDirectory(DATA_DIR);
   } catch (error) {

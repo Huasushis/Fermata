@@ -1,11 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
+import type { BlindProblemContentSample } from "../experiments/lib/blind-evaluation";
 import {
-  runLevelsCalibrationStages,
+  buildLevelsBlindGold,
+  buildLevelsBlindContent,
+  runLevelsCalibrationStages as runLevelsCalibrationStagesProduction,
   selectCodingCalibrationResult,
   selectThinkingCalibrationResult
 } from "../experiments/lib/levels-calibration-runner";
 import {
   LevelsCalibrationStateError,
+  completeCalibrationRows,
+  joinBlindCalibrationProgressWithGold,
   type CalibrationCheckpointState,
   type CalibrationCodingResult,
   type CalibrationDatasetItem,
@@ -13,6 +18,7 @@ import {
   type CalibrationProgress,
   type CalibrationThinkingResult
 } from "../experiments/lib/levels-calibration-state";
+import type { BlindContentDataset } from "../experiments/lib/blind-evaluation";
 
 function item(
   contestId: number,
@@ -88,16 +94,49 @@ function codingResult(level = 2): CalibrationCodingResult {
   };
 }
 
-function completeProgress(source: CalibrationDatasetItem): CalibrationProgress {
+function completeProgress(source: CalibrationDatasetItem): CalibrationCheckpointState["progress"][number] {
+  const content = buildLevelsBlindContent({
+    datasetId: "levels-development",
+    purpose: "development",
+    items: [source]
+  });
   return {
     safeId: source.safeId,
-    contestId: source.contestId,
-    index: source.index,
-    rating: source.rating,
-    humanThinkingLevel: source.humanThinkingLevel,
-    humanCodingLevel: source.humanCodingLevel,
+    contentHash: content.samples[0]!.problem.contentHash,
     thinking: thinkingResult(),
     coding: codingResult()
+  };
+}
+
+type ProductionRunnerInput = Parameters<
+  typeof runLevelsCalibrationStagesProduction
+>[0];
+
+async function runLevelsCalibrationStages(
+  input: Omit<ProductionRunnerInput, "blindContent"> & {
+    readonly items: readonly CalibrationDatasetItem[];
+    readonly blindContent?: BlindContentDataset;
+  }
+) {
+  const { items, blindContent: providedContent, ...productionInput } = input;
+  const blindContent = providedContent ?? buildLevelsBlindContent({
+    datasetId: "levels-development",
+    purpose: "development",
+    items
+  });
+  const gold = buildLevelsBlindGold({ content: blindContent, items });
+  const result = await runLevelsCalibrationStagesProduction({
+    ...productionInput,
+    blindContent
+  });
+  const scoredProgress = joinBlindCalibrationProgressWithGold({
+    content: blindContent,
+    gold,
+    progress: result.progress
+  });
+  return {
+    ...result,
+    rows: completeCalibrationRows(scoredProgress)
   };
 }
 
@@ -106,6 +145,133 @@ function copyState(state: CalibrationCheckpointState): CalibrationCheckpointStat
 }
 
 describe("思维和代码标定的分阶段执行", () => {
+  it("prompt 可见的题目 id/title 使用不透明身份，不回显数据集 safeId", () => {
+    const source = {
+      ...item(1),
+      safeId: "private-source-identity-must-stay-opaque"
+    };
+    const blindContent = buildLevelsBlindContent({
+      datasetId: "levels-development",
+      purpose: "development",
+      items: [source]
+    });
+    const promptVisibleIdentity = JSON.stringify({
+      id: blindContent.samples[0]!.problem.id,
+      title: blindContent.samples[0]!.problem.title
+    });
+    expect(promptVisibleIdentity).not.toContain(source.safeId);
+    expect(promptVisibleIdentity).toMatch(/calibration-[a-f0-9]{24}/);
+  });
+
+  it("相同 safeId 的内容被换掉时，gold 建立在任何请求前失败", () => {
+    const source = item(1);
+    const blindContent = buildLevelsBlindContent({
+      datasetId: "levels-development",
+      purpose: "development",
+      items: [source]
+    });
+    expect(() => buildLevelsBlindGold({
+      content: blindContent,
+      items: [{ ...source, statement: `${source.statement}-swapped` }]
+    })).toThrowError(
+      expect.objectContaining({ code: "LEVELS_BLIND_GOLD_MISMATCH" })
+    );
+  });
+
+  it("整批推理收束前后的检查点和事件都不含人工 gold，评分只在返回后连接", async () => {
+    const goldSentinel = 31_337;
+    const sources = [
+      { ...item(1), rating: goldSentinel, humanThinkingLevel: 5, humanCodingLevel: 4 },
+      { ...item(2, "B"), rating: goldSentinel + 1, humanThinkingLevel: 4, humanCodingLevel: 5 }
+    ];
+    const blindContent = buildLevelsBlindContent({
+      datasetId: "levels-development",
+      purpose: "development",
+      items: sources
+    });
+    const blindGold = buildLevelsBlindGold({ content: blindContent, items: sources });
+    const persistedBeforeScoring: string[] = [];
+    const eventsBeforeScoring: string[] = [];
+
+    const result = await runLevelsCalibrationStagesProduction({
+      blindContent,
+      concurrency: 2,
+      runThinking: async () => thinkingResult(),
+      runCoding: async () => codingResult(),
+      saveCheckpoint: (state) => {
+        persistedBeforeScoring.push(JSON.stringify(state));
+      },
+      onStageCompleted: (event) => {
+        eventsBeforeScoring.push(JSON.stringify(event));
+      },
+      onStageFailed: (event) => {
+        eventsBeforeScoring.push(JSON.stringify(event));
+      }
+    });
+
+    const blindArtifacts = JSON.stringify({
+      persistedBeforeScoring,
+      eventsBeforeScoring,
+      result
+    });
+    for (const forbidden of [
+      "rating",
+      "humanThinkingLevel",
+      "humanCodingLevel",
+      String(goldSentinel),
+      String(goldSentinel + 1)
+    ]) {
+      expect(blindArtifacts).not.toContain(forbidden);
+    }
+
+    const scored = joinBlindCalibrationProgressWithGold({
+      content: blindContent,
+      gold: blindGold,
+      progress: result.progress
+    });
+    expect(scored.map((entry) => entry.rating).sort((a, b) => a - b)).toEqual([
+      goldSentinel,
+      goldSentinel + 1
+    ]);
+  });
+
+  it("生产推理回调只能读取 blind content，拿不到 rating 或人工等级", async () => {
+    const source: CalibrationDatasetItem = {
+      ...item(1, "A", 31_337),
+      humanThinkingLevel: 5,
+      humanCodingLevel: 4
+    };
+    const blindContent = buildLevelsBlindContent({
+      datasetId: "levels-development",
+      purpose: "development",
+      items: [source]
+    });
+    const received: unknown[] = [];
+    await runLevelsCalibrationStages({
+      items: [source],
+      blindContent,
+      concurrency: 1,
+      runThinking: async (blindItem) => {
+        received.push(blindItem);
+        return thinkingResult();
+      },
+      runCoding: async (blindItem) => {
+        received.push(blindItem);
+        return codingResult();
+      },
+      saveCheckpoint: () => undefined
+    });
+    expect(received).toHaveLength(2);
+    for (const blindItem of received) {
+      expect(Object.keys(blindItem as object).sort()).toEqual(["problem", "safeId"]);
+      const serialized = JSON.stringify(blindItem);
+      expect(serialized).not.toContain("rating");
+      expect(serialized).not.toContain("humanThinkingLevel");
+      expect(serialized).not.toContain("humanCodingLevel");
+      expect(serialized).not.toContain("31337");
+    }
+  });
+
   it("只选取等级和严格信号，不保存流水线返回中的说明文字", () => {
     const secret = "SENSITIVE_MODEL_RESPONSE_SENTINEL";
     const fullThinkingResult = {
@@ -389,7 +555,7 @@ describe("思维和代码标定的分阶段执行", () => {
         runCoding: async () => codingResult(),
         saveCheckpoint: () => undefined
       })
-    ).rejects.toMatchObject({ code: "LEVELS_CHECKPOINT_INVALID" });
+    ).rejects.toMatchObject({ code: "BLIND_CONTENT_DOCUMENT_INVALID" });
     expect(runThinking).not.toHaveBeenCalled();
   });
 
@@ -489,14 +655,10 @@ describe("思维和代码标定的分阶段执行", () => {
 
     for (let index = 1; index < snapshots.length; index += 1) {
       const previousKeys = new Set(
-        snapshots[index - 1]!.progress.map(
-          (entry) => `${entry.contestId}:${entry.index}`
-        )
+        snapshots[index - 1]!.progress.map((entry) => entry.safeId)
       );
       const currentKeys = new Set(
-        snapshots[index]!.progress.map(
-          (entry) => `${entry.contestId}:${entry.index}`
-        )
+        snapshots[index]!.progress.map((entry) => entry.safeId)
       );
       expect([...previousKeys].every((key) => currentKeys.has(key))).toBe(true);
     }
@@ -527,7 +689,7 @@ describe("思维和代码标定的分阶段执行", () => {
     const secondCanFinish = new Promise<void>((resolve) => {
       releaseSecond = () => resolve();
     });
-    const runThinking = vi.fn(async (source: CalibrationDatasetItem) => {
+    const runThinking = vi.fn(async (source: BlindProblemContentSample) => {
       if (source.safeId === sources[0]!.safeId) {
         await secondStarted;
         throw Object.assign(new Error("不能保存的取消说明"), {
@@ -742,7 +904,7 @@ describe("思维和代码标定的分阶段执行", () => {
       releaseSecond = () => resolve();
     });
     const runCoding = vi.fn(async () => codingResult());
-    const runThinking = vi.fn(async (source: CalibrationDatasetItem) => {
+    const runThinking = vi.fn(async (source: BlindProblemContentSample) => {
       if (source.safeId === sources[0]!.safeId) {
         await secondStarted;
         notifyFatalThrown();

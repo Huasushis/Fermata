@@ -27,7 +27,6 @@ import {
   buildLevelsReportRunConfiguration,
   buildLevelsRunConfiguration,
   checkpointUrl,
-  completeCalibrationRows,
   loadCalibrationCheckpoint,
   loadCalibrationDatasetDirectory,
   preflightCalibrationDatasetBundle,
@@ -36,9 +35,10 @@ import {
   writeCalibrationCheckpoint,
   writeJsonAtomically,
   type CalibrationDatasetItem,
-  type CalibrationFailureCount,
-  type CalibrationProgress
+  type BlindCalibrationProgress,
+  type CalibrationFailureCount
 } from "../experiments/lib/levels-calibration-state";
+import { buildLevelsBlindContent } from "../experiments/lib/levels-calibration-runner";
 
 const temporaryDirectories: string[] = [];
 
@@ -125,15 +125,12 @@ function materializeRegisteredDataset(
 
 function progress(
   source: CalibrationDatasetItem,
-  overrides: Partial<CalibrationProgress> = {}
-): CalibrationProgress {
+  overrides: Partial<BlindCalibrationProgress> = {}
+): BlindCalibrationProgress {
+  const blindContent = content([source]);
   return {
     safeId: source.safeId,
-    contestId: source.contestId,
-    index: source.index,
-    rating: source.rating,
-    humanThinkingLevel: source.humanThinkingLevel,
-    humanCodingLevel: source.humanCodingLevel,
+    contentHash: blindContent.samples[0]!.problem.contentHash,
     thinking: {
       level: 2,
       signals: {
@@ -154,6 +151,14 @@ function progress(
     },
     ...overrides
   };
+}
+
+function content(dataset: readonly CalibrationDatasetItem[]) {
+  return buildLevelsBlindContent({
+    datasetId: "levels-state-test",
+    purpose: "development",
+    items: dataset
+  });
 }
 
 const noFailures: readonly CalibrationFailureCount[] = [];
@@ -762,24 +767,20 @@ describe("实验校验摘要与续跑", () => {
         expectedLabel: "source",
         expectedProfileName: "review-balanced",
         expectedFingerprint: currentFingerprint,
-        expectedItems: dataset
+        expectedContent: content(dataset)
       })
     );
     expect(error.code).toBe("LEVELS_CHECKPOINT_MISSING");
   });
 
-  it("第 4 版检查点可以只保存思维阶段，并在恢复后继续保留严格信号", () => {
+  it("第 5 版盲检查点可以只保存思维阶段，并在恢复后继续保留严格信号", () => {
     const directory = makeDirectoryUrl();
     const dataset = [item()];
     const currentFingerprint = fingerprint(dataset);
     const complete = progress(dataset[0]!);
-    const thinkingOnly: CalibrationProgress = {
+    const thinkingOnly: BlindCalibrationProgress = {
       safeId: complete.safeId,
-      contestId: complete.contestId,
-      index: complete.index,
-      rating: complete.rating,
-      humanThinkingLevel: complete.humanThinkingLevel,
-      humanCodingLevel: complete.humanCodingLevel,
+      contentHash: complete.contentHash,
       thinking: complete.thinking
     };
     const target = checkpointUrl(directory, "source");
@@ -808,13 +809,13 @@ describe("实验校验摘要与续跑", () => {
       readonly schemaVersion: unknown;
       readonly chainRunId: string;
     };
-    expect(serialized.schemaVersion).toBe(4);
+    expect(serialized.schemaVersion).toBe(5);
     const restored = loadCalibrationCheckpoint({
       source: target,
       expectedLabel: "source",
       expectedProfileName: "review-balanced",
       expectedFingerprint: currentFingerprint,
-      expectedItems: dataset
+      expectedContent: content(dataset)
     });
     expect(restored).toEqual({
       chainRunId: serialized.chainRunId,
@@ -829,7 +830,7 @@ describe("实验校验摘要与续跑", () => {
         }
       ]
     });
-    expect(completeCalibrationRows(restored.progress)).toEqual([]);
+    expect(restored.progress[0]?.coding).toBeUndefined();
   });
 
   it("检查点写入不能省略实验链 UUID 或 activeStages", () => {
@@ -883,7 +884,7 @@ describe("实验校验摘要与续跑", () => {
       expectedLabel: "stale",
       expectedProfileName: "review-balanced",
       expectedFingerprint: currentFingerprint,
-      expectedItems: dataset
+      expectedContent: content(dataset)
     });
     expect(restored.activeStages).toEqual([]);
     expect(restored.failureCounts).toEqual([
@@ -896,7 +897,7 @@ describe("实验校验摘要与续跑", () => {
     ]);
   });
 
-  it("第 4 版检查点不再接受旧的笼统模型错误码", () => {
+  it("第 5 版检查点不再接受旧的笼统模型错误码", () => {
     const directory = makeDirectoryUrl();
     const dataset = [item()];
     const currentFingerprint = fingerprint(dataset);
@@ -937,7 +938,7 @@ describe("实验校验摘要与续跑", () => {
           expectedLabel: "legacy-errors",
           expectedProfileName: "review-balanced",
           expectedFingerprint: currentFingerprint,
-          expectedItems: dataset
+          expectedContent: content(dataset)
         })
       ).code
     ).toBe("LEVELS_CHECKPOINT_INVALID");
@@ -954,9 +955,9 @@ describe("实验校验摘要与续跑", () => {
         expectedLabel: "legacy",
         expectedProfileName: "review-balanced",
         expectedFingerprint: currentFingerprint,
-        expectedItems: dataset
+        expectedContent: content(dataset)
       });
-    for (const schemaVersion of [2, 3, 5]) {
+    for (const schemaVersion of [2, 3, 4, 6]) {
       writeFileSync(
         target,
         JSON.stringify({
@@ -976,7 +977,7 @@ describe("实验校验摘要与续跑", () => {
     writeFileSync(
       target,
       JSON.stringify({
-        schemaVersion: "4",
+        schemaVersion: "5",
         label: "legacy",
         profileName: "review-balanced",
         fingerprint: currentFingerprint,
@@ -1026,7 +1027,7 @@ describe("实验校验摘要与续跑", () => {
         expectedLabel: "source",
         expectedProfileName: "review-balanced",
         expectedFingerprint: fingerprint(changedDataset),
-        expectedItems: changedDataset
+        expectedContent: content(changedDataset)
       })
     );
     expect(error.code).toBe("LEVELS_FINGERPRINT_MISMATCH");
@@ -1058,7 +1059,7 @@ describe("实验校验摘要与续跑", () => {
           expectedLabel: "source",
           expectedProfileName: "review-balanced",
           expectedFingerprint: fingerprint(dataset, changedConfiguration),
-          expectedItems: dataset
+          expectedContent: content(dataset)
         })
       );
       expect(error.code).toBe("LEVELS_FINGERPRINT_MISMATCH");
@@ -1084,7 +1085,7 @@ describe("实验校验摘要与续跑", () => {
         expectedLabel: "legacy",
         expectedProfileName: "review-balanced",
         expectedFingerprint: fingerprint(dataset),
-        expectedItems: dataset
+        expectedContent: content(dataset)
       })
     );
     expect(error.code).toBe("LEVELS_CHECKPOINT_INVALID");
@@ -1094,7 +1095,7 @@ describe("实验校验摘要与续跑", () => {
     const directory = makeDirectoryUrl();
     const dataset = [item()];
     const currentFingerprint = fingerprint(dataset);
-    const write = (candidate: CalibrationProgress) =>
+    const write = (candidate: BlindCalibrationProgress) =>
       writeCalibrationCheckpoint({
         target: checkpointUrl(directory, "invalid"),
         label: "invalid",
@@ -1109,11 +1110,7 @@ describe("实验校验摘要与续跑", () => {
       captureStateError(() =>
         write({
           safeId: dataset[0]!.safeId,
-          contestId: dataset[0]!.contestId,
-          index: dataset[0]!.index,
-          rating: dataset[0]!.rating,
-          humanThinkingLevel: dataset[0]!.humanThinkingLevel,
-          humanCodingLevel: dataset[0]!.humanCodingLevel
+          contentHash: content(dataset).samples[0]!.problem.contentHash
         })
       ).code
     ).toBe("LEVELS_CHECKPOINT_INVALID");
@@ -1122,11 +1119,7 @@ describe("实验校验摘要与续跑", () => {
       captureStateError(() =>
         write({
           safeId: complete.safeId,
-          contestId: complete.contestId,
-          index: complete.index,
-          rating: complete.rating,
-          humanThinkingLevel: complete.humanThinkingLevel,
-          humanCodingLevel: complete.humanCodingLevel,
+          contentHash: complete.contentHash,
           coding: complete.coding
         })
       ).code
@@ -1142,7 +1135,7 @@ describe("实验校验摘要与续跑", () => {
               leakedText: "不能保存"
             }
           }
-        } as unknown as CalibrationProgress)
+        } as unknown as BlindCalibrationProgress)
       ).code
     ).toBe("LEVELS_CHECKPOINT_INVALID");
   });
@@ -1222,7 +1215,7 @@ describe("实验校验摘要与续跑", () => {
           expectedLabel: "levels",
           expectedProfileName: "review-balanced",
           expectedFingerprint: currentFingerprint,
-          expectedItems: dataset
+          expectedContent: content(dataset)
         })
       ).code
     ).toBe("LEVELS_CHECKPOINT_INVALID");
@@ -1243,7 +1236,7 @@ describe("实验校验摘要与续跑", () => {
           {
             ...progress(dataset[0]!),
             coding: { level, signals }
-          } as unknown as CalibrationProgress
+          } as unknown as BlindCalibrationProgress
         ],
         activeStages: [],
         failureCounts: noFailures
@@ -1443,7 +1436,7 @@ describe("实验校验摘要与续跑", () => {
     ).toBe("LEVELS_LABEL_ALREADY_USED");
   });
 
-  it("检查点中的未知题目、重复题目或不同 rating 会被拒绝", () => {
+  it("检查点中的未知题目、重复题目或不同 contentHash 会被拒绝", () => {
     const directory = makeDirectoryUrl();
     const dataset = [item()];
     const currentFingerprint = fingerprint(dataset);
@@ -1462,13 +1455,13 @@ describe("实验校验摘要与续跑", () => {
       string,
       unknown
     > & {
-      progress: CalibrationProgress[];
+      progress: BlindCalibrationProgress[];
     };
     const validProgress = saved.progress[0]!;
-    const invalidProgressSets: readonly CalibrationProgress[][] = [
-      [{ ...validProgress, contestId: validProgress.contestId + 1 }],
+    const invalidProgressSets: readonly BlindCalibrationProgress[][] = [
+      [{ ...validProgress, safeId: "unknown-sample" }],
       [validProgress, validProgress],
-      [{ ...validProgress, rating: validProgress.rating + 100 }]
+      [{ ...validProgress, contentHash: "f".repeat(64) }]
     ];
     for (const invalidProgress of invalidProgressSets) {
       writeFileSync(
@@ -1483,7 +1476,7 @@ describe("实验校验摘要与续跑", () => {
             expectedLabel: "source",
             expectedProfileName: "review-balanced",
             expectedFingerprint: currentFingerprint,
-            expectedItems: dataset
+            expectedContent: content(dataset)
           })
         ).code
       ).toBe("LEVELS_CHECKPOINT_INVALID");

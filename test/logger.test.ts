@@ -38,6 +38,31 @@ describe("安全错误码", () => {
         message: "旧检查点内容"
       })
     ).toBe("LEVELS_CHECKPOINT_VERSION_UNSUPPORTED");
+    for (const code of [
+      "BLIND_CONTENT_CONTAINER_IDENTITY_MISMATCH",
+      "BLIND_EVALUATION_SAMPLE_SET_MISMATCH",
+      "BLIND_INFERENCE_STOPPED",
+      "LEVELS_BLIND_GOLD_MISMATCH",
+      "RECENT_CONTEST_FILTER_UNAVAILABLE",
+      "CODEFORCES_DATASET_PROBLEM_IDENTITY_INVALID",
+      "DIFFICULTY_CHECKPOINT_VERSION_UNSUPPORTED"
+    ]) {
+      expect(describeError({ code, message: "不得记录的私有内容" })).toBe(code);
+    }
+    for (const code of [
+      "LEVELS_RESUME_SOURCE_LOCKED",
+      "LEVELS_CROSS_LABEL_RESUME_UNSUPPORTED",
+      "LEVELS_REPORT_RUN_ALREADY_USED",
+      "VERDICT_CHECKPOINT_VERSION_UNSUPPORTED",
+      "VERDICT_CHECKPOINT_LOCKED_OR_UNAVAILABLE",
+      "VERDICT_CHECKPOINT_LOCK_NOT_HELD",
+      "VERDICT_CHECKPOINT_LOCK_OWNERSHIP_LOST",
+      "CODEFORCES_DATASET_SAMPLE_SIZE_INVALID",
+      "CODEFORCES_DATASET_BUCKET_INCOMPLETE",
+      "CODEFORCES_DATASET_FETCH_INCOMPLETE"
+    ]) {
+      expect(describeError({ code, message: "不得记录的私有内容" })).toBe(code);
+    }
   });
 
   it("把解析、校验和取消请求映射为固定错误码", () => {

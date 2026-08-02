@@ -1,7 +1,7 @@
 /**
- * 固定并发度的映射：把一组输入分给最多 N 个并行 worker 处理，保留原始顺序。
- * 实验脚本用它把逐题串行的 LLM 调用改成有限并发，大幅缩短总时长，同时不至于
- * 一次性把所有请求打给网关。
+ * 固定并发度的分批映射：每批最多 N 个 worker，整批全部成功收束后才启动下一批，
+ * 并保留原始顺序。不能用“某个成功 worker 立刻补位”的动态队列；Promise 已经拒绝
+ * 到失败 handler 真正关闸之间存在微任务窗口，补位会在首个失败后误发新的付费请求。
  */
 export async function mapWithConcurrency<TInput, TOutput>(
   items: readonly TInput[],
@@ -12,33 +12,20 @@ export async function mapWithConcurrency<TInput, TOutput>(
     throw new RangeError("同时处理任务数必须是 1 到 32 之间的整数。");
   }
   const results = new Array<TOutput>(items.length);
-  const limit = Math.max(1, Math.min(concurrency, items.length || 1));
-  let cursor = 0;
-  let stopped = false;
-  let firstError: unknown;
-
-  async function run(): Promise<void> {
-    while (!stopped) {
-      const index = cursor;
-      cursor += 1;
-      if (index >= items.length) {
-        return;
-      }
-      try {
-        results[index] = await worker(items[index]!, index);
-      } catch (error) {
-        if (!stopped) {
-          stopped = true;
-          firstError = error;
-        }
-        return;
-      }
+  for (let offset = 0; offset < items.length; offset += concurrency) {
+    const batch = items.slice(offset, offset + concurrency);
+    const settled = await Promise.allSettled(
+      batch.map((item, batchIndex) => worker(item, offset + batchIndex))
+    );
+    const failed = settled.find(
+      (entry): entry is PromiseRejectedResult => entry.status === "rejected"
+    );
+    if (failed !== undefined) {
+      throw failed.reason;
     }
-  }
-
-  await Promise.allSettled(Array.from({ length: limit }, () => run()));
-  if (stopped) {
-    throw firstError;
+    for (const [batchIndex, entry] of settled.entries()) {
+      results[offset + batchIndex] = (entry as PromiseFulfilledResult<TOutput>).value;
+    }
   }
   return results;
 }
