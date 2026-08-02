@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -57,8 +59,10 @@ import {
   scorePhysicalBlindArtifacts
 } from "../experiments/lib/physical-blind-score";
 import {
+  ensurePrivateArtifactExact,
   openPrivateArtifactSnapshotDescriptor,
-  verifyAndClosePrivateArtifactSnapshotDescriptor
+  verifyAndClosePrivateArtifactSnapshotDescriptor,
+  writePrivateArtifactExclusive
 } from "../experiments/lib/private-artifact-io";
 import type { ReviewTaskProblem } from "../src/pipelines/types";
 import type { RobotReviewTask } from "../src/urmotiv-schemas";
@@ -594,6 +598,50 @@ describe("物理盲测可信边界", () => {
     })).toThrowError(expect.objectContaining({
       code: "BLIND_ARTIFACT_SYMBOLIC_LINK"
     }));
+  });
+
+  it("exclusive publish 在 link 后崩溃会由 exact resume 收养唯一同 inode orphan", () => {
+    const directory = preparePrivateDirectory(outputDirectory, directoryOptions);
+    const target = join(outputDirectory, "recover.private.json");
+    expect(() => writePrivateArtifactExclusive(
+      directory,
+      "recover.private.json",
+      "{\"ok\":true}\n",
+      { afterTargetLink: () => { throw new Error("SIMULATED_PROCESS_CRASH"); } }
+    )).toThrow();
+    expect(lstatSync(target).nlink).toBe(2);
+    expect(readdirSync(outputDirectory).filter((name) => name.startsWith(".blind-")))
+      .toHaveLength(1);
+    expect(ensurePrivateArtifactExact(
+      directory,
+      "recover.private.json",
+      "{\"ok\":true}\n"
+    ).toString("utf8")).toBe("{\"ok\":true}\n");
+    expect(lstatSync(target).nlink).toBe(1);
+    expect(readdirSync(outputDirectory).filter((name) => name.startsWith(".blind-")))
+      .toHaveLength(0);
+    closePrivateDirectory(directory);
+  });
+
+  it("orphan 恢复遇到非内部名称或多余链接时失败关闭且不误删", () => {
+    const directory = preparePrivateDirectory(outputDirectory, directoryOptions);
+    const target = join(outputDirectory, "protected.private.json");
+    writePrivateArtifactExclusive(
+      directory,
+      "protected.private.json",
+      "{\"ok\":true}\n"
+    );
+    const unrelated = join(outputDirectory, "must-remain.alias");
+    linkSync(target, unrelated);
+    expect(() => ensurePrivateArtifactExact(
+      directory,
+      "protected.private.json",
+      "{\"ok\":true}\n"
+    )).toThrow("BLIND_ARTIFACT_FILE_LINK_INVALID");
+    expect(existsSync(target)).toBe(true);
+    expect(existsSync(unrelated)).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe("{\"ok\":true}\n");
+    closePrivateDirectory(directory);
   });
 
   it("callback/checkpoint/prediction 均不含 gold，且明确标为无可信执行证据", async () => {

@@ -2,6 +2,7 @@ import {
   chmodSync,
   existsSync,
   lstatSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -18,6 +19,7 @@ import {
   anchoredPrivatePath,
   closePrivateDirectory,
   durablyCommitCreatedPrivateDirectory,
+  openExistingPrivateDirectory,
   preparePrivateDirectory,
   readProtectedEnvFile
 } from "../scripts/private-runtime.mjs";
@@ -54,6 +56,43 @@ describe("Fermata 私有运行路径", () => {
       "PRIVATE_DIRECTORY_HANDLE_CLOSED"
     );
     closePrivateDirectory(result);
+  });
+
+  it("只读打开不存在目录时不创建，存在目录仍保持 dirfd 锚定", () => {
+    const missing = join(privateRoot, "missing-input");
+    expect(() => openExistingPrivateDirectory(missing, options)).toThrow(
+      "PRIVATE_DIRECTORY_UNAVAILABLE"
+    );
+    expect(existsSync(missing)).toBe(false);
+
+    const original = join(privateRoot, "existing-input");
+    const moved = join(privateRoot, "existing-input-moved");
+    mkdirSync(original, { mode: 0o700 });
+    const handle = openExistingPrivateDirectory(original, options);
+    expect(handle.created).toBe(false);
+    renameSync(original, moved);
+    mkdirSync(original, { mode: 0o700 });
+    writeFileSync(anchoredPrivatePath(handle, "proof.txt"), "anchored\n", {
+      mode: 0o600
+    });
+    expect(readFileSync(join(moved, "proof.txt"), "utf8")).toBe("anchored\n");
+    expect(existsSync(join(original, "proof.txt"))).toBe(false);
+    closePrivateDirectory(handle);
+  });
+
+  it("只读打开同样拒绝过宽权限与末级符号链接", () => {
+    const broad = join(privateRoot, "broad-input");
+    mkdirSync(broad, { mode: 0o755 });
+    expect(() => openExistingPrivateDirectory(broad, options)).toThrow(
+      "PRIVATE_DIRECTORY_INVALID_MODE"
+    );
+    const target = join(privateRoot, "input-target");
+    const linked = join(privateRoot, "input-linked");
+    mkdirSync(target, { mode: 0o700 });
+    symlinkSync(target, linked);
+    expect(() => openExistingPrivateDirectory(linked, options)).toThrow(
+      "PRIVATE_DIRECTORY_INVALID_TYPE"
+    );
   });
 
   it("新建目录先 fsync 自身、再 fsync 持有目录项的父目录", () => {
@@ -134,6 +173,26 @@ describe("Fermata 私有运行路径", () => {
     chmodSync(envPath, 0o644);
     expect(() => readProtectedEnvFile(envPath, options)).toThrow(
       "ENV_FILE_INVALID_MODE"
+    );
+
+    chmodSync(envPath, 0o400);
+    expect(() => readProtectedEnvFile(envPath, options)).toThrow(
+      "ENV_FILE_INVALID_MODE"
+    );
+
+    chmodSync(envPath, 0o640);
+    expect(() => readProtectedEnvFile(envPath, options)).toThrow(
+      "ENV_FILE_INVALID_MODE"
+    );
+  });
+
+  it("拒绝有额外硬链接的 env 文件", () => {
+    const envPath = join(privateRoot, "fermata.env");
+    const aliasPath = join(privateRoot, "fermata-alias.env");
+    writeFileSync(envPath, "EVAL_CONCURRENCY=2\n", { mode: 0o600 });
+    linkSync(envPath, aliasPath);
+    expect(() => readProtectedEnvFile(envPath, options)).toThrow(
+      "ENV_FILE_INVALID_LINK"
     );
   });
 

@@ -21,6 +21,14 @@ export function preparePrivateDirectory(
   }
 ): PrivateDirectoryHandle;
 
+export function openExistingPrivateDirectory(
+  privateDirectory: string,
+  options?: {
+    readonly privateRoot?: string;
+    readonly containingWorkspace?: string;
+  }
+): PrivateDirectoryHandle;
+
 export function anchoredPrivatePath(
   privateDirectoryHandle: PrivateDirectoryHandle,
   fileName: string

@@ -213,12 +213,13 @@ export function durablyCommitCreatedPrivateDirectory(
   synchronize(parentDirectoryDescriptor);
 }
 
-export function preparePrivateDirectory(
+function openPrivateDirectoryInternal(
   privateDirectory,
   {
     privateRoot = projectPrivateRoot,
-    containingWorkspace = workspaceRoot
-  } = {}
+    containingWorkspace = workspaceRoot,
+    createMissing
+  }
 ) {
   if (!isAbsolute(privateDirectory)) {
     failPrivateRuntime("PRIVATE_DIRECTORY_NOT_ABSOLUTE");
@@ -242,6 +243,7 @@ export function preparePrivateDirectory(
       finalDescriptor = openSync(finalAnchoredPath, directoryOpenFlags);
     } catch (error) {
       if (
+        !createMissing ||
         typeof error !== "object" ||
         error === null ||
         !("code" in error) ||
@@ -288,6 +290,36 @@ export function preparePrivateDirectory(
     }
     failPrivateRuntime("PRIVATE_DIRECTORY_UNAVAILABLE");
   }
+}
+
+/** 打开已存在的私有输入目录；只读路径绝不能因为拼写错误而创建空目录。 */
+export function openExistingPrivateDirectory(
+  privateDirectory,
+  {
+    privateRoot = projectPrivateRoot,
+    containingWorkspace = workspaceRoot
+  } = {}
+) {
+  return openPrivateDirectoryInternal(privateDirectory, {
+    privateRoot,
+    containingWorkspace,
+    createMissing: false
+  });
+}
+
+/** 打开输出目录，不存在时只创建经过逐段验证的末级目录。 */
+export function preparePrivateDirectory(
+  privateDirectory,
+  {
+    privateRoot = projectPrivateRoot,
+    containingWorkspace = workspaceRoot
+  } = {}
+) {
+  return openPrivateDirectoryInternal(privateDirectory, {
+    privateRoot,
+    containingWorkspace,
+    createMissing: true
+  });
 }
 
 function sameFileSnapshot(before, after) {
@@ -363,8 +395,11 @@ export function readProtectedEnvFile(
     if (!before.isFile()) {
       failPrivateRuntime("ENV_FILE_INVALID_TYPE");
     }
-    if ((before.mode & 0o77n) !== 0n) {
+    if ((before.mode & 0o777n) !== 0o600n) {
       failPrivateRuntime("ENV_FILE_INVALID_MODE");
+    }
+    if (before.nlink !== 1n) {
+      failPrivateRuntime("ENV_FILE_INVALID_LINK");
     }
     if (
       typeof process.getuid === "function" &&
