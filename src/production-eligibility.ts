@@ -25,7 +25,32 @@ export interface ProductionReviewGrantClaims {
   readonly evidenceFingerprint: string;
 }
 
-const productionReviewGrantClaims = new WeakMap<object, ProductionReviewGrantClaims>();
+function frozenClaimsCopy(
+  claims: ProductionReviewGrantClaims
+): ProductionReviewGrantClaims {
+  return Object.freeze({
+    profileName: claims.profileName,
+    experimentVersion: claims.experimentVersion,
+    expectedRunnerIdentity: claims.expectedRunnerIdentity,
+    engineBuildFingerprint: claims.engineBuildFingerprint,
+    evidenceFingerprint: claims.evidenceFingerprint
+  });
+}
+
+/**
+ * 所有未来登记都先复制并冻结 claims，避免签发方保留的原对象在登记后反向改写
+ * WeakMap 内的资格绑定。当前仍没有任何可达的登记或签发入口。
+ */
+class ProductionReviewGrantClaimsStore extends WeakMap<
+  object,
+  ProductionReviewGrantClaims
+> {
+  override set(grant: object, claims: ProductionReviewGrantClaims): this {
+    return super.set(grant, frozenClaimsCopy(claims));
+  }
+}
+
+const productionReviewGrantClaims = new ProductionReviewGrantClaimsStore();
 
 /**
  * 当前模块故意没有签发入口；未来源证据聚合器必须在本模块内完成校验后才能
@@ -49,7 +74,8 @@ export function inspectProductionReviewGrant(
   ) {
     return null;
   }
-  return claims;
+  // 不向调用方暴露 WeakMap 内保存的对象；返回值自身也不可变。
+  return frozenClaimsCopy(claims);
 }
 
 export type ProductionEligibilityDecision =

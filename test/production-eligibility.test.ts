@@ -44,5 +44,17 @@ describe("正式审题资格总门", () => {
       expectedRunnerIdentity: "b".repeat(64),
       engineBuildFingerprint: "c".repeat(64)
     }, expected)).toBeNull();
+
+    const frozenLookalike = Object.freeze({
+      profileName: expected.profileName,
+      experimentVersion: expected.experimentVersion,
+      evidenceFingerprint: "a".repeat(64),
+      expectedRunnerIdentity: "b".repeat(64),
+      engineBuildFingerprint: "c".repeat(64)
+    });
+    expect(inspectProductionReviewGrant(frozenLookalike, expected)).toBeNull();
+    expect(
+      inspectProductionReviewGrant({ ...frozenLookalike }, expected)
+    ).toBeNull();
   });
 });
