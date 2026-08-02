@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
+import type { ZodType } from "zod";
 import type { PipelineModelConfig } from "../src/pipelines/types";
 import type { ProductionReviewGrant } from "../src/production-eligibility";
-import { sealEvidenceArtifact } from "../src/review-flow/evidence";
+import {
+  sealEvidenceArtifact,
+  type EvidenceArtifact
+} from "../src/review-flow/evidence";
 import {
   buildAdjudicatorMessages,
   buildAdversaryMessages,
@@ -25,16 +29,31 @@ import {
   historicalReviewRubricPromptText
 } from "../src/review-flow/historical-rubric";
 import {
+  adversaryPayloadSchema,
+  contestFitPayloadSchema,
+  criticPayloadSchema,
+  difficultyPayloadSchema,
+  editorialPayloadSchema,
+  originalityPayloadSchema,
   reviewFlowRoleSchema,
   solutionAnalystPayloadSchema,
   solverPayloadSchema,
-  technicalAuditPayloadSchema
+  tagsPayloadSchema,
+  trustedRoleExecutionResultSchema,
+  technicalAuditPayloadSchema,
+  type ReviewFlowRole
 } from "../src/review-flow/schemas";
 import {
+  buildAdjudicatorView,
+  buildAdversaryView,
   buildContestFitView,
+  buildCriticView,
+  buildDifficultyView,
   buildEditorialJudgeView,
+  buildOriginalityView,
   buildSolutionAnalystView,
   buildStatementOnlyView,
+  buildTagsView,
   buildTechnicalAuditorView,
   freezeReviewFlowSource
 } from "../src/review-flow/views";
@@ -146,6 +165,11 @@ function flowViews() {
   return {
     source: frozenSource,
     statement,
+    artifacts: {
+      solver,
+      solutionAnalyst,
+      technicalAudit
+    },
     technical: buildTechnicalAuditorView({
       source: frozenSource,
       statement,
@@ -166,6 +190,14 @@ function flowViews() {
       solutionAnalyst,
       technicalAudit
     }),
+    difficulty: buildDifficultyView({
+      statement,
+      solver,
+      solutionAnalyst,
+      technicalAudit
+    }),
+    originality: buildOriginalityView(frozenSource, statement),
+    tags: buildTagsView(frozenSource, statement),
     solutionAnalyst: buildSolutionAnalystView(frozenSource, statement, solver)
   };
 }
@@ -189,6 +221,119 @@ function modelConfigs(model = "synthetic-model"): ReviewFlowModelConfigs {
     reviewFlowRoleSchema.options.map((role) => [role, modelConfig(model)])
   ) as unknown as ReviewFlowModelConfigs;
 }
+
+function syntheticArtifact<T>(
+  role: ReviewFlowRole,
+  payloadSchema: ZodType<T>,
+  payload: unknown
+): EvidenceArtifact<T> {
+  return sealEvidenceArtifact({
+    role,
+    problemContentHash,
+    inputHash: "3".repeat(64),
+    sourceSnapshotHash,
+    execution: untrustedExecution,
+    identity: { promptVersion: `wire-${role}-v1`, modelIdentity },
+    payloadSchema,
+    payload
+  });
+}
+
+const wireRolePayloads: Readonly<Record<ReviewFlowRole, unknown>> = {
+  solver: {
+    solved: true,
+    narrative: "合成盲解记录。",
+    approach: "直接处理输入。",
+    claimedComplexity: "O(1)",
+    uncertainties: []
+  },
+  solution_analyst: {
+    solverCorrect: true,
+    officialSolutionCorrect: true,
+    approachRelation: "equivalent",
+    keyInsights: ["直接处理"],
+    issues: [],
+    rationale: "合成题解与盲解一致。"
+  },
+  technical_auditor: {
+    statementSolutionConsistency: "verified",
+    judgeability: "verified",
+    sampleConsistency: "verified",
+    constraintSufficiency: "verified",
+    concerns: [],
+    rationale: "合成技术核验通过。"
+  },
+  difficulty: {
+    codeforcesDifficulty: 800,
+    thinkingLevel: 1,
+    codingLevel: 1,
+    confidence: 0.8,
+    rationale: "合成难度证据。"
+  },
+  editorial_judge: {
+    qualityLevel: 4,
+    noveltyLevel: 4,
+    ideaDepthLevel: 4,
+    naturalnessLevel: 4,
+    contestantExperienceLevel: 4,
+    evidenceCoverage: { strengths: "found", concerns: "none_found" },
+    evidence: [{
+      dimension: "idea_depth",
+      direction: "strength",
+      severity: "note",
+      confidence: 0.8,
+      summary: "合成正向品味证据。"
+    }],
+    rationale: "合成命题品味判断。"
+  },
+  contest_fit: {
+    icpcFit: "strong",
+    implementationBurden: 2,
+    thinkingImplementationBalance: "strong",
+    knowledgeFairness: "fair",
+    problemsetRole: "introductory",
+    roleConfidence: 0.8,
+    evidenceCoverage: { strengths: "found", concerns: "none_found" },
+    evidence: [{
+      dimension: "icpc_fit",
+      direction: "strength",
+      severity: "note",
+      confidence: 0.8,
+      summary: "合成比赛适配证据。"
+    }],
+    rationale: "合成比赛适配判断。"
+  },
+  originality: {
+    originalityLevel: 4,
+    sameProblemAsExisting: false,
+    highestSimilarity: 0,
+    evidenceIds: [],
+    rationale: "合成查重证据未发现同题。"
+  },
+  tags: {
+    tagIds: ["basic.simulation"],
+    rationale: "选择合成固定标签。"
+  },
+  critic: {
+    conflicts: [],
+    missingRoles: [],
+    rationale: "合成证据无冲突。"
+  },
+  adversary: {
+    counterexamples: [],
+    rationale: "合成证据无致命反例。"
+  },
+  adjudicator: {
+    verdict: "approve",
+    qualityLevel: 4,
+    fixability: "none",
+    strengths: ["合成优点"],
+    improvements: "合成材料已满足要求。",
+    publicComment: "",
+    privateNote: "",
+    citedEvidenceIds: [`ev-${"4".repeat(32)}`]
+  }
+};
 
 describe("历史人工标准驱动的多角色提示词", () => {
   it("盲解者只收到题面视图，提示词是分阶段约束而不是一句综合判断", () => {
@@ -270,6 +415,141 @@ describe("历史人工标准驱动的多角色提示词", () => {
     for (const role of reviewFlowRoleSchema.options) {
       expect(changedModel[role].modelIdentity).not.toBe(first[role].modelIdentity);
     }
+  });
+
+  it("11 个正式角色逐一调用各自模型槽位并完成严格 HTTP receipt", async () => {
+    const uniqueModels = Object.fromEntries(
+      reviewFlowRoleSchema.options.map((role) => [role, `wire-model-${role}`])
+    ) as Record<ReviewFlowRole, string>;
+    const roleByModel = new Map(
+      reviewFlowRoleSchema.options.map((role) => [uniqueModels[role], role] as const)
+    );
+    const observedRequests: { readonly role: ReviewFlowRole; readonly model: string }[] = [];
+    const fetchImpl = vi.fn(async (
+      _url: string | URL | Request,
+      init?: RequestInit
+    ) => {
+      const body = JSON.parse(String(init?.body)) as { readonly model?: unknown };
+      if (typeof body.model !== "string") throw new Error("wire_model_missing");
+      const role = roleByModel.get(body.model);
+      if (role === undefined) throw new Error("wire_model_unexpected");
+      observedRequests.push({ role, model: body.model });
+      return new Response(JSON.stringify({
+        choices: [{
+          message: { content: JSON.stringify(wireRolePayloads[role]) },
+          finish_reason: "stop"
+        }]
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    const models = Object.fromEntries(reviewFlowRoleSchema.options.map((role) => {
+      const config = modelConfig(uniqueModels[role]);
+      return [role, {
+        ...config,
+        runtime: { ...config.runtime, fetch: fetchImpl }
+      }];
+    })) as unknown as ReviewFlowModelConfigs;
+    const bundle = createReviewFlowLlmBundle({
+      models,
+      difficultyAnchors: [],
+      profileName: "synthetic-profile",
+      experimentVersion: "synthetic-experiment",
+      engineBuildFingerprint: "c".repeat(64),
+      productionGrant: null
+    });
+
+    const views = flowViews();
+    const difficulty = syntheticArtifact(
+      "difficulty",
+      difficultyPayloadSchema,
+      wireRolePayloads.difficulty
+    );
+    const editorial = syntheticArtifact(
+      "editorial_judge",
+      editorialPayloadSchema,
+      wireRolePayloads.editorial_judge
+    );
+    const contestFit = syntheticArtifact(
+      "contest_fit",
+      contestFitPayloadSchema,
+      wireRolePayloads.contest_fit
+    );
+    const originality = syntheticArtifact(
+      "originality",
+      originalityPayloadSchema,
+      wireRolePayloads.originality
+    );
+    const tags = syntheticArtifact(
+      "tags",
+      tagsPayloadSchema,
+      wireRolePayloads.tags
+    );
+    const coreEvidence: EvidenceArtifact<unknown>[] = [
+      views.artifacts.solver,
+      views.artifacts.solutionAnalyst,
+      views.artifacts.technicalAudit,
+      difficulty,
+      editorial,
+      contestFit,
+      originality,
+      tags
+    ];
+    const criticView = buildCriticView(problemContentHash, coreEvidence);
+    const adversaryView = buildAdversaryView(criticView);
+    const critic = syntheticArtifact(
+      "critic",
+      criticPayloadSchema,
+      wireRolePayloads.critic
+    );
+    const adversary = syntheticArtifact(
+      "adversary",
+      adversaryPayloadSchema,
+      wireRolePayloads.adversary
+    );
+    const adjudicatorView = buildAdjudicatorView(criticView, critic, adversary);
+    const invocations: Readonly<Record<ReviewFlowRole, () => Promise<unknown>>> = {
+      solver: () => bundle.roles.solver(views.statement),
+      solution_analyst: () => bundle.roles.solutionAnalyst(views.solutionAnalyst),
+      technical_auditor: () => bundle.roles.technicalAuditor(views.technical),
+      difficulty: () => bundle.roles.difficulty(views.difficulty),
+      editorial_judge: () => bundle.roles.editorialJudge(views.editorial),
+      contest_fit: () => bundle.roles.contestFit(views.contestFit),
+      originality: () => bundle.roles.originality(views.originality),
+      tags: () => bundle.roles.tags(views.tags),
+      critic: () => bundle.roles.critic(criticView),
+      adversary: () => bundle.roles.adversary(adversaryView),
+      adjudicator: () => bundle.roles.adjudicator(adjudicatorView)
+    };
+    expect(Object.keys(invocations).sort()).toEqual([...reviewFlowRoleSchema.options].sort());
+
+    const completedRoles: ReviewFlowRole[] = [];
+    for (const role of reviewFlowRoleSchema.options) {
+      const requestIndex = observedRequests.length;
+      const result = trustedRoleExecutionResultSchema.parse(await invocations[role]());
+      expect(observedRequests).toHaveLength(requestIndex + 1);
+      expect(observedRequests[requestIndex]).toEqual({ role, model: uniqueModels[role] });
+      expect(result.receipt).toEqual({
+        schemaVersion: 2,
+        requestCount: 1,
+        transportAttemptCount: 1,
+        eofVerified: true,
+        jsonSchemaValidated: true,
+        responses: [{
+          schemaVersion: 2,
+          transportAttemptCount: 1,
+          eofVerified: true,
+          responseMode: "json",
+          finishReasonStopVerified: true,
+          sseDoneObserved: null
+        }]
+      });
+      completedRoles.push(role);
+    }
+
+    expect(fetchImpl).toHaveBeenCalledTimes(reviewFlowRoleSchema.options.length);
+    expect(completedRoles).toEqual(reviewFlowRoleSchema.options);
+    expect(new Set(observedRequests.map((request) => request.role))).toEqual(
+      new Set(reviewFlowRoleSchema.options)
+    );
   });
 
   it("可信 runner 使用工厂内捕获并冻结的配置，创建后篡改原对象不能换模型或传输层", async () => {
