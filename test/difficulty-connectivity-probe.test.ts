@@ -115,7 +115,7 @@ function validResult(): DifficultyConnectivityProbeResult {
 
 function validCommonEvidence() {
   return {
-    schemaVersion: 3 as const,
+    schemaVersion: 4 as const,
     label: difficultyConnectivityProbeLabel,
     experimentVersion: difficultyConnectivityProbeExperimentVersion,
     codeVersion: "b".repeat(40),
@@ -172,25 +172,26 @@ function setupPrivateDirectory() {
 }
 
 describe("Candidate C 连通性请求契约", () => {
-  it("全新 e 身份严格绑定 v6、schema v3 与当前配置，a/b/c/d 永久历史化", () => {
+  it("全新 f 身份严格绑定 v7、schema v4 与当前配置，a/b/c/d/e 永久历史化", () => {
     expect(difficultyConnectivityProbeExperimentVersion).toBe(
-      "experiment-2026-08-difficulty-candidate-c-provider-v1-post-done-shape-v6"
+      "experiment-2026-08-difficulty-candidate-c-provider-v1-post-done-shape-v7"
     );
-    expect(difficultyConnectivityProbeArtifactSchemaVersion).toBe(3);
+    expect(difficultyConnectivityProbeArtifactSchemaVersion).toBe(4);
     expect(difficultyConnectivityExpectedModelsConfigSha256).toBe(
-      "d7f9058d2a2f13c4582e931075fb0ffc2d17296b985fd258d4e1c6ae3fa690f7"
+      "bee5d987338283bb3c7f283f9192c97fd1acc9a32dfca4fece94ac42d97d8cea"
     );
     expect(sha256ConnectivityProbe(
       readFileSync(new URL("../config/models.yaml", import.meta.url))
     )).toBe(difficultyConnectivityExpectedModelsConfigSha256);
     expect(difficultyConnectivityProbeLabel).toBe(
-      "difficulty-candidate-c-connectivity-probe-20260801-e"
+      "difficulty-candidate-c-connectivity-probe-20260802-f"
     );
     expect(difficultyConnectivityPreviousProbeLabels).toEqual([
       "difficulty-candidate-c-connectivity-probe-20260801-a",
       "difficulty-candidate-c-connectivity-probe-20260801-b",
       "difficulty-candidate-c-connectivity-probe-20260801-c",
-      "difficulty-candidate-c-connectivity-probe-20260801-d"
+      "difficulty-candidate-c-connectivity-probe-20260801-d",
+      "difficulty-candidate-c-connectivity-probe-20260801-e"
     ]);
     for (const previousLabel of difficultyConnectivityPreviousProbeLabels) {
       expect(difficultyConnectivityProbeCompletionFileName).not.toContain(
@@ -419,11 +420,11 @@ describe("Candidate C 单请求与真实 EOF", () => {
 
   it.each([
     {
-      substage: "duplicate_done",
+      substage: "data_after_done_benign_controls_only",
       invalidEvents: ["data: [DONE]", "", "data: [DONE]", "", ""].join("\n")
     },
     {
-      substage: "data_after_done_usage_metadata_only",
+      substage: "data_after_done_benign_controls_only",
       invalidEvents: [
         "data: [DONE]",
         "",
@@ -460,7 +461,37 @@ describe("Candidate C 单请求与真实 EOF", () => {
       ].join("\n")
     },
     {
-      substage: "data_after_done_other_or_unclassifiable",
+      substage: "data_after_done_json_syntax_invalid",
+      invalidEvents: [
+        "data: [DONE]",
+        "",
+        "data: {not-json}",
+        "",
+        ""
+      ].join("\n")
+    },
+    {
+      substage: "data_after_done_json_non_object",
+      invalidEvents: [
+        "data: [DONE]",
+        "",
+        "data: 7",
+        "",
+        ""
+      ].join("\n")
+    },
+    {
+      substage: "data_after_done_error_object",
+      invalidEvents: [
+        "data: [DONE]",
+        "",
+        'data: {"error":{"code":"synthetic"}}',
+        "",
+        ""
+      ].join("\n")
+    },
+    {
+      substage: "data_after_done_unknown_object_or_scan_limit",
       invalidEvents: [
         "data: [DONE]",
         "",
@@ -546,6 +577,67 @@ describe("Candidate C 单请求与真实 EOF", () => {
     }
   );
 
+  it("逐字节分片的空 data、重复 DONE 与严格元数据组合只落 benign 枚举", async () => {
+    const validContent = JSON.stringify({
+      rating: 800,
+      confidence: 0.9,
+      rationale: "合成样本"
+    });
+    const bytes = new TextEncoder().encode([
+      `data: ${JSON.stringify({
+        choices: [{
+          delta: { content: validContent },
+          finish_reason: "stop"
+        }]
+      })}`,
+      "",
+      "data: [DONE]",
+      "",
+      "data:",
+      "",
+      "data: [DONE]",
+      "",
+      `data: ${JSON.stringify({
+        choices: [],
+        usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 }
+      })}`,
+      "",
+      ""
+    ].join("\r\n"));
+    let offset = 0;
+    const result = await executeDifficultyConnectivityProbe({
+      problem,
+      anchors: [],
+      spec,
+      credentials,
+      runtime,
+      baseFetch: async () => new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (offset < bytes.byteLength) {
+              controller.enqueue(bytes.slice(offset, offset + 1));
+              offset += 1;
+            } else {
+              controller.close();
+            }
+          }
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } }
+      )
+    });
+    expect(result).toMatchObject({
+      status: "failed",
+      requestCount: 1,
+      fetchInvocationCount: 1,
+      httpStatus: 200,
+      httpEofObserved: true,
+      responseBodyCancelled: false,
+      formatFailureStage: "trailing_data",
+      formatFailureSubstage: "data_after_done_benign_controls_only",
+      code: "LLM_RESPONSE_FORMAT_INVALID"
+    });
+  });
+
   it("DONE 后元数据在真实 EOF 前取消只能落为 tail-incomplete", async () => {
     const encoder = new TextEncoder();
     const taskController = new AbortController();
@@ -613,6 +705,77 @@ describe("Candidate C 单请求与真实 EOF", () => {
     }).complete).toBe(false);
   });
 
+  it("DONE 后即使已看到危险形状，等待 EOF 超时也只能落为 tail-incomplete", async () => {
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      let cancelled = false;
+      const baseFetch = vi.fn(async () => new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            streamController = controller;
+          },
+          cancel() {
+            cancelled = true;
+          }
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } }
+      ));
+      const pending = executeDifficultyConnectivityProbe({
+        problem,
+        anchors: [],
+        spec,
+        credentials,
+        runtime: {
+          firstOutputTimeoutMs: 1_000,
+          outputIdleTimeoutMs: 1_000,
+          maximumDurationMs: 5_000,
+          maxAttempts: 1,
+          baseDelayMs: 1
+        },
+        baseFetch
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(baseFetch).toHaveBeenCalledTimes(1);
+      streamController.enqueue(encoder.encode([
+        `data: ${JSON.stringify({
+          choices: [{
+            delta: { content: JSON.stringify({
+              rating: 800,
+              confidence: 0.9,
+              rationale: "合成样本"
+            }) },
+            finish_reason: "stop"
+          }]
+        })}`,
+        "",
+        "data: [DONE]",
+        "",
+        'data: {"choices":[],"content":"绝不落盘的尾部正文"}',
+        "",
+        ""
+      ].join("\n")));
+      await vi.advanceTimersByTimeAsync(0);
+
+      const settled = expect(pending).resolves.toMatchObject({
+        status: "failed",
+        httpEofObserved: false,
+        responseBodyCancelled: true,
+        formatFailureStage: "trailing_data",
+        formatFailureSubstage: "data_after_done_tail_incomplete",
+        code: "LLM_OUTPUT_IDLE_TIMEOUT"
+      });
+      await vi.advanceTimersByTimeAsync(1_001);
+      await settled;
+      expect(cancelled).toBe(true);
+      const result = await pending;
+      expect(JSON.stringify(result)).not.toContain("绝不落盘");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("结果 schema 拒绝未知子阶段、主子阶段错配、外部错误码和额外字段", () => {
     const failed = {
       ...validResult(),
@@ -620,15 +783,17 @@ describe("Candidate C 单请求与真实 EOF", () => {
       schemaValidated: null,
       stopAndHttpEofVerified: null,
       formatFailureStage: "trailing_data" as const,
-      formatFailureSubstage: "duplicate_done" as const,
+      formatFailureSubstage: "data_after_done_benign_controls_only" as const,
       code: "LLM_RESPONSE_FORMAT_INVALID"
     };
     for (const formatFailureSubstage of [
-      "duplicate_done",
-      "data_after_done_usage_metadata_only",
+      "data_after_done_benign_controls_only",
+      "data_after_done_json_syntax_invalid",
+      "data_after_done_json_non_object",
+      "data_after_done_error_object",
+      "data_after_done_unknown_object_or_scan_limit",
       "data_after_done_choices_present",
       "data_after_done_content_or_tool_present",
-      "data_after_done_other_or_unclassifiable",
       "choice_after_stop"
     ] as const) {
       expect(difficultyConnectivityProbeResultSchema.parse({
@@ -647,6 +812,9 @@ describe("Candidate C 单请求与真实 EOF", () => {
     });
     for (const invalid of [
       { ...failed, formatFailureSubstage: "data_after_done" },
+      { ...failed, formatFailureSubstage: "duplicate_done" },
+      { ...failed, formatFailureSubstage: "data_after_done_usage_metadata_only" },
+      { ...failed, formatFailureSubstage: "data_after_done_other_or_unclassifiable" },
       { ...failed, formatFailureSubstage: "provider_private_value" },
       { ...failed, formatFailureStage: "event_json" },
       { ...failed, code: "PRIVATE_PROVIDER_ERROR_TEXT" },
@@ -654,13 +822,13 @@ describe("Candidate C 单请求与真实 EOF", () => {
       {
         ...failed,
         httpEofObserved: false,
-        formatFailureSubstage: "data_after_done_usage_metadata_only"
+        formatFailureSubstage: "data_after_done_benign_controls_only"
       },
       {
         ...failed,
         httpEofObserved: false,
         responseBodyCancelled: true,
-        formatFailureSubstage: "data_after_done_usage_metadata_only",
+        formatFailureSubstage: "data_after_done_benign_controls_only",
         code: "LLM_CANCELLED"
       },
       {
@@ -762,7 +930,7 @@ describe("Candidate C 单请求与真实 EOF", () => {
 });
 
 describe("Candidate C 私有检查点、completion 与标签锁", () => {
-  it("保留旧 a/b/c/d 产物，但 e 只认自己的独立命名空间", () => {
+  it("保留旧 a/b/c/d/e 产物，但 f 只认自己的独立命名空间", () => {
     const fixture = setupPrivateDirectory();
     try {
       for (const previousLabel of difficultyConnectivityPreviousProbeLabels) {
@@ -780,7 +948,7 @@ describe("Candidate C 私有检查点、completion 与标签锁", () => {
       writeFileSync(
         join(fixture.output, difficultyConnectivityProbeCompletionFileName),
         `${JSON.stringify({
-          label: "difficulty-candidate-c-connectivity-probe-20260801-d",
+          label: "difficulty-candidate-c-connectivity-probe-20260801-e",
           complete: false
         })}\n`,
         { encoding: "utf8", flag: "wx", mode: 0o600 }
@@ -793,7 +961,7 @@ describe("Candidate C 私有检查点、completion 与标签锁", () => {
     }
   });
 
-  it("a/b/c/d 的旧 completion 即使改名也不能通过 e 的严格 schema", () => {
+  it("a/b/c/d/e 的旧 completion 即使改名也不能通过 f 的严格 schema", () => {
     const completion = buildDifficultyConnectivityCompletion({
       commonEvidence: validCommonEvidence(),
       result: validResult(),

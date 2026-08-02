@@ -497,11 +497,11 @@ describe("chatComplete：正常路径", () => {
 
   it.each([
     {
-      substage: "duplicate_done",
+      substage: "data_after_done_benign_controls_only",
       invalidEvents: ["data: [DONE]", "", "data: [DONE]", "", ""].join("\n")
     },
     {
-      substage: "data_after_done_other_or_unclassifiable",
+      substage: "data_after_done_unknown_object_or_scan_limit",
       invalidEvents: [
         "data: [DONE]",
         "",
@@ -578,24 +578,24 @@ describe("chatComplete：正常路径", () => {
     {
       name: "strict usage metadata",
       tailData: JSON.stringify(strictUsageMetadataEvent()),
-      expectedSubstage: "data_after_done_usage_metadata_only"
+      expectedSubstage: "data_after_done_benign_controls_only"
     },
     {
       name: "empty choices is metadata evidence",
       tailData: JSON.stringify({ choices: [] }),
-      expectedSubstage: "data_after_done_usage_metadata_only"
+      expectedSubstage: "data_after_done_benign_controls_only"
     },
     {
       name: "bounded usage counters are metadata evidence",
       tailData: JSON.stringify({ usage: { total_tokens: 7 } }),
-      expectedSubstage: "data_after_done_usage_metadata_only"
+      expectedSubstage: "data_after_done_benign_controls_only"
     },
     {
       name: "nullable usage detail needs a real numeric counter",
       tailData: JSON.stringify({
         usage: { total_tokens: 7, completion_tokens_details: null }
       }),
-      expectedSubstage: "data_after_done_usage_metadata_only"
+      expectedSubstage: "data_after_done_benign_controls_only"
     },
     {
       name: "nested nullable usage detail can accompany a real numeric counter",
@@ -605,12 +605,12 @@ describe("chatComplete：正常路径", () => {
           completion_tokens_details: { reasoning_tokens: null }
         }
       }),
-      expectedSubstage: "data_after_done_usage_metadata_only"
+      expectedSubstage: "data_after_done_benign_controls_only"
     },
     {
       name: "bounded standard id is metadata evidence",
       tailData: JSON.stringify({ id: "synthetic-completion-id" }),
-      expectedSubstage: "data_after_done_usage_metadata_only"
+      expectedSubstage: "data_after_done_benign_controls_only"
     },
     {
       name: "non-empty choices without output fields",
@@ -652,12 +652,12 @@ describe("chatComplete：正常路径", () => {
     {
       name: "unknown top-level field",
       tailData: JSON.stringify({ choices: [], provider_payload: "合成未知值" }),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
     },
     {
       name: "empty object has no metadata evidence",
       tailData: JSON.stringify({}),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
     },
     {
       name: "null and blank standard fields have no metadata evidence",
@@ -666,7 +666,7 @@ describe("chatComplete：正常路径", () => {
         system_fingerprint: null,
         service_tier: null
       }),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
     },
     {
       name: "all-null optional fields have no metadata evidence",
@@ -674,14 +674,14 @@ describe("chatComplete：正常路径", () => {
         system_fingerprint: null,
         service_tier: null
       }),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
     },
     {
       name: "all-null usage has no numeric metadata evidence",
       tailData: JSON.stringify({
         usage: { total_tokens: null, completion_tokens_details: null }
       }),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
     },
     {
       name: "nested all-null usage still has no numeric metadata evidence",
@@ -690,26 +690,34 @@ describe("chatComplete：正常路径", () => {
           completion_tokens_details: { reasoning_tokens: null }
         }
       }),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
     },
     {
       name: "scalar usage is not the strict usage object",
       tailData: JSON.stringify({ usage: 7 }),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
     },
     {
       name: "unknown null field is not metadata evidence",
       tailData: JSON.stringify({ provider_payload: null }),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
     },
     {
       name: "provider error object",
       tailData: JSON.stringify({ error: { code: "synthetic_error" } }),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_error_object"
     },
     {
-      name: "message inside an error object still uses dangerous priority",
+      name: "standard message inside a top-level error remains an error envelope",
       tailData: JSON.stringify({ error: { message: "合成错误正文" } }),
+      expectedSubstage: "data_after_done_error_object"
+    },
+    {
+      name: "content sibling outside an error object still uses dangerous priority",
+      tailData: JSON.stringify({
+        error: { message: "合成错误说明" },
+        content: "合成尾部正文"
+      }),
       expectedSubstage: "data_after_done_content_or_tool_present"
     },
     {
@@ -728,7 +736,17 @@ describe("chatComplete：正常路径", () => {
     {
       name: "malformed JSON",
       tailData: "{not-json}",
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_json_syntax_invalid"
+    },
+    {
+      name: "valid JSON scalar is not an event object",
+      tailData: "7",
+      expectedSubstage: "data_after_done_json_non_object"
+    },
+    {
+      name: "valid JSON array without dangerous fields is not an event object",
+      tailData: "[]",
+      expectedSubstage: "data_after_done_json_non_object"
     },
     {
       name: "usage counter exceeds depth bound",
@@ -736,17 +754,17 @@ describe("chatComplete：正常路径", () => {
         choices: [],
         usage: { a: { b: { c: { d: { e: 1 } } } } }
       }),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
     },
     {
       name: "usage contains a negative counter",
       tailData: JSON.stringify({ choices: [], usage: { total_tokens: -1 } }),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
     },
     {
       name: "usage key is outside the fixed grammar",
       tailData: JSON.stringify({ choices: [], usage: { "total-tokens": 7 } }),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
     },
     {
       name: "usage counter is not a safe integer",
@@ -754,7 +772,7 @@ describe("chatComplete：正常路径", () => {
         choices: [],
         usage: { total_tokens: Number.MAX_SAFE_INTEGER + 1 }
       }),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
     },
     {
       name: "usage exceeds bounded key count",
@@ -764,22 +782,32 @@ describe("chatComplete：正常路径", () => {
           Array.from({ length: 65 }, (_, index) => [`counter_${index}`, index])
         )
       }),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
+    },
+    {
+      name: "non-empty choices outrank an oversized sibling-key set",
+      tailData: JSON.stringify({
+        ...Object.fromEntries(
+          Array.from({ length: 260 }, (_, index) => [`filler_${index}`, index])
+        ),
+        choices: [{ index: 0 }]
+      }),
+      expectedSubstage: "data_after_done_choices_present"
     },
     {
       name: "metadata string exceeds the length bound",
       tailData: JSON.stringify({ id: "x".repeat(1_025) }),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
     },
     {
       name: "metadata string contains a control character",
       tailData: JSON.stringify({ id: "synthetic\nidentifier" }),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
     },
     {
       name: "created timestamp is negative",
       tailData: JSON.stringify({ created: -1 }),
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
     }
   ] as const)(
     "DONE 后形状只输出封闭分类且仍严格失败：$name",
@@ -821,7 +849,7 @@ describe("chatComplete：正常路径", () => {
       })).rejects.toMatchObject({
         code: "LLM_RESPONSE_FORMAT_INVALID",
         formatFailureStage: "trailing_data",
-        formatFailureSubstage: "data_after_done_other_or_unclassifiable"
+        formatFailureSubstage: "data_after_done_benign_controls_only"
       });
     }
   );
@@ -874,7 +902,7 @@ describe("chatComplete：正常路径", () => {
       expect(error).toMatchObject({
         code: expectedCode,
         formatFailureStage: "trailing_data",
-        formatFailureSubstage: "data_after_done_other_or_unclassifiable"
+        formatFailureSubstage: "data_after_done_tail_incomplete"
       });
       expect((error as Error).message).not.toContain("合成空尾部传输中断");
       expect(cancelled).toBe(expectedCancelled);
@@ -967,7 +995,7 @@ describe("chatComplete：正常路径", () => {
     expect(error).toMatchObject({
       code: "LLM_RESPONSE_FORMAT_INVALID",
       formatFailureStage: "trailing_data",
-      formatFailureSubstage: "data_after_done_other_or_unclassifiable"
+      formatFailureSubstage: "data_after_done_unknown_object_or_scan_limit"
     });
     expect((error as Error).message).not.toContain(marker);
   });
@@ -1003,7 +1031,7 @@ describe("chatComplete：正常路径", () => {
     })).rejects.toMatchObject({
       code: "LLM_RESPONSE_FORMAT_INVALID",
       formatFailureStage: "trailing_data",
-      formatFailureSubstage: "data_after_done_other_or_unclassifiable"
+      formatFailureSubstage: "data_after_done_tail_incomplete"
     });
     expect(cancelled).toBe(true);
   });
@@ -1065,7 +1093,7 @@ describe("chatComplete：正常路径", () => {
     await expect(resultPromise).rejects.toMatchObject({
       code: "LLM_RESPONSE_FORMAT_INVALID",
       formatFailureStage: "trailing_data",
-      formatFailureSubstage: "data_after_done_usage_metadata_only"
+      formatFailureSubstage: "data_after_done_benign_controls_only"
     });
     expect(cancelled).toBe(false);
   });
@@ -1077,7 +1105,7 @@ describe("chatComplete：正常路径", () => {
         JSON.stringify(strictUsageMetadataEvent()),
         JSON.stringify({ choices: [], usage: { total_tokens: 7 } })
       ],
-      expectedSubstage: "data_after_done_usage_metadata_only"
+      expectedSubstage: "data_after_done_benign_controls_only"
     },
     {
       name: "usage followed by choices upgrades to choices",
@@ -1117,7 +1145,7 @@ describe("chatComplete：正常路径", () => {
         JSON.stringify(strictUsageMetadataEvent()),
         "{not-json}"
       ],
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_json_syntax_invalid"
     },
     {
       name: "choices followed by content uses content priority",
@@ -1128,9 +1156,40 @@ describe("chatComplete：正常路径", () => {
       expectedSubstage: "data_after_done_content_or_tool_present"
     },
     {
-      name: "duplicate DONE mixed with metadata is not metadata-only",
-      tailEvents: ["[DONE]", JSON.stringify(strictUsageMetadataEvent())],
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      name: "empty data, duplicate DONE and metadata remain one benign class",
+      tailEvents: [
+        "",
+        "[DONE]",
+        JSON.stringify(strictUsageMetadataEvent()),
+        ""
+      ],
+      expectedSubstage: "data_after_done_benign_controls_only"
+    },
+    {
+      name: "valid scalar outranks malformed JSON",
+      tailEvents: ["{not-json}", "7"],
+      expectedSubstage: "data_after_done_json_non_object"
+    },
+    {
+      name: "error object outranks valid scalar",
+      tailEvents: ["7", JSON.stringify({ error: { code: "synthetic" } })],
+      expectedSubstage: "data_after_done_error_object"
+    },
+    {
+      name: "unknown object outranks error object",
+      tailEvents: [
+        JSON.stringify({ error: { code: "synthetic" } }),
+        JSON.stringify({ provider_payload: true })
+      ],
+      expectedSubstage: "data_after_done_unknown_object_or_scan_limit"
+    },
+    {
+      name: "choices outrank unknown object",
+      tailEvents: [
+        JSON.stringify({ provider_payload: true }),
+        JSON.stringify({ choices: [{ index: 0 }] })
+      ],
+      expectedSubstage: "data_after_done_choices_present"
     }
   ] as const)(
     "聚合整个 DONE 后尾部并让危险类别优先：$name",
@@ -1173,7 +1232,7 @@ describe("chatComplete：正常路径", () => {
     })).rejects.toMatchObject({
       code: "LLM_RESPONSE_FORMAT_INVALID",
       formatFailureStage: "trailing_data",
-      formatFailureSubstage: "data_after_done_usage_metadata_only"
+      formatFailureSubstage: "data_after_done_benign_controls_only"
     });
   });
 
@@ -1277,7 +1336,7 @@ describe("chatComplete：正常路径", () => {
     })).rejects.toMatchObject({
       code: "LLM_RESPONSE_FORMAT_INVALID",
       formatFailureStage: "trailing_data",
-      formatFailureSubstage: "data_after_done_usage_metadata_only"
+      formatFailureSubstage: "data_after_done_benign_controls_only"
     });
   });
 
@@ -1356,7 +1415,7 @@ describe("chatComplete：正常路径", () => {
     expect(error).toMatchObject({
       code: "LLM_RESPONSE_BODY_TOO_LARGE",
       formatFailureStage: "trailing_data",
-      formatFailureSubstage: "data_after_done_other_or_unclassifiable"
+      formatFailureSubstage: "data_after_done_tail_incomplete"
     });
     expect(cancelled).toBe(true);
   });
@@ -1404,19 +1463,19 @@ describe("chatComplete：正常路径", () => {
       mode: "stream_interrupted",
       expectedCode: "LLM_STREAM_INTERRUPTED",
       expectedCancelled: false,
-      expectedSubstage: "duplicate_done"
+      expectedSubstage: "data_after_done_tail_incomplete"
     },
     {
       mode: "cancelled",
       expectedCode: "LLM_CANCELLED",
       expectedCancelled: true,
-      expectedSubstage: "duplicate_done"
+      expectedSubstage: "data_after_done_tail_incomplete"
     },
     {
       mode: "body_too_large",
       expectedCode: "LLM_RESPONSE_BODY_TOO_LARGE",
       expectedCancelled: true,
-      expectedSubstage: "data_after_done_other_or_unclassifiable"
+      expectedSubstage: "data_after_done_tail_incomplete"
     }
   ] as const)(
     "终止序列首错在排空异常后仍保留封闭子阶段：$mode",
@@ -2051,7 +2110,7 @@ describe("chatComplete：按输出活动判断是否停住", () => {
       const rejection = expect(resultPromise).rejects.toMatchObject({
         code: "LLM_OUTPUT_IDLE_TIMEOUT",
         formatFailureStage: "trailing_data",
-        formatFailureSubstage: "duplicate_done"
+        formatFailureSubstage: "data_after_done_tail_incomplete"
       });
       await vi.advanceTimersByTimeAsync(1_001);
       await rejection;

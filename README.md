@@ -156,9 +156,10 @@ node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:calibrate-a
 # 真实 HEAD、Git 可见的干净工作树，以及 runner 与登记依赖的实际字节。
 node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:eval-difficulty -- --label=calibrated
 
-# 当前入口的 e 标签已经实际运行并永久占用，a/b/c/d/e 都禁止删除、重跑或复用 completion。
-# 目前没有登记可运行的新 connectivity 标签；必须先完成下一版诊断设计、测试、独立复审和提交，
-# 再登记全新身份。不要再次执行当前入口。
+# a/b/c/d/e 都已经实际运行并永久占用，禁止删除、重跑或复用 completion。
+# 当前源码登记的全新 f 标签尚未运行，也尚未完成提交后的代码绑定和独立复审。
+# 禁止执行下面的探针入口；这里只保留命令名称供以后经明确批准的操作员识别。
+# 不要执行：npm run experiment:probe-difficulty-connectivity
 
 # 4. 思维/代码难度标定：检验 rating 越高等级是否单调上升。
 # 首次运行不加 --resume。
@@ -249,7 +250,7 @@ npm run experiment:calibrate-levels:detached -- \
 
 正式服务已有的 `settings.json` 会保留上次保存的 `experimentVersion`，不会因为替换
 `models.yaml` 自动改变。当前配置版本是
-`experiment-2026-08-difficulty-candidate-c-provider-v1-post-done-shape-v6`。部署后必须先保持
+`experiment-2026-08-difficulty-candidate-c-provider-v1-post-done-shape-v7`。部署后必须先保持
 `enabled=false`；只有在没有在途任务、逐项核对整个所选档位的协议和准确性证据后，才能通过
 Urmotiv 的 Fermata 设置页或管理接口显式写入当前版本并开启。worker 还会在每轮 claim 前重新
 比较版本和生产资格证据，旧值即使同时保存了 `enabled=true` 也不会领取任务。由于当前
@@ -352,7 +353,23 @@ failed=1、complete=false，request/fetch 都精确为 1。服务返回 HTTP 200
 用量/标准元数据”，但不能安全推断未知尾部的字段或内容，因此仍不得放宽协议或启动 83 题实验。
 两个私有产物均为 `0600`，标签锁已释放；completion 的 SHA-256 为
 `e898c52405da58fe6c122eaf4676ac71101b2304a1531aab7033658c4c36959c`。a/b/c/d/e 均已永久占用，
-当前没有登记下一标签，也没有发起其它请求。
+此后没有发起其它请求。
+
+当前源码中的 v7/f 只进一步诊断 e 的 `data_after_done_other_or_unclassifiable`，不改变生产
+解析器的接受条件。它把整个 DONE 后尾部归入一个固定闭集：只含空 data、重复 DONE 与严格
+元数据的任意组合；JSON 语法无效；JSON 是合法值但不是对象；顶层 error 对象；未知对象或
+扫描上限；非空 choices；以及正文或工具字段。多个事件只保留危险优先级最高的一个枚举，
+不保存各类是否同时出现、出现次数、原始事件、字段名、字段值、正文、长度或计数。无论最终
+类别是什么，只要 DONE 后出现 data，仍必须排空到真实 HTTP EOF 后以固定格式错误失败；EOF
+前的中断、超时、取消、正文上限或分块上限只能记录 `data_after_done_tail_incomplete`。
+
+f 的唯一标签是 `difficulty-candidate-c-connectivity-probe-20260802-f`，产物 schema 是第 4 版；
+a/b/c/d/e 都列入不可重放的历史标签。**f 尚未运行，当前禁止执行。**源码不预填尚不存在的
+提交 SHA；它继续要求运行时 `EVAL_CODE_VERSION` 与干净仓库的完整 HEAD 精确一致，并核对 runner
+与 HEAD 中的字节。只有本组代码完成独立复审并提交后，才可由明确获准的操作员先运行
+`npm run experiment:update-connectivity-code-version -- --environment-file=<Fermata/private 内专用 env 绝对路径>`
+完成提交后绑定；更新绑定本身不发送模型请求。此后仍需再次取得运行 f 的明确批准，不能因为完成
+绑定就自动执行探针。
 
 探针与 env 更新工具不从调用者 `PATH` 查找 Git，而是固定使用经系统路径权限检查的
 `/usr/bin/git`。每次仓库检查都会新建一个 `0700` 临时 Git 元数据目录；Git 只读取其中固定生成的
@@ -460,7 +477,7 @@ completion marker 表示这条执行链已完整收束并阻止重放，不等�
 
 | 流水线 | 状态 | 说明 |
 | --- | --- | --- |
-| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；provider-v1 已读到 EOF，但协议仍未通过** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate D 与恢复后的 Candidate C 请求都在旧根路径配置下返回 404；一次只读 `/v1/models` 已确认目录声明包含 flash/pro。修正 `/v1` 后的 b 单请求得到 HTTP 200，但客户端取消正文、未观察 EOF；v4 的 c 单请求安全排空到真实 EOF，固定失败阶段为 `trailing_data`。v5 的 d 单请求也是 HTTP 200、request/fetch=1、真实 EOF、未取消，但只得到粗分类 `data_after_done`。v6 的 e 单请求同样 request/fetch=1、HTTP 200、真实 EOF、未取消，并进一步固定为 `data_after_done_other_or_unclassifiable`；它仍是 `complete=false`，当前没有登记下一探针，也没有启动新的 83 题。a/b/c/d/e 证据均保留，当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
+| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；provider-v1 已读到 EOF，但协议仍未通过** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate D 与恢复后的 Candidate C 请求都在旧根路径配置下返回 404；一次只读 `/v1/models` 已确认目录声明包含 flash/pro。修正 `/v1` 后的 b 单请求得到 HTTP 200，但客户端取消正文、未观察 EOF；v4 的 c 单请求安全排空到真实 EOF，固定失败阶段为 `trailing_data`。v5 的 d 单请求也是 HTTP 200、request/fetch=1、真实 EOF、未取消，但只得到粗分类 `data_after_done`。v6 的 e 单请求同样 request/fetch=1、HTTP 200、真实 EOF、未取消，并进一步固定为 `data_after_done_other_or_unclassifiable`；它仍是 `complete=false`。v7/f 只完成了代码、测试与安全枚举设计，尚未提交后绑定、尚未运行，也没有启动新的 83 题。a/b/c/d/e 证据均保留，当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
 | 思维难度（thinking.ts） | **旧实验均不可作基线** | 两份早期报告无法证明完整；后两份明确只完成 6/24、9/24，而且都缺高分段。 |
 | 代码难度（coding.ts） | **旧实验均不可作基线** | 与思维难度共用的旧实验不完整；小样本曾出现难度分段升高但代码难度均值下降，需要在完整基线上复核。 |
 | 查重判断（verdict.ts） | **旧设计不可作准确性基线** | 旧实验只有 3 个正常样本和 3 个人工重复样本；正常组只验证“不是不通过”，没有区分通过与需要修改。 |

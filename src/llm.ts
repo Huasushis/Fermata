@@ -296,6 +296,12 @@ export type LlmResponseFormatFailureSubstage =
   /** v5/d 的历史粗分类；v6/e 不再产生，但保留类型兼容。 */
   | "data_after_done"
   | "data_after_done_usage_metadata_only"
+  /** v7/f 的闭集分类：空 data、重复 DONE 与严格元数据可以任意混合。 */
+  | "data_after_done_benign_controls_only"
+  | "data_after_done_json_syntax_invalid"
+  | "data_after_done_json_non_object"
+  | "data_after_done_error_object"
+  | "data_after_done_unknown_object_or_scan_limit"
   | "data_after_done_choices_present"
   | "data_after_done_content_or_tool_present"
   | "data_after_done_other_or_unclassifiable"
@@ -308,6 +314,11 @@ const safeFormatFailureSubstageValues = new Set<
   "duplicate_done",
   "data_after_done",
   "data_after_done_usage_metadata_only",
+  "data_after_done_benign_controls_only",
+  "data_after_done_json_syntax_invalid",
+  "data_after_done_json_non_object",
+  "data_after_done_error_object",
+  "data_after_done_unknown_object_or_scan_limit",
   "data_after_done_choices_present",
   "data_after_done_content_or_tool_present",
   "data_after_done_other_or_unclassifiable",
@@ -753,8 +764,8 @@ class LlmRequestWatchdog {
     formatFailureStage?: LlmResponseFormatFailureStage,
     formatFailureSubstage?: LlmResponseFormatFailureSubstage
   ): void {
-    // DONE 后的诊断会在继续读取尾部时单向升级安全分类；超时或取消必须
-    // 带走最新的危险类别，不能永远冻结在第一个 metadata-only 事件。
+    // DONE 后的诊断只有在真实 EOF 才能落最终结构分类。读取期间统一保留
+    // tail-incomplete；超时、取消或断流不能带走一个尚未收口的暂态判断。
     this.#formatFailureStage = formatFailureStage;
     this.#formatFailureSubstage = formatFailureSubstage;
     if (this.#timeoutCode !== null) return;
@@ -1135,11 +1146,27 @@ async function drainResponseAfterProtocolError(
 }
 
 type PostDoneTailShape =
-  | "duplicate_done_only"
-  | "usage_metadata_only"
+  | "benign_controls_only"
+  | "json_syntax_invalid"
+  | "json_non_object"
+  | "error_object"
+  | "unknown_object_or_scan_limit"
   | "choices_present"
-  | "content_or_tool_present"
-  | "other_or_unclassifiable";
+  | "content_or_tool_present";
+
+/**
+ * DONE 后尾部只保留一个固定枚举。数字越大表示越需要优先调查的协议形状；
+ * 合并多个事件时只取最高级别，不保存每类出现次数或事件组合。
+ */
+const postDoneTailShapePriority: Readonly<Record<PostDoneTailShape, number>> = {
+  benign_controls_only: 0,
+  json_syntax_invalid: 1,
+  json_non_object: 2,
+  error_object: 3,
+  unknown_object_or_scan_limit: 4,
+  choices_present: 5,
+  content_or_tool_present: 6
+};
 
 const postDoneMetadataKeys = new Set([
   "choices",
@@ -1223,14 +1250,23 @@ function scanPostDonePayloadShape(value: unknown): {
     }
     if (!isPlainJsonRecord(current.value)) continue;
     const entries = Object.entries(current.value);
-    // 先检查当前有界对象的键，使正文/工具标记始终高于普通无法分类。
-    for (const [key] of entries) {
+    // 在节点预算判断前先检查当前对象本身的危险键。这样即使对象还有
+    // 大量无关兄弟字段，正文/工具和非空 choices 也不会降级成普通的
+    // “未知对象或扫描上限”。正文/工具仍保持最高优先级。
+    for (const [key, child] of entries) {
       if (postDoneContentOrToolKeys.has(key)) {
         return {
           contentOrToolPresent: true,
           choicesPresent,
           unclassifiable: false
         };
+      }
+      if (key === "choices") {
+        if (Array.isArray(child)) {
+          choicesPresent ||= child.length > 0;
+        } else {
+          unclassifiable = true;
+        }
       }
     }
     if (entries.length > maximumPostDoneShapeNodes - visited) {
@@ -1251,6 +1287,10 @@ function scanPostDonePayloadShape(value: unknown): {
           unclassifiable = true;
         }
       }
+      // 顶层 error 有自己的闭集分类。服务商通常把说明放在 error.message；
+      // 不遍历这个子树，避免把已知错误信封误报成模型正文。error 之外的
+      // content/tool/choices 兄弟字段仍会按更高危险级别优先。
+      if (current.depth === 0 && key === "error") continue;
       if (typeof child === "object" && child !== null) {
         pending.push({ value: child, depth: current.depth + 1 });
       }
@@ -1377,26 +1417,28 @@ function isStrictPostDoneUsageMetadata(raw: unknown): boolean {
 }
 
 function classifyPostDoneData(data: string): PostDoneTailShape {
-  if (data === "[DONE]") return "duplicate_done_only";
+  // 空 data、重复 DONE 和严格元数据都是已知控制形状；任意组合仍只落
+  // 一个 benign 枚举，但协议接受条件不变，真实 EOF 后照样失败。
+  if (data.length === 0 || data === "[DONE]") {
+    return "benign_controls_only";
+  }
   let raw: unknown;
   try {
     raw = JSON.parse(data) as unknown;
   } catch {
-    return "other_or_unclassifiable";
+    return "json_syntax_invalid";
   }
   const scan = scanPostDonePayloadShape(raw);
   if (scan.contentOrToolPresent) return "content_or_tool_present";
   if (scan.choicesPresent) return "choices_present";
-  if (
-    scan.unclassifiable ||
-    !isPlainJsonRecord(raw) ||
-    Object.hasOwn(raw, "error")
-  ) {
-    return "other_or_unclassifiable";
+  if (!isPlainJsonRecord(raw)) return "json_non_object";
+  if (Object.hasOwn(raw, "error")) return "error_object";
+  if (scan.unclassifiable) {
+    return "unknown_object_or_scan_limit";
   }
   return isStrictPostDoneUsageMetadata(raw)
-    ? "usage_metadata_only"
-    : "other_or_unclassifiable";
+    ? "benign_controls_only"
+    : "unknown_object_or_scan_limit";
 }
 
 function mergePostDoneTailShape(
@@ -1404,37 +1446,37 @@ function mergePostDoneTailShape(
   next: PostDoneTailShape
 ): PostDoneTailShape {
   if (current === undefined || current === next) return next;
-  if (
-    current === "content_or_tool_present" ||
-    next === "content_or_tool_present"
-  ) {
-    return "content_or_tool_present";
-  }
-  if (current === "choices_present" || next === "choices_present") {
-    return "choices_present";
-  }
-  return "other_or_unclassifiable";
+  return postDoneTailShapePriority[next] > postDoneTailShapePriority[current]
+    ? next
+    : current;
 }
 
 function postDoneFailureSubstage(
   shape: PostDoneTailShape,
   tailComplete: boolean
 ): LlmResponseFormatFailureSubstage {
+  // 只有真实 HTTP EOF 才能把尾部最终归类；任何超时、取消、中断、正文
+  // 上限或分块上限都只能说明尾部未完整，不能泄露已经看到的暂态形状。
+  if (!tailComplete) return "data_after_done_tail_incomplete";
   if (shape === "content_or_tool_present") {
     return "data_after_done_content_or_tool_present";
   }
   if (shape === "choices_present") {
     return "data_after_done_choices_present";
   }
-  if (shape === "other_or_unclassifiable") {
-    return "data_after_done_other_or_unclassifiable";
+  if (shape === "unknown_object_or_scan_limit") {
+    return "data_after_done_unknown_object_or_scan_limit";
   }
-  if (!tailComplete && shape === "usage_metadata_only") {
-    return "data_after_done_tail_incomplete";
+  if (shape === "error_object") {
+    return "data_after_done_error_object";
   }
-  return shape === "duplicate_done_only"
-    ? "duplicate_done"
-    : "data_after_done_usage_metadata_only";
+  if (shape === "json_non_object") {
+    return "data_after_done_json_non_object";
+  }
+  if (shape === "json_syntax_invalid") {
+    return "data_after_done_json_syntax_invalid";
+  }
+  return "data_after_done_benign_controls_only";
 }
 
 interface ChatCompletionStreamState {
@@ -1519,7 +1561,15 @@ async function readChatCompletionEventStream(
       }
       if (chunk.done) {
         readerFinished = true;
-        if (firstProtocolError !== undefined) throw firstProtocolError;
+        if (firstProtocolError !== undefined) {
+          if (state.postDoneTailShape !== undefined) {
+            throw new LlmResponseFormatError(
+              "trailing_data",
+              postDoneFailureSubstage(state.postDoneTailShape, true)
+            );
+          }
+          throw firstProtocolError;
+        }
         try {
           const normalized = normalizeEventStreamText(
             trailingCarriageReturn,
@@ -1540,7 +1590,7 @@ async function readChatCompletionEventStream(
           }
           updatePostDoneTailShape(
             state,
-            "other_or_unclassifiable",
+            "unknown_object_or_scan_limit",
             observer
           );
         }
@@ -1572,7 +1622,7 @@ async function readChatCompletionEventStream(
       ) {
         updatePostDoneTailShape(
           state,
-          "other_or_unclassifiable",
+          "unknown_object_or_scan_limit",
           observer
         );
       }
@@ -1597,12 +1647,12 @@ async function readChatCompletionEventStream(
           if (state.sawDone) {
             updatePostDoneTailShape(
               state,
-              "other_or_unclassifiable",
+              "unknown_object_or_scan_limit",
               observer
             );
             throw new LlmResponseFormatError(
               "trailing_data",
-              "data_after_done_other_or_unclassifiable"
+              "data_after_done_tail_incomplete"
             );
           }
           throw new LlmResponseFormatError("event_shape");
@@ -1633,13 +1683,13 @@ async function readChatCompletionEventStream(
         if (state.sawDone) {
           updatePostDoneTailShape(
             state,
-            "other_or_unclassifiable",
+            "unknown_object_or_scan_limit",
             observer
           );
           firstProtocolError = new LlmResponseFormatError(
             "trailing_data",
             postDoneFailureSubstage(
-              state.postDoneTailShape ?? "other_or_unclassifiable",
+              state.postDoneTailShape ?? "unknown_object_or_scan_limit",
               false
             )
           );
@@ -1661,6 +1711,16 @@ async function readChatCompletionEventStream(
         );
       }
     }
+  } catch (error) {
+    if (
+      !readerFinished &&
+      state.sawDone &&
+      (state.postDoneTailShape !== undefined ||
+        state.postDoneTailHasUnresolvedData)
+    ) {
+      publishUnresolvedPostDoneData(state, observer);
+    }
+    throw error;
   } finally {
     if (!readerFinished && !readerErrored) {
       cancelReaderWithoutReplacingResult(reader);
@@ -1909,9 +1969,7 @@ function publishUnresolvedPostDoneData(
   state.reasoning = "";
   observer.onInvalidResponseDrainStarted(
     "trailing_data",
-    state.postDoneTailShape === undefined
-      ? "data_after_done_tail_incomplete"
-      : postDoneFailureSubstage(state.postDoneTailShape, false)
+    "data_after_done_tail_incomplete"
   );
 }
 
@@ -1944,7 +2002,7 @@ function consumeChatCompletionEvent(
   if (dataFields.length === 0) return false;
   const data = dataFields.join("\n").trim();
   if (state.sawDone) {
-    // e 只记录封闭形状并继续解析整个尾部；无论形状如何都在 EOF 后失败。
+    // f 只记录封闭形状并继续解析整个尾部；无论形状如何都在 EOF 后失败。
     observePostDoneShape(classifyPostDoneData(data));
     return false;
   }

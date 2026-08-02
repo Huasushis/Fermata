@@ -1,5 +1,5 @@
 /**
- * Candidate C 恢复配置的 e 标签单样本连通性/协议预检。
+ * Candidate C 恢复配置的 f 标签单样本连通性/协议预检。
  *
  * 只发送一个人工合成短题，严格允许一次真实 fetch。成功必须同时满足当前
  * provider 身份、Git/runner/config/锚点绑定、请求体契约、结构化输出、
@@ -60,17 +60,18 @@ import { loadDifficultyAnchorsStrict } from "./lib/difficulty-anchors-strict";
 import { hasUnknownPrefixedEnvironmentKeys } from "./lib/evaluation-integrity";
 
 export const difficultyConnectivityProbeExperimentVersion =
-  "experiment-2026-08-difficulty-candidate-c-provider-v1-post-done-shape-v6";
-export const difficultyConnectivityProbeArtifactSchemaVersion = 3;
-// 这些标签都已经留下永久证据；新 runner 只登记 e，不读取、复用或重跑它们。
+  "experiment-2026-08-difficulty-candidate-c-provider-v1-post-done-shape-v7";
+export const difficultyConnectivityProbeArtifactSchemaVersion = 4;
+// 这些标签都已经留下永久证据；新 runner 只登记 f，不读取、复用或重跑它们。
 export const difficultyConnectivityPreviousProbeLabels = [
   "difficulty-candidate-c-connectivity-probe-20260801-a",
   "difficulty-candidate-c-connectivity-probe-20260801-b",
   "difficulty-candidate-c-connectivity-probe-20260801-c",
-  "difficulty-candidate-c-connectivity-probe-20260801-d"
+  "difficulty-candidate-c-connectivity-probe-20260801-d",
+  "difficulty-candidate-c-connectivity-probe-20260801-e"
 ] as const;
 export const difficultyConnectivityProbeLabel =
-  "difficulty-candidate-c-connectivity-probe-20260801-e";
+  "difficulty-candidate-c-connectivity-probe-20260802-f";
 export const difficultyConnectivityProbeMaxOutputTokens = 2_048;
 
 const repositoryDirectory = fileURLToPath(new URL("../", import.meta.url));
@@ -85,7 +86,7 @@ const lockFileName = `${difficultyConnectivityProbeLabel}.lock.private`;
 export const difficultyConnectivityProbeCompletionFileName =
   `${difficultyConnectivityProbeLabel}.completion.private.json`;
 export const difficultyConnectivityExpectedModelsConfigSha256 =
-  "d7f9058d2a2f13c4582e931075fb0ffc2d17296b985fd258d4e1c6ae3fa690f7";
+  "bee5d987338283bb3c7f283f9192c97fd1acc9a32dfca4fece94ac42d97d8cea";
 export const difficultyConnectivityExpectedCandidateCAnchorsSha256 =
   "48b4c5f95732347b2a0a48f4143f50dbc6bc6706f427aa75179def45988b9a7f";
 // 旧 a 探针确认根路径配置会命中不存在的 chat/completions；当前身份只把
@@ -191,11 +192,13 @@ const safeFormatFailureStageValues = [
   "trailing_data"
 ] as const satisfies readonly LlmResponseFormatFailureStage[];
 const safeFormatFailureSubstageValues = [
-  "duplicate_done",
-  "data_after_done_usage_metadata_only",
+  "data_after_done_benign_controls_only",
+  "data_after_done_json_syntax_invalid",
+  "data_after_done_json_non_object",
+  "data_after_done_error_object",
+  "data_after_done_unknown_object_or_scan_limit",
   "data_after_done_choices_present",
   "data_after_done_content_or_tool_present",
-  "data_after_done_other_or_unclassifiable",
   "data_after_done_tail_incomplete",
   "choice_after_stop"
 ] as const satisfies readonly LlmResponseFormatFailureSubstage[];
@@ -254,15 +257,16 @@ export const difficultyConnectivityProbeResultSchema: z.ZodType<
       });
     }
     if (
-      result.formatFailureSubstage ===
-        "data_after_done_usage_metadata_only" &&
+      result.formatFailureStage === "trailing_data" &&
+      result.formatFailureSubstage !== "data_after_done_tail_incomplete" &&
+      result.formatFailureSubstage !== "choice_after_stop" &&
       (!result.httpEofObserved ||
         result.responseBodyCancelled ||
         result.code !== "LLM_RESPONSE_FORMAT_INVALID")
     ) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "只能在真实 HTTP EOF 后记录完整元数据尾部。",
+        message: "只能在真实 HTTP EOF 后记录 DONE 后尾部的最终结构分类。",
         path: ["formatFailureSubstage"]
       });
     }
@@ -290,8 +294,8 @@ export type DifficultyConnectivityProbeGlobalFailureCode = z.infer<
 
 export const difficultyConnectivityCommonEvidenceSchema = z
   .object({
-    // e 使用第 3 版；历史 a/b/c/d 产物保持原字节与哈希，不由当前 schema
-    // 重新解释，也不能充当 e 的 completion。
+    // f 使用第 4 版；历史 a/b/c/d/e 产物保持原字节与哈希，不由当前 schema
+    // 重新解释，也不能充当 f 的 completion。
     schemaVersion: z.literal(difficultyConnectivityProbeArtifactSchemaVersion),
     label: z.literal(difficultyConnectivityProbeLabel),
     experimentVersion: z.literal(difficultyConnectivityProbeExperimentVersion),
