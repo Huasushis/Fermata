@@ -16,11 +16,14 @@ describe("run-with-env：命令行边界", () => {
     expect(result.status).toBe(2);
     expect(result.stdout).toBe("");
     expect(result.stderr).toBe(
-      "用法：node scripts/run-with-env.mjs <env文件> <命令> [参数...]\n"
+      "用法：node scripts/run-with-env.mjs <env文件> <命令> [参数...]\n" +
+      "      node scripts/run-with-env.mjs --review-flow-evaluation <env文件> [评测参数...]\n"
     );
   });
 
   for (const [key, value] of [
+    ["LD_PRELOAD", "/lib/x86_64-linux-gnu/libc.so.6"],
+    ["LD_LIBRARY_PATH", "/tmp/untrusted-libraries"],
     ["NODE_DEBUG", "child_process"],
     ["NODE_DEBUG_NATIVE", "http"],
     ["NODE_TLS_REJECT_UNAUTHORIZED", "0"]

@@ -72,7 +72,6 @@ describe("后台标定参数与环境", () => {
         http_proxy: "http://127.0.0.1:10808",
         EVAL_CONCURRENCY: "31",
         AETHER_API_KEY: "parent-secret",
-        LD_PRELOAD: "/tmp/inject.so",
         RANDOM_PARENT_VALUE: "drop-me"
       }
     );
@@ -80,7 +79,6 @@ describe("后台标定参数与环境", () => {
     expect(environment.AETHER_API_KEY).toBe("file-secret");
     expect(environment.http_proxy).toBe("http://127.0.0.1:10808");
     expect(environment.PATH).toBe("/safe/bin");
-    expect(environment.LD_PRELOAD).toBeUndefined();
     expect(environment.RANDOM_PARENT_VALUE).toBeUndefined();
     expect(environment.NODE_OPTIONS).toBe("");
   });
@@ -93,6 +91,12 @@ describe("后台标定参数与环境", () => {
     ).toThrow("TLS_VERIFICATION_DISABLED");
     expect(() =>
       buildChildEnvironment("NODE_OPTIONS=--inspect\n", { PATH: "/bin" })
+    ).toThrow("DANGEROUS_NODE_ENVIRONMENT");
+    expect(() =>
+      buildChildEnvironment("EVAL_CONCURRENCY=2\n", {
+        PATH: "/bin",
+        LD_PRELOAD: "/tmp/inject.so"
+      })
     ).toThrow("DANGEROUS_NODE_ENVIRONMENT");
     expect(() =>
       buildChildEnvironment("LEVELS_LLM_MAX_DURATON_MS=14400000\n", {

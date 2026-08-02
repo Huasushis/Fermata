@@ -6,8 +6,11 @@ import {
   selectEnvironment
 } from "../scripts/env-file.mjs";
 import {
+  buildReviewFlowEvaluationRunEnvironment,
   buildRunEnvironment,
+  createRunWithEnvSignalController,
   formatRunWithEnvFailure,
+  reviewFlowEvaluationBootstrapPath,
   runWithEnv,
   spawnRunCommand
 } from "../scripts/run-with-env.mjs";
@@ -47,6 +50,9 @@ describe("env 文件安全解析", () => {
   });
 
   it.each([
+    ["LD_PRELOAD", "/tmp/inject.so"],
+    ["LD_LIBRARY_PATH", "/tmp/untrusted-libraries"],
+    ["LD_AUDIT", "/tmp/audit.so"],
     ["NODE_OPTIONS", "--import=/tmp/inject.mjs"],
     ["NODE_DEBUG", "child_process"],
     ["NODE_EXTRA_CA_CERTS", "/tmp/untrusted.pem"],
@@ -91,7 +97,7 @@ describe("run-with-env 的受控环境与同步启动异常", () => {
         PATH: "/safe/bin",
         http_proxy: "http://127.0.0.1:10808",
         EVAL_CONCURRENCY: "30",
-        LD_PRELOAD: "/tmp/inject.so",
+        UNRELATED_PARENT: "/tmp/not-selected",
         UNKNOWN_PARENT: "drop"
       }
     );
@@ -102,9 +108,10 @@ describe("run-with-env 的受控环境与同步启动异常", () => {
       EVAL_CODE_VERSION: "1234567890abcdef1234567890abcdef12345678",
       EVAL_DATASET_MANIFEST_PATH: "/project/private/manifest.json",
       EVAL_REQUIRE_DATASET_MANIFEST: "1",
-      AETHER_API_KEY: "file-value"
+      AETHER_API_KEY: "file-value",
+      FERMATA_RUN_WITH_ENV: "1"
     });
-    expect(environment.LD_PRELOAD).toBeUndefined();
+    expect(environment.UNRELATED_PARENT).toBeUndefined();
     expect(environment.UNKNOWN_PARENT).toBeUndefined();
   });
 
@@ -126,6 +133,18 @@ describe("run-with-env 的受控环境与同步启动异常", () => {
         PATH: "/bin",
         LEVELS_LLM_MAX_DURATON_MS: "14400000"
       })
+    ).toThrow("UNKNOWN_PROTECTED_ENVIRONMENT_KEY");
+  });
+
+  it("reviewFlow 安全启动标记不能由父环境或 env 文件伪造", () => {
+    expect(() =>
+      buildRunEnvironment("", {
+        PATH: "/bin",
+        FERMATA_RUN_WITH_ENV: "1"
+      })
+    ).toThrow("UNKNOWN_PROTECTED_ENVIRONMENT_KEY");
+    expect(() =>
+      buildRunEnvironment("FERMATA_RUN_WITH_ENV=1\n", { PATH: "/bin" })
     ).toThrow("UNKNOWN_PROTECTED_ENVIRONMENT_KEY");
   });
 
@@ -164,5 +183,214 @@ describe("run-with-env 的受控环境与同步启动异常", () => {
       })
     ).toThrow("DANGEROUS_NODE_ENVIRONMENT");
     expect(readCalled).toBe(false);
+  });
+
+  it("外层信号在 spawn 前关闭闸门时不读取 env 也不启动 child", () => {
+    const signalController = createRunWithEnvSignalController();
+    signalController.request("SIGTERM");
+    let readCalled = false;
+    let spawnCalled = false;
+    expect(runWithEnv(
+      ["/project/private/test.env", "command"],
+      {
+        signalController,
+        readEnvFile: () => {
+          readCalled = true;
+          return "";
+        },
+        spawnProcess: () => {
+          spawnCalled = true;
+          return { once() {} };
+        }
+      }
+    )).toBeUndefined();
+    expect(readCalled).toBe(false);
+    expect(spawnCalled).toBe(false);
+  });
+
+  it("外层多次信号只向直接 child 转发第一次并继续由调用方等待", () => {
+    const signalController = createRunWithEnvSignalController();
+    const signals = [];
+    signalController.attach({ kill: (signal) => signals.push(signal) });
+    signalController.request("SIGINT");
+    signalController.request("SIGTERM");
+    signalController.request("SIGHUP");
+    expect(signals).toEqual(["SIGINT"]);
+  });
+
+  it("专用 review-flow 模式只透传模型、评估版本/并发、代理和基本环境", () => {
+    const environment = buildReviewFlowEvaluationRunEnvironment(
+      "AETHER_BASE_URL=https://model.example/v1\n" +
+        "AETHER_API_KEY=private-value\n" +
+        "EVAL_CODE_VERSION=1234567890abcdef1234567890abcdef12345678\n" +
+        "EVAL_CONCURRENCY=2\n",
+      {
+        PATH: "/safe/bin",
+        HTTP_PROXY: "http://127.0.0.1:10808",
+        RANDOM_PARENT_VALUE: "must-not-pass"
+      }
+    );
+    expect(environment).toMatchObject({
+      PATH: "/safe/bin",
+      HTTP_PROXY: "http://127.0.0.1:10808",
+      AETHER_BASE_URL: "https://model.example/v1",
+      AETHER_API_KEY: "private-value",
+      EVAL_CODE_VERSION: "1234567890abcdef1234567890abcdef12345678",
+      EVAL_CONCURRENCY: "2",
+      FERMATA_RUN_WITH_ENV: "1"
+    });
+    expect(environment.RANDOM_PARENT_VALUE).toBeUndefined();
+    expect(environment.URMOTIV_ROBOT_TOKEN).toBeUndefined();
+    expect(environment.CODEFORCES_SECRET).toBeUndefined();
+  });
+
+  it("专用文件必须自行登记版本、并发和至少一组完整 provider，父环境不能补缺", () => {
+    const parent = {
+      PATH: "/safe/bin",
+      AETHER_BASE_URL: "https://parent.example/v1",
+      AETHER_API_KEY: "parent-key",
+      EVAL_CODE_VERSION: "2".repeat(40),
+      EVAL_CONCURRENCY: "31"
+    };
+    expect(() => buildReviewFlowEvaluationRunEnvironment(
+      "AETHER_BASE_URL=https://file.example/v1\n" +
+        "AETHER_API_KEY=file-key\n" +
+        "EVAL_CONCURRENCY=2\n",
+      parent
+    )).toThrow("REVIEW_FLOW_EVALUATION_ENV_FILE_INCOMPLETE");
+    expect(() => buildReviewFlowEvaluationRunEnvironment(
+      `EVAL_CODE_VERSION=${"1".repeat(40)}\nEVAL_CONCURRENCY=2\n`,
+      parent
+    )).toThrow("REVIEW_FLOW_EVALUATION_ENV_FILE_INCOMPLETE");
+    expect(() => buildReviewFlowEvaluationRunEnvironment(
+      "AETHER_BASE_URL=https://file.example/v1\n" +
+        `EVAL_CODE_VERSION=${"1".repeat(40)}\n` +
+        "EVAL_CONCURRENCY=2\n",
+      parent
+    )).toThrow("REVIEW_FLOW_EVALUATION_ENV_FILE_INCOMPLETE");
+  });
+
+  it("专用文件完整时丢弃父环境中的同名 provider 与评估参数", () => {
+    const environment = buildReviewFlowEvaluationRunEnvironment(
+      "AETHER_BASE_URL=https://file.example/v1\n" +
+        "AETHER_API_KEY=file-key\n" +
+        `EVAL_CODE_VERSION=${"1".repeat(40)}\n` +
+        "EVAL_CONCURRENCY=2\n",
+      {
+        PATH: "/safe/bin",
+        AETHER_BASE_URL: "https://parent.example/v1",
+        AETHER_API_KEY: "parent-key",
+        EVAL_CODE_VERSION: "2".repeat(40),
+        EVAL_CONCURRENCY: "31"
+      }
+    );
+    expect(environment).toMatchObject({
+      AETHER_BASE_URL: "https://file.example/v1",
+      AETHER_API_KEY: "file-key",
+      EVAL_CODE_VERSION: "1".repeat(40),
+      EVAL_CONCURRENCY: "2"
+    });
+  });
+
+  it.each([
+    "URMOTIV_ROBOT_TOKEN=robot-token\n",
+    "FERMATA_MANAGEMENT_TOKEN=management-token\n",
+    "CODEFORCES_KEY=key\n",
+    "CODEFORCES_SECRET=secret\n",
+    "EVAL_DATASET_MANIFEST_PATH=/private/manifest.json\n",
+    "FERMATA_REVIEW_FLOW_RUNTIME_ATTESTATION={}\n",
+    "PATH=/must/not/override\n"
+  ])("专用 review-flow env 文件拒绝无关键 %#", (content) => {
+    expect(() =>
+      buildReviewFlowEvaluationRunEnvironment(content, { PATH: "/safe/bin" })
+    ).toThrow("UNKNOWN_PROTECTED_ENVIRONMENT_KEY");
+  });
+
+  it("专用 review-flow 模式也拒绝父环境中的项目凭据", () => {
+    expect(() =>
+      buildReviewFlowEvaluationRunEnvironment("", {
+        PATH: "/safe/bin",
+        URMOTIV_ROBOT_TOKEN: "must-not-enter-child"
+      })
+    ).toThrow("UNKNOWN_PROTECTED_ENVIRONMENT_KEY");
+    expect(() =>
+      buildReviewFlowEvaluationRunEnvironment("", {
+        PATH: "/safe/bin",
+        FERMATA_REVIEW_FLOW_RUNTIME_ATTESTATION: "{}"
+      })
+    ).toThrow("UNKNOWN_PROTECTED_ENVIRONMENT_KEY");
+  });
+
+  it("显式模式参数选择 review-flow 专用环境", () => {
+    let receivedEnvironment;
+    let receivedCommand;
+    let receivedArguments;
+    const child = { once() {} };
+    expect(
+      runWithEnv(
+        [
+          "--review-flow-evaluation",
+          "/project/private/test.env",
+          "command",
+          "argument"
+        ],
+        {
+          parentEnvironment: { PATH: "/safe/bin" },
+          readEnvFile: () =>
+            "AETHER_BASE_URL=https://model.example/v1\n" +
+            "AETHER_API_KEY=private-value\n" +
+            `EVAL_CODE_VERSION=${"1".repeat(40)}\n` +
+            "EVAL_CONCURRENCY=2\n",
+          spawnProcess: (command, arguments_, options) => {
+            receivedCommand = command;
+            receivedArguments = arguments_;
+            receivedEnvironment = options.env;
+            return child;
+          }
+        }
+      )
+    ).toBe(child);
+    expect(receivedEnvironment).toMatchObject({
+      AETHER_BASE_URL: "https://model.example/v1",
+      AETHER_API_KEY: "private-value",
+      FERMATA_RUN_WITH_ENV: "1"
+    });
+    expect(receivedEnvironment.URMOTIV_ROBOT_TOKEN).toBeUndefined();
+    expect(receivedCommand).toBe(process.execPath);
+    expect(receivedArguments).toEqual([
+      reviewFlowEvaluationBootstrapPath,
+      "command",
+      "argument"
+    ]);
+  });
+
+  it("专用模式即使父 PATH 可疑，也不会经 PATH 解析 npm、tsx 或调用者命令", () => {
+    let receivedCommand;
+    let receivedArguments;
+    runWithEnv(
+      [
+        "--review-flow-evaluation",
+        "/project/private/test.env",
+        "--action=run"
+      ],
+      {
+        parentEnvironment: { PATH: "/attacker/first:/safe/bin" },
+        readEnvFile: () =>
+          "AETHER_BASE_URL=https://model.example/v1\n" +
+          "AETHER_API_KEY=private-value\n" +
+          `EVAL_CODE_VERSION=${"1".repeat(40)}\n` +
+          "EVAL_CONCURRENCY=2\n",
+        spawnProcess: (command, arguments_) => {
+          receivedCommand = command;
+          receivedArguments = arguments_;
+          return { once() {} };
+        }
+      }
+    );
+    expect(receivedCommand).toBe(process.execPath);
+    expect(receivedArguments).toEqual([
+      reviewFlowEvaluationBootstrapPath,
+      "--action=run"
+    ]);
   });
 });

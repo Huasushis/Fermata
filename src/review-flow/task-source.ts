@@ -153,7 +153,7 @@ const anklangV2Common = {
   recommendation: recommendationSchema
 } as const;
 
-const completeAnklangV2ResultSchema = z
+export const completeAnklangV2ResultSchema = z
   .object({
     ...anklangV2Common,
     completion: completeCompletionSchema,
@@ -172,6 +172,9 @@ const completeAnklangV2ResultSchema = z
       });
     }
   });
+export type CompleteAnklangV2Result = z.infer<
+  typeof completeAnklangV2ResultSchema
+>;
 
 const partialAnklangV2ResultSchema = z
   .object({

@@ -1,0 +1,1040 @@
+/**
+ * review-flow 标定的私有、可恢复检查点。
+ *
+ * 检查点始终从已经验证的目录描述符读取；0600、当前用户、普通文件、nlink=1
+ * 任一不满足即拒绝。active/failed/终止信号都是不可洗白的污染状态，resume 不
+ * 会再次付费。执行封存时间用于确定性生成报告，崩溃恢复时不得重新取时钟。
+ */
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+  writeSync
+} from "node:fs";
+import { isAbsolute } from "node:path";
+import { z } from "zod";
+import {
+  anchoredPrivatePath,
+  closePrivateDirectory,
+  openExistingPrivateDirectory,
+  preparePrivateDirectory,
+  projectPrivateRoot,
+  workspaceRoot,
+  type PrivateDirectoryHandle
+} from "../../scripts/private-runtime.mjs";
+import {
+  reviewFlowCalibrationProjectionSchema,
+  reviewFlowFailureKindAllowlist
+} from "../../src/review-flow/orchestrator";
+import { hashCanonicalValue } from "../../src/review-flow/evidence";
+import { reviewFlowRoleSchema } from "../../src/review-flow/schemas";
+import {
+  readPrivateArtifactBytes
+} from "./private-artifact-io";
+import {
+  reviewFlowEvaluationDigestSchema,
+  reviewFlowEvaluationLabelSchema,
+  reviewFlowEvaluationPurposeSchema,
+  reviewFlowEvaluationSafeIdSchema,
+  reviewFlowEvaluationSubjectIdSchema
+} from "./review-flow-evaluation-dataset";
+import { PhysicalBlindArtifactError } from "./physical-blind-common";
+import { reviewFlowRuntimeIdentitySchema } from "./review-flow-runtime-attestation";
+
+const digestSchema = reviewFlowEvaluationDigestSchema;
+export { reviewFlowEvaluationLabelSchema };
+const timestampSchema = z.string().datetime();
+const roleProviderSummarySchema = z
+  .object({
+    role: reviewFlowRoleSchema,
+    provider: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/u),
+    model: z.string().trim().min(1).max(200)
+  })
+  .strict();
+
+export const reviewFlowEvaluationBaselineBindingSchema = z
+  .object({
+    schemaVersion: z.literal(2),
+    label: reviewFlowEvaluationLabelSchema,
+    runId: z.string().uuid(),
+    datasetFingerprint: digestSchema,
+    summarySha256: digestSchema,
+    markdownSha256: digestSchema,
+    reportSetSha256: digestSchema,
+    labelClaimSha256: digestSchema,
+    publicationReceiptSha256: digestSchema,
+    executionCompletionFingerprint: digestSchema,
+    codeVersion: z.string().regex(/^[0-9a-f]{40}$/u),
+    configurationFingerprint: digestSchema,
+    runnerIdentity: digestSchema
+  })
+  .strict();
+export type ReviewFlowEvaluationBaselineBinding = z.infer<
+  typeof reviewFlowEvaluationBaselineBindingSchema
+>;
+
+export const reviewFlowEvaluationIdentitySchema = z
+  .object({
+    schemaVersion: z.literal(2),
+    protocolVersion: z.literal("review-flow-evaluation-v2"),
+    datasetFingerprint: digestSchema,
+    manifestSha256: digestSchema,
+    purpose: reviewFlowEvaluationPurposeSchema,
+    codeIdentity: z
+      .object({
+        codeVersion: z.string().regex(/^[0-9a-f]{40}$/u),
+        runnerSha256: digestSchema,
+        dependencyCodeSha256: digestSchema,
+        dependencyFileCount: z.number().int().positive(),
+        productionDependencyCodeSha256: digestSchema,
+        productionDependencyFileCount: z.number().int().positive()
+      })
+      .strict(),
+    runtime: reviewFlowRuntimeIdentitySchema
+      .superRefine((runtime, context) => {
+        const major = Number.parseInt(runtime.nodeVersion.split(".")[0] ?? "", 10);
+        if (!Number.isSafeInteger(major) || major < 24) {
+          context.addIssue({
+            code: "custom",
+            path: ["nodeVersion"],
+            message: "review-flow 标定必须绑定 Node.js 24 或更高版本。"
+          });
+        }
+      }),
+    configurationFingerprint: digestSchema,
+    configurationSummary: z
+      .object({
+        llmFirstOutputMs: z.number().int().positive(),
+        llmOutputIdleMs: z.number().int().positive(),
+        llmMaximumDurationMs: z.number().int().positive(),
+        maxAttempts: z.number().int().min(1).max(10),
+        baseDelayMs: z.number().int().positive(),
+        concurrency: z.number().int().min(1).max(32),
+        proxyEnvironmentFingerprint: digestSchema,
+        proxyEnvironmentKeys: z
+          .array(z.enum([
+            "ALL_PROXY",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "NO_PROXY",
+            "all_proxy",
+            "http_proxy",
+            "https_proxy",
+            "no_proxy"
+          ]))
+          .max(8),
+        duplicateSimilarityReject: z.number().finite().min(0).max(1),
+        difficultyAnchorsFingerprint: digestSchema,
+        difficultyAnchorsProvisional: z.boolean()
+      })
+      .strict(),
+    experimentVersion: z.string().trim().min(1).max(120),
+    profileName: z.string().trim().min(1).max(120),
+    runnerIdentity: digestSchema,
+    transportMode: z.literal("production_undici"),
+    providerSummary: z.array(roleProviderSummarySchema).length(11)
+  })
+  .strict()
+  .superRefine((identity, context) => {
+    const roles = identity.providerSummary.map((entry) => entry.role);
+    if (
+      new Set(roles).size !== reviewFlowRoleSchema.options.length ||
+      reviewFlowRoleSchema.options.some(
+        (role, index) => roles[index] !== role
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["providerSummary"],
+        message: "必须按固定顺序绑定全部 11 个角色。"
+      });
+    }
+  });
+export type ReviewFlowEvaluationIdentity = z.infer<
+  typeof reviewFlowEvaluationIdentitySchema
+>;
+
+export const reviewFlowEvaluationProductionIdentitySchema = z
+  .object({
+    productionDependencyCodeSha256: digestSchema,
+    productionDependencyFileCount: z.number().int().positive(),
+    configurationFingerprint: digestSchema,
+    runnerIdentity: digestSchema,
+    experimentVersion: z.string().trim().min(1).max(120),
+    profileName: z.string().trim().min(1).max(120),
+    transportMode: z.literal("production_undici"),
+    runtime: reviewFlowEvaluationIdentitySchema.shape.runtime,
+    providerSummary: z.array(roleProviderSummarySchema).length(11)
+  })
+  .strict();
+export type ReviewFlowEvaluationProductionIdentity = z.infer<
+  typeof reviewFlowEvaluationProductionIdentitySchema
+>;
+
+export function reviewFlowEvaluationProductionIdentity(
+  identity: ReviewFlowEvaluationIdentity
+): ReviewFlowEvaluationProductionIdentity {
+  return reviewFlowEvaluationProductionIdentitySchema.parse({
+    productionDependencyCodeSha256:
+      identity.codeIdentity.productionDependencyCodeSha256,
+    productionDependencyFileCount:
+      identity.codeIdentity.productionDependencyFileCount,
+    configurationFingerprint: identity.configurationFingerprint,
+    runnerIdentity: identity.runnerIdentity,
+    experimentVersion: identity.experimentVersion,
+    profileName: identity.profileName,
+    transportMode: identity.transportMode,
+    runtime: identity.runtime,
+    providerSummary: identity.providerSummary
+  });
+}
+
+export function reviewFlowEvaluationProductionIdentityFingerprint(
+  identity: ReviewFlowEvaluationIdentity
+): string {
+  return hashCanonicalValue(reviewFlowEvaluationProductionIdentity(identity));
+}
+
+const expectedCaseSchema = z
+  .object({
+    safeId: reviewFlowEvaluationSafeIdSchema,
+    subjectId: reviewFlowEvaluationSubjectIdSchema,
+    sourceLineageSha256: digestSchema,
+    contentSha256: digestSchema
+  })
+  .strict();
+export type ReviewFlowEvaluationExpectedCase = z.infer<
+  typeof expectedCaseSchema
+>;
+
+const failureSchema = z
+  .object({
+    code: z.string().regex(/^[A-Z0-9_]{1,120}$/u),
+    failureKind: z.enum(reviewFlowFailureKindAllowlist).nullable(),
+    httpStatus: z.number().int().min(100).max(599).nullable(),
+    completedRoleCount: z.number().int().min(0).max(11),
+    failedRoleCount: z.number().int().min(0).max(11)
+  })
+  .strict();
+export type ReviewFlowEvaluationFailure = z.infer<typeof failureSchema>;
+
+const pendingEntrySchema = z
+  .object({ safeId: reviewFlowEvaluationSafeIdSchema, status: z.literal("pending") })
+  .strict();
+const activeEntrySchema = z
+  .object({
+    safeId: reviewFlowEvaluationSafeIdSchema,
+    status: z.literal("active"),
+    startedAt: timestampSchema
+  })
+  .strict();
+const completedEntrySchema = z
+  .object({
+    safeId: reviewFlowEvaluationSafeIdSchema,
+    status: z.literal("completed"),
+    completedAt: timestampSchema,
+    projection: reviewFlowCalibrationProjectionSchema
+  })
+  .strict();
+const failedEntrySchema = z
+  .object({
+    safeId: reviewFlowEvaluationSafeIdSchema,
+    status: z.literal("failed"),
+    failedAt: timestampSchema,
+    failure: failureSchema
+  })
+  .strict();
+export const reviewFlowEvaluationEntrySchema = z.discriminatedUnion("status", [
+  pendingEntrySchema,
+  activeEntrySchema,
+  completedEntrySchema,
+  failedEntrySchema
+]);
+export type ReviewFlowEvaluationEntry = z.infer<
+  typeof reviewFlowEvaluationEntrySchema
+>;
+
+const terminationSchema = z
+  .object({
+    signal: z.enum(["SIGINT", "SIGTERM", "SIGHUP"]),
+    observedAt: timestampSchema
+  })
+  .strict();
+
+const executionSealSchema = z
+  .object({
+    sealedAt: timestampSchema,
+    complete: z.boolean(),
+    completionFingerprint: digestSchema
+  })
+  .strict();
+
+export const reviewFlowEvaluationPublicationBindingSchema = z
+  .object({
+    kind: z.enum(["scored_report", "holdout_prediction"]),
+    artifactSetSha256: digestSchema,
+    registryReceiptSha256: digestSchema,
+    complete: z.boolean(),
+    acknowledgedAt: timestampSchema
+  })
+  .strict();
+export type ReviewFlowEvaluationPublicationBinding = z.infer<
+  typeof reviewFlowEvaluationPublicationBindingSchema
+>;
+
+export const reviewFlowEvaluationCheckpointSchema = z
+  .object({
+    schemaVersion: z.literal(2),
+    label: reviewFlowEvaluationLabelSchema,
+    variant: z.enum(["baseline", "candidate"]),
+    baselineLabel: reviewFlowEvaluationLabelSchema.nullable(),
+    baselineBinding: reviewFlowEvaluationBaselineBindingSchema.nullable(),
+    runId: z.string().uuid(),
+    identity: reviewFlowEvaluationIdentitySchema,
+    identityFingerprint: digestSchema,
+    holdoutIdentity: digestSchema.nullable(),
+    thresholdPolicySha256: digestSchema.nullable(),
+    expectedCases: z.array(expectedCaseSchema).min(1).max(1_000),
+    entries: z.array(reviewFlowEvaluationEntrySchema).min(1).max(1_000),
+    globalClaimSha256: digestSchema.nullable(),
+    termination: terminationSchema.nullable(),
+    executionSeal: executionSealSchema.nullable(),
+    publication: reviewFlowEvaluationPublicationBindingSchema.nullable(),
+    revision: z.number().int().positive(),
+    createdAt: timestampSchema,
+    updatedAt: timestampSchema
+  })
+  .strict()
+  .superRefine((state, context) => {
+    const candidateDevelopment =
+      state.variant === "candidate" && state.identity.purpose === "development";
+    const candidateHoldout =
+      state.variant === "candidate" && state.identity.purpose === "holdout";
+    if (
+      (state.variant === "baseline" &&
+        (state.baselineLabel !== null || state.baselineBinding !== null)) ||
+      (candidateDevelopment &&
+        (state.baselineLabel === null ||
+          state.baselineLabel === state.label ||
+          state.baselineBinding === null ||
+          state.baselineBinding.label !== state.baselineLabel)) ||
+      (candidateHoldout &&
+        (state.baselineLabel === null ||
+          state.baselineLabel === state.label ||
+          state.baselineBinding !== null))
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["baselineLabel"],
+        message: "基线/候选绑定与分区不一致。"
+      });
+    }
+    if (
+      (state.identity.purpose === "holdout" &&
+        (state.holdoutIdentity === null || state.thresholdPolicySha256 === null)) ||
+      (state.identity.purpose === "development" &&
+        (state.holdoutIdentity !== null || state.thresholdPolicySha256 !== null))
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["holdoutIdentity"],
+        message: "holdout 身份只能出现在 holdout 检查点。"
+      });
+    }
+    const expectedIds = state.expectedCases.map((entry) => entry.safeId);
+    const entryIds = state.entries.map((entry) => entry.safeId);
+    if (
+      new Set(expectedIds).size !== expectedIds.length ||
+      new Set(state.expectedCases.map((entry) => entry.subjectId)).size !==
+        state.expectedCases.length ||
+      new Set(entryIds).size !== entryIds.length ||
+      expectedIds.length !== entryIds.length ||
+      expectedIds.some((safeId, index) => safeId !== entryIds[index]) ||
+      state.identityFingerprint !== hashCanonicalValue(state.identity)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["entries"],
+        message: "检查点身份或样本集合不一致。"
+      });
+    }
+    if (state.executionSeal !== null) {
+      const expectedFingerprint = executionCompletionFingerprint(state);
+      const actuallyComplete =
+        state.termination === null &&
+        state.entries.every((entry) => entry.status === "completed");
+      if (
+        state.executionSeal.completionFingerprint !== expectedFingerprint ||
+        state.executionSeal.complete !== actuallyComplete
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["executionSeal"],
+          message: "执行封存摘要与检查点终态不一致。"
+        });
+      }
+    }
+    if (
+      state.publication !== null &&
+      (state.executionSeal === null ||
+        state.publication.complete !== state.executionSeal.complete)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["publication"],
+        message: "发布确认必须绑定已封存执行终态。"
+      });
+    }
+  });
+export type ReviewFlowEvaluationCheckpointState = z.infer<
+  typeof reviewFlowEvaluationCheckpointSchema
+>;
+
+export interface ReviewFlowEvaluationCheckpointGenesisBinding {
+  readonly schemaVersion: 2;
+  readonly label: string;
+  readonly variant: "baseline" | "candidate";
+  readonly purpose: "development" | "holdout";
+  readonly runId: string;
+  readonly identityFingerprint: string;
+  readonly productionIdentityFingerprint: string;
+  readonly expectedCasesFingerprint: string;
+  readonly checkpointGenesisFingerprint: string;
+  readonly stateDirectory: { readonly device: string; readonly inode: string };
+}
+
+export interface ReviewFlowEvaluationCheckpointRevealSnapshot {
+  readonly state: ReviewFlowEvaluationCheckpointState;
+  readonly genesis: ReviewFlowEvaluationCheckpointGenesisBinding;
+}
+
+/**
+ * reveal 只读已封存链，不重建旧模型配置。读取仍锚定已验证 dirfd，并返回目录
+ * dev/ino 供全局 claim 对账；未封存状态由 reveal ledger 后续拒绝。
+ */
+export function loadReviewFlowEvaluationCheckpointForReveal(input: {
+  readonly privateDirectory: string;
+  readonly label: string;
+  readonly privateRoot?: string;
+  readonly containingWorkspace?: string;
+}): ReviewFlowEvaluationCheckpointRevealSnapshot {
+  if (!isAbsolute(input.privateDirectory)) {
+    throw new ReviewFlowEvaluationCheckpointError(
+      "REVIEW_FLOW_EVALUATION_PRIVATE_DIRECTORY_INVALID"
+    );
+  }
+  const label = reviewFlowEvaluationLabelSchema.parse(input.label);
+  const directory = openExistingPrivateDirectory(input.privateDirectory, {
+    privateRoot: input.privateRoot ?? projectPrivateRoot,
+    containingWorkspace: input.containingWorkspace ?? workspaceRoot
+  });
+  try {
+    const bytes = readPrivateArtifactBytes(
+      directory,
+      `review-flow-${label}.checkpoint.private.json`,
+      128 * 1024 * 1024
+    );
+    const state = reviewFlowEvaluationCheckpointSchema.parse(
+      JSON.parse(bytes.toString("utf8")) as unknown
+    );
+    if (state.label !== label) {
+      throw new Error("mismatch");
+    }
+    return {
+      state,
+      genesis: checkpointGenesisBinding(state, directory)
+    };
+  } catch {
+    throw new ReviewFlowEvaluationCheckpointError(
+      "REVIEW_FLOW_EVALUATION_REVEAL_CHECKPOINT_INVALID"
+    );
+  } finally {
+    closePrivateDirectory(directory);
+  }
+}
+
+export class ReviewFlowEvaluationCheckpointError extends Error {
+  public readonly code: string;
+
+  public constructor(code: string) {
+    super(code);
+    this.name = "ReviewFlowEvaluationCheckpointError";
+    this.code = code;
+  }
+}
+
+export class ReviewFlowEvaluationCheckpoint {
+  readonly #directory: PrivateDirectoryHandle;
+  readonly #stateFileName: string;
+  readonly #lockFileName: string;
+  readonly #now: () => Date;
+  #lockDescriptor: number | undefined;
+  #state: ReviewFlowEvaluationCheckpointState;
+  #openedExisting = false;
+  #closed = false;
+
+  public constructor(options: {
+    readonly privateDirectory: string;
+    readonly label: string;
+    readonly variant: "baseline" | "candidate";
+    readonly baselineLabel: string | null;
+    readonly baselineBinding: ReviewFlowEvaluationBaselineBinding | null;
+    readonly identity: ReviewFlowEvaluationIdentity;
+    readonly holdoutIdentity?: string | null;
+    readonly thresholdPolicySha256?: string | null;
+    readonly expectedCases: readonly ReviewFlowEvaluationExpectedCase[];
+    readonly resume: boolean;
+    readonly privateRoot?: string;
+    readonly containingWorkspace?: string;
+    readonly now?: () => Date;
+    readonly randomId?: () => string;
+  }) {
+    if (!isAbsolute(options.privateDirectory)) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_PRIVATE_DIRECTORY_INVALID"
+      );
+    }
+    const label = reviewFlowEvaluationLabelSchema.parse(options.label);
+    const identity = reviewFlowEvaluationIdentitySchema.parse(options.identity);
+    const expectedCases = z
+      .array(expectedCaseSchema)
+      .min(1)
+      .max(1_000)
+      .parse(options.expectedCases);
+    const holdoutIdentity = options.holdoutIdentity ?? null;
+    const thresholdPolicySha256 = options.thresholdPolicySha256 ?? null;
+    const privateRoot = options.privateRoot ?? projectPrivateRoot;
+    const containingWorkspace = options.containingWorkspace ?? workspaceRoot;
+    this.#directory = preparePrivateDirectory(options.privateDirectory, {
+      privateRoot,
+      containingWorkspace
+    });
+    this.#stateFileName = `review-flow-${label}.checkpoint.private.json`;
+    this.#lockFileName = `review-flow-${label}.lock.private`;
+    this.#now = options.now ?? (() => new Date());
+    try {
+      this.acquireLock();
+      const existing = this.loadStateIfPresent();
+      if (existing !== null && !options.resume) {
+        throw new ReviewFlowEvaluationCheckpointError(
+          "REVIEW_FLOW_EVALUATION_LABEL_ALREADY_USED"
+        );
+      }
+      if (existing === null && options.resume) {
+        throw new ReviewFlowEvaluationCheckpointError(
+          "REVIEW_FLOW_EVALUATION_RESUME_NOT_FOUND"
+        );
+      }
+      if (existing !== null) {
+        this.#state = existing;
+        this.#openedExisting = true;
+        if (
+          this.#state.label !== label ||
+          this.#state.variant !== options.variant ||
+          this.#state.baselineLabel !== options.baselineLabel ||
+          hashCanonicalValue(this.#state.baselineBinding) !==
+            hashCanonicalValue(options.baselineBinding) ||
+          this.#state.identityFingerprint !== hashCanonicalValue(identity) ||
+          this.#state.holdoutIdentity !== holdoutIdentity ||
+          this.#state.thresholdPolicySha256 !== thresholdPolicySha256 ||
+          hashCanonicalValue(this.#state.expectedCases) !==
+            hashCanonicalValue(expectedCases)
+        ) {
+          throw new ReviewFlowEvaluationCheckpointError(
+            "REVIEW_FLOW_EVALUATION_RESUME_IDENTITY_MISMATCH"
+          );
+        }
+        return;
+      }
+
+      const now = this.#now().toISOString();
+      this.#state = reviewFlowEvaluationCheckpointSchema.parse({
+        schemaVersion: 2,
+        label,
+        variant: options.variant,
+        baselineLabel: options.baselineLabel,
+        baselineBinding: options.baselineBinding,
+        runId: (options.randomId ?? randomUUID)(),
+        identity,
+        identityFingerprint: hashCanonicalValue(identity),
+        holdoutIdentity,
+        thresholdPolicySha256,
+        expectedCases,
+        entries: expectedCases.map((entry) => ({
+          safeId: entry.safeId,
+          status: "pending" as const
+        })),
+        globalClaimSha256: null,
+        termination: null,
+        executionSeal: null,
+        publication: null,
+        revision: 1,
+        createdAt: now,
+        updatedAt: now
+      });
+      this.persist();
+    } catch (error) {
+      this.releaseResources();
+      if (error instanceof ReviewFlowEvaluationCheckpointError) throw error;
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_CHECKPOINT_UNAVAILABLE"
+      );
+    }
+  }
+
+  public snapshot(): ReviewFlowEvaluationCheckpointState {
+    return reviewFlowEvaluationCheckpointSchema.parse(this.#state);
+  }
+
+  public openedExistingCheckpoint(): boolean {
+    return this.#openedExisting;
+  }
+
+  public genesisBinding(): ReviewFlowEvaluationCheckpointGenesisBinding {
+    this.assertOpen();
+    return checkpointGenesisBinding(this.#state, this.#directory);
+  }
+
+  public bindGlobalClaim(claimSha256: string): void {
+    this.assertOpen();
+    const parsed = digestSchema.parse(claimSha256);
+    if (this.#state.globalClaimSha256 === parsed) return;
+    if (
+      this.#state.globalClaimSha256 !== null ||
+      this.#state.entries.some((entry) => entry.status !== "pending") ||
+      this.#state.executionSeal !== null
+    ) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_GLOBAL_CLAIM_MISMATCH"
+      );
+    }
+    this.update({ globalClaimSha256: parsed });
+  }
+
+  public pendingSafeIds(): string[] {
+    return this.#state.entries.flatMap((entry) =>
+      entry.status === "pending" ? [entry.safeId] : []
+    );
+  }
+
+  public terminallyContaminated(): boolean {
+    return this.#state.termination !== null || this.#state.entries.some(
+      (entry) => entry.status === "active" || entry.status === "failed"
+    );
+  }
+
+  public startGateOpen(): boolean {
+    return this.#state.termination === null && this.#state.executionSeal === null;
+  }
+
+  public markTerminationRequested(
+    signal: "SIGINT" | "SIGTERM" | "SIGHUP"
+  ): void {
+    this.assertOpen();
+    if (this.#state.termination !== null) return;
+    if (this.#state.executionSeal !== null) return;
+    this.update({
+      termination: {
+        signal,
+        observedAt: this.#now().toISOString()
+      }
+    });
+  }
+
+  public markActive(safeId: string): void {
+    if (
+      this.#state.globalClaimSha256 === null ||
+      !this.startGateOpen()
+    ) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_START_GATE_CLOSED"
+      );
+    }
+    this.replaceEntry(safeId, (entry) => {
+      if (entry.status !== "pending") {
+        throw new ReviewFlowEvaluationCheckpointError(
+          "REVIEW_FLOW_EVALUATION_CASE_NOT_PENDING"
+        );
+      }
+      return {
+        safeId,
+        status: "active",
+        startedAt: this.#now().toISOString()
+      };
+    });
+  }
+
+  public markCompleted(
+    safeId: string,
+    projection: z.infer<typeof reviewFlowCalibrationProjectionSchema>
+  ): void {
+    const parsed = reviewFlowCalibrationProjectionSchema.parse(projection);
+    this.replaceEntry(safeId, (entry) => {
+      if (entry.status !== "active") {
+        throw new ReviewFlowEvaluationCheckpointError(
+          "REVIEW_FLOW_EVALUATION_CASE_NOT_ACTIVE"
+        );
+      }
+      return {
+        safeId,
+        status: "completed",
+        completedAt: this.#now().toISOString(),
+        projection: parsed
+      };
+    });
+  }
+
+  public markFailed(
+    safeId: string,
+    failure: ReviewFlowEvaluationFailure
+  ): void {
+    const parsed = failureSchema.parse(failure);
+    this.replaceEntry(safeId, (entry) => {
+      if (entry.status !== "active") {
+        throw new ReviewFlowEvaluationCheckpointError(
+          "REVIEW_FLOW_EVALUATION_CASE_NOT_ACTIVE"
+        );
+      }
+      return {
+        safeId,
+        status: "failed",
+        failedAt: this.#now().toISOString(),
+        failure: parsed
+      };
+    });
+  }
+
+  public sealExecution(): ReviewFlowEvaluationCheckpointState {
+    this.assertOpen();
+    if (this.#state.globalClaimSha256 === null) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_GLOBAL_CLAIM_MISSING"
+      );
+    }
+    if (this.#state.executionSeal !== null) return this.snapshot();
+    const sealedAt = this.#now().toISOString();
+    const draft = {
+      ...this.#state,
+      executionSeal: {
+        sealedAt,
+        complete:
+          this.#state.termination === null &&
+          this.#state.entries.every((entry) => entry.status === "completed"),
+        completionFingerprint: executionCompletionFingerprint(this.#state)
+      },
+      revision: this.#state.revision + 1,
+      updatedAt: sealedAt
+    };
+    this.#state = reviewFlowEvaluationCheckpointSchema.parse(draft);
+    this.persist();
+    return this.snapshot();
+  }
+
+  public acknowledgePublication(
+    publication: Omit<ReviewFlowEvaluationPublicationBinding, "acknowledgedAt">
+  ): void {
+    this.assertOpen();
+    if (this.#state.executionSeal === null) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_EXECUTION_NOT_SEALED"
+      );
+    }
+    if (this.#state.publication !== null) {
+      const expected = {
+        ...publication,
+        acknowledgedAt: this.#state.publication.acknowledgedAt
+      };
+      if (hashCanonicalValue(expected) === hashCanonicalValue(this.#state.publication)) {
+        return;
+      }
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_PUBLICATION_MISMATCH"
+      );
+    }
+    this.update({
+      publication: reviewFlowEvaluationPublicationBindingSchema.parse({
+        ...publication,
+        acknowledgedAt: this.#now().toISOString()
+      })
+    });
+  }
+
+  public close(): void {
+    if (!this.#closed) {
+      this.#closed = true;
+      this.releaseResources();
+    }
+  }
+
+  private loadStateIfPresent(): ReviewFlowEvaluationCheckpointState | null {
+    try {
+      const bytes = readPrivateArtifactBytes(
+        this.#directory,
+        this.#stateFileName,
+        128 * 1024 * 1024
+      );
+      return reviewFlowEvaluationCheckpointSchema.parse(
+        JSON.parse(bytes.toString("utf8")) as unknown
+      );
+    } catch (error) {
+      if (
+        error instanceof PhysicalBlindArtifactError &&
+        error.code === "BLIND_ARTIFACT_FILE_MISSING"
+      ) {
+        return null;
+      }
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_CHECKPOINT_INVALID"
+      );
+    }
+  }
+
+  private replaceEntry(
+    safeId: string,
+    replacement: (entry: ReviewFlowEvaluationEntry) => ReviewFlowEvaluationEntry
+  ): void {
+    this.assertOpen();
+    if (this.#state.executionSeal !== null) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_EXECUTION_ALREADY_SEALED"
+      );
+    }
+    const index = this.#state.entries.findIndex((entry) => entry.safeId === safeId);
+    if (index < 0) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_CASE_UNKNOWN"
+      );
+    }
+    const entries = [...this.#state.entries];
+    entries[index] = replacement(entries[index]!);
+    this.update({ entries });
+  }
+
+  private update(
+    patch: Partial<ReviewFlowEvaluationCheckpointState>
+  ): void {
+    const now = this.#now().toISOString();
+    this.#state = reviewFlowEvaluationCheckpointSchema.parse({
+      ...this.#state,
+      ...patch,
+      revision: this.#state.revision + 1,
+      updatedAt: now
+    });
+    this.persist();
+  }
+
+  private persist(): void {
+    this.assertOpen();
+    const temporaryName = `${this.#stateFileName}.tmp-${process.pid}-${randomUUID()}`;
+    const temporaryPath = anchoredPrivatePath(this.#directory, temporaryName);
+    const targetPath = anchoredPrivatePath(this.#directory, this.#stateFileName);
+    let descriptor: number | undefined;
+    try {
+      descriptor = openSync(
+        temporaryPath,
+        constants.O_WRONLY |
+          constants.O_CREAT |
+          constants.O_EXCL |
+          (constants.O_NOFOLLOW ?? 0),
+        0o600
+      );
+      fchmodSync(descriptor, 0o600);
+      writeFileSync(descriptor, `${JSON.stringify(this.#state, null, 2)}\n`, "utf8");
+      fsyncSync(descriptor);
+      closeSync(descriptor);
+      descriptor = undefined;
+      renameSync(temporaryPath, targetPath);
+      fsyncSync(this.#directory.descriptor);
+    } catch {
+      if (descriptor !== undefined) closeQuietly(descriptor);
+      try {
+        unlinkSync(temporaryPath);
+      } catch {
+        // 只清理本次随机命名的临时文件。
+      }
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_CHECKPOINT_WRITE_FAILED"
+      );
+    }
+  }
+
+  private acquireLock(): void {
+    const temporaryName = `${this.#lockFileName}.tmp-${process.pid}-${randomUUID()}`;
+    const temporaryPath = anchoredPrivatePath(this.#directory, temporaryName);
+    const lockPath = anchoredPrivatePath(this.#directory, this.#lockFileName);
+    let descriptor: number | undefined;
+    let temporaryExists = false;
+    try {
+      descriptor = openSync(
+        temporaryPath,
+        constants.O_RDWR |
+          constants.O_CREAT |
+          constants.O_EXCL |
+          (constants.O_NOFOLLOW ?? 0),
+        0o600
+      );
+      temporaryExists = true;
+      fchmodSync(descriptor, 0o600);
+      const lockDocument = Buffer.from(
+        `${JSON.stringify({
+          schemaVersion: 1,
+          processId: process.pid,
+          processStartTimeTicks: readCurrentProcessStartTimeTicks(),
+          acquiredAt: this.#now().toISOString(),
+          recoveryRule:
+            "VERIFY_PID_START_TIME_AND_PROJECT_PROCESS_BEFORE_MANUAL_REMOVAL"
+        }, null, 2)}\n`,
+        "utf8"
+      );
+      writeAll(descriptor, lockDocument);
+      fsyncSync(descriptor);
+      linkSync(temporaryPath, lockPath);
+      this.#lockDescriptor = descriptor;
+      descriptor = undefined;
+      unlinkSync(temporaryPath);
+      temporaryExists = false;
+      fsyncSync(this.#directory.descriptor);
+    } catch {
+      if (descriptor !== undefined) closeQuietly(descriptor);
+      if (temporaryExists) {
+        try {
+          unlinkSync(temporaryPath);
+        } catch {
+          // 不接触固定锁文件。
+        }
+      }
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_LOCKED_OR_UNAVAILABLE"
+      );
+    }
+  }
+
+  private assertOpen(): void {
+    if (this.#closed) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_CHECKPOINT_CLOSED"
+      );
+    }
+  }
+
+  private releaseResources(): void {
+    if (this.#lockDescriptor !== undefined) {
+      const lockPath = anchoredPrivatePath(this.#directory, this.#lockFileName);
+      try {
+        const held = fstatSync(this.#lockDescriptor, { bigint: true });
+        const linked = lstatSync(lockPath, { bigint: true });
+        if (held.dev === linked.dev && held.ino === linked.ino && linked.isFile()) {
+          unlinkSync(lockPath);
+          fsyncSync(this.#directory.descriptor);
+        }
+      } catch {
+        // 无法证明锁归属时保留锁，禁止误删另一进程的新锁。
+      }
+      closeQuietly(this.#lockDescriptor);
+      this.#lockDescriptor = undefined;
+    }
+    closePrivateDirectory(this.#directory);
+  }
+}
+
+function executionCompletionFingerprint(
+  state: Pick<
+    ReviewFlowEvaluationCheckpointState,
+    | "runId"
+    | "identityFingerprint"
+    | "expectedCases"
+    | "entries"
+    | "globalClaimSha256"
+    | "termination"
+  >
+): string {
+  return hashCanonicalValue({
+    protocol: "review-flow-evaluation-execution-completion-v2",
+    runId: state.runId,
+    identityFingerprint: state.identityFingerprint,
+    expectedCases: state.expectedCases,
+    entries: state.entries,
+    globalClaimSha256: state.globalClaimSha256,
+    termination: state.termination
+  });
+}
+
+function checkpointGenesisBinding(
+  state: ReviewFlowEvaluationCheckpointState,
+  directory: PrivateDirectoryHandle
+): ReviewFlowEvaluationCheckpointGenesisBinding {
+  const status = fstatSync(directory.descriptor, { bigint: true });
+  const base = {
+    schemaVersion: 2 as const,
+    label: state.label,
+    variant: state.variant,
+    purpose: state.identity.purpose,
+    runId: state.runId,
+    identityFingerprint: state.identityFingerprint,
+    productionIdentityFingerprint:
+      reviewFlowEvaluationProductionIdentityFingerprint(state.identity),
+    expectedCasesFingerprint: hashCanonicalValue(state.expectedCases),
+    stateDirectory: {
+      device: status.dev.toString(10),
+      inode: status.ino.toString(10)
+    }
+  };
+  return {
+    ...base,
+    checkpointGenesisFingerprint: hashCanonicalValue(base)
+  };
+}
+
+function writeAll(descriptor: number, bytes: Buffer): void {
+  let offset = 0;
+  while (offset < bytes.byteLength) {
+    const written = writeSync(
+      descriptor,
+      bytes,
+      offset,
+      bytes.byteLength - offset,
+      offset
+    );
+    if (written <= 0) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_LOCK_WRITE_FAILED"
+      );
+    }
+    offset += written;
+  }
+}
+
+function closeQuietly(descriptor: number): void {
+  try {
+    closeSync(descriptor);
+  } catch {
+    // 固定错误码，不记录路径。
+  }
+}
+
+function readCurrentProcessStartTimeTicks(): string {
+  try {
+    const stat = readFileSync("/proc/self/stat", "utf8");
+    const commandEnd = stat.lastIndexOf(")");
+    const fields = stat.slice(commandEnd + 1).trim().split(/\s+/u);
+    const value = fields[19];
+    if (commandEnd < 0 || value === undefined || !/^[1-9][0-9]*$/u.test(value)) {
+      throw new Error("invalid");
+    }
+    return value;
+  } catch {
+    throw new ReviewFlowEvaluationCheckpointError(
+      "REVIEW_FLOW_EVALUATION_PROCESS_IDENTITY_UNAVAILABLE"
+    );
+  }
+}

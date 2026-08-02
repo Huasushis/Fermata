@@ -5,10 +5,10 @@
  * 与 HEAD 字节一致，以及 runner 的直接/传递依赖代码全集哈希。任何不一致都在
  * 付费请求前用固定错误码关闭，不输出文件内容或私有路径。
  */
-import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { withTrustedGitSnapshot } from "../../scripts/trusted-git-state.mjs";
 
 const commitPattern = /^(?!0{40}$)[0-9a-f]{40}$/u;
 const safeRepositoryPathPattern = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/u;
@@ -23,6 +23,8 @@ export const difficultyEvaluationCodePaths = [
   "experiments/lib/difficulty-evaluation-eligibility.ts",
   "experiments/lib/evaluation-code-identity.ts",
   "experiments/lib/evaluation-integrity.ts",
+  "scripts/trusted-git-state.d.mts",
+  "scripts/trusted-git-state.mjs",
   "scripts/private-runtime.mjs",
   "src/config.ts",
   "src/llm.ts",
@@ -48,6 +50,8 @@ export const verdictEvaluationCodePaths = [
   "experiments/lib/levels-calibration-state.ts",
   "experiments/lib/verdict-evaluation-design.ts",
   "experiments/lib/verdict-evaluation-checkpoint.ts",
+  "scripts/trusted-git-state.d.mts",
+  "scripts/trusted-git-state.mjs",
   "scripts/private-runtime.mjs",
   "src/config.ts",
   "src/llm.ts",
@@ -69,6 +73,8 @@ export interface EvaluationCodeIdentity {
   readonly runnerSha256: string;
   readonly dependencyCodeSha256: string;
   readonly dependencyFileCount: number;
+  readonly productionDependencyCodeSha256: string;
+  readonly productionDependencyFileCount: number;
 }
 
 export interface EvaluationRepositoryStateSnapshot {
@@ -126,17 +132,6 @@ export function hashEvaluationCodeBundle(
   return digest.digest("hex");
 }
 
-function git(repositoryDirectory: string, args: readonly string[]): Buffer {
-  try {
-    return execFileSync("git", args, {
-      cwd: repositoryDirectory,
-      stdio: ["ignore", "pipe", "ignore"]
-    });
-  } catch {
-    throw new Error("EVALUATION_CODE_IDENTITY_INVALID");
-  }
-}
-
 function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
@@ -146,81 +141,106 @@ export function loadEvaluationCodeIdentity(input: {
   readonly expectedCodeVersion: string;
   readonly runnerPath: string;
   readonly dependencyPaths: readonly string[];
+  readonly productionDependencyPaths?: readonly string[];
 }): EvaluationCodeIdentity {
   try {
     const dependencyPaths = [...input.dependencyPaths];
+    const productionDependencyPaths = [
+      ...(input.productionDependencyPaths ?? dependencyPaths)
+    ];
     if (
       !dependencyPaths.includes(input.runnerPath) ||
-      new Set(dependencyPaths).size !== dependencyPaths.length
+      new Set(dependencyPaths).size !== dependencyPaths.length ||
+      productionDependencyPaths.length === 0 ||
+      new Set(productionDependencyPaths).size !== productionDependencyPaths.length ||
+      productionDependencyPaths.some((path) => !dependencyPaths.includes(path))
     ) {
       throw new Error("EVALUATION_CODE_IDENTITY_INVALID");
     }
-    // --error-unmatch 确保清单里的每个文件都已跟踪；不接受运行时新增依赖。
-    git(input.repositoryDirectory, [
-      "ls-files",
-      "--error-unmatch",
-      "--",
-      ...dependencyPaths
-    ]);
-    const actualHead = git(input.repositoryDirectory, ["rev-parse", "--verify", "HEAD"])
-      .toString("utf8")
-      .trim();
-    const porcelain = git(input.repositoryDirectory, [
-      "status",
-      "--porcelain=v1",
-      "--untracked-files=all"
-    ]).toString("utf8");
-    const trackedPrivatePaths = git(input.repositoryDirectory, [
-      "ls-files",
-      "private"
-    ]).toString("utf8");
-
-    const workingFiles: { path: string; bytes: Buffer }[] = [];
-    const headFiles: { path: string; bytes: Buffer }[] = [];
-    for (const path of dependencyPaths) {
-      if (
-        !safeRepositoryPathPattern.test(path) ||
-        path.startsWith("/") ||
-        path.split("/").some((component) => component === ".." || component === ".")
-      ) {
-        throw new Error("EVALUATION_CODE_IDENTITY_INVALID");
+    return withTrustedGitSnapshot(input.repositoryDirectory, (git) => {
+      // --error-unmatch 确保清单里的每个文件都已跟踪；不接受运行时新增依赖。
+      git.run([
+        "ls-files",
+        "--error-unmatch",
+        "--",
+        ...dependencyPaths
+      ]);
+      // copied index 仍可能带 assume-unchanged、skip-worktree 或 fsmonitor
+      // valid 位。三类标志都会让 porcelain 少报工作树变化，付费评测一律拒绝。
+      for (const arguments_ of [
+        ["ls-files", "-v", "-z"],
+        ["ls-files", "-f", "-z"]
+      ] as const) {
+        const entries = git.run(arguments_).toString("utf8").split("\0");
+        if (entries.some((entry) => entry.length > 0 && !entry.startsWith("H "))) {
+          throw new Error("EVALUATION_CODE_IDENTITY_INVALID");
+        }
       }
-      const absolutePath = resolve(input.repositoryDirectory, path);
-      const status = lstatSync(absolutePath);
-      if (!status.isFile() || status.isSymbolicLink()) {
-        throw new Error("EVALUATION_CODE_IDENTITY_INVALID");
-      }
-      workingFiles.push({ path, bytes: readFileSync(absolutePath) });
-      headFiles.push({
-        path,
-        bytes: git(input.repositoryDirectory, ["show", `HEAD:${path}`])
+      const actualHead = git.run(["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      const porcelain = git.run([
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all"
+      ], { encoding: "utf8" });
+      const trackedPrivatePaths = git.run(["ls-files", "private"], {
+        encoding: "utf8"
       });
-    }
-    const runnerWorking = workingFiles.find((file) => file.path === input.runnerPath);
-    const runnerHead = headFiles.find((file) => file.path === input.runnerPath);
-    if (runnerWorking === undefined || runnerHead === undefined) {
-      throw new Error("EVALUATION_CODE_IDENTITY_INVALID");
-    }
-    const dependencyWorkingSha256 = hashEvaluationCodeBundle(workingFiles);
-    const dependencyHeadSha256 = hashEvaluationCodeBundle(headFiles);
-    const runnerWorkingSha256 = sha256(runnerWorking.bytes);
-    const runnerHeadSha256 = sha256(runnerHead.bytes);
-    assertEvaluationRepositoryState({
-      expectedCodeVersion: input.expectedCodeVersion,
-      actualHead,
-      porcelain,
-      trackedPrivatePaths,
-      runnerWorkingSha256,
-      runnerHeadSha256,
-      dependencyWorkingSha256,
-      dependencyHeadSha256
+
+      const workingFiles: { path: string; bytes: Buffer }[] = [];
+      const headFiles: { path: string; bytes: Buffer }[] = [];
+      for (const path of dependencyPaths) {
+        if (
+          !safeRepositoryPathPattern.test(path) ||
+          path.startsWith("/") ||
+          path.split("/").some((component) => component === ".." || component === ".")
+        ) {
+          throw new Error("EVALUATION_CODE_IDENTITY_INVALID");
+        }
+        const absolutePath = resolve(input.repositoryDirectory, path);
+        const status = lstatSync(absolutePath);
+        if (!status.isFile() || status.isSymbolicLink()) {
+          throw new Error("EVALUATION_CODE_IDENTITY_INVALID");
+        }
+        workingFiles.push({ path, bytes: readFileSync(absolutePath) });
+        headFiles.push({ path, bytes: git.run(["show", `HEAD:${path}`]) });
+      }
+      const runnerWorking = workingFiles.find((file) => file.path === input.runnerPath);
+      const runnerHead = headFiles.find((file) => file.path === input.runnerPath);
+      if (runnerWorking === undefined || runnerHead === undefined) {
+        throw new Error("EVALUATION_CODE_IDENTITY_INVALID");
+      }
+      const dependencyWorkingSha256 = hashEvaluationCodeBundle(workingFiles);
+      const dependencyHeadSha256 = hashEvaluationCodeBundle(headFiles);
+      const productionWorkingSha256 = hashEvaluationCodeBundle(
+        workingFiles.filter((file) => productionDependencyPaths.includes(file.path))
+      );
+      const productionHeadSha256 = hashEvaluationCodeBundle(
+        headFiles.filter((file) => productionDependencyPaths.includes(file.path))
+      );
+      const runnerWorkingSha256 = sha256(runnerWorking.bytes);
+      const runnerHeadSha256 = sha256(runnerHead.bytes);
+      assertEvaluationRepositoryState({
+        expectedCodeVersion: input.expectedCodeVersion,
+        actualHead,
+        porcelain,
+        trackedPrivatePaths,
+        runnerWorkingSha256,
+        runnerHeadSha256,
+        dependencyWorkingSha256,
+        dependencyHeadSha256
+      });
+      if (productionWorkingSha256 !== productionHeadSha256) {
+        throw new Error("EVALUATION_CODE_IDENTITY_INVALID");
+      }
+      return {
+        codeVersion: actualHead,
+        runnerSha256: runnerWorkingSha256,
+        dependencyCodeSha256: dependencyWorkingSha256,
+        dependencyFileCount: dependencyPaths.length,
+        productionDependencyCodeSha256: productionWorkingSha256,
+        productionDependencyFileCount: productionDependencyPaths.length
+      };
     });
-    return {
-      codeVersion: actualHead,
-      runnerSha256: runnerWorkingSha256,
-      dependencyCodeSha256: dependencyWorkingSha256,
-      dependencyFileCount: dependencyPaths.length
-    };
   } catch {
     throw new Error("EVALUATION_CODE_IDENTITY_INVALID");
   }

@@ -24,7 +24,9 @@
     "experiment:calibrate-levels": "tsx experiments/calibrate-levels.ts",
     "experiment:calibrate-levels:detached": "node scripts/start-detached-calibration.mjs",
     "experiment:verify-legacy-reports": "node scripts/verify-legacy-report-registry.mjs",
-    "experiment:eval-verdict": "tsx experiments/eval-verdict.ts"
+    "experiment:eval-verdict": "tsx experiments/eval-verdict.ts",
+    "experiment:eval-review-flow": "node scripts/review-flow-evaluation-bootstrap.mjs",
+    "experiment:prepare-review-flow-dataset": "tsx experiments/prepare-review-flow-dataset.ts"
   },
   "dependencies": {
     "undici": "8.9.0",
