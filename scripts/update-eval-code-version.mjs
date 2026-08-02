@@ -366,7 +366,10 @@ export function parseUpdateArguments(argv) {
   return resolve(value);
 }
 
-export function readCleanRepositoryHead(expectedHeadCodeVersion) {
+export function readCleanRepositoryHead(
+  expectedHeadCodeVersion,
+  { temporaryRoot } = {}
+) {
   try {
     return withTrustedGitSnapshot(repositoryRoot, (git) => {
       const porcelain = git.run(
@@ -398,7 +401,7 @@ export function readCleanRepositoryHead(expectedHeadCodeVersion) {
         privatePathIgnored,
         expectedHeadCodeVersion
       });
-    });
+    }, temporaryRoot === undefined ? {} : { temporaryRoot });
   } catch {
     failUpdate();
   }

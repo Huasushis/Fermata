@@ -8,20 +8,28 @@ import {
   constants,
   fchmodSync,
   fsyncSync,
+  lstatSync,
   linkSync,
   openSync,
+  realpathSync,
   unlinkSync,
   writeSync
 } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
-import { parseEnvFile } from "./env-file.mjs";
+import {
+  assertSafeNodeEnvironment,
+  parseEnvFile
+} from "./env-file.mjs";
 import {
   anchoredPrivatePath,
   closePrivateDirectory,
+  isInside,
   preparePrivateDirectory,
-  readProtectedEnvFile
+  projectPrivateRoot,
+  readProtectedEnvFile,
+  workspaceRoot
 } from "./private-runtime.mjs";
 import {
   buildReviewFlowEvaluationRunEnvironment
@@ -29,8 +37,12 @@ import {
 import {
   readCleanRepositoryHead
 } from "./update-eval-code-version.mjs";
+import {
+  assertSafeCallerGitEnvironment
+} from "./trusted-git-state.mjs";
 
 const outputFileName = "review-flow.env";
+const projectCacheRoot = resolve(workspaceRoot, ".cache");
 const codeVersionPattern = /^(?!0{40}$)[0-9a-f]{40}$/u;
 const providerPairs = Object.freeze([
   ["AETHER_BASE_URL", "AETHER_API_KEY"],
@@ -39,6 +51,26 @@ const providerPairs = Object.freeze([
 
 function failPreparation() {
   throw new Error("REVIEW_FLOW_EVALUATION_ENV_PREPARATION_FAILED");
+}
+
+function assertInternalTemporaryRoot(temporaryRoot, containingWorkspace) {
+  try {
+    const resolved = resolve(temporaryRoot);
+    const status = lstatSync(resolved);
+    if (
+      !status.isDirectory() ||
+      status.isSymbolicLink() ||
+      (status.mode & 0o777) !== 0o700 ||
+      realpathSync(resolved) !== resolved ||
+      !isInside(containingWorkspace, resolved, { allowSame: false }) ||
+      (typeof process.getuid === "function" && status.uid !== process.getuid())
+    ) {
+      failPreparation();
+    }
+    return resolved;
+  } catch {
+    failPreparation();
+  }
 }
 
 function rawEnvironmentLines(content) {
@@ -105,7 +137,7 @@ export function buildReviewFlowEvaluationEnvFile(
   }
 }
 
-function writeExclusivePrivateFile(directory, content) {
+function writeExclusivePrivateFile(directory, content, validateBeforePublish) {
   const temporaryName = `.review-flow-env-${process.pid}-${randomUUID()}.tmp`;
   const temporaryPath = anchoredPrivatePath(directory, temporaryName);
   const targetPath = anchoredPrivatePath(directory, outputFileName);
@@ -138,6 +170,7 @@ function writeExclusivePrivateFile(directory, content) {
     fsyncSync(descriptor);
     closeSync(descriptor);
     descriptor = undefined;
+    validateBeforePublish();
     linkSync(temporaryPath, targetPath);
     unlinkSync(temporaryPath);
     temporaryExists = false;
@@ -176,22 +209,53 @@ function parseArguments(argv) {
   return { source: resolve(source), targetDirectory: resolve(targetDirectory) };
 }
 
-export function prepareReviewFlowEvaluationEnv(argv) {
+export function prepareReviewFlowEvaluationEnv(
+  argv,
+  {
+    parentEnvironment = process.env,
+    privateRoot = projectPrivateRoot,
+    containingWorkspace = workspaceRoot,
+    temporaryRoot = projectCacheRoot,
+    readRepositoryHead = readCleanRepositoryHead,
+    readEnvFile = readProtectedEnvFile,
+    prepareDirectory = preparePrivateDirectory
+  } = {}
+) {
+  // 必须先拒绝 Node/Git 注入，再解析路径或接触含密钥的源文件。
+  assertSafeNodeEnvironment(parentEnvironment);
+  assertSafeCallerGitEnvironment(parentEnvironment);
+  const trustedTemporaryRoot = assertInternalTemporaryRoot(
+    temporaryRoot,
+    containingWorkspace
+  );
   const { source, targetDirectory } = parseArguments(argv);
-  const codeVersion = readCleanRepositoryHead();
+  const gitOptions = { temporaryRoot: trustedTemporaryRoot };
+  const codeVersion = readRepositoryHead(undefined, gitOptions);
+  const runtimeOptions = { privateRoot, containingWorkspace };
+  const sourceContent = readEnvFile(source, runtimeOptions);
   const content = buildReviewFlowEvaluationEnvFile(
-    readProtectedEnvFile(source),
+    sourceContent,
     codeVersion
   );
-  const directory = preparePrivateDirectory(targetDirectory);
+  const directory = prepareDirectory(targetDirectory, runtimeOptions);
   try {
-    writeExclusivePrivateFile(directory, content);
+    writeExclusivePrivateFile(directory, content, () => {
+      if (readEnvFile(source, runtimeOptions) !== sourceContent) {
+        failPreparation();
+      }
+      readRepositoryHead(codeVersion, gitOptions);
+    });
   } finally {
     closePrivateDirectory(directory);
   }
   const target = resolve(targetDirectory, outputFileName);
-  if (readProtectedEnvFile(target) !== content) failPreparation();
-  readCleanRepositoryHead(codeVersion);
+  if (
+    readEnvFile(target, runtimeOptions) !== content ||
+    readEnvFile(source, runtimeOptions) !== sourceContent
+  ) {
+    failPreparation();
+  }
+  readRepositoryHead(codeVersion, gitOptions);
 }
 
 function isDirectEntry() {
