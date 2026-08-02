@@ -177,6 +177,508 @@ node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:eval-verdic
 完整用法是 `node scripts/run-with-env.mjs <env文件> <命令> [参数...]`。不要改回
 shell 的 `source` 或 `.`。
 
+### 正式 11 角色审题流的准确性实验
+
+`experiment:eval-review-flow` 是这个入口在 package.json 中的识别名；真实付费运行不得先执行
+`npm run`，必须使用下文专用包装命令。它评估当前生产路径实际使用的 11 个角色，而不是旧的
+thinking/coding/verdict 流水线。这个入口只消费已经人工整理好的严格数据集，不生成题目、
+不生成 gold，也不会直接读取 Urmotiv、历史 XML 或题库目录。导入人员必须先在隔离步骤中把允许使用的
+材料整理成完整 `robotReviewTaskSchema` 快照，并确保任务里的 Anklang 证据是完整、`no-store`
+（没有过期时间）的可信快照；入口会在任何付费请求前一次性校验所有样本。
+
+manifest、固定标签目录、逐题 content 和逐题 gold 都必须放在 `--dataset-private-root` 明确指定的
+Git 忽略私有根内；当前桥接输出可以留在 `Urmotiv/private/`，只有 registry、检查点和报告固定写入
+`Fermata/private/`。私有根及每层目录必须是当前用户所有的 `0700` 真目录；文件必须是当前用户所有、硬链接数为
+1 的 `0600` 普通文件，不能是符号链接。manifest 只可用同目录文件名引用材料。所有 `sha256` 都是
+磁盘文件**原始字节**的 SHA-256，不是解析后 JSON 的摘要。一个 manifest 必须固定非空
+`development`；`holdout` 可以非空并登记冻结标签对，也可以显式为空且令 `holdoutRegistration=null`，
+但两分区必须互不重叠。每题必须有稳定、不透露题号的 `subjectId` 和来源谱系摘要；即使后来
+改写 content 字节，同一主体也不能从 development 移入 holdout。两边还会按安全编号、来源谱系、
+content 与原始 Anklang 响应摘要检查交叉污染。固定标签目录单独保存为：
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "version": 1,
+  "tags": [
+    {
+      "id": "固定标签编号",
+      "name": "标签名",
+      "categoryId": "固定大类编号",
+      "categoryName": "大类名",
+      "description": "",
+      "aliases": [],
+      "active": true
+    }
+  ]
+}
+```
+
+每个 content 文件必须是完整且无额外字段的 `robotReviewTaskSchema` 文档；其中 `tagCatalog` 必须与
+上述固定目录逐字段一致。manifest v3 的两个分区都**不得**保存 Gold 文件名、逐题 Gold 摘要、
+原始审核行摘要、封存 Gold 证据摘要、verdict、理由、难度、比赛使用情况或任何 Gold 聚合摘要，避免
+这些低熵字段形成可枚举的哈希 oracle。只有 development 运行或一次性 reveal 真正打开
+所选分区 Gold 后，程序才在内存中计算该分区摘要。12 个品味维度键为 `novelty`、
+`idea_depth`、`naturalness`、`contestant_experience`、`icpc_fit`、
+`implementation_balance`、`difficulty_role`、`fairness`、`judgeability`、
+`statement_expression`、`solution_exposition`、`data_preparation`。
+
+```jsonc
+{
+  "schemaVersion": 3,
+  "datasetId": "dataset-16位小写十六进制",
+  "tagCatalog": {
+    "fileName": "固定标签目录.private.json",
+    "sha256": "64位小写十六进制",
+    "version": 1
+  },
+  "holdoutRegistration": {
+    "baselineLabel": "预先冻结的 holdout 基线标签",
+    "candidateLabel": "预先冻结的 holdout 候选标签",
+    "thresholdPolicySha256": "预先冻结的阈值政策摘要"
+  },
+  "developmentRevealCommitmentSha256": "带独立随机 nonce 的 development reveal descriptor 原始字节摘要",
+  "holdoutRevealCommitmentSha256": "带随机 nonce 的独立 reveal descriptor 原始字节摘要",
+  "partitions": {
+    "development": {
+      "cases": [
+        {
+          "safeId": "case-0001",
+          "subjectId": "subject-不透明稳定编号",
+          "sourceLineageSha256": "来源谱系摘要",
+          "originalAnklangResponseSha256": "原始 Anklang v2 响应字节摘要",
+          "content": {
+            "fileName": "开发集题目快照.private.json",
+            "sha256": "64位小写十六进制"
+          }
+        }
+      ]
+    },
+    "holdout": {
+      "cases": [
+        {
+          "safeId": "case-0002",
+          "subjectId": "subject-另一个不透明稳定编号",
+          "sourceLineageSha256": "另一个来源谱系摘要",
+          "originalAnklangResponseSha256": "另一个原始 Anklang v2 响应字节摘要",
+          "content": {
+            "fileName": "留出集题目快照.private.json",
+            "sha256": "64位小写十六进制"
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+development 与 holdout 的 Gold 分别写入两个独立 `0700` 真目录中的 reveal descriptor；两条
+commitment 使用不同 nonce，development run 绝不能获得 holdout descriptor 路径。descriptor 的绝对
+路径不出现在 prediction manifest；development run 虽显式接收自己的 descriptor 路径，也必须先用
+无 Gold 的身份视图完成全局用途登记，成功后才能首次打开。`commitmentNonce` 必须由密码学安全随机数
+生成器新建 256 bit 随机值，
+不能由题号、标签或 Gold 内容推导。manifest 只绑定整个 descriptor 的原始字节摘要，因此不能枚举
+`approve/reject` 或 `confirmedDuplicate` 等低熵组合反查逐题标签。descriptor 的严格形状是：
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "artifactKind": "review_flow_evaluation_reveal_descriptor",
+  "protocolVersion": "review-flow-evaluation-reveal-v1",
+  "datasetId": "必须与 prediction manifest 一致",
+  "purpose": "development 或 holdout；两个 descriptor 各固定一个用途",
+  "predictionBindingSha256": "不含 Gold 的 holdout 输入集合摘要",
+  "commitmentNonce": "密码学安全生成的 64 位小写十六进制随机值",
+  "cases": [
+    {
+      "safeId": "case-0002",
+      "subjectId": "必须与 prediction manifest 一致",
+      "sourceLineageSha256": "必须与 prediction manifest 一致",
+      "contentSha256": "必须与 prediction manifest 一致",
+      "upstreamEvidence": {
+        "sealedEvidenceSha256": "上游封存证据摘要",
+        "rowEvidenceSha256": "原始审核行证据摘要",
+        "originalAnklangResponseSha256": "必须与 prediction manifest 一致",
+        "bridgeEvidence": {
+          "bridgeVersion": "urmotiv-review-flow-bridge-v2",
+          "verificationAttestationSha256": "上游验证证明原始字节摘要",
+          "bridgePlanSha256": "桥接计划原始字节摘要",
+          "reviewGoldEvidenceSha256": "上游 evidence 原始字节摘要",
+          "sourceBindingsSha256": "上游 source-bindings 原始字节摘要",
+          "upstreamGoldSha256": "本题上游 Gold 原始字节摘要",
+          "worksheetSha256": "审核工作表原始字节摘要",
+          "inspectionSha256": "原始表格检查报告原始字节摘要",
+          "layoutSha256": "人工布局确认原始字节摘要",
+          "reviewInputSetSha256": "原始审核输入集合摘要",
+          "humanMappingSha256": "本题人工映射原始字节摘要"
+        }
+      },
+      "gold": {
+        "fileName": "与 descriptor 同目录的留出集人工标准.private.json",
+        "sha256": "Gold 文件原始字节摘要"
+      }
+    }
+  ]
+}
+```
+
+上面的 JSONC 只展示字段位置，尖括号式说明和中文摘要占位必须替换为真实、满足 schema 的值，不能
+原样作为 manifest。Urmotiv `prepare-review-gold.py seal` 的输出只是上游证据，不能直接当作这里的
+manifest；必须先验证 `REVIEW_GOLD_COMPLETE`、evidence、source-bindings 和逐题 Gold 的摘要，再由人工
+复核题面/题解边界及 XML 稀疏意见映射，生成本 schema 的 content、Gold、prediction manifest 与独立
+reveal descriptor。这里的
+`sealedEvidenceSha256` 绑定整批上游完成标记，因此同一封存批次的多题可以共享；逐题
+`rowEvidenceSha256` 和 `bridgeEvidence` 只进入受随机 nonce 保护的 reveal/Gold 材料；它们及其中任何
+摘要都不得出现在 prediction manifest 或 `sourceLineageSha256`。原始 Anklang 响应摘要、`subjectId` 与
+`sourceLineageSha256` 仍各自唯一绑定。`sourceLineageSha256` 不得由带审核结论的 XML 行或其它标签材料
+派生，不能凭空填写理由文字或伪造空查重候选。现有封存集若只有 development，必须使用空
+`holdout.cases`、`holdoutRegistration: null` 与 `holdoutRevealCommitmentSha256: null`；不能为了满足
+schema 伪造 holdout。只有非空 holdout 才能登记标签对。
+
+转换器必须最后写出同目录固定文件 `REVIEW_FLOW_DATASET_COMPLETE`，loader 会在读取任何题目内容前验证它
+绑定 manifest、标签目录、逐题来源谱系集合和精确分区计数；标记缺失、截断或摘要不符的 partial 目录一律
+不能运行。它还必须绑定独立 reveal commitment，但仍不保存 reveal 文件名。标记的严格结构如下，
+转换版本当前固定为 `urmotiv-review-flow-bridge-v2`：
+
+```jsonc
+{
+  "schemaVersion": 2,
+  "artifactKind": "review_flow_evaluation_dataset_bridge_completion",
+  "bridgeVersion": "urmotiv-review-flow-bridge-v2",
+  "datasetId": "必须与 manifest 一致",
+  "manifestFileName": "manifest.private.json",
+  "manifestSha256": "manifest 原始字节摘要",
+  "generator": {
+    "codeVersion": "生成数据集的 Fermata 40 位 clean Git HEAD",
+    "runnerSha256": "experiments/prepare-review-flow-dataset.ts 原始字节摘要",
+    "dependencyCodeSha256": "完整 reviewFlowEvaluationCodePaths 代码包摘要",
+    "dependencyFileCount": 46
+  },
+  "tagCatalogSha256": "必须与 manifest 一致",
+  "sourceLineageSetSha256": "按 v3 契约计算的全部来源谱系集合摘要",
+  "developmentPredictionBindingSha256": "无标签 development 输入集合摘要",
+  "developmentRevealCommitmentSha256": "必须与 manifest 的 development commitment 一致",
+  "holdoutPredictionBindingSha256": "非空 holdout 的无标签输入集合摘要；否则 null",
+  "holdoutRevealCommitmentSha256": "必须与 manifest 的 opaque commitment 一致；否则 null",
+  "caseCount": 36,
+  "developmentCount": 36,
+  "holdoutCount": 0
+}
+```
+
+桥接时必须验证原始 Anklang v2 complete/contentHash，保留全部候选与判断；只允许把复用政策收紧为
+`no-store` 并令 item `expiresAt=null`，同时把原始响应字节摘要和转换版本纳入来源谱系/完成标记。不得
+伪造空候选，也不得由实验入口自动调用 Anklang。
+
+正式转换使用 `experiment:prepare-review-flow-dataset`。它不是“相信一份已经写好的 JSON”：每次执行都先
+要求 `--fermata-code-version` 精确等于当前干净 Fermata HEAD，并用可信 Git 快照核对固定 runner
+`experiments/prepare-review-flow-dataset.ts` 与完整 `reviewFlowEvaluationCodePaths`；代码版本、runner
+摘要、依赖代码全集摘要和文件数会写入 completion，并进入每题无标签 `sourceLineageSha256`。全部 Gold、
+reveal、content 和 manifest 写完后、完成标记发布前会再次核对同一身份；期间代码、HEAD 或工作树发生
+任何变化都只留下没有完成标记的 partial 目录。当前未提交或含任意未跟踪文件的 Fermata 工作树不能正式
+转换。
+
+转换器同时会以固定 `/usr/bin/python3` 调用干净 Urmotiv HEAD 中的
+`scripts/migrate-hist/prepare-review-gold.py verify-sealed`，并把安全 stdout 与 bridge plan 预先绑定的
+`urmotiv_review_gold_verification_attestation` 原始字节逐字比较。attestation 固定绑定 verifier 的 40 位
+Git HEAD、runner 摘要和 `prepare-review-gold.py`/`parse-metadata.py` 两文件代码全集；运行前后都会用隔离
+Git 配置和复制索引重新核对。缺少 action、非零退出、代码脏、摘要不符、stdout 多一个字节或 attestation
+缺失时都不会创建完成标记。
+
+attestation v1 必须报告两类不同摘要，不能混用：普通 `*Sha256` 对原始文件字节计算；
+`sourceConfirmationCanonicalSha256`、`materializationReportCanonicalSha256` 和
+`materializationSourceSetSha256` 按 Urmotiv 的 Python compact JSON 字段顺序计算。它还必须绑定全部 1–2 份
+原始 XLSX/XML 的 `inputId`/格式/原始摘要、`inputSetSha256`、inspection、layout、worksheet、
+`REVIEW_WORKSHEET_COMPLETE`、materialization、plan、tuning history、sealed evidence，以及每题的
+case/subject/purpose/scope/source/path/source 摘要/row evidence/Gold 摘要和全部计数。严格结构以
+`reviewFlowEvaluationUpstreamAttestationSchema` 为准。
+
+bridge plan 同目录只放 basename 引用，并逐题绑定四份既有 `0600` 文件：不含 review item 的
+RobotReviewTask draft、`urmotiv_problem_content_hash_input`、原始 Anklang v2 complete 响应和人工
+`review_flow_evaluation_human_mapping`。problem hash input 保存 Urmotiv 计算 contentHash 所需、但 robot
+task 不可见的难度、样例 UUID、完整 judge config 和状态；转换器按 Urmotiv 的字段顺序重算 SHA-256，再
+核对 task 可见字段。人工 mapping 必须显式确认题面/题解边界来自绑定的物化源，并把 XML 意见只映射成
+稀疏观察；投稿者自报难度不能进入独立难度真值。
+
+```bash
+npm run experiment:prepare-review-flow-dataset -- \
+  --private-root=/absolute/project/private-root \
+  --fermata-code-version=当前干净Fermata_HEAD的40位小写提交号 \
+  --bridge-plan=/absolute/project/private-root/bridge-input/bridge-plan.private.json \
+  --upstream-gold=/absolute/project/private-root/review-gold-sealed \
+  --materialized=/absolute/project/private-root/materialized \
+  --worksheet=/absolute/project/private-root/review-worksheet/review-worksheet.private.json \
+  --worksheet-completion=/absolute/project/private-root/review-worksheet/REVIEW_WORKSHEET_COMPLETE \
+  --inspection=/absolute/project/private-root/review-input-inspection.private.json \
+  --layout=/absolute/project/private-root/review-layout.private.json \
+  --upstream-plan=/absolute/project/private-root/review-plan.private.json \
+  --tuning-history=/absolute/project/private-root/tuning-history.private.json \
+  --review-input=/absolute/project/private-root/review-list-older.xml \
+  --review-input=/absolute/project/private-root/review-list-newer.xml \
+  --out=/absolute/project/private-root/review-flow-prediction \
+  --development-reveal-out=/absolute/project/private-root/review-flow-development-reveal \
+  --holdout-reveal-out=/absolute/project/private-root/review-flow-holdout-reveal
+```
+
+输出三个末级目录必须都不存在；转换器只创建新目录，绝不续写或覆盖 partial。它先写两边 Gold 和 reveal
+descriptor，再写标签目录、全部 content 和 manifest，重新核对精确目录清单后才最后写
+`REVIEW_FLOW_DATASET_COMPLETE`。若没有 holdout，省略最后一个输出参数，bridge plan 的 registration 也必须
+为 `null`。development 与 holdout descriptor 的 nonce 分别调用系统密码学随机源生成 32 字节；相同或长度
+错误固定拒绝。
+
+每个 gold 只能选择以下两个互斥范围之一。普通通过/否决题使用
+`verdict_and_taste`：历史 XML 的最终通过/否决只进入二分类 `historicalOutcome`；三态 verdict、
+穷尽品味理由、标签和可选难度必须另行人工独立标注，不能把投稿者自报难度当作 gold。XML 中明确写出的
+审核理由只是稀疏观察，只计算召回率；某个轴没写出来不等于负例。独立三态裁决和穷尽品味都可整段
+缺省；缺省样本不参与对应指标，绝不能为了凑数复制历史二元结论或伪造 `independent_human`。
+
+```jsonc
+{
+  "schemaVersion": 2,
+  "safeId": "case-0001",
+  "subjectId": "必须与 manifest 一致",
+  "sourceLineageSha256": "必须与 manifest 一致",
+  "contentSha256": "对应 content 原始字节的 64 位小写十六进制",
+  "upstreamEvidence": {
+    "schemaVersion": 1,
+    "sealedEvidenceSha256": "必须与对应 reveal descriptor 一致",
+    "rowEvidenceSha256": "必须与对应 reveal descriptor 一致",
+    "sourceLineageSha256": "必须与 manifest 一致",
+    "originalAnklangResponseSha256": "必须与 manifest 一致",
+    "bridgeEvidence": {
+      "bridgeVersion": "urmotiv-review-flow-bridge-v2",
+      "verificationAttestationSha256": "只在揭盲侧绑定",
+      "bridgePlanSha256": "只在揭盲侧绑定",
+      "reviewGoldEvidenceSha256": "只在揭盲侧绑定",
+      "sourceBindingsSha256": "只在揭盲侧绑定",
+      "upstreamGoldSha256": "只在揭盲侧绑定",
+      "worksheetSha256": "只在揭盲侧绑定",
+      "inspectionSha256": "只在揭盲侧绑定",
+      "layoutSha256": "只在揭盲侧绑定",
+      "reviewInputSetSha256": "只在揭盲侧绑定",
+      "humanMappingSha256": "只在揭盲侧绑定"
+    }
+  },
+  "evaluationScope": "verdict_and_taste",
+  "historicalOutcome": "accepted",
+  "contestUse": "used",
+  "observedHistoricalTasteReasons": [
+    { "dimension": "icpc_fit", "direction": "strength" }
+  ],
+  "observedHistoricalTechnicalReasons": ["judgeability_concern"],
+  "independentVerdict": {
+    "annotation": "independent_human_three_way",
+    "verdict": "approve"
+  },
+  "independentTaste": {
+    "annotation": "exhaustive_independent_human",
+    "reasons": [
+      { "dimension": "icpc_fit", "direction": "strength" }
+    ]
+  },
+  "independentOriginality": {
+    "annotation": "independent_human_originality",
+    "confirmedDuplicate": false
+  },
+  "expectedTagIds": ["固定标签编号"],
+  "independentDifficulty": {
+    "annotation": "independent_human_without_submitter_metadata",
+    "codeforcesDifficulty": 1800,
+    "thinkingLevel": 3,
+    "codingLevel": 2
+  }
+}
+```
+
+`independentVerdict`、`independentTaste`、`independentOriginality`、`expectedTagIds` 和
+`independentDifficulty` 都可整段省略，不能用不可靠字段补齐。稀疏技术理由只允许
+`statement_solution_inconsistency`、`judgeability_concern`、`sample_mismatch`、
+`constraint_insufficiency`、`official_solution_incorrect`、`complexity_unacceptable`、
+`reference_implementation_incorrect`；它们同样只计算召回，不把缺席当负例，也不要求投稿附带标程。
+确认原题/重复题只评估原创性，必须使用严格的最小 gold；普通题没有独立原创性标注时不会默认成
+“非原题”。`originality_only` 不能再携带 verdict、品味、比赛使用、标签或难度字段：
+
+```jsonc
+{
+  "schemaVersion": 2,
+  "safeId": "case-0003",
+  "subjectId": "必须与 manifest 一致",
+  "sourceLineageSha256": "必须与 manifest 一致",
+  "contentSha256": "对应 content 原始字节的 64 位小写十六进制",
+  "upstreamEvidence": {
+    "schemaVersion": 1,
+    "sealedEvidenceSha256": "必须与对应 reveal descriptor 一致",
+    "rowEvidenceSha256": "必须与对应 reveal descriptor 一致",
+    "sourceLineageSha256": "必须与 manifest 一致",
+    "originalAnklangResponseSha256": "必须与 manifest 一致",
+    "bridgeEvidence": {
+      "bridgeVersion": "urmotiv-review-flow-bridge-v2",
+      "verificationAttestationSha256": "只在揭盲侧绑定",
+      "bridgePlanSha256": "只在揭盲侧绑定",
+      "reviewGoldEvidenceSha256": "只在揭盲侧绑定",
+      "sourceBindingsSha256": "只在揭盲侧绑定",
+      "upstreamGoldSha256": "只在揭盲侧绑定",
+      "worksheetSha256": "只在揭盲侧绑定",
+      "inspectionSha256": "只在揭盲侧绑定",
+      "layoutSha256": "只在揭盲侧绑定",
+      "reviewInputSetSha256": "只在揭盲侧绑定",
+      "humanMappingSha256": "只在揭盲侧绑定"
+    }
+  },
+  "evaluationScope": "originality_only",
+  "originalityAnnotation": "confirmed_duplicate_evidence",
+  "confirmedDuplicate": true
+}
+```
+
+真实运行前，专用私有 env 文件必须自行登记 `EVAL_CODE_VERSION`（当前**已提交且工作树干净**的完整 40 位
+小写 Git HEAD）和 `EVAL_CONCURRENCY`，以及实际被 11 个角色使用的 provider 的 `*_BASE_URL`、
+`*_API_KEY`；每个 provider 的地址和密钥必须成对登记，未使用的 provider 可以不写。启动终端里遗留的
+同名 provider/`EVAL_*` 变量不会补缺、参与或覆盖这份文件。这个专用 env **不得**含 Urmotiv 机器人/管理令牌、Fermata 管理令牌、设置路径或
+Codeforces 凭据；入口不调用通用 `loadConfig`，这些值不会进入实验配置对象。必须使用 Node.js 24 或
+更高版本，并经过 `scripts/run-with-env.mjs --review-flow-evaluation`。这个专用模式不接受任意命令，
+也不经 `PATH` 启动 npm/tsx；它固定用当前 Node 先运行纯内置模块 bootstrap。bootstrap 在任何 npm 包或
+评测 TypeScript 载入前，核对干净 HEAD、逐文件代码清单、Node 可执行文件，以及 tsx/esbuild/undici/zod
+实际安装字节；随后只从 `Fermata/private/review-flow-runtime-snapshots/` 内的临时 0700 代码快照运行，
+模块解析钩子拒绝任何落到该快照之外的非 `node:` 模块。子进程 stdout/stderr 不直接继承终端；启动器
+只捕获至严格上限，接受唯一一行登记的完成消息并转换成不含 label、路径和模型内容的
+`FERMATA_REVIEW_FLOW_RESULT` JSON 协议，详细报告仍从固定私有 registry 取得。Node/tsx 加载错误、额外
+输出、stderr 或协议不符都只返回固定失败。结束后复核原始源码的初次 stat 身份、原始依赖和快照字节，
+再按精确目录身份清理；因此读取后改写再恢复原字节也会失败关闭。报告绑定这些字节摘要，不把路径写入
+报告。`run-with-env` 外层与 bootstrap 都捕获 `SIGINT`/`SIGTERM`/`SIGHUP`：child 尚未启动时直接关闭
+启动闸门；启动后只向各自的直接 child 幂等转发第一次信号，不用 Abort 中断付费流，并继续等待 runner
+关掉新请求、让在途响应读到真实 EOF、复核身份和清理 snapshot。runtime identity 会明确写入
+`trusted_host_system_runtime_unbound`：该边界不声称能防御同一 UID
+直接篡改进程内存或删改 bootstrap 自身；Node 可执行文件摘要也不覆盖系统动态库、TLS CA、DNS 和内核，
+fresh 来源复核固定调用的系统 Git、curl、tar、npm 及其动态库也属于这个受信服务器宿主边界。
+这些仍不由项目 manifest 单独证明。`SIGKILL` 无法捕获，若在清理前强杀 bootstrap，项目私有 snapshot 根中
+可能留下只读临时目录，必须按目录身份人工核对后处理。但 ignored `node_modules` 修改、
+普通并发编辑、父目录模块回退和“先载入后恢复”都会失败关闭。包装器标记只是启动约定，CLI 仍独立检查危险 Node 环境、未知变量和
+bootstrap attestation。下面的变量值是格式占位，不是真实私有路径：
+
+`config/review-flow-runtime.json` 不能从当前 `node_modules` 自报更新。它同时绑定
+Node 官方发布归档的 SHA-256，以及 `tsx`、`esbuild`、Linux 平台 binary、`undici`、
+`zod` 在 `package-lock.json` 中的 npm 官方归档地址和 sha512 完整性值；bootstrap
+每次离线核对这些语义绑定。更新或独立复核时，先取得该 manifest 指定的官方 Node
+归档，并把候选改动提交到待审分支，再用固定系统 Node 运行下面的工具。工具先逐字节
+确认自身、manifest、`package.json` 和 lock 都来自当前 HEAD；工作树临时改写不能生成
+可接受结果。它还会通过系统 TLS 从严格推导的 Node 官方地址重新取得
+`SHASUMS256.txt`；本地归档只作为缓存，必须同时匹配 fresh 官方摘要和 manifest，
+校验后的原始字节会复制到私有临时目录再解压，避免路径在校验后被替换。随后它在项目
+`.cache/` 的 `0700` 临时目录中
+执行全新的 `npm ci --ignore-scripts`，不会执行任何安装脚本；esbuild 的 launcher 只由
+已经过完整性校验的平台 binary 按固定步骤映射。默认只比较，不修改 manifest；
+`--proposal` 也只向 stdout 生成不含路径或密钥的候选 runtime JSON，仍须另一名审阅者
+核对来源和 diff 后才能用 `apply_patch` 更新正式文件。
+
+```bash
+/usr/bin/node scripts/verify-review-flow-runtime-manifest.mjs \
+  --node-archive=/absolute/path/under/codex-urmotiv/node-v24.18.0-linux-x64.tar.xz
+```
+
+`--dataset-private-root` 必须显式给出绝对真实私有根；prediction manifest 与 reveal descriptor 必须位于
+其下两个不同的受保护子目录，各自只能按 basename 引用同目录普通文件。development run 必须提供
+development reveal descriptor，但 loader 会先只读无 Gold 身份并完成全局用途占用，成功后才打开它；
+holdout prediction run 禁止提供 descriptor，只有 reveal 阶段在永久 claim 落盘后才打开 holdout descriptor。
+根与每层目录仍要求当前用户所有、
+精确 `0700`、逐段禁止跟随符号链接，
+文件要求精确 `0600` 且 `nlink=1`。这个参数只影响只读数据集 loader；registry、检查点和报告仍固定在
+Fermata 自己的 `private/` 边界，不能借此改根。
+
+```bash
+FERMATA_REVIEW_ENV="/absolute/path/under/Fermata/private/实验环境文件.env"
+FERMATA_REVIEW_DATASET_ROOT="/home/ubuntu/codex-urmotiv/Urmotiv/private"
+FERMATA_REVIEW_MANIFEST="$FERMATA_REVIEW_DATASET_ROOT/受保护转换输出/manifest.private.json"
+FERMATA_REVIEW_DEV_REVEAL_DESCRIPTOR="$FERMATA_REVIEW_DATASET_ROOT/development揭盲材料/reveal.private.json"
+FERMATA_REVIEW_HOLDOUT_REVEAL_DESCRIPTOR="$FERMATA_REVIEW_DATASET_ROOT/holdout揭盲材料/reveal.private.json"
+FERMATA_DEV_BASELINE_STATE="/absolute/path/under/Fermata/private/dev-baseline-state"
+FERMATA_DEV_CANDIDATE_STATE="/absolute/path/under/Fermata/private/dev-candidate-state"
+FERMATA_HOLDOUT_BASELINE_STATE="/absolute/path/under/Fermata/private/holdout-baseline-state"
+FERMATA_HOLDOUT_CANDIDATE_STATE="/absolute/path/under/Fermata/private/holdout-candidate-state"
+
+# env 文件内：
+# AETHER_BASE_URL=https://...
+# AETHER_API_KEY=...
+# 如果冻结档位实际使用 dashscope，再加入对应 DASHSCOPE_* 两项。
+# EVAL_CODE_VERSION=<与干净 HEAD 完全一致的 40 位小写提交 SHA>
+# EVAL_CONCURRENCY=2
+
+# 阶段 1：冻结的 v1 配置在 development 上跑修改前基线。
+node scripts/run-with-env.mjs --review-flow-evaluation "$FERMATA_REVIEW_ENV" \
+  --action=run --manifest="$FERMATA_REVIEW_MANIFEST" \
+  --reveal-descriptor="$FERMATA_REVIEW_DEV_REVEAL_DESCRIPTOR" \
+  --dataset-private-root="$FERMATA_REVIEW_DATASET_ROOT" \
+  --private-dir="$FERMATA_DEV_BASELINE_STATE" \
+  --partition=development --variant=baseline --label=reviewflow-v1-dev-baseline
+
+# 阶段 2：修改、提交并更新 EVAL_CODE_VERSION 后，只在 development 上迭代候选；
+# 每轮用全新 label，并绑定同 datasetFingerprint 的 development 基线。
+node scripts/run-with-env.mjs --review-flow-evaluation "$FERMATA_REVIEW_ENV" \
+  --action=run --manifest="$FERMATA_REVIEW_MANIFEST" \
+  --reveal-descriptor="$FERMATA_REVIEW_DEV_REVEAL_DESCRIPTOR" \
+  --dataset-private-root="$FERMATA_REVIEW_DATASET_ROOT" \
+  --private-dir="$FERMATA_DEV_CANDIDATE_STATE" \
+  --partition=development --variant=candidate --label=reviewflow-v2-dev-candidate-01 \
+  --baseline-label=reviewflow-v1-dev-baseline
+
+# 阶段 3：人工选定完整 development candidate 后，第一次进入 holdout。
+# 命令会先永久冻结 development baseline/candidate 的发布物和生产身份，再生成 baseline 预测链；
+# holdout label 必须与 manifest.holdoutRegistration.baselineLabel 完全一致。
+node scripts/run-with-env.mjs --review-flow-evaluation "$FERMATA_REVIEW_ENV" \
+  --action=run --manifest="$FERMATA_REVIEW_MANIFEST" \
+  --dataset-private-root="$FERMATA_REVIEW_DATASET_ROOT" \
+  --private-dir="$FERMATA_HOLDOUT_BASELINE_STATE" \
+  --partition=holdout --variant=baseline --label=reviewflow-v1-holdout-baseline \
+  --development-baseline-label=reviewflow-v1-dev-baseline \
+  --development-candidate-label=reviewflow-v2-dev-candidate-01
+
+# 阶段 4：候选提示词、处理步骤、配置与提交全部冻结后，只运行一次 holdout candidate；
+# label 对和阈值摘要已经写死在 manifest，不能临时换 label 重跑。
+node scripts/run-with-env.mjs --review-flow-evaluation "$FERMATA_REVIEW_ENV" \
+  --action=run --manifest="$FERMATA_REVIEW_MANIFEST" \
+  --dataset-private-root="$FERMATA_REVIEW_DATASET_ROOT" \
+  --private-dir="$FERMATA_HOLDOUT_CANDIDATE_STATE" \
+  --partition=holdout --variant=candidate --label=reviewflow-v2-holdout-candidate \
+  --baseline-label=reviewflow-v1-holdout-baseline \
+  --development-baseline-label=reviewflow-v1-dev-baseline \
+  --development-candidate-label=reviewflow-v2-dev-candidate-01
+
+# 阶段 5：两条 holdout phase 都完整后，一次性打开 Gold，同时生成前、后和 comparison。
+node scripts/run-with-env.mjs --review-flow-evaluation "$FERMATA_REVIEW_ENV" \
+  --action=reveal --manifest="$FERMATA_REVIEW_MANIFEST" \
+  --reveal-descriptor="$FERMATA_REVIEW_HOLDOUT_REVEAL_DESCRIPTOR" \
+  --dataset-private-root="$FERMATA_REVIEW_DATASET_ROOT" \
+  --baseline-private-dir="$FERMATA_HOLDOUT_BASELINE_STATE" \
+  --candidate-private-dir="$FERMATA_HOLDOUT_CANDIDATE_STATE"
+```
+
+holdout baseline/candidate 阶段不会生成任何可读分数；只保存完整的安全枚举投影、每题固定 11 角色的
+EOF/`finish_reason=stop`/SSE `DONE` 收据摘要，以及全局 phase marker。candidate 不完整就不能 reveal，
+也不能换 label 或目录另跑新链，只能对原链做不重发请求的 exact resume。阶段 5 在打开第一份 holdout
+Gold **之前**先永久占用 reveal claim；崩溃恢复必须是同一代码身份、同一两条链和 `--resume`。
+第一次 holdout 请求前还会以 O_EXCL 永久提名完整发布的 development baseline 与人工选定 candidate，
+并分别冻结模型/provider/提示词角色身份、运行配置和正式审题代码摘要。holdout 两个槽位必须逐一匹配；
+完整 runtime fingerprint 当前绑定 46 个登记代码文件；同一条链的 exact resume 要求这 46 个文件和提交
+身份全部不变。即使只修改 checkpoint、报告、CLI 或 bootstrap，也必须新建实验链/label，不能拿新提交
+续接旧链。较小的 production code 子集只用于比较人工选定的生产逻辑身份，不会放宽运行链本身的冻结。
+
+所有 development 报告、揭盲后的两份 holdout 报告与 comparison 都只写到固定的
+`Fermata/private/review-flow-evaluation-registry/`（目录 `0700`、文件 `0600`），不再写
+`experiments/results/`。JSON、Markdown、report-set marker 和全局 publication receipt 按固定字节
+幂等补齐，marker 最后发布；在任何一步崩溃后，exact resume 只核对/补齐，不重发模型请求。普通题
+原创性只计有独立标注的样本；历史/XML 品味与技术意见只计召回；`contestUse` 会分别报告 used、
+not_used、unknown、历史通过和历史否决覆盖，并明确使用 `icpcFit=strong/acceptable → used` 的运行指标
+映射。任何样本量下报告都固定 `eligible=false`，不能只凭一两个样本的高百分比宣布准确性达标。
+
+每个 label 和 run UUID 都是全项目永久实验身份；固定私有全局 registry 用 O_EXCL claim 绑定 label、
+run、代码/配置身份和检查点目录的 device/inode，因此换 `--private-dir` 或并发启动也不能重用 label。
+只有同一 label、同一主体/case 集合、同一代码、Node/platform/arch、实际依赖版本、配置、profile、
+11 个 provider/model 槽位和基线绑定全部精确一致时才能加 `--resume`。每道题在付费前先同步落成
+`active`；`active` 或 `failed` 都是永久污染证据，续跑绝不重发。首个 499、取消、断流、缺角色、
+跳过、receipt 不完整或本地持久化失败都会使整链不完整。SIGINT、SIGTERM、SIGHUP 只关闭新请求闸门，
+不会 Abort 已付费流；入口等待全部在途请求自然读到服务端真正结束后再封存不完整状态。不会恢复
+120 秒总时限，也不得用手工 JSON 或只有 `complete=true` 的报告开启生产。
+
 ### 让长时间标定留在服务器运行
 
 思维/代码难度标定的一次模型请求可能持续数分钟。通过 SSH 在服务器上启动时，可以
@@ -511,9 +1013,10 @@ completion marker 表示这条执行链已完整收束并阻止重放，不等�
 随机临时文件原子替换。日志与公开汇总只记录安全编号、固定错误码、阶段、等级、运行参数和汇总数字，
 不记录私有文件名、服务商错误原文、题面、题解或模型原始输出。服务地址仍只显示不含密钥的短校验值。
 
-产出的 `experiments/results/*.json` 和 `*.md` 是不含题面原文的汇总统计，会
-入库；`experiments/data/` 和 `experiments/results/raw/` 里含有较完整的题面/
-中间结果，不入库。规则详见 AGENTS.md 第 4 节。
+旧 difficulty/levels 工具产出的 `experiments/results/*.json` 和 `*.md` 是不含题面原文的汇总统计，
+会入库；review-flow 报告是上一节所述的例外，全部只留在固定私有 registry。
+`experiments/data/` 和 `experiments/results/raw/` 里含有较完整的题面/中间结果，不入库。规则详见
+AGENTS.md 第 4 节。
 
 如果要修改 `src/pipelines/{thinking,coding,verdict}.ts` 里的数值映射表/阈值，
 必须先跑一遍对比评测再改——见 AGENTS.md 第 5 节。
@@ -536,7 +1039,7 @@ completion marker 表示这条执行链已完整收束并阻止重放，不等�
 | 思维难度（thinking.ts） | **旧实验均不可作基线** | 两份早期报告无法证明完整；后两份明确只完成 6/24、9/24，而且都缺高分段。 |
 | 代码难度（coding.ts） | **旧实验均不可作基线** | 与思维难度共用的旧实验不完整；小样本曾出现难度分段升高但代码难度均值下降，需要在完整基线上复核。 |
 | 查重判断（verdict.ts） | **旧设计不可作准确性基线；新盲评/续跑基础尚未实跑** | 旧实验只有 3 个正常样本和 3 个人工重复样本；新代码已把 content-only 选择、独立 case gold、prediction-only 检查点和完整链防重放接入，但尚未用新唯一标签运行，不能声明准确率。 |
-| 11 角色 reviewFlow | **安全边界已接线，准确性未标定，生产恒关闭** | 历史人工审核标准只进入命题品味相关角色；盲解不看题解、自报难度或历史结论。EOF receipt、失败完整性、严格任务源与安全 decision 已覆盖合成测试，但尚无合格的修改前/后完整准确性报告和可信聚合指纹。 |
+| 11 角色 reviewFlow | **盲测/恢复工具已接线，准确性未实跑，生产恒关闭** | 历史二元结论和稀疏 XML 意见与可选独立人工标注已分开；holdout 两条链只保存预测与 11-role EOF receipt，独立 one-shot reveal 才同时计分。全局 label/主体/phase 账本、dirfd 检查点、信号收口和私有报告崩溃恢复已覆盖合成测试，但尚无合格的修改前/后真实准确性报告和可信聚合指纹。 |
 
 这张表应该随每一次真正跑过评测脚本之后更新。只有当前代码生成、对应脱敏汇总与完成证据存在，
 并且报告明确 `eligible=true` 时，才能把结果写成合格候选；仅有完整性为真不代表准确性达标。
