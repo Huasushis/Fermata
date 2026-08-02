@@ -172,7 +172,7 @@ function setupPrivateDirectory() {
 }
 
 describe("Candidate C 连通性请求契约", () => {
-  it("全新 f 身份严格绑定 v7、schema v4 与当前配置，a/b/c/d/e 永久历史化", () => {
+  it("f 身份永久绑定旧 v7/schema v4；当前 review-flow 配置不能重跑历史探针", () => {
     expect(difficultyConnectivityProbeExperimentVersion).toBe(
       "experiment-2026-08-difficulty-candidate-c-provider-v1-post-done-shape-v7"
     );
@@ -182,7 +182,7 @@ describe("Candidate C 连通性请求契约", () => {
     );
     expect(sha256ConnectivityProbe(
       readFileSync(new URL("../config/models.yaml", import.meta.url))
-    )).toBe(difficultyConnectivityExpectedModelsConfigSha256);
+    )).not.toBe(difficultyConnectivityExpectedModelsConfigSha256);
     expect(difficultyConnectivityProbeLabel).toBe(
       "difficulty-candidate-c-connectivity-probe-20260802-f"
     );
