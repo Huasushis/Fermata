@@ -31,6 +31,41 @@ function completionResponse(content: string, reasoning?: string): Response {
   );
 }
 
+function stoppedSsePrefix(lineEnding = "\n"): string {
+  const event = JSON.stringify({
+    choices: [{ delta: { content: "合成完整答案" }, finish_reason: "stop" }]
+  });
+  return [
+    `data: ${event}`,
+    "",
+    "data: [DONE]",
+    "",
+    ""
+  ].join(lineEnding);
+}
+
+function sseDataEvent(data: string, lineEnding = "\n"): string {
+  return [`data: ${data}`, "", ""].join(lineEnding);
+}
+
+function strictUsageMetadataEvent(): Record<string, unknown> {
+  return {
+    id: "synthetic-completion-id",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "synthetic-model",
+    system_fingerprint: null,
+    service_tier: "default",
+    choices: [],
+    usage: {
+      prompt_tokens: 3,
+      completion_tokens: 4,
+      total_tokens: 7,
+      prompt_tokens_details: { cached_tokens: 0 }
+    }
+  };
+}
+
 describe("chatComplete：正常路径", () => {
   it("请求正确的 URL、鉴权头，并解析 content 和 reasoning_content", async () => {
     const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
@@ -412,6 +447,29 @@ describe("chatComplete：正常路径", () => {
     ).resolves.toEqual({ content: "完整答案", reasoning: null });
   });
 
+  it("DONE 前的严格用量事件保持原有兼容行为", async () => {
+    const answer = JSON.stringify({
+      choices: [{ delta: { content: "完整答案" }, finish_reason: "stop" }]
+    });
+    const fetchMock = vi.fn(async () => new Response([
+      `data: ${answer}`,
+      "",
+      `data: ${JSON.stringify(strictUsageMetadataEvent())}`,
+      "",
+      "data: [DONE]",
+      "",
+      ""
+    ].join("\n"), {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    }));
+
+    await expect(chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    })).resolves.toEqual({ content: "完整答案", reasoning: null });
+  });
+
   it("正文和 DONE 到达 HTTP 结尾但没有 stop 时固定失败且不重试或泄漏正文", async () => {
     const sensitiveContent = "不应进入异常的无终止正文";
     const fetchMock = vi.fn(
@@ -443,7 +501,7 @@ describe("chatComplete：正常路径", () => {
       invalidEvents: ["data: [DONE]", "", "data: [DONE]", "", ""].join("\n")
     },
     {
-      substage: "data_after_done",
+      substage: "data_after_done_other_or_unclassifiable",
       invalidEvents: [
         "data: [DONE]",
         "",
@@ -516,6 +574,793 @@ describe("chatComplete：正常路径", () => {
     }
   );
 
+  it.each([
+    {
+      name: "strict usage metadata",
+      tailData: JSON.stringify(strictUsageMetadataEvent()),
+      expectedSubstage: "data_after_done_usage_metadata_only"
+    },
+    {
+      name: "empty choices is metadata evidence",
+      tailData: JSON.stringify({ choices: [] }),
+      expectedSubstage: "data_after_done_usage_metadata_only"
+    },
+    {
+      name: "bounded usage counters are metadata evidence",
+      tailData: JSON.stringify({ usage: { total_tokens: 7 } }),
+      expectedSubstage: "data_after_done_usage_metadata_only"
+    },
+    {
+      name: "nullable usage detail needs a real numeric counter",
+      tailData: JSON.stringify({
+        usage: { total_tokens: 7, completion_tokens_details: null }
+      }),
+      expectedSubstage: "data_after_done_usage_metadata_only"
+    },
+    {
+      name: "nested nullable usage detail can accompany a real numeric counter",
+      tailData: JSON.stringify({
+        usage: {
+          total_tokens: 7,
+          completion_tokens_details: { reasoning_tokens: null }
+        }
+      }),
+      expectedSubstage: "data_after_done_usage_metadata_only"
+    },
+    {
+      name: "bounded standard id is metadata evidence",
+      tailData: JSON.stringify({ id: "synthetic-completion-id" }),
+      expectedSubstage: "data_after_done_usage_metadata_only"
+    },
+    {
+      name: "non-empty choices without output fields",
+      tailData: JSON.stringify({ choices: [{ index: 0 }] }),
+      expectedSubstage: "data_after_done_choices_present"
+    },
+    {
+      name: "content outside choices",
+      tailData: JSON.stringify({ choices: [], content: "合成尾部正文" }),
+      expectedSubstage: "data_after_done_content_or_tool_present"
+    },
+    {
+      name: "reasoning key is dangerous even with null value",
+      tailData: JSON.stringify({ choices: [], reasoning: null }),
+      expectedSubstage: "data_after_done_content_or_tool_present"
+    },
+    {
+      name: "delta key is dangerous even when empty",
+      tailData: JSON.stringify({ choices: [], delta: {} }),
+      expectedSubstage: "data_after_done_content_or_tool_present"
+    },
+    {
+      name: "message key is dangerous even when empty",
+      tailData: JSON.stringify({ choices: [], message: {} }),
+      expectedSubstage: "data_after_done_content_or_tool_present"
+    },
+    {
+      name: "function key is dangerous even when empty",
+      tailData: JSON.stringify({ choices: [], function: {} }),
+      expectedSubstage: "data_after_done_content_or_tool_present"
+    },
+    {
+      name: "nested tool call",
+      tailData: JSON.stringify({
+        choices: [{ delta: { tool_calls: [{ function: { arguments: "{}" } }] } }]
+      }),
+      expectedSubstage: "data_after_done_content_or_tool_present"
+    },
+    {
+      name: "unknown top-level field",
+      tailData: JSON.stringify({ choices: [], provider_payload: "合成未知值" }),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "empty object has no metadata evidence",
+      tailData: JSON.stringify({}),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "null and blank standard fields have no metadata evidence",
+      tailData: JSON.stringify({
+        id: "   ",
+        system_fingerprint: null,
+        service_tier: null
+      }),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "all-null optional fields have no metadata evidence",
+      tailData: JSON.stringify({
+        system_fingerprint: null,
+        service_tier: null
+      }),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "all-null usage has no numeric metadata evidence",
+      tailData: JSON.stringify({
+        usage: { total_tokens: null, completion_tokens_details: null }
+      }),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "nested all-null usage still has no numeric metadata evidence",
+      tailData: JSON.stringify({
+        usage: {
+          completion_tokens_details: { reasoning_tokens: null }
+        }
+      }),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "scalar usage is not the strict usage object",
+      tailData: JSON.stringify({ usage: 7 }),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "unknown null field is not metadata evidence",
+      tailData: JSON.stringify({ provider_payload: null }),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "provider error object",
+      tailData: JSON.stringify({ error: { code: "synthetic_error" } }),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "message inside an error object still uses dangerous priority",
+      tailData: JSON.stringify({ error: { message: "合成错误正文" } }),
+      expectedSubstage: "data_after_done_content_or_tool_present"
+    },
+    {
+      name: "content inside a malformed top-level array uses dangerous priority",
+      tailData: JSON.stringify([{ content: "合成尾部正文" }]),
+      expectedSubstage: "data_after_done_content_or_tool_present"
+    },
+    {
+      name: "content sibling outranks malformed choices regardless of DFS order",
+      tailData: JSON.stringify([
+        { content: "合成尾部正文" },
+        { choices: 1 }
+      ]),
+      expectedSubstage: "data_after_done_content_or_tool_present"
+    },
+    {
+      name: "malformed JSON",
+      tailData: "{not-json}",
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "usage counter exceeds depth bound",
+      tailData: JSON.stringify({
+        choices: [],
+        usage: { a: { b: { c: { d: { e: 1 } } } } }
+      }),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "usage contains a negative counter",
+      tailData: JSON.stringify({ choices: [], usage: { total_tokens: -1 } }),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "usage key is outside the fixed grammar",
+      tailData: JSON.stringify({ choices: [], usage: { "total-tokens": 7 } }),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "usage counter is not a safe integer",
+      tailData: JSON.stringify({
+        choices: [],
+        usage: { total_tokens: Number.MAX_SAFE_INTEGER + 1 }
+      }),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "usage exceeds bounded key count",
+      tailData: JSON.stringify({
+        choices: [],
+        usage: Object.fromEntries(
+          Array.from({ length: 65 }, (_, index) => [`counter_${index}`, index])
+        )
+      }),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "metadata string exceeds the length bound",
+      tailData: JSON.stringify({ id: "x".repeat(1_025) }),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "metadata string contains a control character",
+      tailData: JSON.stringify({ id: "synthetic\nidentifier" }),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "created timestamp is negative",
+      tailData: JSON.stringify({ created: -1 }),
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    }
+  ] as const)(
+    "DONE 后形状只输出封闭分类且仍严格失败：$name",
+    async ({ tailData, expectedSubstage }) => {
+      const marker = "合成尾部正文";
+      const fetchMock = vi.fn(async () => new Response(
+        stoppedSsePrefix() + sseDataEvent(tailData),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } }
+      ));
+      const error = await chatComplete(provider, spec, [], {
+        ...runtime,
+        fetch: fetchMock
+      }).catch((caught: unknown) => caught);
+      expect(error).toMatchObject({
+        code: "LLM_RESPONSE_FORMAT_INVALID",
+        formatFailureStage: "trailing_data",
+        formatFailureSubstage: expectedSubstage
+      });
+      expect((error as Error).message).not.toContain(marker);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it.each([
+    { name: "empty value", rawTail: "data:\n\n" },
+    { name: "whitespace value", rawTail: "data:    \n\n" },
+    { name: "field without colon", rawTail: "data\n\n" },
+    { name: "multiple empty lines", rawTail: "data:\ndata:   \n\n" }
+  ] as const)(
+    "DONE 后空 data 字段到达 EOF 仍固定失败：$name",
+    async ({ rawTail }) => {
+      const fetchMock = vi.fn(async () => new Response(
+        stoppedSsePrefix() + rawTail,
+        { status: 200, headers: { "Content-Type": "text/event-stream" } }
+      ));
+      await expect(chatComplete(provider, spec, [], {
+        ...runtime,
+        fetch: fetchMock
+      })).rejects.toMatchObject({
+        code: "LLM_RESPONSE_FORMAT_INVALID",
+        formatFailureStage: "trailing_data",
+        formatFailureSubstage: "data_after_done_other_or_unclassifiable"
+      });
+    }
+  );
+
+  it.each([
+    {
+      mode: "stream_interrupted",
+      expectedCode: "LLM_STREAM_INTERRUPTED",
+      expectedCancelled: false
+    },
+    {
+      mode: "cancelled",
+      expectedCode: "LLM_CANCELLED",
+      expectedCancelled: true
+    }
+  ] as const)(
+    "DONE 后完整空 data 事件在 $mode 时保留固定危险分类",
+    async ({ mode, expectedCode, expectedCancelled }) => {
+      const encoder = new TextEncoder();
+      const taskController = new AbortController();
+      let cancelled = false;
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamController = controller;
+        },
+        cancel() {
+          cancelled = true;
+        }
+      });
+      const fetchMock = vi.fn(async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      }));
+      const resultPromise = chatComplete(provider, spec, [], {
+        ...runtime,
+        signal: taskController.signal,
+        fetch: fetchMock
+      });
+      streamController.enqueue(encoder.encode(
+        stoppedSsePrefix() + "data:\n\n"
+      ));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (mode === "stream_interrupted") {
+        streamController.error(new Error("合成空尾部传输中断"));
+      } else {
+        taskController.abort();
+      }
+      const error = await resultPromise.catch((caught: unknown) => caught);
+      expect(error).toMatchObject({
+        code: expectedCode,
+        formatFailureStage: "trailing_data",
+        formatFailureSubstage: "data_after_done_other_or_unclassifiable"
+      });
+      expect((error as Error).message).not.toContain("合成空尾部传输中断");
+      expect(cancelled).toBe(expectedCancelled);
+    }
+  );
+
+  it.each([
+    {
+      mode: "stream_interrupted",
+      expectedCode: "LLM_STREAM_INTERRUPTED",
+      expectedCancelled: false
+    },
+    {
+      mode: "cancelled",
+      expectedCode: "LLM_CANCELLED",
+      expectedCancelled: true
+    }
+  ] as const)(
+    "DONE 后尚未分派的空 data 字段在 $mode 时只能报告 tail-incomplete",
+    async ({ mode, expectedCode, expectedCancelled }) => {
+      const encoder = new TextEncoder();
+      const taskController = new AbortController();
+      let cancelled = false;
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamController = controller;
+        },
+        cancel() {
+          cancelled = true;
+        }
+      });
+      const fetchMock = vi.fn(async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      }));
+      const resultPromise = chatComplete(provider, spec, [], {
+        ...runtime,
+        signal: taskController.signal,
+        fetch: fetchMock
+      });
+      streamController.enqueue(encoder.encode(
+        stoppedSsePrefix() + "data:"
+      ));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (mode === "stream_interrupted") {
+        streamController.error(new Error("合成未收齐空尾部传输中断"));
+      } else {
+        taskController.abort();
+      }
+      const error = await resultPromise.catch((caught: unknown) => caught);
+      expect(error).toMatchObject({
+        code: expectedCode,
+        formatFailureStage: "trailing_data",
+        formatFailureSubstage: "data_after_done_tail_incomplete"
+      });
+      expect((error as Error).message).not.toContain("合成未收齐空尾部传输中断");
+      expect(cancelled).toBe(expectedCancelled);
+    }
+  );
+
+  it("高度分片的 DONE 后长事件只增量扫描并保持固定失败", async () => {
+    const encoder = new TextEncoder();
+    const marker = "x".repeat(32_768);
+    const tail = encoder.encode(
+      sseDataEvent(JSON.stringify({ provider_payload: marker }))
+    );
+    let offset = -1;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (offset < 0) {
+          controller.enqueue(encoder.encode(stoppedSsePrefix()));
+          offset = 0;
+        } else if (offset < tail.length) {
+          controller.enqueue(tail.slice(offset, offset + 1));
+          offset += 1;
+        } else {
+          controller.close();
+        }
+      }
+    });
+    const fetchMock = vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    }));
+    const error = await chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "trailing_data",
+      formatFailureSubstage: "data_after_done_other_or_unclassifiable"
+    });
+    expect((error as Error).message).not.toContain(marker);
+  });
+
+  it("响应分块数量上限阻止微小分块无限饿死超时定时器", async () => {
+    const encoder = new TextEncoder();
+    const tail = encoder.encode(`data: ${"x".repeat(70_000)}`);
+    let offset = -1;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (offset < 0) {
+          controller.enqueue(encoder.encode(stoppedSsePrefix()));
+          offset = 0;
+        } else if (offset < tail.length) {
+          controller.enqueue(tail.slice(offset, offset + 1));
+          offset += 1;
+        } else {
+          controller.close();
+        }
+      },
+      cancel() {
+        cancelled = true;
+      }
+    });
+    const fetchMock = vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    }));
+    await expect(chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    })).rejects.toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "trailing_data",
+      formatFailureSubstage: "data_after_done_other_or_unclassifiable"
+    });
+    expect(cancelled).toBe(true);
+  });
+
+  it("跨块的 database 等未知 SSE 字段不会误判为空 data", async () => {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(stoppedSsePrefix() + "dat"));
+        controller.enqueue(encoder.encode("abase: synthetic-ignored\n\n"));
+        controller.close();
+      }
+    });
+    const fetchMock = vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    }));
+    await expect(chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    })).resolves.toMatchObject({
+      content: "合成完整答案"
+    });
+  });
+
+  it("只有整个 DONE 后尾部都是严格元数据且到达 EOF 才归为 metadata-only", async () => {
+    const encoder = new TextEncoder();
+    let cancelled = false;
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+      },
+      cancel() {
+        cancelled = true;
+      }
+    });
+    const fetchMock = vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    }));
+    let settled = false;
+    const resultPromise = chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    });
+    void resultPromise.finally(() => {
+      settled = true;
+    }).catch(() => undefined);
+    streamController.enqueue(encoder.encode(
+      stoppedSsePrefix() +
+        sseDataEvent(JSON.stringify(strictUsageMetadataEvent()))
+    ));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    expect(cancelled).toBe(false);
+
+    streamController.close();
+    await expect(resultPromise).rejects.toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "trailing_data",
+      formatFailureSubstage: "data_after_done_usage_metadata_only"
+    });
+    expect(cancelled).toBe(false);
+  });
+
+  it.each([
+    {
+      name: "multiple metadata events stay metadata-only",
+      tailEvents: [
+        JSON.stringify(strictUsageMetadataEvent()),
+        JSON.stringify({ choices: [], usage: { total_tokens: 7 } })
+      ],
+      expectedSubstage: "data_after_done_usage_metadata_only"
+    },
+    {
+      name: "usage followed by choices upgrades to choices",
+      tailEvents: [
+        JSON.stringify(strictUsageMetadataEvent()),
+        JSON.stringify({ choices: [{ index: 0 }] })
+      ],
+      expectedSubstage: "data_after_done_choices_present"
+    },
+    {
+      name: "usage followed by content upgrades to content",
+      tailEvents: [
+        JSON.stringify(strictUsageMetadataEvent()),
+        JSON.stringify({ choices: [], content: "合成危险尾部" })
+      ],
+      expectedSubstage: "data_after_done_content_or_tool_present"
+    },
+    {
+      name: "unknown followed by tool data uses dangerous priority",
+      tailEvents: [
+        JSON.stringify({ provider_payload: true }),
+        JSON.stringify({ choices: [], function_call: { arguments: "{}" } })
+      ],
+      expectedSubstage: "data_after_done_content_or_tool_present"
+    },
+    {
+      name: "malformed event followed by content still uses dangerous priority",
+      tailEvents: [
+        "{not-json}",
+        JSON.stringify({ choices: [], content: "合成危险尾部" })
+      ],
+      expectedSubstage: "data_after_done_content_or_tool_present"
+    },
+    {
+      name: "metadata followed by malformed event is not metadata-only",
+      tailEvents: [
+        JSON.stringify(strictUsageMetadataEvent()),
+        "{not-json}"
+      ],
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    },
+    {
+      name: "choices followed by content uses content priority",
+      tailEvents: [
+        JSON.stringify({ choices: [{ index: 0 }] }),
+        JSON.stringify({ choices: [], reasoning_content: "合成推理尾部" })
+      ],
+      expectedSubstage: "data_after_done_content_or_tool_present"
+    },
+    {
+      name: "duplicate DONE mixed with metadata is not metadata-only",
+      tailEvents: ["[DONE]", JSON.stringify(strictUsageMetadataEvent())],
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
+    }
+  ] as const)(
+    "聚合整个 DONE 后尾部并让危险类别优先：$name",
+    async ({ tailEvents, expectedSubstage }) => {
+      const bodyText = stoppedSsePrefix() +
+        tailEvents.map((event) => sseDataEvent(event)).join("");
+      const fetchMock = vi.fn(async () => new Response(bodyText, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      }));
+      await expect(chatComplete(provider, spec, [], {
+        ...runtime,
+        fetch: fetchMock
+      })).rejects.toMatchObject({
+        code: "LLM_RESPONSE_FORMAT_INVALID",
+        formatFailureStage: "trailing_data",
+        formatFailureSubstage: expectedSubstage
+      });
+    }
+  );
+
+  it("逐字节跨块和 CRLF 不改变完整元数据尾部分类", async () => {
+    const encoded = new TextEncoder().encode(
+      stoppedSsePrefix("\r\n") +
+        sseDataEvent(JSON.stringify(strictUsageMetadataEvent()), "\r\n")
+    );
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const byte of encoded) controller.enqueue(Uint8Array.of(byte));
+        controller.close();
+      }
+    });
+    const fetchMock = vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream; charset=utf-8" }
+    }));
+    await expect(chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    })).rejects.toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "trailing_data",
+      formatFailureSubstage: "data_after_done_usage_metadata_only"
+    });
+  });
+
+  it.each([
+    {
+      mode: "stream_interrupted",
+      expectedCode: "LLM_STREAM_INTERRUPTED",
+      expectedCancelled: false
+    },
+    {
+      mode: "cancelled",
+      expectedCode: "LLM_CANCELLED",
+      expectedCancelled: true
+    }
+  ] as const)(
+    "metadata-only 暂态在 EOF 前 $mode 时只能报告 tail-incomplete",
+    async ({ mode, expectedCode, expectedCancelled }) => {
+      const encoder = new TextEncoder();
+      const taskController = new AbortController();
+      let cancelled = false;
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamController = controller;
+        },
+        cancel() {
+          cancelled = true;
+        }
+      });
+      const fetchMock = vi.fn(async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      }));
+      const resultPromise = chatComplete(provider, spec, [], {
+        ...runtime,
+        signal: taskController.signal,
+        fetch: fetchMock
+      });
+      streamController.enqueue(encoder.encode(
+        stoppedSsePrefix() +
+          sseDataEvent(JSON.stringify(strictUsageMetadataEvent()))
+      ));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (mode === "stream_interrupted") {
+        streamController.error(new Error("合成传输中断原文"));
+      } else {
+        taskController.abort();
+      }
+      const error = await resultPromise.catch((caught: unknown) => caught);
+      expect(error).toMatchObject({
+        code: expectedCode,
+        formatFailureStage: "trailing_data",
+        formatFailureSubstage: "data_after_done_tail_incomplete"
+      });
+      expect((error as Error).message).not.toContain("合成传输中断原文");
+      expect(cancelled).toBe(expectedCancelled);
+    }
+  );
+
+  it("DONE 后元数据事件尚未收齐就取消时也只报 tail-incomplete", async () => {
+    const encoder = new TextEncoder();
+    const taskController = new AbortController();
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const fetchMock = vi.fn(async () => new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamController = controller;
+        }
+      }),
+      { status: 200, headers: { "Content-Type": "text/event-stream" } }
+    ));
+    const resultPromise = chatComplete(provider, spec, [], {
+      ...runtime,
+      signal: taskController.signal,
+      fetch: fetchMock
+    });
+    streamController.enqueue(encoder.encode(
+      stoppedSsePrefix() +
+        'data: {"choices":[],"usage":{"total_tokens":'
+    ));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    taskController.abort();
+
+    await expect(resultPromise).rejects.toMatchObject({
+      code: "LLM_CANCELLED",
+      formatFailureStage: "trailing_data",
+      formatFailureSubstage: "data_after_done_tail_incomplete"
+    });
+  });
+
+  it("DONE 后最后一个元数据事件可以由真实 EOF 收口", async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      stoppedSsePrefix() +
+        `data: ${JSON.stringify({ choices: [], usage: { total_tokens: 7 } })}`,
+      { status: 200, headers: { "Content-Type": "text/event-stream" } }
+    ));
+
+    await expect(chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    })).rejects.toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "trailing_data",
+      formatFailureSubstage: "data_after_done_usage_metadata_only"
+    });
+  });
+
+  it("metadata-only 暂态的连续停顿只报告 tail-incomplete", async () => {
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      let cancelled = false;
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamController = controller;
+        },
+        cancel() {
+          cancelled = true;
+        }
+      });
+      const fetchMock = vi.fn(async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      }));
+      const resultPromise = chatComplete(provider, spec, [], {
+        firstOutputTimeoutMs: 1_000,
+        outputIdleTimeoutMs: 1_000,
+        maximumDurationMs: 5_000,
+        maxAttempts: 1,
+        baseDelayMs: 1,
+        fetch: fetchMock
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      streamController.enqueue(encoder.encode(
+        stoppedSsePrefix() +
+          sseDataEvent(JSON.stringify(strictUsageMetadataEvent()))
+      ));
+      await vi.advanceTimersByTimeAsync(0);
+      const rejection = expect(resultPromise).rejects.toMatchObject({
+        code: "LLM_OUTPUT_IDLE_TIMEOUT",
+        formatFailureStage: "trailing_data",
+        formatFailureSubstage: "data_after_done_tail_incomplete"
+      });
+      await vi.advanceTimersByTimeAsync(1_001);
+      await rejection;
+      expect(cancelled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("metadata 后正文超限不能被归为 metadata-only", async () => {
+    const encoder = new TextEncoder();
+    let cancelled = false;
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+      },
+      cancel() {
+        cancelled = true;
+      }
+    });
+    const fetchMock = vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    }));
+    const resultPromise = chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    });
+    streamController.enqueue(encoder.encode(
+      stoppedSsePrefix() +
+        sseDataEvent(JSON.stringify(strictUsageMetadataEvent()))
+    ));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    streamController.enqueue(new Uint8Array(maximumLlmResponseBodyBytes));
+    const error = await resultPromise.catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      code: "LLM_RESPONSE_BODY_TOO_LARGE",
+      formatFailureStage: "trailing_data",
+      formatFailureSubstage: "data_after_done_other_or_unclassifiable"
+    });
+    expect(cancelled).toBe(true);
+  });
+
   it("终止序列子阶段在运行时也是闭集，非法值不会进入错误对象", () => {
     const sensitiveValue = "服务商原始尾部文本";
     const invalidConstructors = [
@@ -558,21 +1403,24 @@ describe("chatComplete：正常路径", () => {
     {
       mode: "stream_interrupted",
       expectedCode: "LLM_STREAM_INTERRUPTED",
-      expectedCancelled: false
+      expectedCancelled: false,
+      expectedSubstage: "duplicate_done"
     },
     {
       mode: "cancelled",
       expectedCode: "LLM_CANCELLED",
-      expectedCancelled: true
+      expectedCancelled: true,
+      expectedSubstage: "duplicate_done"
     },
     {
       mode: "body_too_large",
       expectedCode: "LLM_RESPONSE_BODY_TOO_LARGE",
-      expectedCancelled: true
+      expectedCancelled: true,
+      expectedSubstage: "data_after_done_other_or_unclassifiable"
     }
   ] as const)(
     "终止序列首错在排空异常后仍保留封闭子阶段：$mode",
-    async ({ mode, expectedCode, expectedCancelled }) => {
+    async ({ mode, expectedCode, expectedCancelled, expectedSubstage }) => {
       const encoder = new TextEncoder();
       const sensitiveTransportText = "不应进入错误的排空传输细节";
       const taskController = new AbortController();
@@ -619,7 +1467,7 @@ describe("chatComplete：正常路径", () => {
       expect(error).toMatchObject({
         code: expectedCode,
         formatFailureStage: "trailing_data",
-        formatFailureSubstage: "duplicate_done"
+        formatFailureSubstage: expectedSubstage
       });
       expect((error as Error).message).not.toContain(sensitiveTransportText);
       expect(cancelled).toBe(expectedCancelled);

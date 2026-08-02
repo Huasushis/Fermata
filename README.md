@@ -156,9 +156,9 @@ node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:calibrate-a
 # 真实 HEAD、Git 可见的干净工作树，以及 runner 与登记依赖的实际字节。
 node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:eval-difficulty -- --label=calibrated
 
-# 当前入口只登记全新 d 标签与 v5 配置。包含本登记的提交成为 HEAD、推送完成且工作树完全干净后，
+# 当前入口只登记全新 e 标签与 v6 配置。包含本登记的提交成为 HEAD、推送完成且工作树完全干净后，
 # 才能在单独人工核对中运行恰好一次；提交前、EVAL_CODE_VERSION 不匹配或有任意 tracked/untracked
-# 改动都会在读取私有运行目录和发起请求前失败。a/b/c 已永久占用，禁止删除、重跑或复用 completion。
+# 改动都会在读取私有运行目录和发起请求前失败。a/b/c/d 已永久占用，禁止删除、重跑或复用 completion。
 # FERMATA_CONNECTIVITY_ENV_FILE=/home/ubuntu/codex-urmotiv/Fermata/private/fermata-connectivity-probe.env
 # 提交并推送后，用专用工具从干净 HEAD 安全更新 env 中既有的 EVAL_CODE_VERSION；不要手改或 source：
 # npm run experiment:update-connectivity-code-version -- --environment-file=/home/ubuntu/codex-urmotiv/Fermata/private/fermata-connectivity-probe.env
@@ -249,10 +249,12 @@ npm run experiment:calibrate-levels:detached -- \
 `LEVELS_LLM_MAX_ATTEMPTS` 调整最多尝试次数，但只有模型服务明确返回请求过多时才会再次尝试。
 `EVAL_CONCURRENCY` 决定同时处理几道题，只接受 1 到 32 的整数。模型响应正文按 UTF-8 原始字节
 计算，固定最多读取 4 MiB（约 4 MB）；超过后立即停止读取，并且错误和日志都不会包含响应正文。
+流式响应还固定最多读取 65536 个非空网络分块；分块是底层每次交给客户端的一小段字节。超过上限
+说明响应被异常细碎地发送，客户端会停止并按固定格式错误处理，避免大量微小分块让超时保护无法及时运行。
 
 正式服务已有的 `settings.json` 会保留上次保存的 `experimentVersion`，不会因为替换
 `models.yaml` 自动改变。当前配置版本是
-`experiment-2026-08-difficulty-candidate-c-provider-v1-drain-v5`。部署后必须先保持
+`experiment-2026-08-difficulty-candidate-c-provider-v1-post-done-shape-v6`。部署后必须先保持
 `enabled=false`；只有在没有在途任务、逐项核对整个所选档位的协议和准确性证据后，才能通过
 Urmotiv 的 Fermata 设置页或管理接口显式写入当前版本并开启。worker 还会在每轮 claim 前重新
 比较版本和生产资格证据，旧值即使同时保存了 `enabled=true` 也不会领取任务。由于当前
@@ -331,20 +333,30 @@ failed=1、complete=false，request/fetch 都精确为 1，HTTP 200，正文到�
 120 秒总时限；传输中断、停顿超时或任务取消都不会伪装成 EOF。私有 completion 只保存固定枚举的
 失败阶段，不保存原始事件、响应字段、正文、长度明细或服务商错误。
 
-当前 v5 在不放宽任何接受条件的前提下，把 `trailing_data` 细分为三个固定子阶段：
+v5 在不放宽任何接受条件的前提下，把 `trailing_data` 细分为三个固定子阶段：
 重复终止标记、终止标记后仍有数据，以及 `finish_reason=stop` 后仍有非空候选事件。
-子阶段会随首错排空保留到真实 HTTP EOF；排空中断、取消、停顿超时或正文超限也只携带这一固定
-枚举，不保存或记录原始事件、服务商响应字段名、字段值、文本或长度。历史 c completion 没有这个新增字段，
-继续以其原始哈希为准。后续产物格式已升为第 2 版，公共证据、checkpoint 和 completion 都在写盘前
-经过精确字段与固定全局错误码校验；未知字段或错误码只产生固定本地失败码。下一次且仅一次的探针
-已登记为 `difficulty-candidate-c-connectivity-probe-20260801-d`，绑定当前 v5 版本和
-`config/models.yaml` 的 SHA-256
-`326a0f7d67122db493529929944b8984d64f66092535a596a89afe66ad744df8`。codeVersion 不用可被伪造的
-预填值：入口要求 `EVAL_CODE_VERSION` 精确等于提交后的 HEAD，当前 runner 字节必须等于该 HEAD 中
-的 runner，且整个 Git 可见工作树必须干净，再把 codeVersion 与 runner SHA-256 写入第 2 版证据。
-因此包含登记改动的提交尚未成为 HEAD、runner 有未提交修改、工作树有其它改动或 d 命名空间已有
-锁/checkpoint/completion 时，都会在请求前失败关闭。a/b/c 明确是历史不可重跑身份，d 不读取或
-复用它们的 completion；登记本身没有发起付费请求，也没有创建或改写实验产物。
+d 固定标签已实际运行且永久占用：HTTP 200，request/fetch 都精确为 1，正文到达真实
+EOF，客户端没有取消正文；安全失败阶段是 `trailing_data`，子阶段是历史粗分类
+`data_after_done`，结果码为 `LLM_RESPONSE_FORMAT_INVALID`，`complete=false`。这只能证明 `[DONE]`
+后还有至少一个非空 data 事件，无法区分它是用量元数据、非空 `choices`、正文/工具输出，
+还是其它或无法分类的形状；因此仍不得启动 83 题付费实验。
+
+当前 v6/e 仍严格拒绝任何 `[DONE]` 后 data，但会在有界内解析并排空整个尾部，以封闭枚举区分：
+仅重复 DONE、严格白名单的用量/标准元数据、非空 `choices`、正文或工具字段、其它或无法分类，
+以及在真实 EOF 前中断的元数据尾部。正文/工具和非空候选始终按更危险的类别优先；
+只有整个尾部每个事件都通过严格元数据字段、类型、字符串长度、计数键名、深度和键数上限校验，
+且真正到达 HTTP EOF，才记为 `data_after_done_usage_metadata_only`。正常到达 EOF 的所有尾部形状仍都返回
+`LLM_RESPONSE_FORMAT_INVALID`且 `complete=false`；中断、取消或超时则保留对应的固定传输错误码和安全子阶段，
+也必定 `complete=false`。产物和日志不保存原始事件、字段名、字段值、文本、计数或长度。
+
+当前产物 schema 已升为第 3 版。下一次且仅一次的探针已登记为
+`difficulty-candidate-c-connectivity-probe-20260801-e`，绑定 v6 版本和 `config/models.yaml` 的 SHA-256
+`d7f9058d2a2f13c4582e931075fb0ffc2d17296b985fd258d4e1c6ae3fa690f7`。codeVersion 不用可被伪造的预填值：
+入口要求 `EVAL_CODE_VERSION` 精确等于提交后的 HEAD，当前 runner 字节必须等于该 HEAD 中的 runner，
+且整个 Git 可见工作树必须干净，再把 codeVersion 与 runner SHA-256 写入第 3 版证据。
+因此包含登记改动的提交尚未成为 HEAD、runner 有未提交修改、工作树有其它改动或 e 命名空间已有
+锁/checkpoint/completion 时，都会在请求前失败关闭。a/b/c/d 是历史不可重跑身份，e 不读取或复用它们的
+completion；这次登记没有发起付费请求，也没有创建或改写实验产物。
 
 探针与 env 更新工具不从调用者 `PATH` 查找 Git，而是固定使用经系统路径权限检查的
 `/usr/bin/git`。每次仓库检查都会新建一个 `0700` 临时 Git 元数据目录；Git 只读取其中固定生成的
@@ -364,7 +376,7 @@ HEAD、引用和这些目录未并发变化，再清理唯一临时目录。临�
 协议预检，再使用相应完整人工标准集保留修改前/修改后准确性报告；至少 solver、verdict、difficulty
 三项必须单独留证。任何一项未通过时都不得把整档位写成可用，也不得开启生产领取。
 
-每个固定标签一旦留下检查点、completion 或锁就不能重跑覆盖。旧 a/b/c 的失败证据必须永久保留，
+每个固定标签一旦留下检查点、completion 或锁就不能重跑覆盖。旧 a/b/c/d 的失败证据必须永久保留，
 后续新标签不能读取或复用它们。若后续探针异常退出留下同标签锁，只能在同时核对记录中的 PID、
 进程启动时刻、完整命令和工作目录，确认该进程已不存在且确属本项目后，人工移除这一把锁；不得按
 进程名批量结束 Node.js，也不得删除同标签检查点或 completion 来制造一次“干净重跑”。
@@ -452,7 +464,7 @@ completion marker 表示这条执行链已完整收束并阻止重放，不等�
 
 | 流水线 | 状态 | 说明 |
 | --- | --- | --- |
-| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；provider-v1 的 c 请求已读到 EOF，但协议仍未通过** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate D 与恢复后的 Candidate C 请求都在旧根路径配置下返回 404；一次只读 `/v1/models` 已确认目录声明包含 flash/pro。修正 `/v1` 后的 b 单请求得到 HTTP 200，但客户端取消正文、未观察 EOF；v4 的 c 单请求同样是 HTTP 200，已安全排空并观察到真实 EOF，固定失败阶段为 `trailing_data`，仍未通过完整协议。v5 已加入封闭子阶段诊断并登记了唯一 d 标签，但尚未运行。a/b/c 证据均保留，没有启动新的 83 题。当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
+| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；provider-v1 已读到 EOF，但协议仍未通过** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate D 与恢复后的 Candidate C 请求都在旧根路径配置下返回 404；一次只读 `/v1/models` 已确认目录声明包含 flash/pro。修正 `/v1` 后的 b 单请求得到 HTTP 200，但客户端取消正文、未观察 EOF；v4 的 c 单请求安全排空到真实 EOF，固定失败阶段为 `trailing_data`。v5 的 d 单请求也是 HTTP 200、request/fetch=1、真实 EOF、未取消，但只得到粗分类 `data_after_done`且 `complete=false`。v6 已登记唯一 e 标签，将在不放宽协议的前提下安全细分整个 DONE 后尾部，但尚未运行。a/b/c/d 证据均保留，没有启动新的 83 题。当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
 | 思维难度（thinking.ts） | **旧实验均不可作基线** | 两份早期报告无法证明完整；后两份明确只完成 6/24、9/24，而且都缺高分段。 |
 | 代码难度（coding.ts） | **旧实验均不可作基线** | 与思维难度共用的旧实验不完整；小样本曾出现难度分段升高但代码难度均值下降，需要在完整基线上复核。 |
 | 查重判断（verdict.ts） | **旧设计不可作准确性基线** | 旧实验只有 3 个正常样本和 3 个人工重复样本；正常组只验证“不是不通过”，没有区分通过与需要修改。 |

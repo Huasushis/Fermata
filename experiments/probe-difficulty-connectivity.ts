@@ -1,5 +1,5 @@
 /**
- * Candidate C 恢复配置的 d 标签单样本连通性/协议预检。
+ * Candidate C 恢复配置的 e 标签单样本连通性/协议预检。
  *
  * 只发送一个人工合成短题，严格允许一次真实 fetch。成功必须同时满足当前
  * provider 身份、Git/runner/config/锚点绑定、请求体契约、结构化输出、
@@ -60,16 +60,17 @@ import { loadDifficultyAnchorsStrict } from "./lib/difficulty-anchors-strict";
 import { hasUnknownPrefixedEnvironmentKeys } from "./lib/evaluation-integrity";
 
 export const difficultyConnectivityProbeExperimentVersion =
-  "experiment-2026-08-difficulty-candidate-c-provider-v1-drain-v5";
-export const difficultyConnectivityProbeArtifactSchemaVersion = 2;
-// 这些标签都已经留下永久证据；新 runner 只登记 d，不读取、复用或重跑它们。
+  "experiment-2026-08-difficulty-candidate-c-provider-v1-post-done-shape-v6";
+export const difficultyConnectivityProbeArtifactSchemaVersion = 3;
+// 这些标签都已经留下永久证据；新 runner 只登记 e，不读取、复用或重跑它们。
 export const difficultyConnectivityPreviousProbeLabels = [
   "difficulty-candidate-c-connectivity-probe-20260801-a",
   "difficulty-candidate-c-connectivity-probe-20260801-b",
-  "difficulty-candidate-c-connectivity-probe-20260801-c"
+  "difficulty-candidate-c-connectivity-probe-20260801-c",
+  "difficulty-candidate-c-connectivity-probe-20260801-d"
 ] as const;
 export const difficultyConnectivityProbeLabel =
-  "difficulty-candidate-c-connectivity-probe-20260801-d";
+  "difficulty-candidate-c-connectivity-probe-20260801-e";
 export const difficultyConnectivityProbeMaxOutputTokens = 2_048;
 
 const repositoryDirectory = fileURLToPath(new URL("../", import.meta.url));
@@ -84,7 +85,7 @@ const lockFileName = `${difficultyConnectivityProbeLabel}.lock.private`;
 export const difficultyConnectivityProbeCompletionFileName =
   `${difficultyConnectivityProbeLabel}.completion.private.json`;
 export const difficultyConnectivityExpectedModelsConfigSha256 =
-  "326a0f7d67122db493529929944b8984d64f66092535a596a89afe66ad744df8";
+  "d7f9058d2a2f13c4582e931075fb0ffc2d17296b985fd258d4e1c6ae3fa690f7";
 export const difficultyConnectivityExpectedCandidateCAnchorsSha256 =
   "48b4c5f95732347b2a0a48f4143f50dbc6bc6706f427aa75179def45988b9a7f";
 // 旧 a 探针确认根路径配置会命中不存在的 chat/completions；当前身份只把
@@ -191,7 +192,11 @@ const safeFormatFailureStageValues = [
 ] as const satisfies readonly LlmResponseFormatFailureStage[];
 const safeFormatFailureSubstageValues = [
   "duplicate_done",
-  "data_after_done",
+  "data_after_done_usage_metadata_only",
+  "data_after_done_choices_present",
+  "data_after_done_content_or_tool_present",
+  "data_after_done_other_or_unclassifiable",
+  "data_after_done_tail_incomplete",
   "choice_after_stop"
 ] as const satisfies readonly LlmResponseFormatFailureSubstage[];
 const safeFormatFailureStages = new Set<LlmResponseFormatFailureStage>(
@@ -241,6 +246,36 @@ export const difficultyConnectivityProbeResultSchema: z.ZodType<
         path: ["formatFailureSubstage"]
       });
     }
+    if (result.httpEofObserved && result.responseBodyCancelled) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "HTTP EOF 与本地取消证据不能同时为真。",
+        path: ["httpEofObserved"]
+      });
+    }
+    if (
+      result.formatFailureSubstage ===
+        "data_after_done_usage_metadata_only" &&
+      (!result.httpEofObserved ||
+        result.responseBodyCancelled ||
+        result.code !== "LLM_RESPONSE_FORMAT_INVALID")
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "只能在真实 HTTP EOF 后记录完整元数据尾部。",
+        path: ["formatFailureSubstage"]
+      });
+    }
+    if (
+      result.formatFailureSubstage === "data_after_done_tail_incomplete" &&
+      result.httpEofObserved
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "未完成尾部不能声称已观察 HTTP EOF。",
+        path: ["formatFailureSubstage"]
+      });
+    }
   });
 
 export const difficultyConnectivityProbeGlobalFailureCodeSchema = z.enum([
@@ -255,8 +290,8 @@ export type DifficultyConnectivityProbeGlobalFailureCode = z.infer<
 
 export const difficultyConnectivityCommonEvidenceSchema = z
   .object({
-    // d 使用第 2 版；历史 a/b/c 产物保持原字节与哈希，不由当前 schema
-    // 重新解释，也不能充当 d 的 completion。
+    // e 使用第 3 版；历史 a/b/c/d 产物保持原字节与哈希，不由当前 schema
+    // 重新解释，也不能充当 e 的 completion。
     schemaVersion: z.literal(difficultyConnectivityProbeArtifactSchemaVersion),
     label: z.literal(difficultyConnectivityProbeLabel),
     experimentVersion: z.literal(difficultyConnectivityProbeExperimentVersion),
@@ -524,7 +559,11 @@ function observeResponseEof(
       try {
         const chunk = await reader.read();
         if (chunk.done) {
-          state.httpEofObserved = true;
+          // cancel() 会让正在等待的底层 read() 也返回 done。这是
+          // 本地取消的结果，不是可以写入证据的服务端 HTTP EOF。
+          if (!state.responseBodyCancelled) {
+            state.httpEofObserved = true;
+          }
           releaseReader();
           controller.close();
           return;
@@ -537,6 +576,7 @@ function observeResponseEof(
     },
     cancel: async (reason) => {
       state.responseBodyCancelled = true;
+      state.httpEofObserved = false;
       try {
         await reader.cancel(reason);
       } finally {

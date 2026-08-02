@@ -89,6 +89,7 @@ export interface ChatCompletionJsonOptions {
 
 /** 模型响应正文的固定上限，按 UTF-8 原始字节计算。 */
 export const maximumLlmResponseBodyBytes = 4 * 1024 * 1024;
+const maximumLlmResponseChunks = 65_536;
 /** 显式输出 token 上限本身也必须有界，避免错误配置变成近似无限输出。 */
 export const maximumExplicitLlmOutputTokens = 131_072;
 export const defaultLlmFirstOutputTimeoutMs = 30 * 60 * 1_000;
@@ -292,17 +293,35 @@ export type LlmResponseFormatFailureStage =
  */
 export type LlmResponseFormatFailureSubstage =
   | "duplicate_done"
+  /** v5/d 的历史粗分类；v6/e 不再产生，但保留类型兼容。 */
   | "data_after_done"
+  | "data_after_done_usage_metadata_only"
+  | "data_after_done_choices_present"
+  | "data_after_done_content_or_tool_present"
+  | "data_after_done_other_or_unclassifiable"
+  | "data_after_done_tail_incomplete"
   | "choice_after_stop";
+
+const safeFormatFailureSubstageValues = new Set<
+  LlmResponseFormatFailureSubstage
+>([
+  "duplicate_done",
+  "data_after_done",
+  "data_after_done_usage_metadata_only",
+  "data_after_done_choices_present",
+  "data_after_done_content_or_tool_present",
+  "data_after_done_other_or_unclassifiable",
+  "data_after_done_tail_incomplete",
+  "choice_after_stop"
+]);
 
 function assertSafeFormatFailureSubstage(
   formatFailureStage?: LlmResponseFormatFailureStage,
   formatFailureSubstage?: LlmResponseFormatFailureSubstage
 ): void {
   const knownSubstage =
-    formatFailureSubstage === "duplicate_done" ||
-    formatFailureSubstage === "data_after_done" ||
-    formatFailureSubstage === "choice_after_stop";
+    formatFailureSubstage !== undefined &&
+    safeFormatFailureSubstageValues.has(formatFailureSubstage);
   if (
     (formatFailureStage === "trailing_data" && !knownSubstage) ||
     (formatFailureStage !== "trailing_data" && formatFailureSubstage !== undefined)
@@ -734,10 +753,13 @@ class LlmRequestWatchdog {
     formatFailureStage?: LlmResponseFormatFailureStage,
     formatFailureSubstage?: LlmResponseFormatFailureSubstage
   ): void {
-    if (this.#timeoutCode !== null || this.#drainingInvalidResponse) return;
-    this.#drainingInvalidResponse = true;
+    // DONE 后的诊断会在继续读取尾部时单向升级安全分类；超时或取消必须
+    // 带走最新的危险类别，不能永远冻结在第一个 metadata-only 事件。
     this.#formatFailureStage = formatFailureStage;
     this.#formatFailureSubstage = formatFailureSubstage;
+    if (this.#timeoutCode !== null) return;
+    if (this.#drainingInvalidResponse) return;
+    this.#drainingInvalidResponse = true;
     if (this.#firstOutputTimer !== null) {
       clearTimeout(this.#firstOutputTimer);
       this.#firstOutputTimer = null;
@@ -1112,12 +1134,323 @@ async function drainResponseAfterProtocolError(
   }
 }
 
+type PostDoneTailShape =
+  | "duplicate_done_only"
+  | "usage_metadata_only"
+  | "choices_present"
+  | "content_or_tool_present"
+  | "other_or_unclassifiable";
+
+const postDoneMetadataKeys = new Set([
+  "choices",
+  "usage",
+  "id",
+  "object",
+  "created",
+  "model",
+  "system_fingerprint",
+  "service_tier"
+]);
+const postDoneContentOrToolKeys = new Set([
+  "content",
+  "reasoning",
+  "reasoning_content",
+  "delta",
+  "message",
+  "tool_calls",
+  "tool_call",
+  "tools",
+  "function_call",
+  "function",
+  "arguments",
+  "refusal",
+  "audio"
+]);
+const maximumPostDoneShapeNodes = 256;
+const maximumPostDoneShapeDepth = 8;
+const maximumUsageCounterDepth = 4;
+const maximumUsageCounterKeys = 64;
+const maximumMetadataStringLength = 1_024;
+
+function isPlainJsonRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  return prototype === Object.prototype || prototype === null;
+}
+
+function scanPostDonePayloadShape(value: unknown): {
+  readonly contentOrToolPresent: boolean;
+  readonly choicesPresent: boolean;
+  readonly unclassifiable: boolean;
+} {
+  const pending: Array<{ readonly value: unknown; readonly depth: number }> = [
+    { value, depth: 0 }
+  ];
+  let visited = 0;
+  let choicesPresent = false;
+  let unclassifiable = false;
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined) break;
+    visited += 1;
+    if (
+      visited > maximumPostDoneShapeNodes ||
+      current.depth > maximumPostDoneShapeDepth
+    ) {
+      return {
+        contentOrToolPresent: false,
+        choicesPresent,
+        unclassifiable: true
+      };
+    }
+    if (Array.isArray(current.value)) {
+      if (current.value.length > maximumPostDoneShapeNodes - visited) {
+        return {
+          contentOrToolPresent: false,
+          choicesPresent,
+          unclassifiable: true
+        };
+      }
+      for (const item of current.value) {
+        visited += 1;
+        if (typeof item === "object" && item !== null) {
+          pending.push({ value: item, depth: current.depth + 1 });
+        }
+      }
+      continue;
+    }
+    if (!isPlainJsonRecord(current.value)) continue;
+    const entries = Object.entries(current.value);
+    // 先检查当前有界对象的键，使正文/工具标记始终高于普通无法分类。
+    for (const [key] of entries) {
+      if (postDoneContentOrToolKeys.has(key)) {
+        return {
+          contentOrToolPresent: true,
+          choicesPresent,
+          unclassifiable: false
+        };
+      }
+    }
+    if (entries.length > maximumPostDoneShapeNodes - visited) {
+      return {
+        contentOrToolPresent: false,
+        choicesPresent,
+        unclassifiable: true
+      };
+    }
+    for (const [key, child] of entries) {
+      visited += 1;
+      if (key === "choices") {
+        if (Array.isArray(child)) {
+          choicesPresent ||= child.length > 0;
+        } else {
+          // 畸形 choices 使当前事件无法归为严格元数据，但仍要在有界
+          // 范围内继续扫描其它兄弟节点；正文/工具字段的危险级别更高。
+          unclassifiable = true;
+        }
+      }
+      if (typeof child === "object" && child !== null) {
+        pending.push({ value: child, depth: current.depth + 1 });
+      }
+    }
+  }
+  return {
+    contentOrToolPresent: false,
+    choicesPresent,
+    unclassifiable
+  };
+}
+
+function isBoundedUsageCounterStructure(
+  value: unknown
+): boolean {
+  if (!isPlainJsonRecord(value)) return false;
+  const result = scanBoundedUsageCounter(value, 0, {
+    remaining: maximumPostDoneShapeNodes
+  });
+  return result.valid && result.hasNumericCounter;
+}
+
+function scanBoundedUsageCounter(
+  value: unknown,
+  depth: number,
+  budget: { remaining: number }
+): { readonly valid: boolean; readonly hasNumericCounter: boolean } {
+  if (typeof value === "number") {
+    return {
+      valid: Number.isSafeInteger(value) && value >= 0,
+      hasNumericCounter: Number.isSafeInteger(value) && value >= 0
+    };
+  }
+  if (!isPlainJsonRecord(value) || depth >= maximumUsageCounterDepth) {
+    return { valid: false, hasNumericCounter: false };
+  }
+  const entries = Object.entries(value);
+  if (entries.length === 0 || entries.length > maximumUsageCounterKeys) {
+    return { valid: false, hasNumericCounter: false };
+  }
+  let hasNumericCounter = false;
+  for (const [key, child] of entries) {
+    budget.remaining -= 1;
+    if (budget.remaining < 0 || !/^[A-Za-z0-9_]{1,64}$/u.test(key)) {
+      return { valid: false, hasNumericCounter: false };
+    }
+    if (child === null) continue;
+    const childResult = scanBoundedUsageCounter(
+      child,
+      depth + 1,
+      budget
+    );
+    if (!childResult.valid) {
+      return { valid: false, hasNumericCounter: false };
+    }
+    hasNumericCounter ||= childResult.hasNumericCounter;
+  }
+  return { valid: true, hasNumericCounter };
+}
+
+function isBoundedMetadataString(value: unknown, nullable = false): boolean {
+  return (
+    (nullable && value === null) ||
+    (typeof value === "string" &&
+      value.length <= maximumMetadataStringLength &&
+      value.trim().length > 0 &&
+      !/[\u0000-\u001f\u007f]/u.test(value))
+  );
+}
+
+function isStrictPostDoneUsageMetadata(raw: unknown): boolean {
+  if (!isPlainJsonRecord(raw)) return false;
+  const entries = Object.entries(raw);
+  if (
+    entries.length === 0 ||
+    entries.some(([key]) => !postDoneMetadataKeys.has(key))
+  ) {
+    return false;
+  }
+  if (
+    Object.hasOwn(raw, "choices") &&
+    (!Array.isArray(raw.choices) || raw.choices.length !== 0)
+  ) {
+    return false;
+  }
+  if (
+    Object.hasOwn(raw, "usage") &&
+    !isBoundedUsageCounterStructure(raw.usage)
+  ) {
+    return false;
+  }
+  let hasMetadataEvidence =
+    (Object.hasOwn(raw, "choices") &&
+      Array.isArray(raw.choices) &&
+      raw.choices.length === 0) ||
+    Object.hasOwn(raw, "usage");
+  for (const key of ["id", "object", "model"] as const) {
+    if (Object.hasOwn(raw, key) && !isBoundedMetadataString(raw[key])) {
+      return false;
+    }
+    hasMetadataEvidence ||= Object.hasOwn(raw, key);
+  }
+  for (const key of ["system_fingerprint", "service_tier"] as const) {
+    if (
+      Object.hasOwn(raw, key) &&
+      !isBoundedMetadataString(raw[key], true)
+    ) {
+      return false;
+    }
+    hasMetadataEvidence ||=
+      Object.hasOwn(raw, key) && typeof raw[key] === "string";
+  }
+  if (Object.hasOwn(raw, "created")) {
+    if (
+      !Number.isSafeInteger(raw.created) ||
+      typeof raw.created !== "number" ||
+      raw.created < 0
+    ) {
+      return false;
+    }
+    hasMetadataEvidence = true;
+  }
+  return hasMetadataEvidence;
+}
+
+function classifyPostDoneData(data: string): PostDoneTailShape {
+  if (data === "[DONE]") return "duplicate_done_only";
+  let raw: unknown;
+  try {
+    raw = JSON.parse(data) as unknown;
+  } catch {
+    return "other_or_unclassifiable";
+  }
+  const scan = scanPostDonePayloadShape(raw);
+  if (scan.contentOrToolPresent) return "content_or_tool_present";
+  if (scan.choicesPresent) return "choices_present";
+  if (
+    scan.unclassifiable ||
+    !isPlainJsonRecord(raw) ||
+    Object.hasOwn(raw, "error")
+  ) {
+    return "other_or_unclassifiable";
+  }
+  return isStrictPostDoneUsageMetadata(raw)
+    ? "usage_metadata_only"
+    : "other_or_unclassifiable";
+}
+
+function mergePostDoneTailShape(
+  current: PostDoneTailShape | undefined,
+  next: PostDoneTailShape
+): PostDoneTailShape {
+  if (current === undefined || current === next) return next;
+  if (
+    current === "content_or_tool_present" ||
+    next === "content_or_tool_present"
+  ) {
+    return "content_or_tool_present";
+  }
+  if (current === "choices_present" || next === "choices_present") {
+    return "choices_present";
+  }
+  return "other_or_unclassifiable";
+}
+
+function postDoneFailureSubstage(
+  shape: PostDoneTailShape,
+  tailComplete: boolean
+): LlmResponseFormatFailureSubstage {
+  if (shape === "content_or_tool_present") {
+    return "data_after_done_content_or_tool_present";
+  }
+  if (shape === "choices_present") {
+    return "data_after_done_choices_present";
+  }
+  if (shape === "other_or_unclassifiable") {
+    return "data_after_done_other_or_unclassifiable";
+  }
+  if (!tailComplete && shape === "usage_metadata_only") {
+    return "data_after_done_tail_incomplete";
+  }
+  return shape === "duplicate_done_only"
+    ? "duplicate_done"
+    : "data_after_done_usage_metadata_only";
+}
+
 interface ChatCompletionStreamState {
   content: string;
   reasoning: string;
   sawChoice: boolean;
   sawStop: boolean;
   sawDone: boolean;
+  postDoneTailShape: PostDoneTailShape | undefined;
+  postDoneTailHasUnresolvedData: boolean;
+}
+
+interface PostDonePendingDataScan {
+  confirmedDataField: boolean;
+  currentLineMayBeData: boolean;
+  currentLinePrefix: string;
 }
 
 async function readChatCompletionEventStream(
@@ -1135,11 +1468,36 @@ async function readChatCompletionEventStream(
     reasoning: "",
     sawChoice: false,
     sawStop: false,
-    sawDone: false
+    sawDone: false,
+    postDoneTailShape: undefined,
+    postDoneTailHasUnresolvedData: false
   };
-  let pending = "";
   let trailingCarriageReturn = false;
+  const eventBuffer = createEventStreamEventBuffer();
+  const postDonePendingDataScan: PostDonePendingDataScan = {
+    confirmedDataField: false,
+    currentLineMayBeData: true,
+    currentLinePrefix: ""
+  };
+  const consumeEvent = (event: string): void => {
+    const hasValidOutput = consumeObservedChatCompletionEvent(
+      event,
+      state,
+      observer
+    );
+    resetPostDonePendingDataScan(postDonePendingDataScan, state);
+    if (hasValidOutput) observer.onValidOutput();
+  };
+  const observePartialEventText = (text: string): void => {
+    scanUnresolvedPostDoneData(
+      text,
+      postDonePendingDataScan,
+      state,
+      observer
+    );
+  };
   let totalBytes = 0;
+  let responseChunkCount = 0;
   let readerFinished = false;
   let readerErrored = false;
   let firstProtocolError:
@@ -1154,30 +1512,43 @@ async function readChatCompletionEventStream(
         chunk = await waitForOrAbort(reader.read(), requestController.signal);
       } catch (error) {
         readerErrored = !requestController.signal.aborted;
+        if (state.sawDone && state.postDoneTailHasUnresolvedData) {
+          publishUnresolvedPostDoneData(state, observer);
+        }
         throw error;
       }
       if (chunk.done) {
         readerFinished = true;
         if (firstProtocolError !== undefined) throw firstProtocolError;
-        ({ pending, trailingCarriageReturn } = appendEventStreamText(
-          pending,
-          trailingCarriageReturn,
-          decodeEventStreamText(decoder),
-          true
-        ));
-        for (;;) {
-          const boundary = pending.indexOf("\n\n");
-          if (boundary < 0) break;
-          const event = pending.slice(0, boundary);
-          pending = pending.slice(boundary + 2);
-          if (consumeChatCompletionEvent(event, state)) {
-            observer.onValidOutput();
+        try {
+          const normalized = normalizeEventStreamText(
+            trailingCarriageReturn,
+            decodeEventStreamText(decoder),
+            true
+          );
+          trailingCarriageReturn = normalized.trailingCarriageReturn;
+          consumeEventStreamText(
+            normalized.text,
+            eventBuffer,
+            consumeEvent,
+            observePartialEventText
+          );
+          finishEventStreamEvents(eventBuffer, consumeEvent);
+        } catch (error) {
+          if (!state.sawDone || !isDrainableResponseProtocolError(error)) {
+            throw error;
           }
+          updatePostDoneTailShape(
+            state,
+            "other_or_unclassifiable",
+            observer
+          );
         }
-        if (pending.trim().length > 0) {
-          if (consumeChatCompletionEvent(pending, state)) {
-            observer.onValidOutput();
-          }
+        if (state.postDoneTailShape !== undefined) {
+          throw new LlmResponseFormatError(
+            "trailing_data",
+            postDoneFailureSubstage(state.postDoneTailShape, true)
+          );
         }
         if (!state.sawChoice || !state.sawStop) {
           throw new LlmRequestError("LLM_STREAM_INTERRUPTED");
@@ -1188,16 +1559,55 @@ async function readChatCompletionEventStream(
         extractChatCompletion(raw);
         return raw;
       }
+      if (
+        (state.postDoneTailShape !== undefined ||
+          state.postDoneTailHasUnresolvedData) &&
+        chunk.value.byteLength > 0
+      ) {
+        observer.onInvalidResponseDrainActivity();
+      }
+      if (
+        state.sawDone &&
+        chunk.value.byteLength > maximumLlmResponseBodyBytes - totalBytes
+      ) {
+        updatePostDoneTailShape(
+          state,
+          "other_or_unclassifiable",
+          observer
+        );
+      }
       totalBytes = addResponseChunkSize(
         totalBytes,
         chunk.value.byteLength,
         firstProtocolError instanceof LlmResponseFormatError
           ? firstProtocolError.formatFailureStage
-          : undefined,
+          : state.postDoneTailShape === undefined
+            ? undefined
+            : "trailing_data",
         firstProtocolError instanceof LlmResponseFormatError
           ? firstProtocolError.formatFailureSubstage
-          : undefined
+          : state.postDoneTailShape === undefined
+            ? undefined
+            : postDoneFailureSubstage(state.postDoneTailShape, false)
       );
+      if (chunk.value.byteLength > 0) {
+        responseChunkCount += 1;
+        if (responseChunkCount > maximumLlmResponseChunks) {
+          if (firstProtocolError !== undefined) throw firstProtocolError;
+          if (state.sawDone) {
+            updatePostDoneTailShape(
+              state,
+              "other_or_unclassifiable",
+              observer
+            );
+            throw new LlmResponseFormatError(
+              "trailing_data",
+              "data_after_done_other_or_unclassifiable"
+            );
+          }
+          throw new LlmResponseFormatError("event_shape");
+        }
+      }
       if (firstProtocolError !== undefined) {
         if (chunk.value.byteLength > 0) {
           observer.onInvalidResponseDrainActivity();
@@ -1206,35 +1616,47 @@ async function readChatCompletionEventStream(
       }
       if (chunk.value.byteLength === 0) continue;
       try {
-        ({ pending, trailingCarriageReturn } = appendEventStreamText(
-          pending,
+        const normalized = normalizeEventStreamText(
           trailingCarriageReturn,
           decodeEventStreamText(decoder, chunk.value),
           false
-        ));
-
-        for (;;) {
-          const boundary = pending.indexOf("\n\n");
-          if (boundary < 0) break;
-          const event = pending.slice(0, boundary);
-          pending = pending.slice(boundary + 2);
-          if (consumeChatCompletionEvent(event, state)) {
-            observer.onValidOutput();
-          }
-        }
+        );
+        trailingCarriageReturn = normalized.trailingCarriageReturn;
+        consumeEventStreamText(
+          normalized.text,
+          eventBuffer,
+          consumeEvent,
+          observePartialEventText
+        );
       } catch (error) {
         if (!isDrainableResponseProtocolError(error)) throw error;
-        firstProtocolError = error;
+        if (state.sawDone) {
+          updatePostDoneTailShape(
+            state,
+            "other_or_unclassifiable",
+            observer
+          );
+          firstProtocolError = new LlmResponseFormatError(
+            "trailing_data",
+            postDoneFailureSubstage(
+              state.postDoneTailShape ?? "other_or_unclassifiable",
+              false
+            )
+          );
+        } else {
+          firstProtocolError = error;
+        }
         // 首错后不再保留、解码或解析模型正文，避免后续字段替换首错。
-        pending = "";
+        clearEventStreamEventBuffer(eventBuffer);
+        resetPostDonePendingDataScan(postDonePendingDataScan, state);
         state.content = "";
         state.reasoning = "";
         observer.onInvalidResponseDrainStarted(
-          error instanceof LlmResponseFormatError
-            ? error.formatFailureStage
+          firstProtocolError instanceof LlmResponseFormatError
+            ? firstProtocolError.formatFailureStage
             : undefined,
-          error instanceof LlmResponseFormatError
-            ? error.formatFailureSubstage
+          firstProtocolError instanceof LlmResponseFormatError
+            ? firstProtocolError.formatFailureSubstage
             : undefined
         );
       }
@@ -1276,16 +1698,19 @@ function decodeEventStreamText(
   }
 }
 
-function appendEventStreamText(
-  pending: string,
+function normalizeEventStreamText(
   trailingCarriageReturn: boolean,
   next: string,
   final: boolean
-): { readonly pending: string; readonly trailingCarriageReturn: boolean } {
+): {
+  readonly text: string;
+  readonly trailingCarriageReturn: boolean;
+} {
   let text = next;
   let carried = trailingCarriageReturn;
+  let prefix = "";
   if (carried && text.length > 0) {
-    pending += "\n";
+    prefix = "\n";
     if (text.startsWith("\n")) {
       text = text.slice(1);
     }
@@ -1295,32 +1720,235 @@ function appendEventStreamText(
     text = text.slice(0, -1);
     carried = true;
   }
-  pending += text.replace(/\r\n/gu, "\n").replace(/\r/gu, "\n");
+  const normalized = text.replace(/\r\n/gu, "\n").replace(/\r/gu, "\n");
+  let suffix = "";
   if (final && carried) {
-    pending += "\n";
+    suffix = "\n";
     carried = false;
   }
-  return { pending, trailingCarriageReturn: carried };
+  return {
+    text: prefix + normalized + suffix,
+    trailingCarriageReturn: carried
+  };
+}
+
+interface EventStreamEventBuffer {
+  readonly blocks: string[];
+  readonly fragments: string[];
+  length: number;
+  pendingLineBreak: boolean;
+}
+
+const maximumEventStreamFragmentsPerBlock = 1_024;
+
+function createEventStreamEventBuffer(): EventStreamEventBuffer {
+  return {
+    blocks: [],
+    fragments: [],
+    length: 0,
+    pendingLineBreak: false
+  };
+}
+
+function appendEventStreamEventText(
+  buffer: EventStreamEventBuffer,
+  text: string
+): void {
+  if (text.length === 0) return;
+  buffer.fragments.push(text);
+  buffer.length += text.length;
+  if (buffer.fragments.length >= maximumEventStreamFragmentsPerBlock) {
+    buffer.blocks.push(buffer.fragments.join(""));
+    buffer.fragments.length = 0;
+  }
+}
+
+function takeEventStreamEvent(buffer: EventStreamEventBuffer): string {
+  if (buffer.fragments.length > 0) {
+    buffer.blocks.push(buffer.fragments.join(""));
+  }
+  const event =
+    buffer.blocks.length === 1 ? buffer.blocks[0]! : buffer.blocks.join("");
+  buffer.blocks.length = 0;
+  buffer.fragments.length = 0;
+  buffer.length = 0;
+  return event;
+}
+
+function clearEventStreamEventBuffer(buffer: EventStreamEventBuffer): void {
+  buffer.blocks.length = 0;
+  buffer.fragments.length = 0;
+  buffer.length = 0;
+  buffer.pendingLineBreak = false;
+}
+
+function consumeEventStreamText(
+  text: string,
+  buffer: EventStreamEventBuffer,
+  consumeEvent: (event: string) => void,
+  observePartialText: (text: string) => void
+): void {
+  let offset = 0;
+  while (offset < text.length) {
+    const lineBreak = text.indexOf("\n", offset);
+    const end = lineBreak < 0 ? text.length : lineBreak;
+    const part = text.slice(offset, end);
+    if (part.length > 0) {
+      if (buffer.pendingLineBreak) {
+        appendEventStreamEventText(buffer, "\n");
+        observePartialText("\n");
+        buffer.pendingLineBreak = false;
+      }
+      appendEventStreamEventText(buffer, part);
+      observePartialText(part);
+    }
+    if (lineBreak < 0) break;
+    if (buffer.pendingLineBreak) {
+      const event = takeEventStreamEvent(buffer);
+      buffer.pendingLineBreak = false;
+      consumeEvent(event);
+    } else {
+      buffer.pendingLineBreak = true;
+    }
+    offset = lineBreak + 1;
+  }
+}
+
+function finishEventStreamEvents(
+  buffer: EventStreamEventBuffer,
+  consumeEvent: (event: string) => void
+): void {
+  buffer.pendingLineBreak = false;
+  if (buffer.length > 0) {
+    consumeEvent(takeEventStreamEvent(buffer));
+  }
+}
+
+function updatePostDoneTailShape(
+  state: ChatCompletionStreamState,
+  next: PostDoneTailShape,
+  observer: ResponseBodyActivityObserver
+): void {
+  const previous = state.postDoneTailShape;
+  const merged = mergePostDoneTailShape(previous, next);
+  if (previous === merged) return;
+  state.postDoneTailShape = merged;
+  if (previous === undefined) {
+    // 一旦 DONE 后出现协议数据，先前答案不能再作为成功结果保留。
+    state.content = "";
+    state.reasoning = "";
+  }
+  observer.onInvalidResponseDrainStarted(
+    "trailing_data",
+    postDoneFailureSubstage(merged, false)
+  );
+}
+
+function scanUnresolvedPostDoneData(
+  appendedText: string,
+  scan: PostDonePendingDataScan,
+  state: ChatCompletionStreamState,
+  observer: ResponseBodyActivityObserver
+): void {
+  if (!state.sawDone) {
+    state.postDoneTailHasUnresolvedData = false;
+    return;
+  }
+  for (const character of appendedText) {
+    if (character === "\n") {
+      if (
+        scan.currentLineMayBeData &&
+        scan.currentLinePrefix === "data"
+      ) {
+        scan.confirmedDataField = true;
+      }
+      scan.currentLineMayBeData = true;
+      scan.currentLinePrefix = "";
+      continue;
+    }
+    if (!scan.currentLineMayBeData) continue;
+    const nextPrefix = scan.currentLinePrefix + character;
+    if (nextPrefix === "data:") {
+      scan.confirmedDataField = true;
+      scan.currentLineMayBeData = false;
+      scan.currentLinePrefix = "";
+    } else if ("data".startsWith(nextPrefix)) {
+      scan.currentLinePrefix = nextPrefix;
+    } else {
+      scan.currentLineMayBeData = false;
+      scan.currentLinePrefix = "";
+    }
+  }
+  state.postDoneTailHasUnresolvedData =
+    scan.confirmedDataField ||
+    (scan.currentLineMayBeData &&
+      scan.currentLinePrefix.length > 0 &&
+      "data".startsWith(scan.currentLinePrefix));
+  if (scan.confirmedDataField) {
+    publishUnresolvedPostDoneData(state, observer);
+  }
+}
+
+function resetPostDonePendingDataScan(
+  scan: PostDonePendingDataScan,
+  state: ChatCompletionStreamState
+): void {
+  scan.confirmedDataField = false;
+  scan.currentLineMayBeData = true;
+  scan.currentLinePrefix = "";
+  state.postDoneTailHasUnresolvedData = false;
+}
+
+function publishUnresolvedPostDoneData(
+  state: ChatCompletionStreamState,
+  observer: ResponseBodyActivityObserver
+): void {
+  // 事件未收齐时不猜它的字段。若在收齐前中断或取消，
+  // 只能留下封闭的 tail-incomplete；后续收齐后再用真实形状升级。
+  state.content = "";
+  state.reasoning = "";
+  observer.onInvalidResponseDrainStarted(
+    "trailing_data",
+    state.postDoneTailShape === undefined
+      ? "data_after_done_tail_incomplete"
+      : postDoneFailureSubstage(state.postDoneTailShape, false)
+  );
+}
+
+function consumeObservedChatCompletionEvent(
+  event: string,
+  state: ChatCompletionStreamState,
+  observer: ResponseBodyActivityObserver
+): boolean {
+  return consumeChatCompletionEvent(
+    event,
+    state,
+    (shape) => updatePostDoneTailShape(state, shape, observer)
+  );
 }
 
 function consumeChatCompletionEvent(
   event: string,
-  state: ChatCompletionStreamState
+  state: ChatCompletionStreamState,
+  observePostDoneShape: (shape: PostDoneTailShape) => void
 ): boolean {
-  const data = event
+  const dataFields = event
     .split("\n")
-    .filter((line) => line.startsWith("data:"))
-    .map((line) => line.slice("data:".length).trimStart())
-    .join("\n")
-    .trim();
-  if (data.length === 0) return false;
-  if (state.sawDone) {
-    // [DONE] 后只能是 HTTP 正常收尾；继续出现非空事件说明响应次序损坏。
-    throw new LlmResponseFormatError(
-      "trailing_data",
-      data === "[DONE]" ? "duplicate_done" : "data_after_done"
+    .flatMap((line) =>
+      line === "data"
+        ? [""]
+        : line.startsWith("data:")
+          ? [line.slice("data:".length).trimStart()]
+          : []
     );
+  if (dataFields.length === 0) return false;
+  const data = dataFields.join("\n").trim();
+  if (state.sawDone) {
+    // e 只记录封闭形状并继续解析整个尾部；无论形状如何都在 EOF 后失败。
+    observePostDoneShape(classifyPostDoneData(data));
+    return false;
   }
+  if (data.length === 0) return false;
   if (data === "[DONE]") {
     state.sawDone = true;
     return false;
