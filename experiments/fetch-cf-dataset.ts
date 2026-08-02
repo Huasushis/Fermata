@@ -2,7 +2,7 @@
  * 拉取一个 Codeforces 数据集，供 eval-difficulty.ts（难度评定误差评测）和
  * calibrate-anchors.ts（锚点标定）使用。
  *
- * 规则：只取最近 24 个月内开始的比赛，按 rating 800-3500 每 200 一档，每档
+ * 规则：只取最近 24 个月内开始的比赛，按 rating 800-3500 每 100 一档，每档
  * 随机抽 SAMPLE_SIZE_PER_BUCKET 道（默认 3），抓题面存成
  * experiments/data/cf/{contestId}{index}.json。
  *
@@ -20,18 +20,25 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { z } from "zod";
 import { CodeforcesClient, type CodeforcesCredentials } from "../src/codeforces";
-import { describeError, logError, logInfo, logWarn } from "../src/logger";
+import { logError, logInfo } from "../src/logger";
+import {
+  codeforcesDatasetFileName,
+  fetchCodeforcesDatasetBatchFailClosed,
+  parseCodeforcesDatasetSampleSize,
+  requireCompleteCodeforcesRatingBuckets,
+  requireRecentContestIds
+} from "./lib/recent-contest-policy";
 
 const RATING_MIN = 800;
 const RATING_MAX = 3500;
 const RATING_STEP = 100;
 const MONTHS_BACK = 24;
-const SAMPLE_SIZE_PER_BUCKET = Number.parseInt(process.env.SAMPLE_SIZE_PER_BUCKET ?? "3", 10);
+const DEFAULT_SAMPLE_SIZE_PER_BUCKET = 3;
 const MINIMUM_REQUEST_INTERVAL_MS = 2_100;
 const OUTPUT_DIR = new URL("./data/cf/", import.meta.url);
 
 const contestListItemSchema = z.object({
-  id: z.number().int(),
+  id: z.number().int().positive().max(2_147_483_647),
   phase: z.string(),
   startTimeSeconds: z.number().int().optional()
 });
@@ -73,8 +80,10 @@ function bucketFor(rating: number): number {
 }
 
 async function main(): Promise<void> {
-  mkdirSync(OUTPUT_DIR, { recursive: true });
-
+  const sampleSizePerBucket = parseCodeforcesDatasetSampleSize(
+    process.env.SAMPLE_SIZE_PER_BUCKET,
+    DEFAULT_SAMPLE_SIZE_PER_BUCKET
+  );
   const client = new CodeforcesClient({
     credentials: readCodeforcesCredentials(),
     minimumRequestIntervalMs: MINIMUM_REQUEST_INTERVAL_MS,
@@ -84,65 +93,92 @@ async function main(): Promise<void> {
   const cutoffSeconds = Math.floor(Date.now() / 1000) - MONTHS_BACK * 30 * 24 * 60 * 60;
 
   logInfo("拉取比赛列表以确定最近 24 个月的范围");
-  let recentContestIds: Set<number>;
+  let recentContestIds: ReadonlySet<number>;
   try {
-    recentContestIds = await fetchRecentContestIds(client, cutoffSeconds);
+    recentContestIds = requireRecentContestIds(
+      await fetchRecentContestIds(client, cutoffSeconds)
+    );
   } catch (error) {
-    logWarn("拉取比赛列表失败，退化为不按时间筛选（所有比赛都算在内）", { reason: describeError(error) });
-    recentContestIds = new Set();
+    logError("最近比赛范围不可用，停止抓取，不会退化为全部年代", error);
+    process.exitCode = 1;
+    return;
   }
-  const filterByRecency = recentContestIds.size > 0;
 
   logInfo("拉取题目列表");
   const problems = await client.fetchProblemsetProblems();
 
-  const buckets = new Map<number, { contestId: number; index: string; rating: number }[]>();
-  for (const problem of problems) {
+  // 在任何题面请求、建目录或写文件之前，一次性验证所有可能进入文件名的外部身份。
+  // 发现一条异常身份就整批失败，绝不跳过后继续生成一个看似完整的数据集。
+  const validatedProblems = problems.map((problem) => ({
+    problem,
+    fileName:
+      problem.contestId === undefined
+        ? undefined
+        : codeforcesDatasetFileName(problem.contestId, problem.index)
+  }));
+
+  const buckets = new Map<
+    number,
+    { contestId: number; index: string; rating: number; fileName: string }[]
+  >();
+  for (const { problem, fileName } of validatedProblems) {
     if (problem.contestId === undefined || problem.rating === undefined) {
       continue;
     }
+    const verifiedFileName =
+      fileName ?? codeforcesDatasetFileName(problem.contestId, problem.index);
     if (problem.rating < RATING_MIN || problem.rating > RATING_MAX) {
       continue;
     }
-    if (filterByRecency && !recentContestIds.has(problem.contestId)) {
+    if (!recentContestIds.has(problem.contestId)) {
       continue;
     }
     const bucket = bucketFor(problem.rating);
     const list = buckets.get(bucket) ?? [];
-    list.push({ contestId: problem.contestId, index: problem.index, rating: problem.rating });
+    list.push({
+      contestId: problem.contestId,
+      index: problem.index,
+      rating: problem.rating,
+      fileName: verifiedFileName
+    });
     buckets.set(bucket, list);
   }
 
-  let fetched = 0;
-  let failed = 0;
-  for (let rating = RATING_MIN; rating <= RATING_MAX; rating += RATING_STEP) {
-    const candidates = buckets.get(rating) ?? [];
-    if (candidates.length === 0) {
-      logWarn("这一档没有找到候选题目，跳过", { rating });
-      continue;
-    }
-    const sample = pickRandomSample(candidates, SAMPLE_SIZE_PER_BUCKET);
-    for (const problem of sample) {
-      try {
-        const statement = await client.fetchProblemStatement(problem.contestId, problem.index);
-        const record = {
-          contestId: problem.contestId,
-          index: problem.index,
-          rating: problem.rating,
-          statement
-        };
-        const fileName = `${problem.contestId}${problem.index}.json`;
-        writeFileSync(new URL(fileName, OUTPUT_DIR), JSON.stringify(record, null, 2), "utf8");
-        fetched += 1;
-        logInfo("已抓取题面", { contestId: problem.contestId, index: problem.index, rating: problem.rating });
-      } catch (error) {
-        failed += 1;
-        logError("抓取题面失败，跳过这一题", error, { contestId: problem.contestId, index: problem.index });
-      }
-    }
-  }
+  const expectedRatings = Array.from(
+    { length: Math.floor((RATING_MAX - RATING_MIN) / RATING_STEP) + 1 },
+    (_, index) => RATING_MIN + index * RATING_STEP
+  );
+  requireCompleteCodeforcesRatingBuckets({
+    candidateCounts: new Map(
+      [...buckets].map(([rating, candidates]) => [rating, candidates.length] as const)
+    ),
+    expectedRatings,
+    sampleSizePerBucket
+  });
+  const selected = expectedRatings.flatMap((rating) =>
+    pickRandomSample(buckets.get(rating)!, sampleSizePerBucket)
+  );
+  const records = await fetchCodeforcesDatasetBatchFailClosed({
+    items: selected,
+    fetchOne: (problem) =>
+      client.fetchProblemStatement(problem.contestId, problem.index)
+  });
 
-  logInfo("抓取完成", { fetched, failed, outputDir: OUTPUT_DIR.pathname });
+  mkdirSync(OUTPUT_DIR, { recursive: true });
+  for (const { item: problem, value: statement } of records) {
+    const record = {
+      contestId: problem.contestId,
+      index: problem.index,
+      rating: problem.rating,
+      statement
+    };
+    writeFileSync(
+      new URL(problem.fileName, OUTPUT_DIR),
+      JSON.stringify(record, null, 2),
+      "utf8"
+    );
+  }
+  logInfo("抓取完成", { fetched: records.length, expected: selected.length });
 }
 
 main().catch((error: unknown) => {
