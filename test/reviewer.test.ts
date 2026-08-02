@@ -68,8 +68,31 @@ function sampleTask(assignmentId: string): RobotReviewTask {
       title: "样例题目",
       type: "traditional",
       tagIds: ["dp"],
-      basicStatement: "题面……",
-      basicSolution: "题解……"
+      content: {
+        basicStatement: "题面……",
+        basicSolution: "题解……",
+        background: "",
+        statement: "",
+        inputFormat: "",
+        outputFormat: "",
+        constraints: "",
+        solution: "",
+        hints: ""
+      },
+      samples: [],
+      limits: null
+    },
+    tagCatalog: {
+      version: 4,
+      tags: [{
+        id: "dp",
+        name: "动态规划基础 (DP)",
+        categoryId: "dynamic-programming",
+        categoryName: "动态规划",
+        description: "",
+        aliases: [],
+        active: true
+      }]
     },
     reviewItems: []
   };

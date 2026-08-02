@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { robotReviewTaskSchema } from "../../src/urmotiv-schemas";
+import { reviewTaskProblemSchema } from "../../src/pipelines/types";
 import { mapWithConcurrency } from "./concurrency";
 
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/);
@@ -14,7 +14,7 @@ export type BlindDatasetPurpose = z.infer<typeof blindDatasetPurposeSchema>;
 const blindProblemContentSampleSchema = z
   .object({
     safeId: safeIdSchema,
-    problem: robotReviewTaskSchema.shape.problem
+    problem: reviewTaskProblemSchema
   })
   .strict();
 export type BlindProblemContentSample = z.infer<

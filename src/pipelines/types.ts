@@ -3,10 +3,24 @@
  */
 import type { ModelSpec } from "../config";
 import type { LlmRuntimeOptions, ProviderCredentialsLike } from "../llm";
-import type { RobotReviewTask } from "../urmotiv-schemas";
+import { z } from "zod";
+import { problemTypeSchema, type RobotReviewTask } from "../urmotiv-schemas";
 
-/** 机器人任务里题目部分的类型，直接从契约类型上取，保证和契约同步。 */
-export type ReviewTaskProblem = RobotReviewTask["problem"];
+/** 旧的四条实验流水线使用的扁平视图；生产编排器会逐步由多角色证据流替换。 */
+export const reviewTaskProblemSchema = z
+  .object({
+    id: z.string().min(1).max(200),
+    revision: z.number().int().positive(),
+    reviewRound: z.number().int().positive(),
+    contentHash: z.string().regex(/^[a-f0-9]{64}$/),
+    title: z.string().trim().min(1).max(200),
+    type: problemTypeSchema,
+    tagIds: z.array(z.string().min(1).max(120)).min(1).max(30),
+    basicStatement: z.string().min(1).max(2_000_000),
+    basicSolution: z.string().min(1).max(1_000_000)
+  })
+  .strict();
+export type ReviewTaskProblem = z.infer<typeof reviewTaskProblemSchema>;
 
 /** 机器人任务里已有审核条目的类型。 */
 export type ReviewTaskItem = RobotReviewTask["reviewItems"][number];

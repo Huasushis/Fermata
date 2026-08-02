@@ -44,6 +44,7 @@ import {
   type UrmotivClientLike
 } from "./urmotiv-client";
 import type { ClaimRobotReviewTasksResponse, RobotReviewTask } from "./urmotiv-schemas";
+import { toLegacyPipelineProblem } from "./review-task-input";
 
 export interface ReviewerStatus {
   readonly workerRunning: boolean;
@@ -269,11 +270,12 @@ export class ReviewerWorker {
 
     try {
       logInfo("开始处理审题任务", { problemId: task.problem.id, revision: task.problem.revision });
+      const pipelineProblem = toLegacyPipelineProblem(task.problem);
 
       const [difficultyResult, thinkingResult, codingResult] =
         await Promise.allSettled([
           runDifficultyPipeline({
-            problem: task.problem,
+            problem: pipelineProblem,
             anchors: this.#anchors,
             model: this.resolveModelConfig(
               profile.difficulty,
@@ -281,7 +283,7 @@ export class ReviewerWorker {
             )
           }),
           runThinkingPipeline({
-            problem: task.problem,
+            problem: pipelineProblem,
             solverModel: this.resolveModelConfig(
               profile.thinking.solver,
               inFlight.abortController.signal
@@ -292,7 +294,7 @@ export class ReviewerWorker {
             )
           }),
           runCodingPipeline({
-            problem: task.problem,
+            problem: pipelineProblem,
             model: this.resolveModelConfig(
               profile.coding,
               inFlight.abortController.signal
@@ -325,7 +327,7 @@ export class ReviewerWorker {
         forcedDuplicateReject,
         duplicateSimilarityRejectThreshold
       } = await runVerdictPipeline({
-        problem: task.problem,
+        problem: pipelineProblem,
         reviewItems: task.reviewItems,
         difficulty,
         thinking,
@@ -356,6 +358,7 @@ export class ReviewerWorker {
         requestId: randomUUID(),
         expectedLeaseExpiresAt: inFlight.leaseExpiresAt,
         expectedProblemRevision: task.problem.revision,
+        expectedTagCatalogVersion: task.tagCatalog.version,
         experimentVersion,
         modelProfileName,
         review

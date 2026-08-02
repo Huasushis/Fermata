@@ -36,8 +36,31 @@ function sampleTask(): RobotReviewTask {
       title: "样例题目",
       type: "traditional",
       tagIds: ["dp"],
-      basicStatement: "给定一个数组……",
-      basicSolution: "用动态规划……"
+      content: {
+        basicStatement: "给定一个数组……",
+        basicSolution: "用动态规划……",
+        background: "",
+        statement: "",
+        inputFormat: "",
+        outputFormat: "",
+        constraints: "",
+        solution: "",
+        hints: ""
+      },
+      samples: [],
+      limits: { timeMs: 1_000, memoryMiB: 256 }
+    },
+    tagCatalog: {
+      version: 4,
+      tags: [{
+        id: "dp",
+        name: "动态规划基础 (DP)",
+        categoryId: "dynamic-programming",
+        categoryName: "动态规划",
+        description: "",
+        aliases: [],
+        active: true
+      }]
     },
     reviewItems: []
   };
@@ -48,6 +71,7 @@ function validCompleteInput(): CompleteRobotReviewTaskRequest {
     requestId: completionRequestId,
     expectedLeaseExpiresAt: "2026-07-26T00:05:00.000Z",
     expectedProblemRevision: 3,
+    expectedTagCatalogVersion: 4,
     experimentVersion: "experiment-2026-07",
     modelProfileName: "review-balanced",
     review: {
@@ -127,7 +151,7 @@ describe("UrmotivClient：正常路径", () => {
 });
 
 describe("UrmotivClient：本地校验先于网络请求", () => {
-  it("镜像契约允许评价缺省或显式使用空标签，但领取任务仍要求至少一个标签", () => {
+  it("通用评价仍兼容旧空标签，但机器人领取和提交都要求至少一个固定目录标签", () => {
     const { tagIds: _tagIds, ...reviewWithoutTags } = validCompleteInput().review;
     expect(reviewInputSchema.parse(reviewWithoutTags).tagIds).toEqual([]);
     expect(reviewInputSchema.safeParse({ ...reviewWithoutTags, tagIds: [] }).success).toBe(true);
@@ -143,6 +167,10 @@ describe("UrmotivClient：本地校验先于网络请求", () => {
         problem: { ...sampleTask().problem, tagIds: [] }
       }).success
     ).toBe(false);
+    expect(completeRobotReviewTaskInputSchema.safeParse({
+      ...validCompleteInput(),
+      review: { ...validCompleteInput().review, tagIds: [] }
+    }).success).toBe(false);
   });
 
   it("镜像契约要求 renew 和 complete 都携带请求标识", () => {
@@ -167,18 +195,15 @@ describe("UrmotivClient：本地校验先于网络请求", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("complete 接受评价的空知识点列表并原样发送", async () => {
-    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      expect(JSON.parse(String(init?.body)).review.tagIds).toEqual([]);
-      return jsonResponse({ assignmentId, accepted: true, problemStatus: "approved" });
-    });
+  it("complete 在评价知识点为空时直接拒绝且不发请求", async () => {
+    const fetchMock = vi.fn();
     const client = new UrmotivClient({ baseUrl, robotToken, fetch: fetchMock });
     const input = {
       ...validCompleteInput(),
       review: { ...validCompleteInput().review, tagIds: [] }
     };
-    await expect(client.complete(assignmentId, input)).resolves.toMatchObject({ accepted: true });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await expect(client.complete(assignmentId, input)).rejects.toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("claim 在 leaseSeconds 超出范围时直接抛错，不发请求", async () => {
