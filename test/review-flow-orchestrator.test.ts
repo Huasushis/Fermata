@@ -1,9 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
-import { assertEvidenceArtifact, sealEvidenceArtifact } from "../src/review-flow/evidence";
+import { LlmRequestStartGate } from "../src/llm";
+import {
+  assertEvidenceArtifact,
+  hashCanonicalValue,
+  sealEvidenceArtifact
+} from "../src/review-flow/evidence";
 import {
   consumeReviewFlowSubmission,
   inspectReviewFlowArtifactsForTest,
   inspectReviewFlowSubmissionForTest,
+  reviewFlowCalibrationProjectionSchema,
   ReviewFlowError,
   runReviewEvidenceFlow,
   runReviewEvidenceFlowCalibrationOutcome,
@@ -469,14 +475,15 @@ describe("冻结证据多角色审题编排", () => {
     const outcome = await runReviewEvidenceFlowCalibrationOutcome({
       taskSource: trustedTaskSource(),
       trustedRunner: runner,
-      executionContext: executionContext()
+      executionContext: executionContext(),
+      requestStartGate: new LlmRequestStartGate()
     });
 
     expect(outcome.status).toBe("complete");
     if (outcome.status !== "complete") throw new Error("expected complete");
     expect(fetchImpl).toHaveBeenCalledTimes(11);
-    expect(outcome.projection).toEqual({
-      schemaVersion: 1,
+    expect(outcome.projection).toMatchObject({
+      schemaVersion: 2,
       verdict: "approve",
       codeforcesDifficulty: 800,
       qualityLevel: 4,
@@ -486,6 +493,18 @@ describe("冻结证据多角色审题编排", () => {
       tagIds: ["basic.simulation", "math.counting"],
       hardBlockers: [],
       difficultyConfidence: 0.8,
+      technical: {
+        officialSolutionCorrect: true,
+        statementSolutionConsistency: "verified",
+        judgeability: "verified",
+        sampleConsistency: "verified",
+        constraintSufficiency: "verified",
+        referenceImplementation: {
+          provided: false,
+          status: "unavailable",
+          complexityAcceptable: null
+        }
+      },
       editorial: {
         qualityLevel: 4,
         noveltyLevel: 4,
@@ -521,6 +540,29 @@ describe("冻结证据多角色审题编排", () => {
         highestSimilarity: 0.2
       }
     });
+    expect(outcome.projection.roleReceipts.map((entry) => entry.role)).toEqual(
+      reviewFlowRoleSchema.options
+    );
+    expect(outcome.projection.roleReceipts).toHaveLength(11);
+    expect(outcome.projection.roleReceipts.every((entry) =>
+      entry.responses.every((response) =>
+        response.eofVerified && response.finishReasonStopVerified &&
+        (response.responseMode === "json"
+          ? response.sseDoneObserved === null
+          : response.sseDoneObserved === true)
+      )
+    )).toBe(true);
+    expect(outcome.projection.receiptSetHash).toMatch(/^[0-9a-f]{64}$/u);
+    const tamperedRoleReceipts = outcome.projection.roleReceipts.map(
+      (receipt, index) => index === 0
+        ? { ...receipt, receiptHash: "f".repeat(64) }
+        : receipt
+    );
+    expect(reviewFlowCalibrationProjectionSchema.safeParse({
+      ...outcome.projection,
+      roleReceipts: tamperedRoleReceipts,
+      receiptSetHash: hashCanonicalValue(tamperedRoleReceipts)
+    }).success).toBe(false);
     expect(Object.isFrozen(outcome)).toBe(true);
     expect(Object.isFrozen(outcome.projection)).toBe(true);
     const serialized = JSON.stringify(outcome);
@@ -533,12 +575,12 @@ describe("冻结证据多角色审题编排", () => {
       "improvements",
       "rationale",
       "narrative",
-      "summary",
-      "statement",
-      "solution"
+      "summary"
     ]) {
       expect(serialized).not.toContain(forbiddenField);
     }
+    expect(outcome.projection).not.toHaveProperty("statement");
+    expect(outcome.projection).not.toHaveProperty("solution");
   });
 
   it("离线标定的 499 原样保持安全 incomplete，绝不形成部分预测", async () => {
@@ -547,7 +589,8 @@ describe("冻结证据多角色审题编排", () => {
     const outcome = await runReviewEvidenceFlowCalibrationOutcome({
       taskSource: trustedTaskSource(),
       trustedRunner: runner,
-      executionContext: executionContext()
+      executionContext: executionContext(),
+      requestStartGate: new LlmRequestStartGate()
     });
 
     expect(outcome.status).toBe("incomplete");
@@ -566,6 +609,91 @@ describe("冻结证据多角色审题编排", () => {
     }]);
     expect(JSON.stringify(outcome)).not.toContain(solutionSentinel);
     expect(JSON.stringify(outcome)).not.toContain("projection");
+  });
+
+  it("标定闸门在角色启动前已关闭时归类为 cancelled 且不发请求", async () => {
+    const { runner, fetchImpl } = syntheticTrustedRunner();
+    const gate = new LlmRequestStartGate();
+    gate.close();
+    const outcome = await runReviewEvidenceFlowCalibrationOutcome({
+      taskSource: trustedTaskSource(),
+      trustedRunner: runner,
+      executionContext: executionContext(),
+      requestStartGate: gate
+    });
+
+    expect(outcome.status).toBe("incomplete");
+    if (outcome.status !== "incomplete") throw new Error("expected incomplete");
+    expect(outcome.failure).toMatchObject({
+      code: "REVIEW_FLOW_ROLE_FAILED",
+      failureKind: "cancelled",
+      failedRoles: [{
+        role: "solver",
+        failureKind: "cancelled",
+        httpStatus: null,
+        requestCount: 0,
+        transportAttemptCount: 0,
+        completedResponseCount: 0,
+        terminalResponseMode: null,
+        terminalEofObserved: false,
+        terminalFinishReasonStopObserved: false,
+        terminalSseDoneObserved: null
+      }]
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(JSON.stringify(outcome)).not.toContain("projection");
+  });
+
+  it("并行角色首错同步关门，等待已发的兄弟请求 EOF 且不启动下游角色", async () => {
+    const baseFetch = syntheticRoleFetch()!;
+    const pendingResponses: Array<{
+      readonly url: string | URL | Request;
+      readonly init: RequestInit | undefined;
+      readonly resolve: (response: Response) => void;
+    }> = [];
+    let callCount = 0;
+    const fetchImpl = vi.fn(async (
+      url: string | URL | Request,
+      init?: RequestInit
+    ): Promise<Response> => {
+      callCount += 1;
+      if (callCount <= 3) return baseFetch(url, init);
+      if (callCount === 4) return new Response(null, { status: 500 });
+      if (callCount <= 8) {
+        return new Promise<Response>((resolve) => {
+          pendingResponses.push({ url, init, resolve });
+        });
+      }
+      return baseFetch(url, init);
+    });
+    const { runner } = syntheticTrustedRunner(fetchImpl);
+    const gate = new LlmRequestStartGate();
+    let settled = false;
+    const pending = runReviewEvidenceFlowCalibrationOutcome({
+      taskSource: trustedTaskSource(),
+      trustedRunner: runner,
+      executionContext: executionContext(),
+      requestStartGate: gate
+    }).finally(() => {
+      settled = true;
+    });
+
+    await vi.waitFor(() => {
+      expect(fetchImpl).toHaveBeenCalledTimes(8);
+      expect(pendingResponses).toHaveLength(4);
+      expect(gate.canStartRequest()).toBe(false);
+    });
+    expect(settled).toBe(false);
+    for (const response of pendingResponses) {
+      response.resolve(await baseFetch(response.url, response.init));
+    }
+    const outcome = await pending;
+    expect(outcome.status).toBe("incomplete");
+    if (outcome.status !== "incomplete") throw new Error("expected incomplete");
+    expect(outcome.failure.failedRoles.map((entry) => entry.role)).toEqual([
+      "difficulty"
+    ]);
+    expect(fetchImpl).toHaveBeenCalledTimes(8);
   });
 
   it("solver 运行时只收到题面视图，题解、标签、查重和自报答案均不可见", async () => {

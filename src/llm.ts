@@ -16,6 +16,7 @@
  * reasoning 事件才会续时，心跳、用量和 role-only 事件都不会。
  */
 import { Readable } from "node:stream";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   type Dispatcher,
   EnvHttpProxyAgent,
@@ -135,6 +136,49 @@ export interface LlmRuntimeOptions {
   readonly fetch?: FetchLike;
   /** 任务已经丢失或被明确拒绝时，由上层用它停止仍在运行的付费请求。 */
   readonly signal?: AbortSignal;
+}
+
+/**
+ * 离线付费标定共用的“只阻止下一次请求”闸门。关闭它绝不会 abort 已经发出的
+ * HTTP 流；它只在新的逻辑请求、JSON 修复轮或 429 重试真正调用 fetch 前拒绝。
+ */
+export class LlmRequestStartGate {
+  #open = true;
+
+  public canStartRequest(): boolean {
+    return this.#open;
+  }
+
+  public close(): void {
+    this.#open = false;
+  }
+}
+
+const llmRequestStartGateContext = new AsyncLocalStorage<LlmRequestStartGate>();
+
+export function isLlmRequestStartGate(value: unknown): value is LlmRequestStartGate {
+  return value instanceof LlmRequestStartGate;
+}
+
+export function withLlmRequestStartGate<Result>(
+  gate: LlmRequestStartGate,
+  callback: () => Result
+): Result {
+  if (!isLlmRequestStartGate(gate)) {
+    throw new Error("LLM_REQUEST_START_GATE_INVALID");
+  }
+  const active = llmRequestStartGateContext.getStore();
+  if (active !== undefined && active !== gate) {
+    throw new Error("LLM_REQUEST_START_GATE_INVALID");
+  }
+  return llmRequestStartGateContext.run(gate, callback);
+}
+
+function assertLlmRequestMayStart(): void {
+  const gate = llmRequestStartGateContext.getStore();
+  if (gate !== undefined && !gate.canStartRequest()) {
+    throw new LlmRequestError("LLM_REQUEST_START_BLOCKED");
+  }
 }
 
 export interface ChatCompletionOptions {
@@ -274,6 +318,7 @@ export class LlmRequestError extends Error {
     | "LLM_TOTAL_TIMEOUT"
     | "LLM_STREAM_INTERRUPTED"
     | "LLM_CANCELLED"
+    | "LLM_REQUEST_START_BLOCKED"
     | "LLM_OUTPUT_LENGTH_LIMIT"
     | "LLM_OUTPUT_CONTENT_FILTERED";
   public readonly status: number | undefined;
@@ -302,6 +347,7 @@ export class LlmRequestError extends Error {
       LLM_TOTAL_TIMEOUT: "模型服务在有效输出前超过最终保护时长。",
       LLM_STREAM_INTERRUPTED: "模型服务的输出在完成前中断。",
       LLM_CANCELLED: "模型请求已按任务状态停止。",
+      LLM_REQUEST_START_BLOCKED: "模型请求启动闸门已关闭。",
       LLM_OUTPUT_LENGTH_LIMIT: "模型服务因输出长度限制而停止。",
       LLM_OUTPUT_CONTENT_FILTERED: "模型服务因内容过滤而停止。"
     };
@@ -891,6 +937,7 @@ async function requestWithRetry(
   let attempt = 1;
   for (;;) {
     resetMutableLlmRequestAuditForAttempt(audit);
+    assertLlmRequestMayStart();
     if (runtime.signal?.aborted) {
       throw new LlmRequestError("LLM_CANCELLED");
     }
@@ -1007,6 +1054,7 @@ async function requestWithRetry(
       runtime.signal?.removeEventListener("abort", cancelForTaskState);
       watchdog.close();
     }
+    assertLlmRequestMayStart();
     await delayBeforeRetry(
       backoffMs(runtime.baseDelayMs, attempt),
       deadline,

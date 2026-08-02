@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { LlmRequestStartGate } from "../src/llm";
 
 const trustedRunnerState = vi.hoisted(() => ({
   runners: new WeakSet<object>(),
@@ -341,7 +342,8 @@ describe("生产审题提交的一次性来源与时效绑定", () => {
         runId,
         assignmentId,
         expectedRound: 2
-      }
+      },
+      requestStartGate: new LlmRequestStartGate()
     };
 
     await expect(runReviewEvidenceFlowCalibrationOutcome(input)).rejects.toThrow(
@@ -381,7 +383,8 @@ describe("生产审题提交的一次性来源与时效绑定", () => {
         runId,
         assignmentId,
         expectedRound: 2
-      }
+      },
+      requestStartGate: new LlmRequestStartGate()
     });
 
     expect(outcome.status).toBe("incomplete");

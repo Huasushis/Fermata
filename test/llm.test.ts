@@ -6,12 +6,14 @@ import {
   chatCompleteJson,
   chatCompleteJsonWithReceipt,
   getLlmFailureAudit,
+  LlmRequestStartGate,
   LlmJsonOutputError,
   LlmRequestError,
   LlmResponseBodyTooLargeError,
   LlmResponseFormatError,
   maximumExplicitLlmOutputTokens,
   maximumLlmResponseBodyBytes,
+  withLlmRequestStartGate,
   type ModelCallSpec
 } from "../src/llm";
 import { logError } from "../src/logger";
@@ -70,6 +72,105 @@ function strictUsageMetadataEvent(): Record<string, unknown> {
 }
 
 describe("chatComplete：正常路径", () => {
+  it("共享停发闸门关闭后仍等待已发请求真实 EOF", async () => {
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+        controller.enqueue(new TextEncoder().encode(JSON.stringify({
+          choices: [{
+            message: { role: "assistant", content: "完整答案" },
+            finish_reason: "stop"
+          }]
+        })));
+      }
+    });
+    const fetchMock = vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    }));
+    const gate = new LlmRequestStartGate();
+    let settled = false;
+    const pending = withLlmRequestStartGate(gate, () =>
+      chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock })
+    ).finally(() => {
+      settled = true;
+    });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+    gate.close();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    streamController.close();
+    await expect(pending).resolves.toEqual({ content: "完整答案", reasoning: null });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("共享停发闸门在 429 退避期间关闭时不启动下一次 HTTP 尝试", async () => {
+    vi.useFakeTimers();
+    try {
+      const gate = new LlmRequestStartGate();
+      const fetchMock = vi.fn(async () => new Response(null, { status: 429 }));
+      const outcome = withLlmRequestStartGate(gate, () =>
+        chatComplete(provider, spec, [], {
+          ...runtime,
+          baseDelayMs: 1_000,
+          fetch: fetchMock
+        })
+      ).then(
+        (value) => ({ status: "fulfilled" as const, value }),
+        (error: unknown) => ({ status: "rejected" as const, error })
+      );
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(1);
+      gate.close();
+      await vi.advanceTimersByTimeAsync(1_000);
+      const result = await outcome;
+      expect(result).toMatchObject({
+        status: "rejected",
+        error: { code: "LLM_REQUEST_START_BLOCKED" }
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("并发 AsyncLocalStorage 上下文中的两个停发闸门互不污染", async () => {
+    const closedGate = new LlmRequestStartGate();
+    const openGate = new LlmRequestStartGate();
+    let releaseBoth!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      releaseBoth = resolve;
+    });
+    const closedFetch = vi.fn(async () => completionResponse("不应发送"));
+    const openFetch = vi.fn(async () => completionResponse("独立完整答案"));
+    const closed = withLlmRequestStartGate(closedGate, async () => {
+      await barrier;
+      return chatComplete(provider, spec, [], { ...runtime, fetch: closedFetch });
+    });
+    const open = withLlmRequestStartGate(openGate, async () => {
+      await barrier;
+      return chatComplete(provider, spec, [], { ...runtime, fetch: openFetch });
+    });
+
+    closedGate.close();
+    releaseBoth();
+    const [closedResult, openResult] = await Promise.allSettled([closed, open]);
+    expect(closedResult).toMatchObject({
+      status: "rejected",
+      reason: { code: "LLM_REQUEST_START_BLOCKED" }
+    });
+    expect(openResult).toEqual({
+      status: "fulfilled",
+      value: { content: "独立完整答案", reasoning: null }
+    });
+    expect(closedFetch).not.toHaveBeenCalled();
+    expect(openFetch).toHaveBeenCalledTimes(1);
+  });
+
   it("可信 receipt 只在完整响应后生成，并记录明确 429 后的真实 HTTP 尝试数", async () => {
     let calls = 0;
     const fetchMock = vi.fn(async () => {
@@ -3090,6 +3191,24 @@ describe("chatComplete：响应结构异常", () => {
 const resultSchema = z.object({ rating: z.number().int() }).strict();
 
 describe("chatCompleteJson：结构化输出与一次修复重试", () => {
+  it("共享停发闸门在首轮 EOF 后关闭时不启动 JSON 修复轮", async () => {
+    const gate = new LlmRequestStartGate();
+    const fetchMock = vi.fn(async () => {
+      gate.close();
+      return completionResponse("不是 JSON");
+    });
+    await expect(withLlmRequestStartGate(gate, () =>
+      chatCompleteJsonWithReceipt(
+        provider,
+        spec,
+        [],
+        resultSchema,
+        { ...runtime, fetch: fetchMock }
+      )
+    )).rejects.toMatchObject({ code: "LLM_REQUEST_START_BLOCKED" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("JSON receipt 绑定首轮/修复轮数、总 HTTP 尝试数和 schema 成功", async () => {
     let calls = 0;
     const fetchMock = vi.fn(async () => {

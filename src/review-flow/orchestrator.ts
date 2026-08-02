@@ -1,8 +1,12 @@
 import { z } from "zod";
 import {
   getLlmFailureAudit,
+  isLlmRequestStartGate,
+  LlmRequestError,
   llmTransportProtocolVersion,
-  type LlmFailureAudit
+  withLlmRequestStartGate,
+  type LlmFailureAudit,
+  type LlmRequestStartGate
 } from "../llm";
 import {
   codeforcesDifficultySchema,
@@ -24,6 +28,7 @@ import {
   contestFitPayloadSchema,
   criticPayloadSchema,
   difficultyPayloadSchema,
+  digestSchema,
   editorialPayloadSchema,
   editorialDimensionSchema,
   hardBlockerCodeSchema,
@@ -35,6 +40,7 @@ import {
   solutionAnalystPayloadSchema,
   solverPayloadSchema,
   tagsPayloadSchema,
+  technicalCheckStatusSchema,
   technicalAuditPayloadSchema,
   trustedRoleExecutionResultSchema,
   type AdjudicatorPayload,
@@ -228,6 +234,13 @@ export interface ReviewFlowRoleCompletionSummary {
   readonly requestCount: 0 | 1 | 2;
   readonly transportAttemptCount: number;
   readonly responseModes: readonly ("sse" | "json")[];
+  readonly responses: readonly {
+    readonly responseMode: "sse" | "json";
+    readonly transportAttemptCount: number;
+    readonly eofVerified: true;
+    readonly finishReasonStopVerified: true;
+    readonly sseDoneObserved: true | null;
+  }[];
 }
 
 export interface ReviewFlowRoleFailureSummary {
@@ -274,13 +287,63 @@ const reviewFlowCalibrationEvidenceCoverageSchema = z
   })
   .strict();
 
+const reviewFlowCalibrationReceiptResponseSchema = z
+  .object({
+    responseMode: z.enum(["sse", "json"]),
+    transportAttemptCount: z.number().int().positive().max(1_000),
+    eofVerified: z.literal(true),
+    finishReasonStopVerified: z.literal(true),
+    sseDoneObserved: z.union([z.literal(true), z.null()])
+  })
+  .strict()
+  .superRefine((response, context) => {
+    if (
+      (response.responseMode === "sse" && response.sseDoneObserved !== true) ||
+      (response.responseMode === "json" && response.sseDoneObserved !== null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["sseDoneObserved"],
+        message: "SSE 必须观察 DONE；JSON 回退不得伪造 DONE。"
+      });
+    }
+  });
+
+export const reviewFlowCalibrationRoleReceiptSchema = z
+  .object({
+    role: reviewFlowRoleSchema,
+    receiptHash: digestSchema,
+    requestCount: z.union([z.literal(1), z.literal(2)]),
+    transportAttemptCount: z.number().int().positive().max(2_000),
+    responses: z
+      .array(reviewFlowCalibrationReceiptResponseSchema)
+      .min(1)
+      .max(2)
+  })
+  .strict()
+  .superRefine((receipt, context) => {
+    if (
+      receipt.responses.length !== receipt.requestCount ||
+      receipt.responses.reduce(
+        (sum, response) => sum + response.transportAttemptCount,
+        0
+      ) !== receipt.transportAttemptCount
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["responses"],
+        message: "逐响应收据必须与请求数和传输尝试数一致。"
+      });
+    }
+  });
+
 /**
  * 离线标定唯一可见的完整结果。这里只保留可计分的数值和枚举；模型生成的
  * 解释、评论、改进建议、证据摘要以及题目材料都不属于该边界。
  */
 export const reviewFlowCalibrationProjectionSchema = z
   .object({
-    schemaVersion: z.literal(1),
+    schemaVersion: z.literal(2),
     verdict: reviewVerdictSchema,
     codeforcesDifficulty: codeforcesDifficultySchema,
     qualityLevel: difficultyLevelSchema,
@@ -290,6 +353,27 @@ export const reviewFlowCalibrationProjectionSchema = z
     tagIds: z.array(z.string().min(1).max(120)).min(1).max(30),
     hardBlockers: z.array(hardBlockerCodeSchema),
     difficultyConfidence: z.number().finite().min(0).max(1),
+    technical: z
+      .object({
+        officialSolutionCorrect: z.boolean(),
+        statementSolutionConsistency: technicalCheckStatusSchema,
+        judgeability: technicalCheckStatusSchema,
+        sampleConsistency: technicalCheckStatusSchema,
+        constraintSufficiency: technicalCheckStatusSchema,
+        referenceImplementation: z
+          .object({
+            provided: z.boolean(),
+            status: z.enum([
+              "verified",
+              "invalid",
+              "not_executed",
+              "unavailable"
+            ]),
+            complexityAcceptable: z.boolean().nullable()
+          })
+          .strict()
+      })
+      .strict(),
     editorial: z
       .object({
         qualityLevel: difficultyLevelSchema,
@@ -325,9 +409,42 @@ export const reviewFlowCalibrationProjectionSchema = z
         sameProblemAsExisting: z.boolean(),
         highestSimilarity: z.number().finite().min(0).max(1)
       })
-      .strict()
+      .strict(),
+    roleReceipts: z.array(reviewFlowCalibrationRoleReceiptSchema).length(11),
+    receiptSetHash: digestSchema
   })
-  .strict();
+  .strict()
+  .superRefine((projection, context) => {
+    const expectedRoles = reviewFlowRoleSchema.options;
+    if (
+      projection.roleReceipts.some(
+        (receipt, index) =>
+          receipt.role !== expectedRoles[index] ||
+          receipt.receiptHash !== hashCanonicalValue({
+            schemaVersion: 2,
+            requestCount: receipt.requestCount,
+            transportAttemptCount: receipt.transportAttemptCount,
+            eofVerified: true,
+            jsonSchemaValidated: true,
+            responses: receipt.responses.map((response) => ({
+              schemaVersion: 2,
+              transportAttemptCount: response.transportAttemptCount,
+              eofVerified: response.eofVerified,
+              responseMode: response.responseMode,
+              finishReasonStopVerified: response.finishReasonStopVerified,
+              sseDoneObserved: response.sseDoneObserved
+            }))
+          })
+      ) ||
+      projection.receiptSetHash !== hashCanonicalValue(projection.roleReceipts)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["roleReceipts"],
+        message: "必须按固定顺序绑定完整 11 角色传输收据。"
+      });
+    }
+  });
 
 export type ReviewFlowCalibrationProjection = z.infer<
   typeof reviewFlowCalibrationProjectionSchema
@@ -337,6 +454,7 @@ export interface ReviewFlowCalibrationInput {
   readonly taskSource: unknown;
   readonly trustedRunner: unknown;
   readonly executionContext: unknown;
+  readonly requestStartGate: unknown;
 }
 
 export type ReviewFlowCalibrationOutcome =
@@ -498,6 +616,7 @@ export type ReviewFlowInput =
       readonly taskSource: unknown;
       readonly trustedRunner: unknown;
       readonly executionContext: unknown;
+      readonly requestStartGate?: unknown;
       readonly source?: never;
       readonly identities?: never;
       readonly roles?: never;
@@ -554,12 +673,16 @@ export async function runReviewEvidenceFlowCalibrationOutcome(
   if (
     !isBuiltReviewFlowTaskSourceResult(input.taskSource) ||
     !isTrustedReviewFlowLlmBundle(input.trustedRunner) ||
-    isProductionEligibleReviewFlowLlmBundle(input.trustedRunner)
+    isProductionEligibleReviewFlowLlmBundle(input.trustedRunner) ||
+    !isLlmRequestStartGate(input.requestStartGate)
   ) {
     throw new Error("REVIEW_FLOW_CALIBRATION_INPUT_FORBIDDEN");
   }
 
-  const outcome = await runReviewEvidenceFlowOutcome(input);
+  const outcome = await withLlmRequestStartGate(
+    input.requestStartGate,
+    () => runReviewEvidenceFlowOutcome(input)
+  );
   if (outcome.status === "incomplete") return outcome;
 
   const { decision } = outcome;
@@ -580,7 +703,7 @@ export async function runReviewEvidenceFlowCalibrationOutcome(
     const contestFit = artifacts.contestFit.payload;
     const originality = artifacts.originality.payload;
     const projection = reviewFlowCalibrationProjectionSchema.parse({
-      schemaVersion: 1,
+      schemaVersion: 2,
       verdict: review.verdict,
       codeforcesDifficulty: review.codeforcesDifficulty,
       qualityLevel: review.qualityLevel,
@@ -590,6 +713,24 @@ export async function runReviewEvidenceFlowCalibrationOutcome(
       tagIds: review.tagIds,
       hardBlockers: decision.hardBlockers,
       difficultyConfidence: artifacts.difficulty.payload.confidence,
+      technical: {
+        officialSolutionCorrect:
+          artifacts.solutionAnalyst.payload.officialSolutionCorrect,
+        statementSolutionConsistency:
+          artifacts.technicalAudit.payload.statementSolutionConsistency,
+        judgeability: artifacts.technicalAudit.payload.judgeability,
+        sampleConsistency: artifacts.technicalAudit.payload.sampleConsistency,
+        constraintSufficiency:
+          artifacts.technicalAudit.payload.constraintSufficiency,
+        referenceImplementation: {
+          provided:
+            artifacts.technicalAudit.payload.referenceImplementation.provided,
+          status: artifacts.technicalAudit.payload.referenceImplementation.status,
+          complexityAcceptable:
+            artifacts.technicalAudit.payload.referenceImplementation
+              .complexityAcceptable
+        }
+      },
       editorial: {
         qualityLevel: editorial.qualityLevel,
         noveltyLevel: editorial.noveltyLevel,
@@ -623,7 +764,23 @@ export async function runReviewEvidenceFlowCalibrationOutcome(
         originalityLevel: originality.originalityLevel,
         sameProblemAsExisting: originality.sameProblemAsExisting,
         highestSimilarity: originality.highestSimilarity
-      }
+      },
+      roleReceipts: decision.roleCompletions.map((completion) => ({
+        role: completion.role,
+        receiptHash: completion.receiptHash,
+        requestCount: completion.requestCount,
+        transportAttemptCount: completion.transportAttemptCount,
+        responses: completion.responses
+      })),
+      receiptSetHash: hashCanonicalValue(
+        decision.roleCompletions.map((completion) => ({
+          role: completion.role,
+          receiptHash: completion.receiptHash,
+          requestCount: completion.requestCount,
+          transportAttemptCount: completion.transportAttemptCount,
+          responses: completion.responses
+        }))
+      )
     });
     return deepFreeze({ status: "complete" as const, projection });
   } catch {
@@ -652,6 +809,7 @@ async function runReviewEvidenceFlowTracked(
   })();
   const resolvedRunner = resolveRunner(input);
   const { roles, identities } = resolvedRunner;
+  const requestStartGate = resolveRequestStartGate(input, resolvedRunner);
   const sourceSnapshotHash = hashCanonicalValue(taskSource ?? source);
   tracker.sourceSnapshotHash = sourceSnapshotHash;
   const executionContext = parseExecutionContext(
@@ -697,6 +855,7 @@ async function runReviewEvidenceFlowTracked(
     binding,
     tracker,
     identities,
+    requestStartGate,
     spec: {
       role: "solver",
       schema: solverPayloadSchema,
@@ -709,6 +868,7 @@ async function runReviewEvidenceFlowTracked(
     binding,
     tracker,
     identities,
+    requestStartGate,
     spec: {
       role: "solution_analyst",
       schema: solutionAnalystPayloadSchema,
@@ -726,6 +886,7 @@ async function runReviewEvidenceFlowTracked(
     binding,
     tracker,
     identities,
+    requestStartGate,
     spec: {
       role: "technical_auditor",
       schema: technicalAuditPayloadSchema,
@@ -768,6 +929,7 @@ async function runReviewEvidenceFlowTracked(
     binding,
     tracker,
     identities,
+    requestStartGate,
     specs: [
       {
         role: "difficulty",
@@ -825,6 +987,7 @@ async function runReviewEvidenceFlowTracked(
     binding,
     tracker,
     identities,
+    requestStartGate,
     specs: [
       {
         role: "critic",
@@ -866,6 +1029,7 @@ async function runReviewEvidenceFlowTracked(
     binding,
     tracker,
     identities,
+    requestStartGate,
     spec: {
       role: "adjudicator",
       schema: adjudicatorPayloadSchema,
@@ -975,10 +1139,14 @@ async function runAndSeal<TPayload>(input: {
   readonly binding: ReviewFlowRunBinding;
   readonly tracker: ReviewFlowRunTracker;
   readonly identities: Readonly<Record<ReviewFlowRole, RoleIdentity>>;
+  readonly requestStartGate: LlmRequestStartGate | null;
   readonly spec: RoleSpec<TPayload>;
 }): Promise<EvidenceArtifact<TPayload>> {
   let completedReceipt: RoleCompletionReceipt | null = null;
   try {
+    if (input.requestStartGate !== null && !input.requestStartGate.canStartRequest()) {
+      throw new LlmRequestError("LLM_REQUEST_START_BLOCKED");
+    }
     const rawResult = await input.spec.run();
     const trustedResult = input.binding.runContextHash === null
       ? null
@@ -1018,10 +1186,20 @@ async function runAndSeal<TPayload>(input: {
       receiptHash: receipt === null ? null : hashCanonicalValue(receipt),
       requestCount: receipt?.requestCount ?? 0,
       transportAttemptCount: receipt?.transportAttemptCount ?? 0,
-      responseModes: receipt?.responses.map((response) => response.responseMode) ?? []
+      responseModes: receipt?.responses.map((response) => response.responseMode) ?? [],
+      responses: receipt?.responses.map((response) => ({
+        responseMode: response.responseMode,
+        transportAttemptCount: response.transportAttemptCount,
+        eofVerified: response.eofVerified,
+        finishReasonStopVerified: response.finishReasonStopVerified,
+        // roleCompletionReceiptSchema 已在进入此分支前验证 SSE=true/JSON=null；
+        // 这里收窄为标定投影允许的安全字面量。
+        sseDoneObserved: response.responseMode === "sse" ? true : null
+      })) ?? []
     }));
     return artifact;
   } catch (error) {
+    input.requestStartGate?.close();
     const failureKind = classifyRoleFailure(error);
     input.tracker.completions.delete(input.spec.role);
     const llmAudit = getLlmFailureAudit(error);
@@ -1046,6 +1224,7 @@ async function runIndependentRoles<
   readonly binding: ReviewFlowRunBinding;
   readonly tracker: ReviewFlowRunTracker;
   readonly identities: Readonly<Record<ReviewFlowRole, RoleIdentity>>;
+  readonly requestStartGate: LlmRequestStartGate | null;
   readonly specs: TSpecs;
 }): Promise<{ [K in keyof TSpecs]: TSpecs[K] extends RoleSpec<infer P> ? EvidenceArtifact<P> : never }> {
   const settled = await Promise.allSettled(
@@ -1053,6 +1232,7 @@ async function runIndependentRoles<
       binding: input.binding,
       tracker: input.tracker,
       identities: input.identities,
+      requestStartGate: input.requestStartGate,
       spec
     }))
   );
@@ -1160,6 +1340,27 @@ function resolveRunner(input: ReviewFlowInput): ResolvedReviewFlowRunner {
   };
 }
 
+function resolveRequestStartGate(
+  input: ReviewFlowInput,
+  runner: ResolvedReviewFlowRunner
+): LlmRequestStartGate | null {
+  if (!("requestStartGate" in input) || input.requestStartGate === undefined) {
+    return null;
+  }
+  if (
+    !isLlmRequestStartGate(input.requestStartGate) ||
+    runner.trustedRunner === null ||
+    isProductionEligibleReviewFlowLlmBundle(runner.trustedRunner)
+  ) {
+    throw new ReviewFlowError(
+      "REVIEW_FLOW_TRUSTED_RUNNER_INVALID",
+      null,
+      "input_invalid"
+    );
+  }
+  return input.requestStartGate;
+}
+
 function normalizeReviewFlowOutcomeError(error: unknown): {
   readonly code: ReviewFlowOutcomeErrorCode;
   readonly failureKind: ReviewFlowFailureKind;
@@ -1237,7 +1438,9 @@ function classifyRoleFailure(error: unknown): ReviewFlowFailureKind {
   ].includes(String(code))) {
     return "timeout";
   }
-  if (code === "LLM_CANCELLED") return "cancelled";
+  if (["LLM_CANCELLED", "LLM_REQUEST_START_BLOCKED"].includes(String(code))) {
+    return "cancelled";
+  }
   if (["LLM_OUTPUT_LENGTH_LIMIT", "LLM_RESPONSE_BODY_TOO_LARGE"].includes(String(code))) {
     return "output_limit";
   }
