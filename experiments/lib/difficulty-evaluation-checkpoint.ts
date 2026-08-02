@@ -48,17 +48,25 @@ const sampleIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/);
 const timestampSchema = z.string().datetime();
 const processStartTimeTicksSchema = z.string().regex(/^[1-9][0-9]*$/);
 
-export const difficultyCheckpointRowSchema = z
+class DifficultyCheckpointVersionError extends Error {
+  readonly code = "DIFFICULTY_CHECKPOINT_VERSION_UNSUPPORTED";
+
+  constructor() {
+    super("DIFFICULTY_CHECKPOINT_VERSION_UNSUPPORTED");
+    this.name = "DifficultyCheckpointVersionError";
+  }
+}
+
+export const difficultyCheckpointPredictionSchema = z
   .object({
-    contestId: z.number().int().positive(),
-    index: z.string().regex(/^[A-Z][0-9]{0,7}$/),
-    actualRating: z.number().int().min(800).max(3500).multipleOf(100),
+    contentHash: digestSchema,
     predictedRating: z.number().int().min(800).max(3500).multipleOf(100),
-    error: z.number().int().min(-2700).max(2700).multipleOf(100),
     confidence: z.number().min(0).max(1)
   })
   .strict();
-export type DifficultyCheckpointRow = z.infer<typeof difficultyCheckpointRowSchema>;
+export type DifficultyCheckpointPrediction = z.infer<
+  typeof difficultyCheckpointPredictionSchema
+>;
 
 const pendingEntrySchema = z.object({ sampleId: sampleIdSchema, status: z.literal("pending") }).strict();
 const activeEntrySchema = z
@@ -69,7 +77,7 @@ const succeededEntrySchema = z
     sampleId: sampleIdSchema,
     status: z.literal("succeeded"),
     completedAt: timestampSchema,
-    row: difficultyCheckpointRowSchema
+    prediction: difficultyCheckpointPredictionSchema
   })
   .strict();
 const failedEntrySchema = z
@@ -113,7 +121,7 @@ export type DifficultyCheckpointLockRecord = z.infer<typeof difficultyCheckpoint
 
 const checkpointSchema = z
   .object({
-    schemaVersion: z.literal(1),
+    schemaVersion: z.literal(2),
     chainRunId: z.string().uuid(),
     reportRunId: runIdSchema,
     label: labelSchema,
@@ -162,7 +170,9 @@ export interface DifficultyCheckpointOptions {
 
 export interface ContaminatedDifficultyResume {
   readonly kind: "contaminated";
-  readonly persistedRows: readonly (DifficultyCheckpointRow & { readonly sampleId: string })[];
+  readonly persistedPredictions: readonly (DifficultyCheckpointPrediction & {
+    readonly sampleId: string;
+  })[];
   readonly terminalFailures: readonly EvaluationFailure[];
   readonly integrity: EvaluationCompleteness;
 }
@@ -180,7 +190,7 @@ export interface ContinuedDifficultyEvaluation<T> {
 export async function continueDifficultyEvaluationUnlessContaminated<T>(input: {
   readonly checkpoint: Pick<
     DifficultyEvaluationCheckpoint,
-    "openedExistingCheckpoint" | "terminalFailures" | "succeededRows"
+    "openedExistingCheckpoint" | "terminalFailures" | "succeededPredictions"
   >;
   readonly expectedSampleIds: readonly string[];
   readonly continueClean: () => Promise<T>;
@@ -188,14 +198,14 @@ export async function continueDifficultyEvaluationUnlessContaminated<T>(input: {
   if (input.checkpoint.openedExistingCheckpoint()) {
     const terminalFailures = input.checkpoint.terminalFailures();
     if (terminalFailures.length > 0) {
-      const persistedRows = input.checkpoint.succeededRows();
+      const persistedPredictions = input.checkpoint.succeededPredictions();
       return {
         kind: "contaminated",
-        persistedRows,
+        persistedPredictions,
         terminalFailures,
         integrity: reconcileEvaluation({
           expectedSampleIds: input.expectedSampleIds,
-          succeededSampleIds: persistedRows.map((row) => row.sampleId),
+          succeededSampleIds: persistedPredictions.map((row) => row.sampleId),
           failures: terminalFailures
         })
       };
@@ -252,17 +262,36 @@ export class DifficultyEvaluationCheckpoint {
 
     const statePath = join(this.#directory.path, this.#stateFileName);
     if (existsSync(anchoredPrivatePath(this.#directory, this.#stateFileName))) {
+      let rawState: unknown;
+      try {
+        rawState = JSON.parse(
+          readProtectedEnvFile(statePath, {
+            privateRoot,
+            containingWorkspace,
+            maximumBytes: 4 * 1024 * 1024
+          })
+        ) as unknown;
+      } catch {
+        this.releaseResources();
+        throw new Error("DIFFICULTY_CHECKPOINT_INVALID");
+      }
+      const rawSchemaVersion =
+        typeof rawState === "object" &&
+        rawState !== null &&
+        "schemaVersion" in rawState
+          ? (rawState as { readonly schemaVersion?: unknown }).schemaVersion
+          : undefined;
+      if (
+        typeof rawSchemaVersion === "number" &&
+        Number.isInteger(rawSchemaVersion) &&
+        rawSchemaVersion !== 2
+      ) {
+        this.releaseResources();
+        throw new DifficultyCheckpointVersionError();
+      }
       let loaded: DifficultyEvaluationCheckpointState;
       try {
-        loaded = checkpointSchema.parse(
-          JSON.parse(
-            readProtectedEnvFile(statePath, {
-              privateRoot,
-              containingWorkspace,
-              maximumBytes: 4 * 1024 * 1024
-            })
-          ) as unknown
-        );
+        loaded = checkpointSchema.parse(rawState);
       } catch {
         this.releaseResources();
         throw new Error("DIFFICULTY_CHECKPOINT_INVALID");
@@ -295,7 +324,7 @@ export class DifficultyEvaluationCheckpoint {
 
     const now = this.#now().toISOString();
     this.#state = checkpointSchema.parse({
-      schemaVersion: 1,
+      schemaVersion: 2,
       chainRunId: newChainRunId,
       reportRunId,
       label,
@@ -338,9 +367,13 @@ export class DifficultyEvaluationCheckpoint {
       .map((entry) => entry.sampleId);
   }
 
-  public succeededRows(): Array<DifficultyCheckpointRow & { readonly sampleId: string }> {
+  public succeededPredictions(): Array<
+    DifficultyCheckpointPrediction & { readonly sampleId: string }
+  > {
     return this.#state.entries.flatMap((entry) =>
-      entry.status === "succeeded" ? [{ sampleId: entry.sampleId, ...entry.row }] : []
+      entry.status === "succeeded"
+        ? [{ sampleId: entry.sampleId, ...entry.prediction }]
+        : []
     );
   }
 
@@ -370,8 +403,11 @@ export class DifficultyEvaluationCheckpoint {
     });
   }
 
-  public markSucceeded(sampleId: string, row: DifficultyCheckpointRow): void {
-    const parsedRow = difficultyCheckpointRowSchema.parse(row);
+  public markSucceeded(
+    sampleId: string,
+    prediction: DifficultyCheckpointPrediction
+  ): void {
+    const parsedPrediction = difficultyCheckpointPredictionSchema.parse(prediction);
     this.replaceEntry(sampleId, (entry) => {
       if (entry.status !== "active") {
         throw new Error("DIFFICULTY_CHECKPOINT_SAMPLE_NOT_ACTIVE");
@@ -380,7 +416,7 @@ export class DifficultyEvaluationCheckpoint {
         sampleId,
         status: "succeeded",
         completedAt: this.#now().toISOString(),
-        row: parsedRow
+        prediction: parsedPrediction
       };
     });
   }

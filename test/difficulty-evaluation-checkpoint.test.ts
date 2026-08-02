@@ -6,7 +6,8 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
-  unlinkSync
+  unlinkSync,
+  writeFileSync
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -104,22 +105,60 @@ describe("difficulty 私有检查点", () => {
     let checkpoint = open();
     checkpoint.markActive("source-a");
     checkpoint.markSucceeded("source-a", {
-      contestId: 1,
-      index: "A",
-      actualRating: 800,
+      contentHash: digest,
       predictedRating: 900,
-      error: 100,
       confidence: 0.75
     });
     checkpoint.close();
 
     checkpoint = open();
     expect(checkpoint.pendingSampleIds()).toEqual(["source-b"]);
-    expect(checkpoint.succeededRows()).toEqual([
+    expect(checkpoint.succeededPredictions()).toEqual([
       expect.objectContaining({ sampleId: "source-a", predictedRating: 900 })
     ]);
     expect(checkpoint.terminalFailures()).toEqual([]);
     checkpoint.close();
+  });
+
+  it("推理检查点只保存 content 绑定与预测，不保存官方答案或误差", () => {
+    const goldSentinel = 31_337;
+    const checkpoint = open();
+    checkpoint.markActive("source-a");
+    checkpoint.markSucceeded("source-a", {
+      contentHash: digest,
+      predictedRating: 900,
+      confidence: 0.75
+    });
+    const serialized = readFileSync(
+      join(
+        privateRoot,
+        "evaluation-state",
+        "difficulty-baseline.checkpoint.private.json"
+      ),
+      "utf8"
+    );
+    expect(serialized).toContain('"schemaVersion": 2');
+    expect(serialized).not.toContain("contestId");
+    expect(serialized).not.toContain("actualRating");
+    expect(serialized).not.toContain('"error"');
+    expect(serialized).not.toContain(String(goldSentinel));
+    checkpoint.close();
+  });
+
+  it("旧 gold-bearing v1 检查点显式拒绝，不能静默当作新链续跑", () => {
+    const checkpoint = open();
+    checkpoint.close();
+    const checkpointPath = join(
+      privateRoot,
+      "evaluation-state",
+      "difficulty-baseline.checkpoint.private.json"
+    );
+    const document = JSON.parse(readFileSync(checkpointPath, "utf8")) as {
+      schemaVersion: number;
+    };
+    document.schemaVersion = 1;
+    writeFileSync(checkpointPath, `${JSON.stringify(document, null, 2)}\n`, "utf8");
+    expect(() => open()).toThrow("DIFFICULTY_CHECKPOINT_VERSION_UNSUPPORTED");
   });
 
   it("明确失败不自动重试，指纹变化也不沿用旧链", () => {
@@ -145,11 +184,8 @@ describe("difficulty 私有检查点", () => {
     let checkpoint = openResumeGateCase();
     checkpoint.markActive("source-a");
     checkpoint.markSucceeded("source-a", {
-      contestId: 1,
-      index: "A",
-      actualRating: 800,
+      contentHash: digest,
       predictedRating: 900,
-      error: 100,
       confidence: 0.75
     });
     checkpoint.markActive("source-b");
@@ -180,7 +216,7 @@ describe("difficulty 私有检查点", () => {
     expect(modelCall).not.toHaveBeenCalled();
     expect(checkpoint.pendingSampleIds()).toEqual(["source-d"]);
     if (result.kind === "contaminated") {
-      expect(result.persistedRows.map((row) => row.sampleId)).toEqual(["source-a"]);
+      expect(result.persistedPredictions.map((row) => row.sampleId)).toEqual(["source-a"]);
       expect(result.integrity).toMatchObject({
         expected: 4,
         succeeded: 1,
@@ -212,11 +248,8 @@ describe("difficulty 私有检查点", () => {
         checkpoint.markActive("source-a");
         const value = await modelCall();
         checkpoint.markSucceeded("source-a", {
-          contestId: 1,
-          index: "A",
-          actualRating: 800,
+          contentHash: digest,
           predictedRating: 800,
-          error: 0,
           confidence: 0.5
         });
         return value;
@@ -315,17 +348,14 @@ describe("difficulty 私有检查点", () => {
     expect(() => checkpoint.markCompleteReportPublished("run-a", digest)).toThrow(
       "DIFFICULTY_CHECKPOINT_REPORT_NOT_PUBLISHABLE"
     );
-    for (const [sampleId, contestId, index, rating] of [
-      ["source-a", 1, "A", 800],
-      ["source-b", 2, "B", 1600]
+    for (const [sampleId, rating] of [
+      ["source-a", 800],
+      ["source-b", 1600]
     ] as const) {
       checkpoint.markActive(sampleId);
       checkpoint.markSucceeded(sampleId, {
-        contestId,
-        index,
-        actualRating: rating,
+        contentHash: digest,
         predictedRating: rating,
-        error: 0,
         confidence: 0.5
       });
     }

@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   assertEvaluationRepositoryState,
   difficultyEvaluationCodePaths,
-  hashEvaluationCodeBundle
+  hashEvaluationCodeBundle,
+  verdictEvaluationCodePaths
 } from "../experiments/lib/evaluation-code-identity";
 
 const digest = "a".repeat(64);
@@ -13,6 +14,11 @@ describe("付费评测实际代码身份", () => {
     expect(difficultyEvaluationCodePaths).toContain("experiments/eval-difficulty.ts");
     expect(difficultyEvaluationCodePaths).toContain("scripts/private-runtime.mjs");
     expect(new Set(difficultyEvaluationCodePaths).size).toBe(difficultyEvaluationCodePaths.length);
+    expect(verdictEvaluationCodePaths).toContain("experiments/eval-verdict.ts");
+    expect(verdictEvaluationCodePaths).toContain("experiments/lib/verdict-evaluation-checkpoint.ts");
+    expect(verdictEvaluationCodePaths).toContain("scripts/private-runtime.mjs");
+    expect(verdictEvaluationCodePaths).toContain("src/pipelines/verdict.ts");
+    expect(new Set(verdictEvaluationCodePaths).size).toBe(verdictEvaluationCodePaths.length);
   });
 
   it("声明提交、真实 HEAD、干净工作树、runner 和依赖全集都一致时通过", () => {

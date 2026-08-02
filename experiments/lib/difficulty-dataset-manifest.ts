@@ -68,6 +68,9 @@ export interface DifficultyDatasetItemForManifest {
 }
 
 export const knownPublicDifficultyArchiveProfile = {
+  datasetId: "cf-public83",
+  /** public83 已被反复用于基线与调参，只能作为开发集，不能充当最终盲测集。 */
+  purpose: "development",
   expectedFileCount: 83,
   expectedEditorialCount: 24,
   expectedRatingBands: { low: 18, middle: 24, high: 41 }

@@ -15,6 +15,7 @@ const safeRepositoryPathPattern = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/u;
 
 export const difficultyEvaluationCodePaths = [
   "experiments/eval-difficulty.ts",
+  "experiments/lib/blind-evaluation.ts",
   "experiments/lib/concurrency.ts",
   "experiments/lib/difficulty-anchors-strict.ts",
   "experiments/lib/difficulty-dataset-manifest.ts",
@@ -28,6 +29,35 @@ export const difficultyEvaluationCodePaths = [
   "src/logger.ts",
   "src/pipelines/difficulty.ts",
   "src/pipelines/types.ts",
+  "src/urmotiv-schemas.ts",
+  "src/yaml-lite.ts",
+  "package.json",
+  "package-lock.json",
+  "tsconfig.json"
+] as const;
+
+/** verdict 付费诊断的 runner 与全部直接/传递本地代码依赖。 */
+export const verdictEvaluationCodePaths = [
+  "experiments/eval-verdict.ts",
+  "experiments/lib/blind-evaluation.ts",
+  "experiments/lib/concurrency.ts",
+  "experiments/lib/difficulty-evaluation-eligibility.ts",
+  "experiments/lib/evaluation-code-identity.ts",
+  "experiments/lib/evaluation-integrity.ts",
+  "experiments/lib/levels-calibration-runner.ts",
+  "experiments/lib/levels-calibration-state.ts",
+  "experiments/lib/verdict-evaluation-design.ts",
+  "experiments/lib/verdict-evaluation-checkpoint.ts",
+  "scripts/private-runtime.mjs",
+  "src/config.ts",
+  "src/llm.ts",
+  "src/logger.ts",
+  "src/pipelines/coding.ts",
+  "src/pipelines/difficulty.ts",
+  "src/pipelines/thinking.ts",
+  "src/pipelines/types.ts",
+  "src/pipelines/verdict.ts",
+  "src/urmotiv-schemas.ts",
   "src/yaml-lite.ts",
   "package.json",
   "package-lock.json",

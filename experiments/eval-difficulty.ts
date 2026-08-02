@@ -17,10 +17,21 @@ import { getProviderCredentials, loadConfig, type AppConfig, type ProfileConfig 
 import { logError, logInfo } from "../src/logger";
 import {
   clampAndRoundDifficultyRating,
-  runDifficultyPipeline
+  runDifficultyPipeline,
+  type DifficultyAnchor
 } from "../src/pipelines/difficulty";
-import type { ReviewTaskProblem } from "../src/pipelines/types";
-import { mapWithConcurrency } from "./lib/concurrency";
+import type { PipelineModelConfig, ReviewTaskProblem } from "../src/pipelines/types";
+import {
+  buildBlindContentDataset,
+  buildBlindGoldDataset,
+  deriveBlindContentSubset,
+  joinBlindPredictionSubsetWithGold,
+  runBlindInference,
+  type BlindContentDataset,
+  type BlindGoldDataset,
+  type BlindPrediction,
+  type BlindProblemContentSample
+} from "./lib/blind-evaluation";
 import { loadDifficultyAnchorsStrict } from "./lib/difficulty-anchors-strict";
 import {
   assessDifficultyEvaluationEligibility,
@@ -30,13 +41,14 @@ import {
 } from "./lib/difficulty-evaluation-eligibility";
 import {
   loadDifficultyDatasetManifest,
+  knownPublicDifficultyArchiveProfile,
   verifyDifficultyDatasetManifest,
   verifyKnownPublicDifficultyArchiveProfile
 } from "./lib/difficulty-dataset-manifest";
 import {
   continueDifficultyEvaluationUnlessContaminated,
   DifficultyEvaluationCheckpoint,
-  type DifficultyCheckpointRow
+  type DifficultyCheckpointPrediction
 } from "./lib/difficulty-evaluation-checkpoint";
 import {
   difficultyEvaluationCodePaths,
@@ -82,6 +94,24 @@ const datasetItemSchema = z.object({
 }).strict();
 type DatasetItem = z.infer<typeof datasetItemSchema>;
 
+const difficultyBlindGoldSchema = z
+  .object({
+    contestId: z.number().int().positive(),
+    index: z.string().regex(/^[A-Z][0-9]{0,7}$/),
+    actualRating: z.number().int().min(800).max(3500).multipleOf(100)
+  })
+  .strict();
+type DifficultyBlindGold = z.infer<typeof difficultyBlindGoldSchema>;
+
+interface DifficultyBlindPrediction {
+  readonly predictedRating: number;
+  readonly confidence: number;
+}
+
+type PersistedDifficultyBlindPrediction = DifficultyCheckpointPrediction & {
+  readonly sampleId: string;
+};
+
 interface EvalRow {
   readonly contestId: number;
   readonly index: string;
@@ -96,7 +126,7 @@ interface PersistedEvalRow extends EvalRow {
 }
 
 interface DifficultyReport {
-  readonly schemaVersion: 3;
+  readonly schemaVersion: 4;
   readonly runId: string;
   readonly label: string;
   readonly generatedAt: string;
@@ -120,6 +150,7 @@ interface DifficultyReport {
     readonly executionKind: "preflight" | "new" | "resume" | "replay_blocked";
   };
   readonly dataset: {
+    readonly purpose: "development";
     readonly discoveredFiles: number;
     readonly excludedAnchors: number;
     readonly manifest: {
@@ -139,18 +170,72 @@ function parseLabelArg(): string {
   return parseEvaluationLabel(arg?.slice("--label=".length) ?? "", "baseline");
 }
 
-function toReviewTaskProblem(item: DatasetItem): ReviewTaskProblem {
+function toReviewTaskProblem(
+  safeId: string,
+  item: Pick<DatasetItem, "statement">
+): ReviewTaskProblem {
+  const contentHash = createHash("sha256")
+    .update(item.statement, "utf8")
+    .update("\0", "utf8")
+    .update(NO_SOLUTION_PLACEHOLDER, "utf8")
+    .digest("hex");
   return {
-    id: `cf-${item.contestId}${item.index}`,
+    id: `difficulty-${safeId}`,
     revision: 1,
     reviewRound: 1,
-    contentHash: "0".repeat(64),
-    title: `CF ${item.contestId}${item.index}`,
+    contentHash,
+    title: `公开开发集样本-${safeId}`,
     type: "traditional",
     tagIds: ["experiment"],
     basicStatement: item.statement,
     basicSolution: NO_SOLUTION_PLACEHOLDER
   };
+}
+
+/** 这个函数是付费推理边界：参数中没有官方 rating、人工标签或预期结论。 */
+async function inferDifficultyBlindSample(input: {
+  readonly sample: Readonly<BlindProblemContentSample>;
+  readonly anchors: readonly DifficultyAnchor[];
+  readonly model: PipelineModelConfig;
+}): Promise<DifficultyBlindPrediction> {
+  const result = await runDifficultyPipeline({
+    problem: input.sample.problem,
+    anchors: input.anchors,
+    model: input.model
+  });
+  return {
+    predictedRating: clampAndRoundDifficultyRating(result.rating),
+    confidence: result.confidence
+  };
+}
+
+function scoreDifficultyPredictions(
+  content: BlindContentDataset,
+  gold: BlindGoldDataset<DifficultyBlindGold>,
+  predictions: readonly PersistedDifficultyBlindPrediction[]
+): PersistedEvalRow[] {
+  const blindPredictions: BlindPrediction<DifficultyBlindPrediction>[] =
+    predictions.map((prediction) => ({
+      safeId: prediction.sampleId,
+      contentHash: prediction.contentHash,
+      prediction: {
+        predictedRating: prediction.predictedRating,
+        confidence: prediction.confidence
+      }
+    }));
+  return joinBlindPredictionSubsetWithGold({
+    content,
+    gold,
+    predictions: blindPredictions
+  }).map((joined) => ({
+    sampleId: joined.safeId,
+    contestId: joined.gold.contestId,
+    index: joined.gold.index,
+    actualRating: joined.gold.actualRating,
+    predictedRating: joined.prediction.predictedRating,
+    error: joined.prediction.predictedRating - joined.gold.actualRating,
+    confidence: joined.prediction.confidence
+  }));
 }
 
 function summarize(rows: readonly EvalRow[]): {
@@ -209,6 +294,7 @@ function renderMarkdown(report: DifficultyReport): string {
     `- eligible：${report.eligible ? "true" : "false"}`,
     `- 配置指纹：${report.configurationFingerprint ?? "未能建立"}`,
     `- 模型服务身份指纹：${report.providerIdentityFingerprint ?? "未能建立"}`,
+    `- 数据集用途：${report.dataset.purpose}（public83 已参与调参，不是最终盲测集）`,
     `- MAE（平均绝对误差）：${report.summary.meanAbsoluteError.toFixed(1)}`,
     `- ±200 命中率：${(report.summary.hitRateWithin200 * 100).toFixed(1)}%`,
     `- 准确性门槛：MAE ≤ ${difficultyAccuracyThresholds.maximumMeanAbsoluteError}，±200 命中率 ≥ ${(difficultyAccuracyThresholds.minimumHitRateWithin200 * 100).toFixed(0)}%`,
@@ -316,7 +402,7 @@ function incompleteBeforeCalls(input: {
     anchorsProvisional: input.anchorsProvisional ?? true
   });
   const report: DifficultyReport = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     runId: input.runId,
     label: input.label,
     generatedAt: input.generatedAt,
@@ -336,6 +422,7 @@ function incompleteBeforeCalls(input: {
       executionKind: "preflight"
     },
     dataset: {
+      purpose: knownPublicDifficultyArchiveProfile.purpose,
       discoveredFiles: input.fileCount,
       excludedAnchors: input.excludedAnchors ?? 0,
       manifest: input.manifest ?? {
@@ -630,6 +717,58 @@ async function main(): Promise<void> {
     return;
   }
 
+  let blindContent: BlindContentDataset;
+  let blindGold: BlindGoldDataset<DifficultyBlindGold>;
+  try {
+    blindContent = buildBlindContentDataset({
+      datasetId: knownPublicDifficultyArchiveProfile.datasetId,
+      purpose: knownPublicDifficultyArchiveProfile.purpose,
+      samples: dataset.map((source) => ({
+        safeId: source.sourceId,
+        problem: toReviewTaskProblem(source.sourceId, source.item)
+      }))
+    });
+    const contentBySafeId = new Map(
+      blindContent.samples.map((sample) => [sample.safeId, sample] as const)
+    );
+    blindGold = buildBlindGoldDataset({
+      content: blindContent,
+      goldSchema: difficultyBlindGoldSchema,
+      samples: dataset.map((source) => {
+        const content = contentBySafeId.get(source.sourceId);
+        if (content === undefined) {
+          throw new Error("DIFFICULTY_BLIND_CONTENT_MISSING");
+        }
+        return {
+          safeId: source.sourceId,
+          contentHash: content.problem.contentHash,
+          gold: {
+            contestId: source.item.contestId,
+            index: source.item.index,
+            actualRating: source.item.rating
+          }
+        };
+      })
+    });
+  } catch {
+    incompleteBeforeCalls({
+      runId,
+      label,
+      generatedAt,
+      ...codeEvidence,
+      fileCount: preflight.fileCount,
+      expectedIds: dataset.map((source) => source.sourceId),
+      failures: [{
+        sampleId: "difficulty-blind-dataset",
+        phase: "setup",
+        code: "BLIND_DATASET_PRECHECK_FAILED"
+      }],
+      manifest: manifestReport,
+      anchorsProvisional: strictAnchors.provisional
+    });
+    return;
+  }
+
   let concurrency: number;
   try {
     concurrency = parseBoundedPositiveInteger(
@@ -729,7 +868,9 @@ async function main(): Promise<void> {
     timeouts: config.models.timeouts,
     anchorsFingerprint: strictAnchors.fingerprint,
     anchorsProvisional: strictAnchors.provisional,
-    datasetManifestFingerprint: manifestReport.fingerprint
+    datasetManifestFingerprint: manifestReport.fingerprint,
+    datasetPurpose: blindContent.purpose,
+    blindContentFingerprint: blindContent.contentFingerprint
   }, providerIdentityFingerprint);
   if (!manifestReport.verified || manifestReport.fingerprint === null) {
     incompleteBeforeCalls({
@@ -836,7 +977,11 @@ async function main(): Promise<void> {
         providerIdentityFingerprint,
         anchorsProvisional: strictAnchors.provisional,
         excludedAnchors,
-        persistedRows: checkpoint.succeededRows(),
+        persistedRows: scoreDifficultyPredictions(
+          blindContent,
+          blindGold,
+          checkpoint.succeededPredictions()
+        ),
         chain: { ...chain, executionKind: "replay_blocked" }
       });
       return;
@@ -846,51 +991,52 @@ async function main(): Promise<void> {
       checkpoint,
       expectedSampleIds,
       continueClean: async (): Promise<EvaluationFailure | null> => {
-        const pendingIds = new Set(checkpoint.pendingSampleIds());
-        const pendingDataset = dataset.filter((source) => pendingIds.has(source.sourceId));
-        let done = dataset.length - pendingDataset.length;
+        const pendingIds = checkpoint.pendingSampleIds();
+        if (pendingIds.length === 0) {
+          return null;
+        }
+        const pendingContent = deriveBlindContentSubset(
+          blindContent,
+          pendingIds
+        );
+        let done = dataset.length - pendingContent.samples.length;
         try {
-          await mapWithConcurrency(pendingDataset, concurrency, async (source): Promise<void> => {
-            const item = source.item;
-            const problem = toReviewTaskProblem(item);
-
+          await runBlindInference({
+            content: pendingContent,
+            concurrency,
             // 这是付费调用的提交点。只有 active 已经 fsync 并原子替换成功后，
-            // 才允许进入 runDifficultyPipeline。
-            checkpoint.markActive(source.sourceId);
-
-            let row: DifficultyCheckpointRow;
-            try {
-              const result = await runDifficultyPipeline({ problem, anchors, model });
-              const predictedRating = clampAndRoundDifficultyRating(result.rating);
-              row = {
-                contestId: item.contestId,
-                index: item.index,
-                actualRating: item.rating,
-                predictedRating,
-                error: predictedRating - item.rating,
-                confidence: result.confidence
+            // 才允许进入 inferDifficultyBlindSample。
+            beforeInference: (sample) => {
+              checkpoint.markActive(sample.safeId);
+            },
+            infer: (sample) => inferDifficultyBlindSample({ sample, anchors, model }),
+            // 这里只冻结预测；整批在途请求全部收束后，外层才允许连接 gold。
+            afterInference: (prediction) => {
+              const checkpointPrediction: DifficultyCheckpointPrediction = {
+                contentHash: prediction.contentHash,
+                predictedRating: prediction.prediction.predictedRating,
+                confidence: prediction.prediction.confidence
               };
-            } catch (error) {
+              checkpoint.markSucceeded(
+                prediction.safeId,
+                checkpointPrediction
+              );
               done += 1;
-              const failure = executionFailure(source.sourceId, error);
-              checkpoint.markFailed(source.sourceId, failure);
+              logInfo("完成一题的难度盲评", {
+                sampleId: prediction.safeId,
+                progress: `${done}/${dataset.length}`
+              });
+            },
+            onInferenceError: (sample, error) => {
+              done += 1;
+              const failure = executionFailure(sample.safeId, error);
+              checkpoint.markFailed(sample.safeId, failure);
               logError("这一题的难度评定失败，停止发起后续请求", error, {
-                contestId: item.contestId,
-                index: item.index,
+                sampleId: sample.safeId,
                 progress: `${done}/${dataset.length}`
               });
               throw new Error("DIFFICULTY_EVALUATION_SAMPLE_FAILED");
             }
-
-            // 不保存模型理由；成功数值先原子持久化，之后才计入进度与报告。
-            checkpoint.markSucceeded(source.sourceId, row);
-            done += 1;
-            logInfo("完成一题的难度评定", {
-              contestId: item.contestId,
-              index: item.index,
-              error: row.error,
-              progress: `${done}/${dataset.length}`
-            });
           });
           return null;
         } catch (error) {
@@ -907,7 +1053,11 @@ async function main(): Promise<void> {
     let persistedRows: PersistedEvalRow[];
     let integrity: EvaluationCompleteness;
     if (continuation.kind === "contaminated") {
-      persistedRows = [...continuation.persistedRows];
+      persistedRows = scoreDifficultyPredictions(
+        blindContent,
+        blindGold,
+        continuation.persistedPredictions
+      );
       integrity = continuation.integrity;
       logInfo("既有 difficulty 链含永久失败证据，直接写不完整报告", {
         terminalFailures: continuation.terminalFailures.length,
@@ -917,7 +1067,11 @@ async function main(): Promise<void> {
       });
     } else {
       const orchestrationFailure = continuation.value;
-      persistedRows = checkpoint.succeededRows();
+      persistedRows = scoreDifficultyPredictions(
+        blindContent,
+        blindGold,
+        checkpoint.succeededPredictions()
+      );
       const executionFailures = checkpoint.terminalFailures();
       integrity = reconcileEvaluation({
         expectedSampleIds,
@@ -940,7 +1094,7 @@ async function main(): Promise<void> {
       anchorsProvisional: strictAnchors.provisional
     });
     const report: DifficultyReport = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       runId,
       label,
       generatedAt,
@@ -954,7 +1108,12 @@ async function main(): Promise<void> {
       anchorsProvisional: strictAnchors.provisional,
       ...eligibility,
       chain,
-      dataset: { discoveredFiles: preflight.fileCount, excludedAnchors, manifest: manifestReport },
+      dataset: {
+        purpose: knownPublicDifficultyArchiveProfile.purpose,
+        discoveredFiles: preflight.fileCount,
+        excludedAnchors,
+        manifest: manifestReport
+      },
       integrity,
       summary,
       rows

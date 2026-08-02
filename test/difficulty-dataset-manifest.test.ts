@@ -56,6 +56,11 @@ describe("difficulty 私有 manifest 对账", () => {
   const first = source("source-a", { contestId: 1, index: "A", rating: 800, statement: "synthetic-a" });
   const second = source("source-b", { contestId: 2, index: "B", rating: 1600, statement: "synthetic-b" });
 
+  it("public83 明确登记为开发集，不能作为最终 holdout", () => {
+    expect(knownPublicDifficultyArchiveProfile.datasetId).toBe("cf-public83");
+    expect(knownPublicDifficultyArchiveProfile.purpose).toBe("development");
+  });
+
   it("文件数、题号、难度、文件哈希和题面哈希全部一致时通过", () => {
     expect(verifyDifficultyDatasetManifest([first, second], manifestFor([first, second]))).toEqual({
       expectedSampleIds: ["source-a", "source-b"],
