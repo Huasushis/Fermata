@@ -140,7 +140,7 @@ describe("runVerdictPipeline：整体接线", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("付费请求前拒绝空知识点列表", async () => {
+  it("评价可为空时仍在付费请求前按任务契约拒绝空知识点列表", async () => {
     const fetchMock = vi.fn(async () => jsonResponse({}));
     await expect(
       runVerdictPipeline({

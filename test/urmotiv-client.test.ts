@@ -11,7 +11,9 @@ import {
 } from "../src/urmotiv-client";
 import {
   completeRobotReviewTaskInputSchema,
+  reviewInputSchema,
   renewRobotReviewTaskInputSchema,
+  robotReviewTaskSchema,
   type RobotReviewTask
 } from "../src/urmotiv-schemas";
 
@@ -125,6 +127,24 @@ describe("UrmotivClient：正常路径", () => {
 });
 
 describe("UrmotivClient：本地校验先于网络请求", () => {
+  it("镜像契约允许评价缺省或显式使用空标签，但领取任务仍要求至少一个标签", () => {
+    const { tagIds: _tagIds, ...reviewWithoutTags } = validCompleteInput().review;
+    expect(reviewInputSchema.parse(reviewWithoutTags).tagIds).toEqual([]);
+    expect(reviewInputSchema.safeParse({ ...reviewWithoutTags, tagIds: [] }).success).toBe(true);
+    expect(
+      reviewInputSchema.safeParse({
+        ...reviewWithoutTags,
+        tagIds: Array.from({ length: 31 }, (_, index) => `tag-${index}`)
+      }).success
+    ).toBe(false);
+    expect(
+      robotReviewTaskSchema.safeParse({
+        ...sampleTask(),
+        problem: { ...sampleTask().problem, tagIds: [] }
+      }).success
+    ).toBe(false);
+  });
+
   it("镜像契约要求 renew 和 complete 都携带请求标识", () => {
     expect(
       renewRobotReviewTaskInputSchema.safeParse({
@@ -147,15 +167,18 @@ describe("UrmotivClient：本地校验先于网络请求", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("complete 在 review 没有知识点时直接抛错，不发请求", async () => {
-    const fetchMock = vi.fn();
+  it("complete 接受评价的空知识点列表并原样发送", async () => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      expect(JSON.parse(String(init?.body)).review.tagIds).toEqual([]);
+      return jsonResponse({ assignmentId, accepted: true, problemStatus: "approved" });
+    });
     const client = new UrmotivClient({ baseUrl, robotToken, fetch: fetchMock });
-    const invalidInput = {
+    const input = {
       ...validCompleteInput(),
       review: { ...validCompleteInput().review, tagIds: [] }
     };
-    await expect(client.complete(assignmentId, invalidInput)).rejects.toThrow();
-    expect(fetchMock).not.toHaveBeenCalled();
+    await expect(client.complete(assignmentId, input)).resolves.toMatchObject({ accepted: true });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("claim 在 leaseSeconds 超出范围时直接抛错，不发请求", async () => {

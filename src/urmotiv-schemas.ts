@@ -2,7 +2,7 @@
  * 从 Urmotiv contracts 同步，勿手改。
  *
  * Fermata 是独立仓库，不通过 workspace 依赖 Urmotiv，所以把机器人 API 用到的契约
- * 子集手工镜像到这一个文件里。对齐时间：2026-08-01。来源：
+ * 子集手工镜像到这一个文件里。对齐时间：2026-08-02。来源：
  *
  *   - packages/contracts/src/problem.ts
  *     （problemTypeSchema、difficultyLevelSchema、codeforcesDifficultySchema）
@@ -44,7 +44,7 @@ export const reviewInputSchema = z.object({
   originalityLevel: difficultyLevelSchema.nullable().optional(),
   thinkingLevel: difficultyLevelSchema,
   codingLevel: difficultyLevelSchema,
-  tagIds: z.array(z.string().min(1).max(120)).min(1).max(30),
+  tagIds: z.array(z.string().min(1).max(120)).max(30).default([]),
   improvements: z.string().trim().min(1, "请填写主要改进点").max(20_000),
   publicComment: z.string().trim().max(20_000).optional(),
   privateNote: z.string().trim().max(20_000).default(""),

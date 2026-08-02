@@ -24,7 +24,11 @@
  */
 import { z } from "zod";
 import { chatCompleteJson, type ChatMessage } from "../llm";
-import { reviewInputSchema, type ReviewInput } from "../urmotiv-schemas";
+import {
+  reviewInputSchema,
+  robotReviewTaskSchema,
+  type ReviewInput
+} from "../urmotiv-schemas";
 import type { CodingResult } from "./coding";
 import type { DifficultyResult } from "./difficulty";
 import type { ThinkingResult } from "./thinking";
@@ -71,7 +75,7 @@ export async function runVerdictPipeline(input: VerdictPipelineInput): Promise<V
     );
   // 直接调用流水线的实验代码也可能绕过机器人任务 schema；知识点为空或超限时
   // 必须在任何付费模型请求之前拒绝。
-  const tagIds = reviewInputSchema.shape.tagIds.parse(input.problem.tagIds);
+  const tagIds = robotReviewTaskSchema.shape.problem.shape.tagIds.parse(input.problem.tagIds);
   const highestKnownSimilarity = extractHighestDuplicateSimilarity(input.reviewItems);
   const messages = buildVerdictMessages(input, highestKnownSimilarity);
   const { data } = await chatCompleteJson(
