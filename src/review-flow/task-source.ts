@@ -27,6 +27,7 @@ export type ReviewFlowTaskSourceErrorCode =
   | "REVIEW_FLOW_TASK_ANKLANG_ITEM_AMBIGUOUS"
   | "REVIEW_FLOW_TASK_ANKLANG_SOURCE_UNTRUSTED"
   | "REVIEW_FLOW_TASK_ANKLANG_ITEM_EXPIRED"
+  | "REVIEW_FLOW_TASK_ANKLANG_EXPIRY_MISMATCH"
   | "REVIEW_FLOW_TASK_ANKLANG_VERSION_UNSUPPORTED"
   | "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID"
   | "REVIEW_FLOW_TASK_ANKLANG_RESULT_INCOMPLETE"
@@ -294,6 +295,8 @@ export function isBuiltReviewFlowTaskSourceResult(
 
 export interface BuildReviewFlowTaskSourceOptions {
   readonly duplicateSimilarityRejectThreshold: number;
+  /** 测试可冻结认证证据的判定时刻；生产默认读取当前服务器时间。 */
+  readonly now?: () => Date;
 }
 
 /**
@@ -308,7 +311,7 @@ export function buildReviewFlowTaskSource(
   const task = parseTask(taskCandidate);
   assertCoreMaterials(task.problem);
   assertProblemTagsExist(task);
-  const anklang = parseCompleteAnklangItem(task);
+  const anklang = parseCompleteAnklangItem(task, readNowMs(options.now));
   const anklangResultHash = hashCanonicalValue(anklang.result);
   const duplicateEvidence = anklang.result.candidates.map((candidate, index) => {
     const evidenceId = `anklang-${hashCanonicalValue({
@@ -445,7 +448,7 @@ function assertProblemTagsExist(task: RobotReviewTask): void {
   }
 }
 
-function parseCompleteAnklangItem(task: RobotReviewTask): {
+function parseCompleteAnklangItem(task: RobotReviewTask, nowMs: number): {
   readonly item: RobotReviewTask["reviewItems"][number];
   readonly result: z.infer<typeof completeAnklangV2ResultSchema>;
 } {
@@ -467,7 +470,7 @@ function parseCompleteAnklangItem(task: RobotReviewTask): {
       "REVIEW_FLOW_TASK_ANKLANG_SOURCE_UNTRUSTED"
     );
   }
-  if (item.expiresAt !== null && Date.parse(item.expiresAt) <= Date.now()) {
+  if (item.expiresAt !== null && Date.parse(item.expiresAt) <= nowMs) {
     throw new ReviewFlowTaskSourceError("REVIEW_FLOW_TASK_ANKLANG_ITEM_EXPIRED");
   }
   const apiVersion = readApiVersion(item.data);
@@ -490,6 +493,14 @@ function parseCompleteAnklangItem(task: RobotReviewTask): {
   if (!complete.success) {
     throw new ReviewFlowTaskSourceError("REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
   }
+  const resultExpiresAt = complete.data.reuse.policy === "allowed"
+    ? complete.data.reuse.expiresAt
+    : null;
+  if (item.expiresAt !== resultExpiresAt) {
+    throw new ReviewFlowTaskSourceError(
+      "REVIEW_FLOW_TASK_ANKLANG_EXPIRY_MISMATCH"
+    );
+  }
   if (
     item.contentHash !== task.problem.contentHash ||
     complete.data.contentHash !== task.problem.contentHash
@@ -499,6 +510,16 @@ function parseCompleteAnklangItem(task: RobotReviewTask): {
     );
   }
   return { item, result: complete.data };
+}
+
+function readNowMs(now: (() => Date) | undefined): number {
+  try {
+    const value = (now ?? (() => new Date()))().getTime();
+    if (Number.isFinite(value)) return value;
+  } catch {
+    // 对无效或抛错时钟统一使用固定安全错误，不能把异常内容写进日志。
+  }
+  throw new ReviewFlowTaskSourceError("REVIEW_FLOW_TASK_SOURCE_INVALID");
 }
 
 function readApiVersion(value: unknown): unknown {

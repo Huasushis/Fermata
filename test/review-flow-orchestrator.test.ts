@@ -539,6 +539,7 @@ describe("冻结证据多角色审题编排", () => {
     expect(submission(decision).improvements).toBe(commentSentinel);
     expect(Object.isFrozen(submission(decision))).toBe(true);
     expect(() => consumeReviewFlowSubmission(decision, {
+      taskSource: {},
       assignmentId: executionContext().assignmentId,
       problemContentHash: "b".repeat(64),
       problemRevision: 3,
@@ -547,6 +548,7 @@ describe("冻结证据多角色审题编排", () => {
       accuracyEvidenceFingerprint: "f".repeat(64)
     })).toThrow("REVIEW_FLOW_SUBMISSION_FORBIDDEN");
     expect(() => consumeReviewFlowSubmission({} as ReviewFlowDecision, {
+      taskSource: {},
       assignmentId: executionContext().assignmentId,
       problemContentHash: "b".repeat(64),
       problemRevision: 3,
@@ -574,6 +576,7 @@ describe("冻结证据多角色审题编排", () => {
       expectedRound: 2,
       tagCatalogVersion: 7,
       taskProvenanceHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      anklangEvidenceExpiresAt: null,
       engineBuildFingerprint: "c".repeat(64),
       accuracyEvidenceFingerprint: null,
       runId: executionContext().runId,

@@ -13,6 +13,7 @@ const otherContentHash = "b".repeat(64);
 const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
 const statementMarker = "SYNTHETIC_STATEMENT_MARKER";
 const solutionMarker = "SYNTHETIC_SOLUTION_MARKER";
+const observedNow = new Date("2026-08-02T10:30:00.000Z");
 
 function completeAnklangV2Data(): Record<string, unknown> {
   return {
@@ -105,7 +106,7 @@ function completeTask(): RobotReviewTask {
         summary: "合成查重结果。",
         data: completeAnklangV2Data(),
         contentHash: problemContentHash,
-        expiresAt: "2099-08-02T10:00:01.000Z",
+        expiresAt: null,
         createdAt: "2026-08-02T10:00:01.000Z"
       },
       {
@@ -127,9 +128,10 @@ function completeTask(): RobotReviewTask {
   };
 }
 
-function build(task: unknown = completeTask()) {
+function build(task: unknown = completeTask(), now: Date = observedNow) {
   return buildReviewFlowTaskSource(task, {
-    duplicateSimilarityRejectThreshold: 0.9
+    duplicateSimilarityRejectThreshold: 0.9,
+    now: () => new Date(now.getTime())
   });
 }
 
@@ -204,7 +206,7 @@ describe("robot review task 到可信审题 source 的严格适配", () => {
       reviewItemSource: "anklang",
       sourcePluginId: "org.ustc.urmotiv.anklang",
       reviewItemVisibility: "author",
-      reviewItemExpiresAt: "2099-08-02T10:00:01.000Z",
+      reviewItemExpiresAt: null,
       reportedBlockSubmission: true,
       deterministicConfirmationAllowed: true
     });
@@ -258,7 +260,7 @@ describe("robot review task 到可信审题 source 的严格适配", () => {
     expectFailure(ambiguous, "REVIEW_FLOW_TASK_ANKLANG_ITEM_AMBIGUOUS");
   });
 
-  it("伪造来源或已经过期的 Anklang 条目都 fail closed", () => {
+  it("伪造来源 fail closed；无复用期限的 no-store 条目保持有效", () => {
     const forgedSource = completeTask();
     forgedSource.reviewItems[0]!.source = "plugin";
     expectFailure(forgedSource, "REVIEW_FLOW_TASK_ANKLANG_SOURCE_UNTRUSTED");
@@ -267,13 +269,57 @@ describe("robot review task 到可信审题 source 的严格适配", () => {
     forgedPlugin.reviewItems[0]!.sourcePluginId = "org.example.forged";
     expectFailure(forgedPlugin, "REVIEW_FLOW_TASK_INVALID");
 
-    const expired = completeTask();
-    expired.reviewItems[0]!.expiresAt = "2000-08-02T10:00:01.000Z";
-    expectFailure(expired, "REVIEW_FLOW_TASK_ANKLANG_ITEM_EXPIRED");
-
     const withoutExpiry = completeTask();
     withoutExpiry.reviewItems[0]!.expiresAt = null;
     expect(build(withoutExpiry).provenance.anklang.reviewItemExpiresAt).toBeNull();
+  });
+
+  it("可注入时钟严格拒绝 expiresAt 位于 now-1 或 now，并接受 now+1", () => {
+    const expiryOffsets = [-1, 0, 1] as const;
+    for (const offsetMs of expiryOffsets) {
+      const task = completeTask();
+      const expiresAt = new Date(observedNow.getTime() + offsetMs).toISOString();
+      const data = completeAnklangV2Data();
+      data.reuse = { policy: "allowed", expiresAt };
+      task.reviewItems[0]!.data = data;
+      task.reviewItems[0]!.expiresAt = expiresAt;
+
+      if (offsetMs <= 0) {
+        expectFailure(task, "REVIEW_FLOW_TASK_ANKLANG_ITEM_EXPIRED");
+      } else {
+        expect(build(task).provenance.anklang.reviewItemExpiresAt).toBe(expiresAt);
+      }
+    }
+  });
+
+  it("认证条目的 expiresAt 必须与 allowed reuse 完全一致，no-store 则必须为 null", () => {
+    const allowedExpiry = "2026-08-02T10:31:00.000Z";
+
+    const missingItemExpiry = completeTask();
+    const missingItemExpiryData = completeAnklangV2Data();
+    missingItemExpiryData.reuse = { policy: "allowed", expiresAt: allowedExpiry };
+    missingItemExpiry.reviewItems[0]!.data = missingItemExpiryData;
+    expectFailure(
+      missingItemExpiry,
+      "REVIEW_FLOW_TASK_ANKLANG_EXPIRY_MISMATCH"
+    );
+
+    const differentExpiry = completeTask();
+    const differentExpiryData = completeAnklangV2Data();
+    differentExpiryData.reuse = { policy: "allowed", expiresAt: allowedExpiry };
+    differentExpiry.reviewItems[0]!.data = differentExpiryData;
+    differentExpiry.reviewItems[0]!.expiresAt = "2026-08-02T10:32:00.000Z";
+    expectFailure(
+      differentExpiry,
+      "REVIEW_FLOW_TASK_ANKLANG_EXPIRY_MISMATCH"
+    );
+
+    const noStoreWithExpiry = completeTask();
+    noStoreWithExpiry.reviewItems[0]!.expiresAt = allowedExpiry;
+    expectFailure(
+      noStoreWithExpiry,
+      "REVIEW_FLOW_TASK_ANKLANG_EXPIRY_MISMATCH"
+    );
   });
 
   it("同类型旧版、畸形 v2 和不完整 v2 都 fail closed", () => {

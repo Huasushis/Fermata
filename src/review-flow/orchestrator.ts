@@ -174,6 +174,7 @@ export interface ReviewFlowSafeRunBinding {
   readonly expectedRound: number;
   readonly tagCatalogVersion: number;
   readonly taskProvenanceHash: string | null;
+  readonly anklangEvidenceExpiresAt: string | null;
   readonly engineBuildFingerprint: string | null;
   readonly accuracyEvidenceFingerprint: string | null;
   readonly runId: string | null;
@@ -221,7 +222,11 @@ export type ReviewFlowOutcome =
 const privateArtifacts = new WeakMap<ReviewFlowDecision, ReviewFlowArtifacts>();
 const privateSubmissions = new WeakMap<
   ReviewFlowDecision,
-  { readonly review: ReviewInput; consumed: boolean }
+  {
+    readonly review: ReviewInput;
+    readonly taskSource: ReviewFlowTaskSourceResult | null;
+    consumed: boolean;
+  }
 >();
 
 /**
@@ -256,6 +261,8 @@ export function inspectReviewFlowSubmissionForTest(
 }
 
 export interface ReviewFlowSubmissionExpectation {
+  /** 必须是本次运行实际使用、且仍带进程内品牌的原始 task source。 */
+  readonly taskSource: unknown;
   readonly assignmentId: string;
   readonly problemContentHash: string;
   readonly problemRevision: number;
@@ -273,16 +280,40 @@ export function consumeReviewFlowSubmission(
   expected: ReviewFlowSubmissionExpectation
 ): ReviewInput {
   const submission = privateSubmissions.get(decision);
+  const taskSource = isBuiltReviewFlowTaskSourceResult(expected.taskSource)
+    ? expected.taskSource
+    : null;
+  const sourceSnapshotHash = taskSource === null
+    ? null
+    : hashCanonicalValue(taskSource);
+  const taskProvenanceHash = taskSource === null
+    ? null
+    : hashCanonicalValue(taskSource.provenance);
+  const evidenceExpiresAt = submission === undefined
+    ? null
+    : decision.runBinding.anklangEvidenceExpiresAt;
   if (
     submission === undefined ||
     submission.consumed ||
+    taskSource === null ||
+    submission.taskSource !== taskSource ||
     !decision.executionEligible ||
+    decision.sourceSnapshotHash !== sourceSnapshotHash ||
+    decision.runBinding.taskProvenanceHash !== taskProvenanceHash ||
+    taskSource.provenance.anklang.reviewItemExpiresAt !== evidenceExpiresAt ||
+    (evidenceExpiresAt !== null && Date.parse(evidenceExpiresAt) <= Date.now()) ||
     decision.runBinding.assignmentId !== expected.assignmentId ||
     decision.runBinding.problemContentHash !== expected.problemContentHash ||
     decision.runBinding.problemRevision !== expected.problemRevision ||
     decision.runBinding.expectedRound !== expected.expectedRound ||
     decision.runBinding.tagCatalogVersion !== expected.tagCatalogVersion ||
+    decision.runBinding.accuracyEvidenceFingerprint !== expected.accuracyEvidenceFingerprint ||
     decision.accuracyEvidenceFingerprint !== expected.accuracyEvidenceFingerprint ||
+    taskSource.taskBinding.assignmentId !== expected.assignmentId ||
+    taskSource.taskBinding.problemContentHash !== expected.problemContentHash ||
+    taskSource.taskBinding.problemRevision !== expected.problemRevision ||
+    taskSource.taskBinding.expectedRound !== expected.expectedRound ||
+    taskSource.taskBinding.tagCatalogVersion !== expected.tagCatalogVersion ||
     hashCanonicalValue(submission.review) !== decision.submissionHash
   ) {
     throw new Error("REVIEW_FLOW_SUBMISSION_FORBIDDEN");
@@ -420,6 +451,8 @@ async function runReviewEvidenceFlowTracked(
     taskProvenanceHash: taskSource === null
       ? null
       : hashCanonicalValue(taskSource.provenance),
+    anklangEvidenceExpiresAt:
+      taskSource?.provenance.anklang.reviewItemExpiresAt ?? null,
     engineBuildFingerprint: resolvedRunner.trustedRunner?.engineBuildFingerprint ?? null,
     accuracyEvidenceFingerprint:
       resolvedRunner.trustedRunner?.accuracyEvidenceFingerprint ?? null,
@@ -712,7 +745,7 @@ async function runReviewEvidenceFlowTracked(
     })
   });
   privateArtifacts.set(decision, artifacts);
-  privateSubmissions.set(decision, { review, consumed: false });
+  privateSubmissions.set(decision, { review, taskSource, consumed: false });
   return decision;
 }
 
