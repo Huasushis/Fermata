@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../src/config";
+import type {
+  ProductionReviewGrant,
+  ProductionReviewGrantClaims
+} from "../src/production-eligibility";
 import { ReviewerWorker, type ReviewerWorkerOptions } from "../src/reviewer";
 import { SettingsConflictError, type SettingsStoreLike } from "../src/settings-store";
 import {
@@ -8,6 +12,143 @@ import {
   type UrmotivClientLike
 } from "../src/urmotiv-client";
 import type { FermataPublicSettings, RobotReviewTask } from "../src/urmotiv-schemas";
+
+const productionGrantState = vi.hoisted(() => ({
+  claims: new WeakMap<object, ProductionReviewGrantClaims>()
+}));
+
+vi.mock("../src/production-eligibility", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/production-eligibility")>();
+  return {
+    ...actual,
+    inspectProductionReviewGrant: (candidate: unknown, expected: {
+      readonly profileName: string;
+      readonly experimentVersion: string;
+    }) => {
+      if (typeof candidate !== "object" || candidate === null) return null;
+      const claims = productionGrantState.claims.get(candidate);
+      return claims?.profileName === expected.profileName &&
+        claims.experimentVersion === expected.experimentVersion
+        ? claims
+        : null;
+    }
+  };
+});
+
+// ReviewerWorker 本身只装配正式 reviewFlow。续租/交付测试在模块边界替换整个
+// 证据引擎，模拟五个有界异步阶段；旧生产流水线不再进入 ReviewerWorker 源码。
+vi.mock("../src/review-flow/llm-roles", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/review-flow/llm-roles")>();
+  return {
+    ...actual,
+    createReviewFlowLlmBundle: (input: { readonly models: unknown }) => ({
+      reviewerTestModels: input.models
+    })
+  };
+});
+
+vi.mock("../src/review-flow/orchestrator", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/review-flow/orchestrator")>();
+  const submissions = new WeakMap<object, unknown>();
+  const readPayload = async (
+    model: { readonly runtime: { readonly fetch?: (input: string, init?: RequestInit) => Promise<Response>; readonly signal?: AbortSignal } }
+  ): Promise<Record<string, unknown>> => {
+    const fetch = model.runtime.fetch;
+    if (fetch === undefined) throw new Error("REVIEWER_TEST_FETCH_MISSING");
+    const signal = model.runtime.signal;
+    const cancelled = (): Error => Object.assign(new Error("合成请求已取消。"), {
+      code: "LLM_CANCELLED"
+    });
+    if (signal?.aborted === true) throw cancelled();
+    let removeAbortListener = (): void => undefined;
+    const responsePromise = fetch("https://review-flow.test/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+      signal
+    });
+    const response = signal === undefined
+      ? await responsePromise
+      : await Promise.race([
+          responsePromise,
+          new Promise<never>((_resolve, reject) => {
+            const onAbort = (): void => reject(cancelled());
+            signal.addEventListener("abort", onAbort, { once: true });
+            removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+          })
+        ]).finally(removeAbortListener);
+    if (!response.ok) {
+      throw Object.assign(new Error("合成模型状态失败。"), {
+        code: "LLM_HTTP_ERROR",
+        status: response.status
+      });
+    }
+    const raw = await response.json() as {
+      readonly choices?: readonly {
+        readonly message?: { readonly content?: unknown };
+      }[];
+    };
+    const content = raw.choices?.[0]?.message?.content;
+    if (typeof content !== "string") throw new Error("REVIEWER_TEST_RESPONSE_INVALID");
+    return JSON.parse(content) as Record<string, unknown>;
+  };
+  return {
+    ...actual,
+    consumeReviewFlowSubmission: (decision: object) => {
+      const review = submissions.get(decision);
+      if (review === undefined) throw new Error("REVIEWER_TEST_SUBMISSION_UNAVAILABLE");
+      submissions.delete(decision);
+      return review;
+    },
+    runReviewEvidenceFlowOutcome: async (input: {
+      readonly taskSource: { readonly source: { readonly expectedRound: number } };
+      readonly trustedRunner: {
+        readonly reviewerTestModels: Record<string, {
+          readonly runtime: {
+            readonly fetch?: (input: string, init?: RequestInit) => Promise<Response>;
+            readonly signal?: AbortSignal;
+          };
+        }>;
+      };
+    }) => {
+      const models = input.trustedRunner.reviewerTestModels;
+      const firstStage = await Promise.allSettled([
+        readPayload(models.solver!),
+        readPayload(models.difficulty!),
+        readPayload(models.tags!)
+      ]);
+      const failed = firstStage.find(
+        (entry): entry is PromiseRejectedResult => entry.status === "rejected"
+      );
+      if (failed !== undefined) throw failed.reason;
+      await readPayload(models.critic!);
+      const payload = await readPayload(models.adjudicator!);
+      const review = {
+        verdict: payload.verdict === "reject" ? "reject" : "approve",
+        codeforcesDifficulty: typeof payload.rating === "number" ? payload.rating : 1500,
+        qualityLevel: 3,
+        originalityLevel: 3,
+        thinkingLevel: 3,
+        codingLevel: 3,
+        tagIds: ["dp"],
+        improvements: "合成测试改进建议。",
+        publicComment: "",
+        privateNote: "",
+        expectedRound: input.taskSource.source.expectedRound
+      } as const;
+      const decision = {
+        executionEligible: true,
+        decisionId: "d".repeat(64),
+        policyHash: "e".repeat(64),
+        evidenceIds: Array.from({ length: 11 }, (_, index) => `ev-${String(index).padStart(32, "0")}`)
+      };
+      submissions.set(decision, review);
+      return {
+        status: "complete" as const,
+        decision
+      };
+    }
+  };
+});
 
 function createFakeSettingsStore(initial: FermataPublicSettings): SettingsStoreLike {
   let revision = 1;
@@ -41,7 +182,20 @@ const appConfig: AppConfig = {
           analyst: { provider: "aether", model: "m", temperature: 0.1, thinking: false }
         },
         coding: { provider: "aether", model: "m", temperature: 0.3, thinking: false },
-        verdict: { provider: "aether", model: "m", temperature: 0.1, thinking: false }
+        verdict: { provider: "aether", model: "m", temperature: 0.1, thinking: false },
+        reviewFlow: {
+          solver: { provider: "aether", model: "m", temperature: 0.1, thinking: false },
+          solutionAnalyst: { provider: "aether", model: "m", temperature: 0.1, thinking: false },
+          technicalAuditor: { provider: "aether", model: "m", temperature: 0.1, thinking: false },
+          difficulty: { provider: "aether", model: "m", temperature: 0.1, thinking: false },
+          editorialJudge: { provider: "aether", model: "m", temperature: 0.1, thinking: false },
+          contestFit: { provider: "aether", model: "m", temperature: 0.1, thinking: false },
+          originality: { provider: "aether", model: "m", temperature: 0.1, thinking: false },
+          tags: { provider: "aether", model: "m", temperature: 0.1, thinking: false },
+          critic: { provider: "aether", model: "m", temperature: 0.1, thinking: false },
+          adversary: { provider: "aether", model: "m", temperature: 0.1, thinking: false },
+          adjudicator: { provider: "aether", model: "m", temperature: 0.1, thinking: false }
+        }
       }
     },
     retry: { maxAttempts: 1, baseDelayMs: 1 },
@@ -56,7 +210,27 @@ const appConfig: AppConfig = {
   }
 };
 
+function completeAnklangV2Data(contentHash: string): Record<string, unknown> {
+  return {
+    apiVersion: "2",
+    contentHash,
+    checkedAt: "2026-07-26T00:00:00.000Z",
+    completion: {
+      status: "complete",
+      reasonCode: "complete",
+      retryable: false
+    },
+    candidates: [],
+    recommendation: {
+      blockSubmission: false,
+      message: "完整检索未发现候选。"
+    },
+    reuse: { policy: "no-store" }
+  };
+}
+
 function sampleTask(assignmentId: string): RobotReviewTask {
+  const contentHash = "a".repeat(64);
   return {
     assignmentId,
     leaseExpiresAt: "2026-07-26T00:05:00.000Z",
@@ -64,7 +238,7 @@ function sampleTask(assignmentId: string): RobotReviewTask {
       id: "problem-1",
       revision: 3,
       reviewRound: 1,
-      contentHash: "a".repeat(64),
+      contentHash,
       title: "样例题目",
       type: "traditional",
       tagIds: ["dp"],
@@ -94,7 +268,18 @@ function sampleTask(assignmentId: string): RobotReviewTask {
         active: true
       }]
     },
-    reviewItems: []
+    reviewItems: [{
+      id: "synthetic-anklang-v2",
+      type: "org.ustc.urmotiv.anklang.similarity",
+      source: "anklang",
+      sourcePluginId: "org.ustc.urmotiv.anklang",
+      visibility: "reviewer",
+      summary: "合成完整查重摘要",
+      contentHash,
+      expiresAt: null,
+      createdAt: "2026-07-26T00:00:00.000Z",
+      data: completeAnklangV2Data(contentHash)
+    }]
   };
 }
 
@@ -177,11 +362,19 @@ function createFakeUrmotivClient(requestTimeoutMs = 30_000): FakeUrmotivClient {
 }
 
 function createReviewer(options: ReviewerWorkerOptions): ReviewerWorker {
+  const grant = Object.freeze({}) as ProductionReviewGrant;
+  productionGrantState.claims.set(grant, {
+    profileName: "test-profile",
+    experimentVersion: "exp-test",
+    expectedRunnerIdentity: "b".repeat(64),
+    engineBuildFingerprint: "c".repeat(64),
+    evidenceFingerprint: "a".repeat(64)
+  });
   return new ReviewerWorker({
     ...options,
     productionEligibility: options.productionEligibility ?? (() => ({
       eligible: true,
-      evidenceFingerprint: "a".repeat(64)
+      grant
     }))
   });
 }
@@ -238,6 +431,35 @@ describe("ReviewerWorker：基本轮询与处理", () => {
         experimentVersion: "exp-test"
       })
     );
+    expect(worker.getStatus().activeTasks).toBe(0);
+  });
+
+  it("正式任务路径先经过严格任务源；缺少 Anklang 完整证据时不调用模型或提交", async () => {
+    const client = createFakeUrmotivClient();
+    const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
+    const task = sampleTask(assignmentId);
+    task.reviewItems = [];
+    client.claimMock.mockResolvedValueOnce({ items: [task] });
+    const settingsStore = createFakeSettingsStore({
+      enabled: true,
+      pollingIntervalSeconds: 30,
+      maximumConcurrentTasks: 1,
+      modelProfileName: "test-profile",
+      experimentVersion: "exp-test"
+    });
+    const fetchMock = vi.fn(async () => llmSuccessResponse());
+    worker = createReviewer({
+      urmotivClient: client,
+      settingsStore,
+      appConfig,
+      anchors: [],
+      fetch: fetchMock
+    });
+    worker.start();
+    await flushAsync(100);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(client.completeMock).not.toHaveBeenCalled();
     expect(worker.getStatus().activeTasks).toBe(0);
   });
 
@@ -309,6 +531,19 @@ describe("ReviewerWorker：基本轮询与处理", () => {
     const client = createFakeUrmotivClient();
     const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
     const task = sampleTask(assignmentId);
+    const anklangData = completeAnklangV2Data(task.problem.contentHash);
+    anklangData.candidates = [{
+      source: "public-index",
+      externalId: "synthetic-duplicate",
+      title: "合成公开候选",
+      similarity: 0.95,
+      sameProblemSuggestion: true,
+      explanation: "合成查重证据。"
+    }];
+    anklangData.recommendation = {
+      blockSubmission: true,
+      message: "建议人工复核候选。"
+    };
     client.claimMock.mockResolvedValueOnce({
       items: [
         {
@@ -317,9 +552,13 @@ describe("ReviewerWorker：基本轮询与处理", () => {
             {
               id: "3fa85f64-5717-4562-b3fc-2c963f66afa7",
               type: "org.ustc.urmotiv.anklang.similarity",
+              source: "anklang",
+              sourcePluginId: "org.ustc.urmotiv.anklang",
+              visibility: "reviewer",
               summary: "合成查重记录",
-              data: { similarity: 0.95 },
+              data: anklangData,
               contentHash: task.problem.contentHash,
+              expiresAt: null,
               createdAt: "2026-07-26T00:00:00.000Z"
             }
           ]
@@ -416,6 +655,31 @@ describe("ReviewerWorker：基本轮询与处理", () => {
     });
     // 故意不用测试 helper 注入合格证据；生产门遗漏装配时也必须 fail-closed。
     worker = new ReviewerWorker({ urmotivClient: client, settingsStore, appConfig, anchors: [] });
+    worker.start();
+    await flushAsync();
+
+    expect(client.claimMock).not.toHaveBeenCalled();
+  });
+
+  it("注入手写 eligible=true 与同形 grant 也不能领取任务", async () => {
+    const client = createFakeUrmotivClient();
+    const settingsStore = createFakeSettingsStore({
+      enabled: true,
+      pollingIntervalSeconds: 30,
+      maximumConcurrentTasks: 2,
+      modelProfileName: "test-profile",
+      experimentVersion: "exp-test"
+    });
+    worker = new ReviewerWorker({
+      urmotivClient: client,
+      settingsStore,
+      appConfig,
+      anchors: [],
+      productionEligibility: () => ({
+        eligible: true,
+        grant: Object.freeze({}) as ProductionReviewGrant
+      })
+    });
     worker.start();
     await flushAsync();
 

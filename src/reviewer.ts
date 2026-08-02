@@ -1,15 +1,16 @@
 /**
- * 主循环：定时轮询 claim -> 对每个任务并发跑三条难度流水线 -> 跑 verdict 流水线
- * 综合成一份 review -> complete；每个任务独立续租；单个任务失败不影响其它任务和
- * 下一轮轮询；wake() 可以跳过当前等待立即触发一轮轮询；stop() 优雅停机。
+ * 主循环：定时轮询 claim -> 严格构造完整题目快照 -> 跑 11 个相互隔离并带
+ * EOF receipt 的审题角色 -> 只有完整且绑定生产准确性证据时才 complete。每个任务
+ * 独立续租；单个任务失败不影响其它任务和下一轮轮询；wake() 可以跳过当前等待
+ * 立即触发一轮轮询；stop() 优雅停机。
  *
  * "现在生效的设置"（enabled/pollingIntervalSeconds/maximumConcurrentTasks/
  * modelProfileName/experimentVersion）都从 SettingsStore 实时读取，不在构造时
  * 固定下来——这样通过管理端口改了设置之后，下一轮轮询（或者调用 wake() 之后）
  * 马上生效，不需要重启进程。
  *
- * 难度/思维/代码三条流水线互相没有数据依赖（都只需要题面+题解本身），所以并发
- * 跑；verdict 流水线需要三者的结果，放在它们都完成之后单独跑。
+ * 历史的难度/思维/代码/verdict 路径不再由 worker 引用；离线实验可独立使用
+ * 旧模块，但生产构建没有切回旧审题流程的开关。
  */
 import { randomUUID } from "node:crypto";
 import {
@@ -21,16 +22,15 @@ import {
 } from "./config";
 import type { FetchLike } from "./llm";
 import { logError, logInfo, logWarn } from "./logger";
-import { runCodingPipeline } from "./pipelines/coding";
-import { runDifficultyPipeline, type DifficultyAnchor } from "./pipelines/difficulty";
+import type { DifficultyAnchor } from "./pipelines/difficulty";
 import type { PipelineModelConfig } from "./pipelines/types";
-import { runThinkingPipeline } from "./pipelines/thinking";
-import { runVerdictPipeline } from "./pipelines/verdict";
 import type { SettingsStoreLike } from "./settings-store";
 import { resolveReviewerActivation } from "./reviewer-activation";
 import {
   productionEligibilityBlocked,
-  type ProductionEligibilityDecision
+  type ProductionEligibilityDecision,
+  type ProductionReviewGrant,
+  type ProductionReviewGrantClaims
 } from "./production-eligibility";
 import {
   isAuthenticationError,
@@ -43,8 +43,19 @@ import {
   type RenewRobotReviewTaskRequest,
   type UrmotivClientLike
 } from "./urmotiv-client";
-import type { ClaimRobotReviewTasksResponse, RobotReviewTask } from "./urmotiv-schemas";
-import { toLegacyPipelineProblem } from "./review-task-input";
+import type {
+  ClaimRobotReviewTasksResponse,
+  RobotReviewTask
+} from "./urmotiv-schemas";
+import {
+  consumeReviewFlowSubmission,
+  runReviewEvidenceFlowOutcome
+} from "./review-flow/orchestrator";
+import {
+  createReviewFlowLlmBundle,
+  type ReviewFlowModelConfigs
+} from "./review-flow/llm-roles";
+import { buildReviewFlowTaskSource } from "./review-flow/task-source";
 
 export interface ReviewerStatus {
   readonly workerRunning: boolean;
@@ -241,7 +252,14 @@ export class ReviewerWorker {
     }
 
     for (const task of claimed.items) {
-      const promise = this.processTask(task, settings.modelProfileName, settings.experimentVersion, profile).finally(
+      const promise = this.processTask(
+        task,
+        settings.modelProfileName,
+        settings.experimentVersion,
+        profile,
+        activation.productionGrant,
+        activation.productionClaims
+      ).finally(
         () => {
           this.#taskPromises.delete(task.assignmentId);
         }
@@ -254,7 +272,9 @@ export class ReviewerWorker {
     task: RobotReviewTask,
     modelProfileName: string,
     experimentVersion: string,
-    profile: ProfileConfig
+    profile: ProfileConfig,
+    productionGrant: ProductionReviewGrant,
+    productionClaims: ProductionReviewGrantClaims
   ): Promise<void> {
     const inFlight: InFlightTask = {
       assignmentId: task.assignmentId,
@@ -270,76 +290,58 @@ export class ReviewerWorker {
 
     try {
       logInfo("开始处理审题任务", { problemId: task.problem.id, revision: task.problem.revision });
-      const pipelineProblem = toLegacyPipelineProblem(task.problem);
-
-      const [difficultyResult, thinkingResult, codingResult] =
-        await Promise.allSettled([
-          runDifficultyPipeline({
-            problem: pipelineProblem,
-            anchors: this.#anchors,
-            model: this.resolveModelConfig(
-              profile.difficulty,
-              inFlight.abortController.signal
-            )
-          }),
-          runThinkingPipeline({
-            problem: pipelineProblem,
-            solverModel: this.resolveModelConfig(
-              profile.thinking.solver,
-              inFlight.abortController.signal
-            ),
-            analystModel: this.resolveModelConfig(
-              profile.thinking.analyst,
-              inFlight.abortController.signal
-            )
-          }),
-          runCodingPipeline({
-            problem: pipelineProblem,
-            model: this.resolveModelConfig(
-              profile.coding,
-              inFlight.abortController.signal
-            )
-          })
-        ]);
-
-      // 三条付费请求会并发运行。一条先失败时，另外两条不会因此自动停止；
-      // 必须等它们都落地后再清理续租，避免任务被重新领取后重复付费。
-      if (difficultyResult.status === "rejected") {
-        throw difficultyResult.reason;
-      }
-      if (thinkingResult.status === "rejected") {
-        throw thinkingResult.reason;
-      }
-      if (codingResult.status === "rejected") {
-        throw codingResult.reason;
-      }
-      const difficulty = difficultyResult.value;
-      const thinking = thinkingResult.value;
-      const coding = codingResult.value;
-
-      if (inFlight.abandoned) {
-        logWarn("三条难度流水线跑完时任务已经被判定放弃，不再提交", { problemId: task.problem.id });
+      const taskSource = buildReviewFlowTaskSource(task, {
+        duplicateSimilarityRejectThreshold:
+          this.#appConfig.models.thresholds.duplicateSimilarityReject
+      });
+      const trustedRunner = createReviewFlowLlmBundle({
+        models: this.resolveReviewFlowModelConfigs(
+          profile,
+          inFlight.abortController.signal
+        ),
+        difficultyAnchors: this.#anchors,
+        profileName: modelProfileName,
+        experimentVersion,
+        engineBuildFingerprint: productionClaims.engineBuildFingerprint,
+        productionGrant
+      });
+      const outcome = await runReviewEvidenceFlowOutcome({
+        taskSource,
+        trustedRunner,
+        executionContext: {
+          schemaVersion: 1,
+          runId: randomUUID(),
+          assignmentId: task.assignmentId,
+          expectedRound: task.problem.reviewRound
+        }
+      });
+      if (outcome.status === "incomplete") {
+        logWarn("审题证据工作流不完整，不提交审核意见", {
+          problemId: task.problem.id,
+          failureId: outcome.failure.failureId,
+          failureKind: outcome.failure.failureKind,
+          failedRoles: outcome.failure.failedRoles
+            .map((failure) => failure.role)
+            .join(","),
+          transportAttemptCount: outcome.failure.failedRoles.reduce(
+            (sum, failure) => sum + failure.transportAttemptCount,
+            0
+          )
+        });
         return;
       }
-
-      const {
-        review,
-        forcedDuplicateReject,
-        duplicateSimilarityRejectThreshold
-      } = await runVerdictPipeline({
-        problem: pipelineProblem,
-        reviewItems: task.reviewItems,
-        difficulty,
-        thinking,
-        coding,
-        expectedRound: task.problem.reviewRound,
-        duplicateSimilarityRejectThreshold:
-          this.#appConfig.models.thresholds.duplicateSimilarityReject,
-        model: this.resolveModelConfig(
-          profile.verdict,
-          inFlight.abortController.signal
-        )
-      });
+      if (!outcome.decision.executionEligible) {
+        logWarn("审题结果没有同时绑定生产传输与准确性证据，不提交审核意见", {
+          problemId: task.problem.id,
+          decisionId: outcome.decision.decisionId
+        });
+        return;
+      }
+      const completionLog: Readonly<Record<string, string | number | boolean>> = {
+        decisionId: outcome.decision.decisionId,
+        policyHash: outcome.decision.policyHash,
+        evidenceCount: outcome.decision.evidenceIds.length
+      };
 
       if (inFlight.abandoned) {
         logWarn("综合流水线跑完时任务已经被判定放弃，不再提交", { problemId: task.problem.id });
@@ -354,6 +356,15 @@ export class ReviewerWorker {
         return;
       }
 
+      const review = consumeReviewFlowSubmission(outcome.decision, {
+        assignmentId: task.assignmentId,
+        problemContentHash: task.problem.contentHash,
+        problemRevision: task.problem.revision,
+        expectedRound: task.problem.reviewRound,
+        tagCatalogVersion: task.tagCatalog.version,
+        accuracyEvidenceFingerprint: productionClaims.evidenceFingerprint
+      });
+
       const completion = await this.#urmotivClient.complete(task.assignmentId, {
         requestId: randomUUID(),
         expectedLeaseExpiresAt: inFlight.leaseExpiresAt,
@@ -367,8 +378,7 @@ export class ReviewerWorker {
       logInfo("完成审题任务", {
         problemId: task.problem.id,
         problemStatus: completion.problemStatus,
-        forcedDuplicateReject,
-        duplicateSimilarityRejectThreshold
+        ...completionLog
       });
     } catch (error) {
       if (!inFlight.abandoned) {
@@ -378,6 +388,26 @@ export class ReviewerWorker {
       this.clearRenewal(inFlight);
       this.#inFlight.delete(task.assignmentId);
     }
+  }
+
+  private resolveReviewFlowModelConfigs(
+    profile: ProfileConfig,
+    signal: AbortSignal
+  ): ReviewFlowModelConfigs {
+    const specs = profile.reviewFlow;
+    return {
+      solver: this.resolveModelConfig(specs.solver, signal),
+      solution_analyst: this.resolveModelConfig(specs.solutionAnalyst, signal),
+      technical_auditor: this.resolveModelConfig(specs.technicalAuditor, signal),
+      difficulty: this.resolveModelConfig(specs.difficulty, signal),
+      editorial_judge: this.resolveModelConfig(specs.editorialJudge, signal),
+      contest_fit: this.resolveModelConfig(specs.contestFit, signal),
+      originality: this.resolveModelConfig(specs.originality, signal),
+      tags: this.resolveModelConfig(specs.tags, signal),
+      critic: this.resolveModelConfig(specs.critic, signal),
+      adversary: this.resolveModelConfig(specs.adversary, signal),
+      adjudicator: this.resolveModelConfig(specs.adjudicator, signal)
+    };
   }
 
   private logTaskFailure(task: RobotReviewTask, error: unknown): void {
