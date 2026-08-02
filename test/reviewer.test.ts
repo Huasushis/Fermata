@@ -24,11 +24,17 @@ vi.mock("../src/production-eligibility", async (importOriginal) => {
     inspectProductionReviewGrant: (candidate: unknown, expected: {
       readonly profileName: string;
       readonly experimentVersion: string;
+      readonly expectedRunnerIdentity?: string;
+      readonly engineBuildFingerprint?: string;
     }) => {
       if (typeof candidate !== "object" || candidate === null) return null;
       const claims = productionGrantState.claims.get(candidate);
       return claims?.profileName === expected.profileName &&
-        claims.experimentVersion === expected.experimentVersion
+        claims.experimentVersion === expected.experimentVersion &&
+        (expected.expectedRunnerIdentity === undefined ||
+          claims.expectedRunnerIdentity === expected.expectedRunnerIdentity) &&
+        (expected.engineBuildFingerprint === undefined ||
+          claims.engineBuildFingerprint === expected.engineBuildFingerprint)
         ? claims
         : null;
     }
@@ -36,11 +42,62 @@ vi.mock("../src/production-eligibility", async (importOriginal) => {
 });
 
 // ReviewerWorker 本身只装配正式 reviewFlow。续租/交付测试在模块边界替换整个
-// 证据引擎，模拟五个有界异步阶段；旧生产流水线不再进入 ReviewerWorker 源码。
+// 证据引擎，模拟五个有界异步阶段；预检 mock 仍严格核对 11 槽与 runner/build，
+// 但允许这些测试注入 fetch。真实工厂拒绝 injected fetch 的规则由 llm-role 测试覆盖。
+// 旧生产流水线不再进入 ReviewerWorker 源码。
 vi.mock("../src/review-flow/llm-roles", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/review-flow/llm-roles")>();
   return {
     ...actual,
+    preflightReviewFlowProductionGrant: (input: {
+      readonly models: Record<string, {
+        readonly spec?: { readonly provider?: unknown };
+        readonly credentials?: { readonly baseUrl?: unknown; readonly apiKey?: unknown };
+        readonly runtime?: { readonly fetch?: unknown };
+      }>;
+      readonly difficultyAnchors: readonly unknown[];
+      readonly profileName: string;
+      readonly experimentVersion: string;
+      readonly engineBuildFingerprint: string;
+      readonly productionGrant: unknown;
+    }) => {
+      if (typeof input.productionGrant !== "object" || input.productionGrant === null) {
+        return null;
+      }
+      const claims = productionGrantState.claims.get(input.productionGrant);
+      const expectedRoles = [
+        "solver",
+        "solution_analyst",
+        "technical_auditor",
+        "difficulty",
+        "editorial_judge",
+        "contest_fit",
+        "originality",
+        "tags",
+        "critic",
+        "adversary",
+        "adjudicator"
+      ];
+      const exactElevenSlots = Object.keys(input.models).sort().join(",") ===
+        [...expectedRoles].sort().join(",") && expectedRoles.every((role) => {
+          const model = input.models[role];
+          return model?.spec?.provider === "aether" &&
+            model.credentials?.baseUrl === "https://llm.example.test/v1" &&
+            model.credentials.apiKey === "sk-test" &&
+            model.runtime !== undefined;
+        });
+      const currentBuild = "c".repeat(64);
+      const expectedRunnerIdentity = input.engineBuildFingerprint === currentBuild &&
+        exactElevenSlots && input.difficultyAnchors.length === 0
+        ? "b".repeat(64)
+        : "f".repeat(64);
+      return claims?.profileName === input.profileName &&
+        claims.experimentVersion === input.experimentVersion &&
+        claims.engineBuildFingerprint === input.engineBuildFingerprint &&
+        claims.expectedRunnerIdentity === expectedRunnerIdentity
+        ? claims
+        : null;
+    },
     createReviewFlowLlmBundle: (input: { readonly models: unknown }) => ({
       reviewerTestModels: input.models
     })
@@ -787,6 +844,56 @@ describe("ReviewerWorker：基本轮询与处理", () => {
     await flushAsync();
 
     expect(client.claimMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      name: "runner 身份已过期",
+      expectedRunnerIdentity: "d".repeat(64),
+      engineBuildFingerprint: "c".repeat(64)
+    },
+    {
+      name: "构建摘要与 runner 身份不一致",
+      expectedRunnerIdentity: "b".repeat(64),
+      engineBuildFingerprint: "d".repeat(64)
+    }
+  ])("$name 时在 claim 前拒绝且模型请求为零", async ({
+    expectedRunnerIdentity,
+    engineBuildFingerprint
+  }) => {
+    const client = createFakeUrmotivClient();
+    const fetchMock = vi.fn(async () => llmSuccessResponse());
+    const settingsStore = createFakeSettingsStore({
+      enabled: true,
+      pollingIntervalSeconds: 30,
+      maximumConcurrentTasks: 2,
+      modelProfileName: "test-profile",
+      experimentVersion: "exp-test"
+    });
+    const grant = Object.freeze({}) as ProductionReviewGrant;
+    productionGrantState.claims.set(grant, {
+      profileName: "test-profile",
+      experimentVersion: "exp-test",
+      expectedRunnerIdentity,
+      engineBuildFingerprint,
+      evidenceFingerprint: "a".repeat(64)
+    });
+    worker = new ReviewerWorker({
+      urmotivClient: client,
+      settingsStore,
+      appConfig,
+      anchors: [],
+      fetch: fetchMock,
+      productionEligibility: () => ({ eligible: true, grant })
+    });
+
+    worker.start();
+    await flushAsync();
+
+    expect(client.claimMock).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(client.renewMock).not.toHaveBeenCalled();
+    expect(client.completeMock).not.toHaveBeenCalled();
   });
 
   it("注入手写 eligible=true 与同形 grant 也不能领取任务", async () => {

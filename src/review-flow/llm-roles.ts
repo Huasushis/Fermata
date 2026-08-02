@@ -9,7 +9,8 @@ import type { DifficultyAnchor } from "../pipelines/difficulty";
 import type { PipelineModelConfig } from "../pipelines/types";
 import {
   inspectProductionReviewGrant,
-  type ProductionReviewGrant
+  type ProductionReviewGrant,
+  type ProductionReviewGrantClaims
 } from "../production-eligibility";
 import { deepFreeze, hashCanonicalValue } from "./evidence";
 import {
@@ -82,6 +83,27 @@ export interface ReviewFlowLlmBundle {
   readonly accuracyEvidenceFingerprint: string | null;
 }
 
+interface ReviewFlowRunnerDescriptor {
+  readonly models: ReviewFlowModelConfigs;
+  readonly difficultyAnchors: readonly DifficultyAnchor[];
+  readonly identities: Readonly<Record<ReviewFlowRole, RoleIdentity>>;
+  readonly runnerIdentity: string;
+  readonly engineBuildFingerprint: string;
+  readonly transportMode: "production_undici" | "injected_fetch";
+}
+
+interface ReviewFlowRunnerDescriptorInput {
+  readonly models: ReviewFlowModelConfigs;
+  readonly difficultyAnchors: readonly DifficultyAnchor[];
+  readonly engineBuildFingerprint: string;
+}
+
+interface ReviewFlowProductionGrantInput extends ReviewFlowRunnerDescriptorInput {
+  readonly profileName: string;
+  readonly experimentVersion: string;
+  readonly productionGrant: ProductionReviewGrant;
+}
+
 const trustedLlmBundles = new WeakSet<object>();
 const productionEligibleLlmBundles = new WeakSet<object>();
 
@@ -100,6 +122,18 @@ export function isProductionEligibleReviewFlowLlmBundle(
 }
 
 /**
+ * 在领取 Urmotiv 任务前，用与正式 bundle 完全相同的模型快照和 runner 身份算法
+ * 验证生产 grant。返回 null 表示 runner、构建、传输或 grant 任一绑定不匹配；
+ * 本函数不创建角色、不发送模型请求，也不提供任何 grant 签发入口。
+ */
+export function preflightReviewFlowProductionGrant(
+  input: ReviewFlowProductionGrantInput
+): ProductionReviewGrantClaims | null {
+  const descriptor = resolveReviewFlowRunnerDescriptor(input);
+  return inspectGrantForRunner(input, descriptor);
+}
+
+/**
  * 创建完整的多角色 LLM 工作流。每个角色都有独立模型槽位、上下文视图和多段
  * 提示词；调用方不能用一条综合提示词替代这些证据边界。
  */
@@ -113,10 +147,15 @@ export function createReviewFlowLlmBundle(input: {
   /** 只有源证据 verifier 签发的不透明能力才能使 bundle 具备生产资格。 */
   readonly productionGrant: ProductionReviewGrant | null;
 }): ReviewFlowLlmBundle {
-  const models = captureModelConfigs(input.models);
-  const anchors = validateAnchors(input.difficultyAnchors);
-  const engineBuildFingerprint = digestSchema.parse(input.engineBuildFingerprint);
-  const identities = buildRoleIdentities(models, anchors);
+  const descriptor = resolveReviewFlowRunnerDescriptor(input);
+  const {
+    models,
+    difficultyAnchors: anchors,
+    identities,
+    runnerIdentity,
+    engineBuildFingerprint,
+    transportMode
+  } = descriptor;
 
   const roles: ReviewFlowRoles = {
     solver: async (view) => {
@@ -224,26 +263,16 @@ export function createReviewFlowLlmBundle(input: {
     )
   };
 
-  const transportMode = reviewFlowRoleSchema.options.every(
-    (role) => models[role].runtime.fetch === undefined
-  )
-    ? "production_undici" as const
-    : "injected_fetch" as const;
-  const runnerIdentity = hashCanonicalValue({
-    runnerVersion: "review-flow-llm-runner-v3-build-bound",
-    llmTransportProtocolVersion,
-    engineBuildFingerprint,
-    identities,
-    transportMode
-  });
   const productionClaims = input.productionGrant === null
     ? null
-    : inspectProductionReviewGrant(input.productionGrant, {
-        profileName: input.profileName,
-        experimentVersion: input.experimentVersion,
-        expectedRunnerIdentity: runnerIdentity,
-        engineBuildFingerprint
-      });
+    : inspectGrantForRunner(
+        {
+          profileName: input.profileName,
+          experimentVersion: input.experimentVersion,
+          productionGrant: input.productionGrant
+        },
+        descriptor
+      );
   if (
     input.productionGrant !== null &&
     (productionClaims === null || transportMode !== "production_undici")
@@ -262,6 +291,51 @@ export function createReviewFlowLlmBundle(input: {
   trustedLlmBundles.add(bundle);
   if (productionClaims !== null) productionEligibleLlmBundles.add(bundle);
   return bundle;
+}
+
+function resolveReviewFlowRunnerDescriptor(
+  input: ReviewFlowRunnerDescriptorInput
+): ReviewFlowRunnerDescriptor {
+  const models = captureModelConfigs(input.models);
+  const difficultyAnchors = deepFreeze(validateAnchors(input.difficultyAnchors));
+  const engineBuildFingerprint = digestSchema.parse(input.engineBuildFingerprint);
+  const identities = buildRoleIdentities(models, difficultyAnchors);
+  const transportMode = reviewFlowRoleSchema.options.every(
+    (role) => models[role].runtime.fetch === undefined
+  )
+    ? "production_undici" as const
+    : "injected_fetch" as const;
+  const runnerIdentity = hashCanonicalValue({
+    runnerVersion: "review-flow-llm-runner-v3-build-bound",
+    llmTransportProtocolVersion,
+    engineBuildFingerprint,
+    identities,
+    transportMode
+  });
+  return Object.freeze({
+    models,
+    difficultyAnchors,
+    identities,
+    runnerIdentity,
+    engineBuildFingerprint,
+    transportMode
+  });
+}
+
+function inspectGrantForRunner(
+  input: Pick<
+    ReviewFlowProductionGrantInput,
+    "profileName" | "experimentVersion" | "productionGrant"
+  >,
+  descriptor: ReviewFlowRunnerDescriptor
+): ProductionReviewGrantClaims | null {
+  if (descriptor.transportMode !== "production_undici") return null;
+  return inspectProductionReviewGrant(input.productionGrant, {
+    profileName: input.profileName,
+    experimentVersion: input.experimentVersion,
+    expectedRunnerIdentity: descriptor.runnerIdentity,
+    engineBuildFingerprint: descriptor.engineBuildFingerprint
+  });
 }
 
 function captureModelConfigs(models: ReviewFlowModelConfigs): ReviewFlowModelConfigs {

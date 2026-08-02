@@ -53,6 +53,7 @@ import {
 } from "./review-flow/orchestrator";
 import {
   createReviewFlowLlmBundle,
+  preflightReviewFlowProductionGrant,
   type ReviewFlowModelConfigs
 } from "./review-flow/llm-roles";
 import { buildReviewFlowTaskSource } from "./review-flow/task-source";
@@ -236,6 +237,29 @@ export class ReviewerWorker {
       return;
     }
 
+    // activation 只证明 grant 属于当前 profile/version；在真正领取私有任务前，
+    // 还必须用本进程实际装配的 11 个模型槽位、凭据、anchors、传输模式和构建
+    // 摘要重算 runner 身份并完整验真。预检不创建角色，也不会发出模型请求。
+    let productionClaims: ProductionReviewGrantClaims | null = null;
+    try {
+      productionClaims = preflightReviewFlowProductionGrant({
+        models: this.resolveReviewFlowModelConfigs(profile),
+        difficultyAnchors: this.#anchors,
+        profileName: settings.modelProfileName,
+        experimentVersion: settings.experimentVersion,
+        engineBuildFingerprint: activation.productionClaims.engineBuildFingerprint,
+        productionGrant: activation.productionGrant
+      });
+    } catch {
+      // 配置或构建摘要不满足 runner 身份契约时同样 fail-closed；错误细节可能
+      // 含 provider 配置，不能写进日志。
+      productionClaims = null;
+    }
+    if (productionClaims === null) {
+      logWarn("生产资格证据与当前审题 runner 不匹配，拒绝领取任务");
+      return;
+    }
+
     let claimed: ClaimRobotReviewTasksResponse;
     try {
       claimed = await this.#urmotivClient.claim({
@@ -279,7 +303,7 @@ export class ReviewerWorker {
         settings.experimentVersion,
         profile,
         activation.productionGrant,
-        activation.productionClaims
+        productionClaims
       ).finally(
         () => {
           // 只清理自己登记的 promise；即使以后启动策略变化，也不能让旧任务的
@@ -422,7 +446,7 @@ export class ReviewerWorker {
 
   private resolveReviewFlowModelConfigs(
     profile: ProfileConfig,
-    signal: AbortSignal
+    signal?: AbortSignal
   ): ReviewFlowModelConfigs {
     const specs = profile.reviewFlow;
     return {
@@ -470,7 +494,7 @@ export class ReviewerWorker {
 
   private resolveModelConfig(
     spec: ModelSpec,
-    signal: AbortSignal
+    signal?: AbortSignal
   ): PipelineModelConfig {
     const credentials = getProviderCredentials(this.#appConfig, spec.provider);
     if (credentials === undefined) {
