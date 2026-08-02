@@ -5,9 +5,44 @@ import {
   getProviderCredentials,
   loadConfig,
   missingProvidersForProfile,
-  providersUsedByProfile
+  providersUsedByProfile,
+  reviewFlowModelRoleNames
 } from "../src/config";
 import { currentBlockedProductionExperimentVersion } from "../src/production-eligibility";
+
+type ReviewFlowModelRole = (typeof reviewFlowModelRoleNames)[number];
+
+interface TestModelSlot {
+  readonly provider: "aether" | "dashscope";
+  readonly model: string;
+}
+
+function reviewFlowRoleYaml(role: ReviewFlowModelRole, slot: TestModelSlot): string {
+  return [
+    `      ${role}:`,
+    `        provider: ${slot.provider}`,
+    `        model: ${slot.model}`,
+    "        temperature: 0.1",
+    "        thinking: false"
+  ].join("\n");
+}
+
+function reviewFlowYaml(input: {
+  readonly provider?: "aether" | "dashscope";
+  readonly model?: string;
+  readonly overrides?: Partial<Record<ReviewFlowModelRole, TestModelSlot>>;
+} = {}): string {
+  const defaultSlot: TestModelSlot = {
+    provider: input.provider ?? "aether",
+    model: input.model ?? "claude-sonnet-5"
+  };
+  return [
+    "    reviewFlow:",
+    ...reviewFlowModelRoleNames.map((role) =>
+      reviewFlowRoleYaml(role, input.overrides?.[role] ?? defaultSlot)
+    )
+  ].join("\n");
+}
 
 const validYaml = `
 experimentVersion: "exp-test"
@@ -45,6 +80,9 @@ profiles:
       model: qwen-max
       temperature: 0.1
       thinking: false
+${reviewFlowYaml({
+  overrides: { adjudicator: { provider: "dashscope", model: "qwen-max" } }
+})}
 retry:
   maxAttempts: 3
   baseDelayMs: 500
@@ -58,6 +96,34 @@ codeforces:
 thresholds:
   duplicateSimilarityReject: 0.9
 `;
+
+function yamlWithOnlyReviewFlowRoleUsingDashscope(
+  role: ReviewFlowModelRole
+): string {
+  const aetherSlot = { provider: "aether" as const, model: "claude-sonnet-5" };
+  const dashscopeSlot = { provider: "dashscope" as const, model: "qwen-max" };
+  return validYaml
+    .replace(
+      `    verdict:
+      provider: dashscope
+      model: qwen-max
+      temperature: 0.1
+      thinking: false`,
+      `    verdict:
+      provider: aether
+      model: claude-sonnet-5
+      temperature: 0.1
+      thinking: false`
+    )
+    .replace(
+      reviewFlowRoleYaml("adjudicator", dashscopeSlot),
+      reviewFlowRoleYaml("adjudicator", aetherSlot)
+    )
+    .replace(
+      reviewFlowRoleYaml(role, aetherSlot),
+      reviewFlowRoleYaml(role, dashscopeSlot)
+    );
+}
 
 const validEnv = {
   URMOTIV_BASE_URL: "https://urmotiv.example.test",
@@ -94,6 +160,10 @@ describe("loadConfig：正常路径", () => {
       thinkingRequest: "enabled",
       reasoningEffort: "low"
     });
+    expect(config.models.profiles["test-profile"]?.reviewFlow.adjudicator).toMatchObject({
+      provider: "dashscope",
+      model: "qwen-max"
+    });
   });
 
   it("CODEFORCES_KEY/SECRET 都留空时 codeforces 为 null（可选凭据）", () => {
@@ -108,11 +178,11 @@ describe("loadConfig：正常路径", () => {
     expect(config.server.port).toBe(8720);
   });
 
-  it("正式 YAML 登记 provider /v1 的 Candidate C flash 档位", () => {
+  it("正式 YAML 登记多角色历史审核标准与 EOF receipt 版本", () => {
     const source = readFileSync(new URL("../config/models.yaml", import.meta.url), "utf8");
     const config = loadConfig({ env: validEnv, modelsYamlSource: source });
     expect(config.models.experimentVersion).toBe(
-      "experiment-2026-08-difficulty-candidate-c-provider-v1-post-done-shape-v7"
+      "experiment-2026-08-review-flow-historical-rubric-v1-eof-receipt-v2"
     );
     expect(config.models.experimentVersion).toBe(currentBlockedProductionExperimentVersion);
     expect(config.models.profiles["review-balanced"]?.difficulty).toEqual({
@@ -122,6 +192,9 @@ describe("loadConfig：正常路径", () => {
       thinking: false,
       thinkingRequest: "disabled"
     });
+    expect(
+      Object.keys(config.models.profiles["review-balanced"]!.reviewFlow).sort()
+    ).toEqual([...reviewFlowModelRoleNames].sort());
     expect(config.models.retry).toEqual({ maxAttempts: 3, baseDelayMs: 500 });
     expect(config.models.timeouts).toMatchObject({
       llmFirstOutputMs: 1_800_000,
@@ -166,9 +239,14 @@ describe("loadConfig：必需项缺失或格式错误时快速失败", () => {
     expect(() => loadConfig({ env: rest, modelsYamlSource: validYaml })).toThrow(ConfigError);
   });
 
-  it("默认模型档位引用的 provider 没有配置密钥时抛出 ConfigError", () => {
+  it("只有 reviewFlow 槽引用的 provider 缺少密钥时也抛出 ConfigError", () => {
     const { DASHSCOPE_BASE_URL, DASHSCOPE_API_KEY, ...rest } = validEnv;
-    expect(() => loadConfig({ env: rest, modelsYamlSource: validYaml })).toThrow(ConfigError);
+    const roleOnlyDashscope = yamlWithOnlyReviewFlowRoleUsingDashscope(
+      "adjudicator"
+    );
+    expect(() => loadConfig({ env: rest, modelsYamlSource: roleOnlyDashscope })).toThrow(
+      ConfigError
+    );
   });
 
   it("YAML 结构不合法（缺字段）时抛出 ConfigError", () => {
@@ -186,6 +264,41 @@ profiles:
       temperature: 0.2
 `;
     expect(() => loadConfig({ env: validEnv, modelsYamlSource: brokenYaml })).toThrow(ConfigError);
+  });
+
+  it.each(reviewFlowModelRoleNames)(
+    "reviewFlow 缺少必填角色槽 %s 时抛出 ConfigError",
+    (role) => {
+      const slot = role === "adjudicator"
+        ? { provider: "dashscope" as const, model: "qwen-max" }
+        : { provider: "aether" as const, model: "claude-sonnet-5" };
+      const withoutRole = validYaml.replace(
+        `${reviewFlowRoleYaml(role, slot)}\n`,
+        ""
+      );
+      expect(withoutRole).not.toBe(validYaml);
+      expect(() => loadConfig({
+        env: validEnv,
+        modelsYamlSource: withoutRole
+      })).toThrow(ConfigError);
+    }
+  );
+
+  it("reviewFlow 出现未登记的综合/未知角色槽时抛出 ConfigError", () => {
+    const withUnknownRole = validYaml.replace(
+      "    reviewFlow:\n",
+      `    reviewFlow:
+      combinedReviewer:
+        provider: aether
+        model: claude-sonnet-5
+        temperature: 0.1
+        thinking: false
+`
+    );
+    expect(() => loadConfig({
+      env: validEnv,
+      modelsYamlSource: withUnknownRole
+    })).toThrow(ConfigError);
   });
 
   it("thinkingRequest 可以留空，disabled 不携带 effort 时也合法", () => {
@@ -319,6 +432,26 @@ describe("provider 辅助函数", () => {
     expect(providers).toEqual(["aether", "dashscope"]);
   });
 
+  it.each(reviewFlowModelRoleNames)(
+    "providersUsedByProfile 会纳入只由 reviewFlow.%s 使用的 provider",
+    (role) => {
+      const roleOnlyDashscope = yamlWithOnlyReviewFlowRoleUsingDashscope(role);
+      const config = loadConfig({ env: validEnv, modelsYamlSource: roleOnlyDashscope });
+      const profile = config.models.profiles["test-profile"]!;
+      expect(providersUsedByProfile(profile).sort()).toEqual([
+        "aether",
+        "dashscope"
+      ]);
+      const configWithoutDashscope = {
+        ...config,
+        providers: { aether: config.providers.aether! }
+      };
+      expect(missingProvidersForProfile(configWithoutDashscope, profile)).toEqual([
+        "dashscope"
+      ]);
+    }
+  );
+
   it("missingProvidersForProfile 在全部配置齐全时返回空数组", () => {
     const config = loadConfig({ env: validEnv, modelsYamlSource: validYaml });
     const profile = config.models.profiles["test-profile"];
@@ -371,6 +504,7 @@ profiles:
       model: claude-sonnet-5
       temperature: 0.1
       thinking: false
+${reviewFlowYaml()}
   only-dashscope-profile:
     difficulty:
       provider: dashscope
@@ -398,6 +532,7 @@ profiles:
       model: qwen-max
       temperature: 0.1
       thinking: false
+${reviewFlowYaml({ provider: "dashscope", model: "qwen-max" })}
 retry:
   maxAttempts: 3
   baseDelayMs: 500

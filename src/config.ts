@@ -134,6 +134,39 @@ export const modelSpecSchema = z
   });
 export type ModelSpec = z.infer<typeof modelSpecSchema>;
 
+export const reviewFlowModelRoleNames = [
+  "solver",
+  "solutionAnalyst",
+  "technicalAuditor",
+  "difficulty",
+  "editorialJudge",
+  "contestFit",
+  "originality",
+  "tags",
+  "critic",
+  "adversary",
+  "adjudicator"
+] as const;
+
+const reviewFlowModelConfigShape = {
+  solver: modelSpecSchema,
+  solutionAnalyst: modelSpecSchema,
+  technicalAuditor: modelSpecSchema,
+  difficulty: modelSpecSchema,
+  editorialJudge: modelSpecSchema,
+  contestFit: modelSpecSchema,
+  originality: modelSpecSchema,
+  tags: modelSpecSchema,
+  critic: modelSpecSchema,
+  adversary: modelSpecSchema,
+  adjudicator: modelSpecSchema
+} satisfies Record<(typeof reviewFlowModelRoleNames)[number], typeof modelSpecSchema>;
+
+export const reviewFlowModelConfigSchema = z
+  .object(reviewFlowModelConfigShape)
+  .strict();
+export type ReviewFlowModelConfig = z.infer<typeof reviewFlowModelConfigSchema>;
+
 export const profileConfigSchema = z
   .object({
     difficulty: modelSpecSchema,
@@ -144,7 +177,8 @@ export const profileConfigSchema = z
       })
       .strict(),
     coding: modelSpecSchema,
-    verdict: modelSpecSchema
+    verdict: modelSpecSchema,
+    reviewFlow: reviewFlowModelConfigSchema
   })
   .strict();
 export type ProfileConfig = z.infer<typeof profileConfigSchema>;
@@ -327,7 +361,10 @@ export function providersUsedByProfile(profile: ProfileConfig): ProviderName[] {
     profile.thinking.solver.provider,
     profile.thinking.analyst.provider,
     profile.coding.provider,
-    profile.verdict.provider
+    profile.verdict.provider,
+    ...reviewFlowModelRoleNames.map(
+      (role) => profile.reviewFlow[role].provider
+    )
   ]);
   return [...providers];
 }
