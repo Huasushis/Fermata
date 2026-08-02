@@ -34,9 +34,13 @@ function reviewItem(overrides: Partial<ReviewTaskItem>): ReviewTaskItem {
   return {
     id: "item-1",
     type: "anklang.duplicate_check",
+    source: "human",
+    sourcePluginId: null,
+    visibility: "reviewer",
     summary: "查重结果",
     data: undefined,
     contentHash: "a".repeat(64),
+    expiresAt: null,
     createdAt: "2026-07-26T00:00:00.000Z",
     ...overrides
   };

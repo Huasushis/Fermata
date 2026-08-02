@@ -575,6 +575,9 @@ export function buildFabricatedSimilarityItem(
   return {
     id: randomUUID(),
     type: "org.ustc.urmotiv.anklang.similarity",
+    source: "human",
+    sourcePluginId: null,
+    visibility: "reviewer",
     summary:
       `合成诊断记录：候选题《${problem.title}》与当前题的题面叙述、输入输出格式和数据范围均完全一致，` +
       `仅变量命名不同；最高相似度为 ${(similarity * 100).toFixed(1)}%，请独立判断是否同一道题。`,
@@ -599,6 +602,7 @@ export function buildFabricatedSimilarityItem(
       }
     },
     contentHash: problem.contentHash,
+    expiresAt: null,
     createdAt: timestamp
   };
 }
