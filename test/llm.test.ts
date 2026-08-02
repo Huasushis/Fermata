@@ -2,7 +2,10 @@ import { z } from "zod";
 import { describe, expect, it, vi } from "vitest";
 import {
   chatComplete,
+  chatCompleteWithReceipt,
   chatCompleteJson,
+  chatCompleteJsonWithReceipt,
+  getLlmFailureAudit,
   LlmJsonOutputError,
   LlmRequestError,
   LlmResponseBodyTooLargeError,
@@ -67,6 +70,32 @@ function strictUsageMetadataEvent(): Record<string, unknown> {
 }
 
 describe("chatComplete：正常路径", () => {
+  it("可信 receipt 只在完整响应后生成，并记录明确 429 后的真实 HTTP 尝试数", async () => {
+    let calls = 0;
+    const fetchMock = vi.fn(async () => {
+      calls += 1;
+      return calls === 1
+        ? new Response(null, { status: 429 })
+        : completionResponse("完整答案");
+    });
+    const result = await chatCompleteWithReceipt(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    });
+    expect(result).toEqual({
+      content: "完整答案",
+      reasoning: null,
+      receipt: {
+        schemaVersion: 2,
+        transportAttemptCount: 2,
+        eofVerified: true,
+        responseMode: "json",
+        finishReasonStopVerified: true,
+        sseDoneObserved: null
+      }
+    });
+  });
+
   it("请求正确的 URL、鉴权头，并解析 content 和 reasoning_content", async () => {
     const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       expect(String(url)).toBe("https://llm.example.test/v1/chat/completions");
@@ -83,6 +112,102 @@ describe("chatComplete：正常路径", () => {
     expect(result.content).toBe("这是回答");
     expect(result.reasoning).toBe("这是推理过程");
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("SSE receipt 区分 DONE 完整终止与仅 stop 后 EOF 的兼容响应", async () => {
+    const complete = await chatCompleteWithReceipt(provider, spec, [], {
+      ...runtime,
+      fetch: vi.fn(async () => new Response(stoppedSsePrefix(), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      }))
+    });
+    expect(complete.receipt).toMatchObject({
+      schemaVersion: 2,
+      responseMode: "sse",
+      eofVerified: true,
+      finishReasonStopVerified: true,
+      sseDoneObserved: true
+    });
+
+    const compatibleOnly = await chatCompleteWithReceipt(provider, spec, [], {
+      ...runtime,
+      fetch: vi.fn(async () => new Response(
+        'data: {"choices":[{"delta":{"content":"完整答案"},"finish_reason":"stop"}]}\n\n',
+        { status: 200, headers: { "Content-Type": "text/event-stream" } }
+      ))
+    });
+    expect(compatibleOnly.receipt.sseDoneObserved).toBe(false);
+  });
+
+  it("499 失败通过不可枚举安全审计保留尝试数，不保存服务商正文", async () => {
+    const privateBody = "PRIVATE_PROVIDER_BODY_SENTINEL";
+    let caught: unknown;
+    try {
+      await chatCompleteWithReceipt(provider, spec, [], {
+        ...runtime,
+        fetch: vi.fn(async () => new Response(privateBody, { status: 499 }))
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({ code: "LLM_HTTP_ERROR", status: 499 });
+    expect(getLlmFailureAudit(caught)).toEqual({
+      schemaVersion: 1,
+      requestCount: 1,
+      transportAttemptCount: 1,
+      completedResponses: [],
+      terminal: {
+        status: 499,
+        responseMode: null,
+        eofObserved: false,
+        finishReasonStopObserved: false,
+        sseDoneObserved: null
+      },
+      jsonSchemaValidated: null
+    });
+    expect(JSON.stringify(caught)).not.toContain(privateBody);
+  });
+
+  it("请求前已取消时 fetch=0 且 HTTP 尝试数也必须为 0", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const fetchMock = vi.fn(async () => completionResponse("不应调用"));
+    let caught: unknown;
+    try {
+      await chatCompleteWithReceipt(provider, spec, [], {
+        ...runtime,
+        signal: controller.signal,
+        fetch: fetchMock
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({ code: "LLM_CANCELLED" });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(getLlmFailureAudit(caught)?.transportAttemptCount).toBe(0);
+  });
+
+  it("首个 429 后在退避期取消，不会把未发出的第二次请求计入尝试数", async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.fn(async () => {
+      setTimeout(() => controller.abort(), 0);
+      return new Response(null, { status: 429 });
+    });
+    let caught: unknown;
+    try {
+      await chatCompleteWithReceipt(provider, spec, [], {
+        ...runtime,
+        baseDelayMs: 1_000,
+        signal: controller.signal,
+        fetch: fetchMock
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({ code: "LLM_CANCELLED" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(getLlmFailureAudit(caught)?.transportAttemptCount).toBe(1);
   });
 
   it("没有 reasoning_content 时 reasoning 为 null", async () => {
@@ -2965,6 +3090,47 @@ describe("chatComplete：响应结构异常", () => {
 const resultSchema = z.object({ rating: z.number().int() }).strict();
 
 describe("chatCompleteJson：结构化输出与一次修复重试", () => {
+  it("JSON receipt 绑定首轮/修复轮数、总 HTTP 尝试数和 schema 成功", async () => {
+    let calls = 0;
+    const fetchMock = vi.fn(async () => {
+      calls += 1;
+      return completionResponse(calls === 1 ? "不是 JSON" : '{"rating": 1500}');
+    });
+    const result = await chatCompleteJsonWithReceipt(
+      provider,
+      spec,
+      [],
+      resultSchema,
+      { ...runtime, fetch: fetchMock }
+    );
+    expect(result.data).toEqual({ rating: 1500 });
+    expect(result.receipt).toEqual({
+      schemaVersion: 2,
+      requestCount: 2,
+      transportAttemptCount: 2,
+      eofVerified: true,
+      jsonSchemaValidated: true,
+      responses: [
+        {
+          schemaVersion: 2,
+          transportAttemptCount: 1,
+          eofVerified: true,
+          responseMode: "json",
+          finishReasonStopVerified: true,
+          sseDoneObserved: null
+        },
+        {
+          schemaVersion: 2,
+          transportAttemptCount: 1,
+          eofVerified: true,
+          responseMode: "json",
+          finishReasonStopVerified: true,
+          sseDoneObserved: null
+        }
+      ]
+    });
+  });
+
   it("第一次就是合法 JSON 时直接返回", async () => {
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -2974,6 +3140,77 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
     const result = await chatCompleteJson(provider, spec, [], resultSchema, { ...runtime, fetch: fetchMock });
     expect(result.data).toEqual({ rating: 1500 });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("JSON 修复轮若收到 499，失败审计保留两轮与首轮完成证据", async () => {
+    let calls = 0;
+    let caught: unknown;
+    try {
+      await chatCompleteJsonWithReceipt(
+        provider,
+        spec,
+        [],
+        resultSchema,
+        {
+          ...runtime,
+          fetch: vi.fn(async () => {
+            calls += 1;
+            return calls === 1
+              ? completionResponse("不是 JSON")
+              : new Response(null, { status: 499 });
+          })
+        }
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({ code: "LLM_HTTP_ERROR", status: 499 });
+    expect(getLlmFailureAudit(caught)).toMatchObject({
+      schemaVersion: 1,
+      requestCount: 2,
+      transportAttemptCount: 2,
+      jsonSchemaValidated: false,
+      terminal: {
+        status: 499,
+        responseMode: null,
+        eofObserved: false
+      }
+    });
+    expect(getLlmFailureAudit(caught)?.completedResponses).toHaveLength(1);
+  });
+
+  it("结构化可信调用拒绝缺少 SSE DONE 的 stop+EOF，并保留真实终态", async () => {
+    let caught: unknown;
+    try {
+      await chatCompleteJsonWithReceipt(
+        provider,
+        spec,
+        [],
+        resultSchema,
+        {
+          ...runtime,
+          fetch: vi.fn(async () => new Response(
+            'data: {"choices":[{"delta":{"content":"{\\"rating\\":1500}"},"finish_reason":"stop"}]}\n\n',
+            { status: 200, headers: { "Content-Type": "text/event-stream" } }
+          ))
+        }
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({ code: "LLM_RESPONSE_FORMAT_INVALID" });
+    expect(getLlmFailureAudit(caught)).toMatchObject({
+      requestCount: 1,
+      transportAttemptCount: 1,
+      jsonSchemaValidated: false,
+      terminal: {
+        status: 200,
+        responseMode: "sse",
+        eofObserved: true,
+        finishReasonStopObserved: true,
+        sseDoneObserved: false
+      }
+    });
   });
 
   it("能从代码块里抠出 JSON", async () => {

@@ -33,6 +33,70 @@ export interface ChatCompletionResult {
   readonly reasoning: string | null;
 }
 
+/** 只记录安全的传输完成事实，不包含服务商正文、请求或响应标识。 */
+export type LlmResponseMode = "sse" | "json";
+
+export interface LlmTransportReceipt {
+  readonly schemaVersion: 2;
+  /** 同一逻辑请求中实际进行的 HTTP 尝试数；只有明确 429 才可能大于 1。 */
+  readonly transportAttemptCount: number;
+  /** 只有读到真实 HTTP 正文 EOF 并通过终止状态机后才会生成 receipt。 */
+  readonly eofVerified: true;
+  /** 区分真正的 SSE 流与兼容网关退回的单个 JSON 正文。 */
+  readonly responseMode: LlmResponseMode;
+  /** SSE 必须明确观察到 finish_reason=stop；JSON 回退也做同样校验。 */
+  readonly finishReasonStopVerified: true;
+  /** JSON 没有 `[DONE]`；SSE 则如实记录服务端是否发送了协议终止标记。 */
+  readonly sseDoneObserved: boolean | null;
+}
+
+export interface ChatCompletionWithReceipt extends ChatCompletionResult {
+  readonly receipt: LlmTransportReceipt;
+}
+
+export interface LlmJsonCompletionReceipt {
+  readonly schemaVersion: 2;
+  /** JSON 首轮成功为 1；触发唯一一次修复轮时为 2。 */
+  readonly requestCount: 1 | 2;
+  readonly transportAttemptCount: number;
+  readonly eofVerified: true;
+  readonly jsonSchemaValidated: true;
+  /** 每一轮生成各自的传输完成证据；长度必须等于 requestCount。 */
+  readonly responses:
+    | readonly [LlmTransportReceipt]
+    | readonly [LlmTransportReceipt, LlmTransportReceipt];
+}
+
+/**
+ * 失败路径的安全审计摘要。它只含协议状态与计数，绝不保存请求、题面、
+ * 响应正文、服务商错误说明或响应标识。WeakMap 绑定保证这些字段不会因
+ * 序列化 Error 意外进入普通日志。
+ */
+export interface LlmFailureAudit {
+  readonly schemaVersion: 1;
+  readonly requestCount: 1 | 2;
+  readonly transportAttemptCount: number;
+  readonly completedResponses: readonly LlmTransportReceipt[];
+  readonly terminal: {
+    readonly status: number | null;
+    readonly responseMode: LlmResponseMode | null;
+    readonly eofObserved: boolean;
+    readonly finishReasonStopObserved: boolean;
+    readonly sseDoneObserved: boolean | null;
+  };
+  /** null 表示尚未走到结构化 JSON 校验；false 表示校验未成功。 */
+  readonly jsonSchemaValidated: false | null;
+}
+
+const llmFailureAudits = new WeakMap<object, LlmFailureAudit>();
+
+export function getLlmFailureAudit(error: unknown): LlmFailureAudit | null {
+  if ((typeof error !== "object" && typeof error !== "function") || error === null) {
+    return null;
+  }
+  return llmFailureAudits.get(error) ?? null;
+}
+
 export interface ProviderCredentialsLike {
   readonly baseUrl: string;
   readonly apiKey: string;
@@ -89,6 +153,9 @@ export interface ChatCompletionJsonOptions {
 
 /** 模型响应正文的固定上限，按 UTF-8 原始字节计算。 */
 export const maximumLlmResponseBodyBytes = 4 * 1024 * 1024;
+/** 修改 EOF/终止状态机或 receipt 语义时必须显式递增并重新标定。 */
+export const llmTransportProtocolVersion =
+  "llm-stream-eof-v8-receipt-v2-failure-audit-v1" as const;
 const maximumLlmResponseChunks = 65_536;
 /** 显式输出 token 上限本身也必须有界，避免错误配置变成近似无限输出。 */
 export const maximumExplicitLlmOutputTokens = 131_072;
@@ -381,6 +448,24 @@ export async function chatComplete(
   runtime: LlmRuntimeOptions,
   options: ChatCompletionOptions = {}
 ): Promise<ChatCompletionResult> {
+  const { receipt: _receipt, ...result } = await chatCompleteWithReceipt(
+    provider,
+    spec,
+    messages,
+    runtime,
+    options
+  );
+  return result;
+}
+
+/** 与 chatComplete 相同，但额外返回只能在真实 EOF 后产生的安全 receipt。 */
+export async function chatCompleteWithReceipt(
+  provider: ProviderCredentialsLike,
+  spec: ModelCallSpec,
+  messages: ChatMessage[],
+  runtime: LlmRuntimeOptions,
+  options: ChatCompletionOptions = {}
+): Promise<ChatCompletionWithReceipt> {
   validateThinkingRequest(spec);
   const fetchImpl = runtime.fetch ?? productionLlmFetch;
   const url = new URL("chat/completions", ensureTrailingSlash(provider.baseUrl));
@@ -403,30 +488,68 @@ export async function chatComplete(
     body.max_tokens = validateMaxOutputTokens(options.maxOutputTokens);
   }
 
-  const response = await requestWithRetry(
-    fetchImpl,
-    url,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "text/event-stream, application/json",
-        Authorization: `Bearer ${provider.apiKey}`
+  const requestAudit = createMutableLlmRequestAudit();
+  let response: Awaited<ReturnType<typeof requestWithRetry>>;
+  try {
+    response = await requestWithRetry(
+      fetchImpl,
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream, application/json",
+          Authorization: `Bearer ${provider.apiKey}`
+        },
+        body: JSON.stringify(body)
       },
-      body: JSON.stringify(body)
-    },
-    runtime
-  );
+      runtime,
+      requestAudit
+    );
+  } catch (error) {
+    rememberLlmFailureAudit(error, {
+      requestCount: 1,
+      requestAudit,
+      jsonSchemaValidated: null
+    });
+    throw error;
+  }
 
   if (!response.ok) {
     // 服务商的 error.message 可能回显请求内容，不能放进异常或日志。
-    throw new LlmRequestError("LLM_HTTP_ERROR", response.status);
+    const error = new LlmRequestError("LLM_HTTP_ERROR", response.status);
+    rememberLlmFailureAudit(error, {
+      requestCount: 1,
+      requestAudit,
+      jsonSchemaValidated: null
+    });
+    throw error;
+  }
+  if (response.responseMode === null || !response.finishReasonStopVerified) {
+    const error = new LlmResponseFormatError("response_shape");
+    rememberLlmFailureAudit(error, {
+      requestCount: 1,
+      requestAudit,
+      jsonSchemaValidated: null
+    });
+    throw error;
   }
 
-  const result = extractChatCompletion(response.raw);
-  return spec.thinking
-    ? result
-    : { content: result.content, reasoning: null };
+  const extracted = extractChatCompletion(response.raw);
+  const result = spec.thinking
+    ? extracted
+    : { content: extracted.content, reasoning: null };
+  return {
+    ...result,
+    receipt: {
+      schemaVersion: 2,
+      transportAttemptCount: response.attemptCount,
+      eofVerified: true,
+      responseMode: response.responseMode,
+      finishReasonStopVerified: true,
+      sseDoneObserved: response.sseDoneObserved
+    }
+  };
 }
 
 /**
@@ -479,6 +602,26 @@ export async function chatCompleteJson<T>(
   runtime: LlmRuntimeOptions,
   options: ChatCompletionJsonOptions = {}
 ): Promise<{ data: T; reasoning: string | null }> {
+  const { receipt: _receipt, ...result } = await chatCompleteJsonWithReceipt(
+    provider,
+    spec,
+    messages,
+    schema,
+    runtime,
+    options
+  );
+  return result;
+}
+
+/** JSON 输出的可信变体；receipt 同时绑定修复轮数、HTTP 尝试数和 schema 成功。 */
+export async function chatCompleteJsonWithReceipt<T>(
+  provider: ProviderCredentialsLike,
+  spec: ModelCallSpec,
+  messages: ChatMessage[],
+  schema: z.ZodType<T>,
+  runtime: LlmRuntimeOptions,
+  options: ChatCompletionJsonOptions = {}
+): Promise<{ data: T; reasoning: string | null; receipt: LlmJsonCompletionReceipt }> {
   const jsonInstruction: ChatMessage = {
     role: "system",
     content: "只输出一个满足要求的 JSON 对象本身，不要输出任何解释、前后缀文字，也不要用 Markdown 代码块包裹。"
@@ -486,13 +629,31 @@ export async function chatCompleteJson<T>(
   const firstMessages: ChatMessage[] = [jsonInstruction, ...messages];
   // 当前接入的网关并不都正确支持 response_format。直接用提示词约束 JSON，
   // 避免先付费生成一次空 content，再为了探测兼容性重复发送完整题目。
-  const first = await chatComplete(provider, spec, firstMessages, runtime, {
-    requestJson: false,
-    maxOutputTokens: options.maxOutputTokens
-  });
+  let first: ChatCompletionWithReceipt;
+  try {
+    first = await chatCompleteWithReceipt(provider, spec, firstMessages, runtime, {
+      requestJson: false,
+      maxOutputTokens: options.maxOutputTokens
+    });
+    assertStructuredCompletionTransport(first.receipt);
+  } catch (error) {
+    promoteJsonFailureAudit(error, 1, [], 0);
+    throw error;
+  }
   const firstAttempt = tryParseAndValidate(first.content, schema);
   if (firstAttempt.success) {
-    return { data: firstAttempt.data, reasoning: first.reasoning };
+    return {
+      data: firstAttempt.data,
+      reasoning: first.reasoning,
+      receipt: {
+        schemaVersion: 2,
+        requestCount: 1,
+        transportAttemptCount: first.receipt.transportAttemptCount,
+        eofVerified: true,
+        jsonSchemaValidated: true,
+        responses: [first.receipt]
+      }
+    };
   }
 
   const repairMessages: ChatMessage[] = [
@@ -504,16 +665,48 @@ export async function chatCompleteJson<T>(
     }
   ];
   // 修复轮固定用纯提示词方式，避免再次踩到 response_format 的空内容问题。
-  const second = await chatComplete(provider, spec, repairMessages, runtime, {
-    requestJson: false,
-    maxOutputTokens: options.maxOutputTokens
-  });
+  let second: ChatCompletionWithReceipt;
+  try {
+    second = await chatCompleteWithReceipt(provider, spec, repairMessages, runtime, {
+      requestJson: false,
+      maxOutputTokens: options.maxOutputTokens
+    });
+    assertStructuredCompletionTransport(second.receipt);
+  } catch (error) {
+    promoteJsonFailureAudit(
+      error,
+      2,
+      [first.receipt],
+      first.receipt.transportAttemptCount
+    );
+    throw error;
+  }
   const secondAttempt = tryParseAndValidate(second.content, schema);
   if (secondAttempt.success) {
-    return { data: secondAttempt.data, reasoning: second.reasoning ?? first.reasoning };
+    return {
+      data: secondAttempt.data,
+      reasoning: second.reasoning ?? first.reasoning,
+      receipt: {
+        schemaVersion: 2,
+        requestCount: 2,
+        transportAttemptCount:
+          first.receipt.transportAttemptCount + second.receipt.transportAttemptCount,
+        eofVerified: true,
+        jsonSchemaValidated: true,
+        responses: [first.receipt, second.receipt]
+      }
+    };
   }
 
-  throw new LlmJsonOutputError();
+  const error = new LlmJsonOutputError();
+  rememberLlmFailureAudit(error, {
+    requestCount: 2,
+    requestAudit: mutableAuditFromReceipt(second.receipt),
+    completedResponses: [first.receipt, second.receipt],
+    priorTransportAttemptCount: first.receipt.transportAttemptCount,
+    jsonSchemaValidated: false
+  });
+  throw error;
 }
 
 // ---------------------------------------------------------------------------
@@ -559,16 +752,145 @@ function extractJsonObject(content: string): string | null {
   return null;
 }
 
+interface MutableLlmRequestAudit {
+  attemptCount: number;
+  status: number | null;
+  responseMode: LlmResponseMode | null;
+  eofObserved: boolean;
+  finishReasonStopObserved: boolean;
+  sseDoneObserved: boolean | null;
+}
+
+function createMutableLlmRequestAudit(): MutableLlmRequestAudit {
+  return {
+    attemptCount: 0,
+    status: null,
+    responseMode: null,
+    eofObserved: false,
+    finishReasonStopObserved: false,
+    sseDoneObserved: null
+  };
+}
+
+function resetMutableLlmRequestAuditForAttempt(
+  audit: MutableLlmRequestAudit
+): void {
+  audit.status = null;
+  audit.responseMode = null;
+  audit.eofObserved = false;
+  audit.finishReasonStopObserved = false;
+  audit.sseDoneObserved = null;
+}
+
+function rememberLlmFailureAudit(
+  error: unknown,
+  input: {
+    readonly requestCount: 1 | 2;
+    readonly requestAudit: MutableLlmRequestAudit;
+    readonly completedResponses?: readonly LlmTransportReceipt[];
+    readonly priorTransportAttemptCount?: number;
+    readonly jsonSchemaValidated: false | null;
+  }
+): void {
+  if ((typeof error !== "object" && typeof error !== "function") || error === null) {
+    return;
+  }
+  const completedResponses = (input.completedResponses ?? []).map((receipt) =>
+    Object.freeze({ ...receipt })
+  );
+  const terminal = Object.freeze({
+    status: input.requestAudit.status,
+    responseMode: input.requestAudit.responseMode,
+    eofObserved: input.requestAudit.eofObserved,
+    finishReasonStopObserved: input.requestAudit.finishReasonStopObserved,
+    sseDoneObserved: input.requestAudit.sseDoneObserved
+  });
+  llmFailureAudits.set(error, Object.freeze({
+    schemaVersion: 1,
+    requestCount: input.requestCount,
+    transportAttemptCount:
+      (input.priorTransportAttemptCount ?? 0) + input.requestAudit.attemptCount,
+    completedResponses: Object.freeze(completedResponses),
+    terminal,
+    jsonSchemaValidated: input.jsonSchemaValidated
+  }));
+}
+
+function mutableAuditFromReceipt(
+  receipt: LlmTransportReceipt
+): MutableLlmRequestAudit {
+  return {
+    attemptCount: receipt.transportAttemptCount,
+    status: 200,
+    responseMode: receipt.responseMode,
+    eofObserved: true,
+    finishReasonStopObserved: true,
+    sseDoneObserved: receipt.sseDoneObserved
+  };
+}
+
+function assertStructuredCompletionTransport(
+  receipt: LlmTransportReceipt
+): void {
+  if (receipt.responseMode !== "sse" || receipt.sseDoneObserved === true) return;
+  const error = new LlmResponseFormatError("response_shape");
+  rememberLlmFailureAudit(error, {
+    requestCount: 1,
+    requestAudit: mutableAuditFromReceipt(receipt),
+    jsonSchemaValidated: false
+  });
+  throw error;
+}
+
+function promoteJsonFailureAudit(
+  error: unknown,
+  requestCount: 1 | 2,
+  completedResponses: readonly LlmTransportReceipt[],
+  priorTransportAttemptCount: number
+): void {
+  const existing = getLlmFailureAudit(error);
+  if (existing === null) return;
+  rememberLlmFailureAudit(error, {
+    requestCount,
+    requestAudit: {
+      attemptCount:
+        existing.transportAttemptCount -
+        existing.completedResponses.reduce(
+          (sum, receipt) => sum + receipt.transportAttemptCount,
+          0
+        ),
+      status: existing.terminal.status,
+      responseMode: existing.terminal.responseMode,
+      eofObserved: existing.terminal.eofObserved,
+      finishReasonStopObserved: existing.terminal.finishReasonStopObserved,
+      sseDoneObserved: existing.terminal.sseDoneObserved
+    },
+    completedResponses,
+    priorTransportAttemptCount,
+    jsonSchemaValidated: false
+  });
+}
+
 async function requestWithRetry(
   fetchImpl: FetchLike,
   url: URL,
   init: RequestInit,
-  runtime: LlmRuntimeOptions
-): Promise<{ readonly ok: boolean; readonly status: number; readonly raw: unknown }> {
+  runtime: LlmRuntimeOptions,
+  audit: MutableLlmRequestAudit
+): Promise<{
+  readonly ok: boolean;
+  readonly status: number;
+  readonly raw: unknown;
+  readonly attemptCount: number;
+  readonly responseMode: LlmResponseMode | null;
+  readonly finishReasonStopVerified: boolean;
+  readonly sseDoneObserved: boolean | null;
+}> {
   const durations = resolveLlmRequestDurations(runtime);
   const deadline = Date.now() + durations.maximumDurationMs;
   let attempt = 1;
   for (;;) {
+    resetMutableLlmRequestAuditForAttempt(audit);
     if (runtime.signal?.aborted) {
       throw new LlmRequestError("LLM_CANCELLED");
     }
@@ -590,11 +912,15 @@ async function requestWithRetry(
     });
     let responseReceived = false;
     try {
+      // 只有真正跨过所有付费前检查并调用 fetch 时才计一次 HTTP 尝试。
+      // 请求前取消或 429 退避期间取消不能凭空多记一次。
+      audit.attemptCount += 1;
       const response = await waitForOrAbort(
         fetchImpl(url, { ...init, signal: controller.signal }),
         controller.signal
       );
       responseReceived = true;
+      audit.status = response.status;
       if (!response.ok) {
         cancelResponseBodyWithoutReading(response, controller);
         const timeoutError = watchdog.error();
@@ -605,10 +931,18 @@ async function requestWithRetry(
           throw new LlmRequestError("LLM_TOTAL_TIMEOUT");
         }
         if (response.status !== 429 || attempt >= runtime.maxAttempts) {
-          return { ok: false, status: response.status, raw: undefined };
+          return {
+            ok: false,
+            status: response.status,
+            raw: undefined,
+            attemptCount: audit.attemptCount,
+            responseMode: null,
+            finishReasonStopVerified: false,
+            sseDoneObserved: null
+          };
         }
       } else {
-        const raw = await parseResponseBody(response, controller, {
+        const parsed = await parseResponseBody(response, controller, {
           onValidOutput: () => {
             watchdog.receivedValidOutput();
           },
@@ -624,14 +958,22 @@ async function requestWithRetry(
           onInvalidResponseDrainActivity: () => {
             watchdog.receivedInvalidResponseDrainActivity();
           }
-        });
+        }, audit);
         const timeoutError = watchdog.error();
         if (timeoutError !== undefined) {
           throw timeoutError;
         }
         // 首个有效模型事件会清除绝对保护计时。正常持续输出后只看
         // 有效事件间的停顿，因此不能在这里再用初始 deadline 拒绝结果。
-        return { ok: true, status: response.status, raw };
+        return {
+          ok: true,
+          status: response.status,
+          raw: parsed.raw,
+          attemptCount: audit.attemptCount,
+          responseMode: parsed.responseMode,
+          finishReasonStopVerified: true,
+          sseDoneObserved: parsed.sseDoneObserved
+        };
       }
     } catch (error) {
       const timeoutError = watchdog.error();
@@ -972,11 +1314,18 @@ interface ResponseBodyActivityObserver {
   readonly onInvalidResponseDrainActivity: () => void;
 }
 
+interface ParsedResponseBody {
+  readonly raw: unknown;
+  readonly responseMode: LlmResponseMode;
+  readonly sseDoneObserved: boolean | null;
+}
+
 async function parseResponseBody(
   response: Response,
   requestController: AbortController,
-  observer: ResponseBodyActivityObserver
-): Promise<unknown> {
+  observer: ResponseBodyActivityObserver,
+  audit: MutableLlmRequestAudit
+): Promise<ParsedResponseBody> {
   if (response.body === null) {
     throw new LlmResponseFormatError("missing_body");
   }
@@ -986,12 +1335,22 @@ async function parseResponseBody(
     ?.trim()
     .toLowerCase();
   if (mediaType === "text/event-stream") {
-    return readChatCompletionEventStream(
+    audit.responseMode = "sse";
+    audit.sseDoneObserved = false;
+    const stream = await readChatCompletionEventStream(
       response,
       requestController,
-      observer
+      observer,
+      audit
     );
+    return {
+      raw: stream.raw,
+      responseMode: "sse",
+      sseDoneObserved: stream.sseDoneObserved
+    };
   }
+  audit.responseMode = "json";
+  audit.sseDoneObserved = null;
   if (
     mediaType !== undefined &&
     mediaType.length > 0 &&
@@ -1002,7 +1361,8 @@ async function parseResponseBody(
       response,
       requestController,
       observer,
-      new LlmResponseFormatError("content_type")
+      new LlmResponseFormatError("content_type"),
+      audit
     );
   }
   const text = await readResponseTextWithLimit(
@@ -1010,6 +1370,7 @@ async function parseResponseBody(
     requestController,
     observer
   );
+  audit.eofObserved = true;
   let raw: unknown;
   try {
     raw = JSON.parse(text) as unknown;
@@ -1020,8 +1381,13 @@ async function parseResponseBody(
   // 它必须明确 finish_reason=stop 且最终 content 非空白，然后才算
   // 收到有效模型输出。reasoning-only 不会被暗中升格为最终答案。
   extractChatCompletion(raw, true);
+  audit.finishReasonStopObserved = true;
   observer.onValidOutput();
-  return raw;
+  return {
+    raw,
+    responseMode: "json",
+    sseDoneObserved: null
+  };
 }
 
 async function readResponseTextWithLimit(
@@ -1097,7 +1463,8 @@ async function drainResponseAfterProtocolError(
   response: Response,
   requestController: AbortController,
   observer: ResponseBodyActivityObserver,
-  firstProtocolError: LlmResponseFormatError
+  firstProtocolError: LlmResponseFormatError,
+  audit: MutableLlmRequestAudit
 ): Promise<never> {
   if (response.body === null) throw firstProtocolError;
   const reader = response.body.getReader();
@@ -1119,6 +1486,7 @@ async function drainResponseAfterProtocolError(
       }
       if (chunk.done) {
         readerFinished = true;
+        audit.eofObserved = true;
         throw firstProtocolError;
       }
       totalBytes = addResponseChunkSize(
@@ -1498,8 +1866,9 @@ interface PostDonePendingDataScan {
 async function readChatCompletionEventStream(
   response: Response,
   requestController: AbortController,
-  observer: ResponseBodyActivityObserver
-): Promise<unknown> {
+  observer: ResponseBodyActivityObserver,
+  audit: MutableLlmRequestAudit
+): Promise<{ readonly raw: unknown; readonly sseDoneObserved: boolean }> {
   if (response.body === null) {
     throw new LlmResponseFormatError("missing_body");
   }
@@ -1527,6 +1896,8 @@ async function readChatCompletionEventStream(
       state,
       observer
     );
+    audit.sseDoneObserved = state.sawDone;
+    audit.finishReasonStopObserved = state.sawStop;
     resetPostDonePendingDataScan(postDonePendingDataScan, state);
     if (hasValidOutput) observer.onValidOutput();
   };
@@ -1561,6 +1932,9 @@ async function readChatCompletionEventStream(
       }
       if (chunk.done) {
         readerFinished = true;
+        audit.eofObserved = true;
+        audit.sseDoneObserved = state.sawDone;
+        audit.finishReasonStopObserved = state.sawStop;
         if (firstProtocolError !== undefined) {
           if (state.postDoneTailShape !== undefined) {
             throw new LlmResponseFormatError(
@@ -1607,7 +1981,7 @@ async function readChatCompletionEventStream(
         // 思考内容是辅助信息，不是最终回答。即使 thinking=true，
         // reasoning-only 或空白 content 也是不完整响应。
         extractChatCompletion(raw);
-        return raw;
+        return { raw, sseDoneObserved: state.sawDone };
       }
       if (
         (state.postDoneTailShape !== undefined ||
