@@ -1,10 +1,12 @@
 /**
  * 只读 Git 状态检查的固定执行边界。
  *
- * 正式仓库只提供经过校验的 HEAD、对象目录和工作树；稳定读取的索引会复制
- * 为临时 0400 文件，正式索引描述符绝不传给子进程。Git 进程看到的是本工具
- * 新建的 0700 临时元数据目录，因此不会读取正式仓库的 local config、include、
- * info/attributes 或其它可执行配置。
+ * 正式仓库只提供经过校验的 HEAD、对象目录、工作树和正式索引的逻辑条目。
+ * 状态检查使用的临时索引由受控 Git read-tree 重新生成，不继承正式索引的
+ * stat/fsmonitor cache；正式索引只复制成另一份 0400 source-index，供 write-tree
+ * 重建 staged tree 及只读 flags 查询。Git 进程看到的是本工具新建的 0700 临时
+ * 元数据目录，因此不会读取正式仓库的 local config、include、info/attributes
+ * 或其它可执行配置。
  */
 import { execFileSync } from "node:child_process";
 import {
@@ -643,12 +645,107 @@ function writeControlledFile(path, content, finalMode = 0o600) {
   }
 }
 
-function createControlledGitDirectory(codeVersion, indexBytes, temporaryRoot) {
+function executeControlledIndexCommand(
+  snapshot,
+  directory,
+  indexPath,
+  commandArguments
+) {
+  try {
+    return execFileSync(
+      trustedGitExecutable,
+      [
+        "--no-pager",
+        "--no-replace-objects",
+        `--git-dir=${directory}`,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-c",
+        "core.excludesFile=/dev/null",
+        "-c",
+        "core.untrackedCache=false",
+        "-c",
+        "core.splitIndex=false",
+        ...commandArguments
+      ],
+      {
+        cwd: snapshot.repository,
+        encoding: "buffer",
+        env: {
+          ...buildTrustedGitEnvironment(),
+          GIT_ALTERNATE_OBJECT_DIRECTORIES: "/proc/self/fd/3",
+          GIT_INDEX_FILE: indexPath,
+          GIT_OBJECT_DIRECTORY: join(directory, "objects")
+        },
+        maxBuffer: 1024 * 1024,
+        stdio: [
+          "ignore",
+          "pipe",
+          "pipe",
+          snapshot.objectsBinding.descriptor
+        ]
+      }
+    );
+  } catch {
+    failTrustedGit();
+  }
+}
+
+function rebuildControlledIndex(snapshot, directory) {
+  const sourceIndexPath = join(directory, "source-index");
+  const stagedIndexPath = join(directory, "staged-index");
+  const indexPath = join(directory, "index");
+  writeControlledFile(
+    sourceIndexPath,
+    snapshot.indexBinding.bytes,
+    0o400
+  );
+  // write-tree 可能为了 cache-tree extension 原子刷新 index；因此只让它改写
+  // 另一份可丢弃副本，source-index 始终保留正式 index 的精确只读字节。
+  writeControlledFile(
+    stagedIndexPath,
+    snapshot.indexBinding.bytes,
+    0o600
+  );
+
+  // 先从已绑定 HEAD 创建全新 index，确保不存在正式 index 的 stat cache。
+  executeControlledIndexCommand(
+    snapshot,
+    directory,
+    indexPath,
+    ["read-tree", snapshot.headBinding.codeVersion]
+  );
+  // source-index 只贡献 staged 的逻辑 mode/OID/path；write-tree 不读工作树、
+  // 不执行 clean/process filter。再 read-tree 该 tree 会重新把所有 stat 清零。
+  const stagedTree = decodeUtf8(executeControlledIndexCommand(
+    snapshot,
+    directory,
+    stagedIndexPath,
+    ["write-tree"]
+  )).trim();
+  if (!commitPattern.test(stagedTree)) failTrustedGit();
+  rmSync(stagedIndexPath, { force: false });
+  executeControlledIndexCommand(
+    snapshot,
+    directory,
+    indexPath,
+    ["read-tree", stagedTree]
+  );
+  chmodSync(indexPath, 0o400);
+  return { indexPath, sourceIndexPath };
+}
+
+function createControlledGitDirectory(snapshot, temporaryRoot) {
   const root = resolve(temporaryRoot);
   if (!isAbsolute(root)) failTrustedGit();
   let directory;
   let binding;
   let indexBinding;
+  let sourceIndexBinding;
   try {
     directory = mkdtempSync(join(root, temporaryPrefix));
     const requiredPrefix = root.endsWith(sep) ? root : `${root}${sep}`;
@@ -660,7 +757,10 @@ function createControlledGitDirectory(codeVersion, indexBytes, temporaryRoot) {
     chmodSync(join(directory, "objects"), 0o700);
     mkdirSync(join(directory, "refs"), { mode: 0o700 });
     chmodSync(join(directory, "refs"), 0o700);
-    writeControlledFile(join(directory, "HEAD"), `${codeVersion}\n`);
+    writeControlledFile(
+      join(directory, "HEAD"),
+      `${snapshot.headBinding.codeVersion}\n`
+    );
     writeControlledFile(
       join(directory, "config"),
       "[core]\n" +
@@ -684,9 +784,7 @@ function createControlledGitDirectory(codeVersion, indexBytes, temporaryRoot) {
     // 临时 gitdir 位于 /tmp，正式工作树根下的 .git 否则会被当作普通未跟踪目录。
     // 这里只精确排除这一目录；private 仍必须由仓库跟踪的 .gitignore 证明已忽略。
     writeControlledFile(join(directory, "info", "exclude"), "/.git/\n");
-    // Git 只能看到这份 0400 副本。正式 index 的 O_RDONLY 描述符不传给
-    // 子进程，只留在父进程中用于结束时逐字节复核并发变化。
-    writeControlledFile(join(directory, "index"), indexBytes, 0o400);
+    const rebuilt = rebuildControlledIndex(snapshot, directory);
     binding = openOwnedDirectory(directory, directory);
     const status = fstatSync(binding.descriptor, { bigint: true });
     if ((status.mode & 0o777n) !== 0o700n) failTrustedGit();
@@ -695,15 +793,29 @@ function createControlledGitDirectory(codeVersion, indexBytes, temporaryRoot) {
       "index",
       maximumIndexBytes
     );
+    sourceIndexBinding = openOwnedFileAt(
+      binding.descriptor,
+      "source-index",
+      maximumIndexBytes
+    );
     if (
       (indexBinding.status.mode & 0o777n) !== 0o400n ||
-      !indexBinding.bytes.equals(indexBytes)
+      (sourceIndexBinding.status.mode & 0o777n) !== 0o400n ||
+      !sourceIndexBinding.bytes.equals(snapshot.indexBinding.bytes)
     ) {
       closeQuietly(indexBinding.descriptor);
+      closeQuietly(sourceIndexBinding.descriptor);
       failTrustedGit();
     }
     fsyncSync(binding.descriptor);
-    return { directory, binding, indexBinding };
+    return {
+      directory,
+      binding,
+      indexBinding,
+      sourceIndexBinding,
+      indexPath: rebuilt.indexPath,
+      sourceIndexPath: rebuilt.sourceIndexPath
+    };
   } catch {
     if (binding !== undefined) {
       try {
@@ -713,6 +825,9 @@ function createControlledGitDirectory(codeVersion, indexBytes, temporaryRoot) {
       }
     }
     if (indexBinding !== undefined) closeQuietly(indexBinding.descriptor);
+    if (sourceIndexBinding !== undefined) {
+      closeQuietly(sourceIndexBinding.descriptor);
+    }
     if (directory !== undefined) {
       try {
         rmSync(directory, { recursive: true, force: true });
@@ -748,6 +863,12 @@ function cleanupControlledGitDirectory(controlled) {
         "index",
         controlled.indexBinding
       );
+      assertHeldFileUnchanged(controlled.sourceIndexBinding);
+      reopenAndAssertFileAt(
+        controlled.binding.descriptor,
+        "source-index",
+        controlled.sourceIndexBinding
+      );
     } catch {
       integrityValid = false;
     }
@@ -755,6 +876,9 @@ function cleanupControlledGitDirectory(controlled) {
     integrityValid = false;
   }
   if (!closeQuietly(controlled.indexBinding.descriptor)) {
+    integrityValid = false;
+  }
+  if (!closeQuietly(controlled.sourceIndexBinding.descriptor)) {
     integrityValid = false;
   }
   if (safeToRemove) {
@@ -809,7 +933,23 @@ function isAllowedReadOnlyGitCommand(commandArguments) {
       "--porcelain=v1",
       "--untracked-files=all"
     ]) ||
+    serialized === JSON.stringify(["ls-files", "-v", "-z"]) ||
+    serialized === JSON.stringify(["ls-files", "-f", "-z"]) ||
     serialized === JSON.stringify(["ls-files", "private"])
+  ) {
+    return true;
+  }
+  if (
+    commandArguments.length >= 4 &&
+    commandArguments[0] === "ls-files" &&
+    commandArguments[1] === "--error-unmatch" &&
+    commandArguments[2] === "--" &&
+    commandArguments.slice(3).every(
+      (path) =>
+        /^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/u.test(path) &&
+        !path.startsWith("/") &&
+        !path.split("/").some((component) => component === "." || component === "..")
+    )
   ) {
     return true;
   }
@@ -844,6 +984,9 @@ function executeSnapshotGit(
   ) {
     failTrustedGit();
   }
+  const selectedIndexBinding = commandArguments[0] === "ls-files"
+    ? controlled.sourceIndexBinding
+    : controlled.indexBinding;
   try {
     const output = execute(
       trustedGitExecutable,
@@ -897,7 +1040,7 @@ function executeSnapshotGit(
           "ignore",
           "pipe",
           "pipe",
-          controlled.indexBinding.descriptor,
+          selectedIndexBinding.descriptor,
           snapshot.objectsBinding.descriptor,
           snapshot.repositoryBinding.descriptor,
           controlled.binding.descriptor
@@ -934,11 +1077,7 @@ export function withTrustedGitSnapshot(
   try {
     verifyExecutable();
     snapshot = openRepositorySnapshot(repositoryDirectory);
-    controlled = createControlledGitDirectory(
-      snapshot.headBinding.codeVersion,
-      snapshot.indexBinding.bytes,
-      temporaryRoot
-    );
+    controlled = createControlledGitDirectory(snapshot, temporaryRoot);
     apiActive = true;
     const api = Object.freeze({
       headCodeVersion: snapshot.headBinding.codeVersion,

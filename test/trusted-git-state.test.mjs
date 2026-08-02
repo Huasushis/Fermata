@@ -118,6 +118,10 @@ describe("受信 Git 状态读取", () => {
           `/proc/self/fd/${options.stdio[6]}`
         );
         expect(controlledIndex).toBe(join(controlledGitDirectory, "index"));
+        expect(statSync(join(controlledGitDirectory, "source-index")).mode & 0o777)
+          .toBe(0o400);
+        expect(readFileSync(join(controlledGitDirectory, "source-index")))
+          .toEqual(readFileSync(join(repositoryRoot, ".git", "index")));
         expect(controlledIndex).not.toBe(join(repositoryRoot, ".git", "index"));
         expect(statSync(controlledIndex).mode & 0o777).toBe(0o400);
         let writeError;
@@ -352,6 +356,87 @@ describe("受信 Git 状态读取", () => {
     )).toBe(true);
   });
 
+  it("不信任正式 index 被 local clean filter 刷新的同尺寸 clean stat cache", () => {
+    const { fixture, repository } = createRepository();
+    const cleanCommand = join(fixture, "cache-poison-clean.sh");
+    writeFileSync(
+      cleanCommand,
+      "#!/bin/sh\ncat >/dev/null\nprintf 'clean base\\n'\n",
+      { mode: 0o700 }
+    );
+    writeFileSync(
+      join(repository, ".git", "config"),
+      "[core]\n" +
+        "\trepositoryformatversion = 0\n" +
+        "\tbare = false\n" +
+        `[filter "arbitrary-clean-driver-47"]\n` +
+        `\tclean = ${cleanCommand}\n` +
+        "\trequired = true\n",
+      { mode: 0o600 }
+    );
+    // 与 HEAD 字节数相同；正式 Git 在本地 filter 看来仍等于 clean base，并在
+    // optional-locks 开启时把这份脏工作树的 stat 写回正式 index。
+    writeFileSync(join(repository, "tracked-clean.txt"), "clean flip\n");
+    const poisonedStatus = execFileSync(
+      trustedGitExecutable,
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      {
+        cwd: repository,
+        encoding: "utf8",
+        env: {
+          ...buildTrustedGitEnvironment(),
+          GIT_OPTIONAL_LOCKS: "1"
+        },
+        stdio: ["ignore", "pipe", "pipe"]
+      }
+    );
+    expect(poisonedStatus).not.toContain("tracked-clean.txt");
+
+    const indexPath = join(repository, ".git", "index");
+    const indexBefore = statSync(indexPath, { bigint: true });
+    const indexBytesBefore = readFileSync(indexPath);
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const trustedStatus = runTrustedGit(
+        repository,
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+        { encoding: "utf8" }
+      );
+      expect(trustedStatus).toContain(" M tracked-clean.txt");
+    }
+    expect(readFileSync(indexPath)).toEqual(indexBytesBefore);
+    expect(sameIndexSnapshot(
+      indexBefore,
+      statSync(indexPath, { bigint: true })
+    )).toBe(true);
+  });
+
+  it("HEAD 重建索引仍准确区分 staged、unstaged 与 untracked", () => {
+    const { repository } = createRepository();
+    writeFileSync(join(repository, "tracked-clean.txt"), "staged clean\n");
+    runFixtureGit(repository, ["add", "tracked-clean.txt"]);
+    writeFileSync(join(repository, "tracked-clean.txt"), "working tree\n");
+    writeFileSync(join(repository, "tracked-info.txt"), "staged info\n");
+    runFixtureGit(repository, ["add", "tracked-info.txt"]);
+    writeFileSync(join(repository, "untracked.txt"), "untracked\n");
+
+    const indexPath = join(repository, ".git", "index");
+    const indexBefore = statSync(indexPath, { bigint: true });
+    const indexBytesBefore = readFileSync(indexPath);
+    const status = runTrustedGit(
+      repository,
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      { encoding: "utf8" }
+    );
+    expect(status).toContain("MM tracked-clean.txt");
+    expect(status).toContain("M  tracked-info.txt");
+    expect(status).toContain("?? untracked.txt");
+    expect(readFileSync(indexPath)).toEqual(indexBytesBefore);
+    expect(sameIndexSnapshot(
+      indexBefore,
+      statSync(indexPath, { bigint: true })
+    )).toBe(true);
+  });
+
   it("临时 exclude 只排除根 .git，不会把 private 放宽成隐式忽略", () => {
     const { repository } = createRepository({ ignorePrivate: false });
     mkdirSync(join(repository, "private"));
@@ -477,6 +562,37 @@ describe("受信 Git 状态读取", () => {
       "--porcelain=v1",
       "--untracked-files=all"
     ])).toBe(beforeStatus);
+  });
+
+  it("只放行固定 ls-files 身份检查形状并拒绝 pathspec 选项注入", () => {
+    const { repository } = createRepository();
+    for (const command of [
+      ["ls-files", "-v", "-z"],
+      ["ls-files", "-f", "-z"]
+    ]) {
+      const output = runTrustedGit(repository, command);
+      expect(output.toString("utf8").split("\0").filter(Boolean))
+        .toEqual(expect.arrayContaining(["H tracked-clean.txt"]));
+    }
+    expect(runTrustedGit(repository, [
+      "ls-files",
+      "--error-unmatch",
+      "--",
+      "tracked-clean.txt",
+      "tracked-info.txt"
+    ]).toString("utf8")).toContain("tracked-clean.txt");
+    expect(() => runTrustedGit(repository, [
+      "ls-files",
+      "--error-unmatch",
+      "--",
+      "--stage"
+    ])).toThrow("TRUSTED_GIT_STATE_UNAVAILABLE");
+    expect(() => runTrustedGit(repository, [
+      "ls-files",
+      "--error-unmatch",
+      "--",
+      "../outside"
+    ])).toThrow("TRUSTED_GIT_STATE_UNAVAILABLE");
   });
 
   it("拒绝未登记的写入型或任意 Git 子命令", () => {
