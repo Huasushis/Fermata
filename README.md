@@ -133,6 +133,10 @@ Cloudflare 拦截）；`fetch-hf-dataset` 从公开数据集 open-r1/codeforces�
 经镜像抽样，带官方 rating 和题解，更稳，推荐。评测脚本支持 `EVAL_CONCURRENCY`
 控制并发（默认 6/4），大幅缩短总时长。
 
+`fetch-cf-dataset` 现在按失败关闭处理：最近比赛范围为空、任一预定 rating 档候选不足、
+样本数参数非法或任一题面抓取失败都会整批非零退出；所有题面都成功读入内存前不会开始写输出文件，
+不会再把空档或抓取失败记成“跳过后成功”。
+
 ```bash
 # 下列命令都通过安全脚本读取 Fermata/private/ 中的专用环境文件。
 # 并发数、数据子目录等实验参数也要写入对应文件；文件值优先于父环境。
@@ -412,15 +416,16 @@ thinking solver、thinking analyst、coding、verdict 五个 pipeline slot 分�
 人工确认的思维难度和代码难度（1 到 5 级）、非空题面和题解，并且低、中、高三个 rating 段都要有
 覆盖。损坏 JSON、重复题号、缺人工标准或缺任一分段同样不会被静默跳过。
 
-当前检查点格式是第 4 版。每个思维或代码付费阶段开始前，脚本先把该安全编号和阶段写入
+当前检查点格式是第 5 版。每个思维或代码付费阶段开始前，脚本先把该安全编号和阶段写入
 `activeStages`，原子保存成功后才调用模型；阶段成功或明确失败时，再把结果或固定失败码与移除
 `activeStages` 放在同一次检查点写入中。进程异常退出留下的 active 项在续跑时会转成永久的
-`STALE_IN_FLIGHT` 证据。第 3 版及更早检查点没有这套在途证据、预登记清单和人工标准绑定，全部
-明确拒绝续跑，不会自动转换成看似干净的第 4 版。
+`STALE_IN_FLIGHT` 证据。第 5 版进度只保存 `safeId`、`contentHash` 和模型预测，不保存 rating 或
+人工思维/代码等级；必须等整批在途请求收束后，报告阶段才连接 gold。第 4 版及更早格式不具备这条
+边界，全部明确拒绝续跑，不会自动转换成看似干净的第 5 版。
 
 当前可续跑进度仍保存在
 `experiments/results/raw/levels-<标签>-checkpoint.json`；同标签 `--resume` 只读取这一份，不扫描或
-拼接其它历史快照。第 4 版检查点同时保存实验链 UUID。任何模型失败、HTTP 499、取消、等待超时、
+拼接其它历史快照。第 5 版检查点同时保存实验链 UUID。任何模型失败、HTTP 499、取消、等待超时、
 流中断、历史跳过或陈旧在途都会永久留在同一实验链的失败统计中：即使续跑后来补齐全部题目，
 `complete` 和 `eligible` 仍为假。出现首个失败后，脚本只等待已经发出的模型请求自然结束并保存结果，
 不再启动新的付费阶段；再次运行这条失败链也不会继续付费。只有最初以全新标签从零启动、且整个同标签
@@ -430,6 +435,36 @@ thinking solver、thinking analyst、coding、verdict 五个 pipeline slot 分�
 可能被另一个分支绕开。需要保留修改前、修改后两份实验时，修改后的实验必须使用全新标签从零运行；
 只有当前标签自己的 `--resume` 可以续跑。相同标签仍只允许一个进程持锁；异常留下锁文件时，先确认
 服务器上没有对应标定进程，再人工处理。
+
+盲评的逻辑与类型隔离地基位于 `experiments/lib/blind-evaluation.ts`。第 1 版契约把题目内容与 gold
+（官方难度、人工等级或预期结论）定义为两个可独立序列化的严格文档，用数据集身份、用途、内容指纹
+和逐题 contentHash 对账；每次推理前都会重验完整内容容器，推理回调只收到递归冻结的
+`safeId + problem`，整批推理收束后才允许评分连接 gold。`public83` 以及当前 levels 集都已经参与过基线、实验设计或调参，固定属于
+`development`（开发集），不得改称最终 `holdout`（未参与调参的盲测集）。现有 Git 忽略目录里的
+旧 CF/levels 文件仍是内容与人工字段同文件保存；三个入口现在会先投影到上述函数边界，但磁盘材料
+尚未迁移成两套独立目录，内容和 gold 也仍在同一进程中建立。因此当前实现不是进程级或磁盘级的
+物理隔离。在完成一次私有、可核验的拆分迁移并登记全新 holdout 身份前，不得用这些旧文件发布
+“最终盲测准确率”。
+
+这层地基也不等于产品设想中的完整多角色审题流程。当前仍缺少：冻结且不可变的“只看题面”独立解题
+产物、在冻结后才读取作者/官方题解的独立核验角色、参考实现的编译与样例/正确性/复杂度验证、独立的
+质量/原创性/标签评审、冲突与反方审阅，以及最后按证据汇总的结构化裁决。在这些环节实现并分别标定
+前，现有 thinking/coding/verdict 结果只能作为开发实验，不能声称已复现完整流程。
+
+verdict 合成诊断从报告 schema 第 4 版起，不再按 rating 排序取样；它只按预登记内容身份和固定 seed
+产生可复现的 case 顺序。normal/fabricated treatment 属于推理输入，但 rating、expected verdict 和
+expected forced-reject 保存在另一份 strict case gold 文档中；该文档同时绑定父 content 指纹、case
+身份、contentHash 和独立 gold 指纹。推理检查点与完成日志只保存 case 身份、contentHash 和结构化
+预测，检查点的内容身份和配置指纹不使用包含 gold 的源 manifest 或 case gold 指纹；case gold 只并入
+全部在途请求收束后的报告指纹。`expectationMet` 也只能在这之后计算。
+
+verdict 私有检查点第 1 版位于 `private/evaluation-state/`。每个付费 case 在调用模型前同步、原子登记
+为 active；成功或固定失败再原子落盘。崩溃遗留 active 与明确失败都会永久污染该链，后续同标签运行
+不会继续为 pending case 付费；干净中断只续跑 pending，已成功 case 不重复请求。同标签由不可覆盖的
+锁排他持有，完整链以固定 chain completion marker 防止重放。异常遗留锁只能在核对 PID、进程启动
+时间、完整命令和项目工作目录后人工移除，不能删除检查点来制造干净重跑。
+通用盲推理执行器也在首个请求失败、active 登记失败或结果持久化失败时立即关掉本地启动闸门；即使
+失败回调需要异步写盘，排队样本也不能在这段窗口内开始付费请求，只等待已经在途的请求自然收束。
 
 报告把“当前阶段是否都跑完”的 `operationalComplete`、“实验链是否无失败证据”的
 `integrityClean`、准确性是否达标的 `accuracyPassed` 和最终可用性 `eligible` 分开记录。思维与代码
@@ -441,6 +476,8 @@ CF public83 难度报告从 schema 第 3 版起同样把 `executionComplete`、`
 499、取消、失败或缺失时，才可能按 MAE ≤ 200、±200 命中率 ≥ 75% 判断 `accuracyPassed`。这个指标
 判断可在临时锚点上保留，但 `provisional: true` 会固定令 `anchorsEligible=false`，因此最终
 `eligible=false`；只有执行完整、准确性达标、数据 manifest 已验证且锚点非 provisional 时才可用。
+第 4 版再明确写入 `dataset.purpose=development`；verdict 合成诊断第 4 版继续写入同一用途字段，
+并分别记录 prediction-only 推理配置指纹与推理收束后才加入 case gold 的报告指纹。
 报告另存当前 provider/baseUrl/apiKey 的安全摘要，并把该摘要纳入带 Git 提交的配置
 指纹；更换网关或密钥不能沿用旧实验链。脚本还会在打开检查点或发起付费请求前，核对
 `EVAL_CODE_VERSION` 与真实 HEAD 完全一致、Git 可见的工作树干净、runner 及其登记的直接/传递
@@ -480,7 +517,7 @@ completion marker 表示这条执行链已完整收束并阻止重放，不等�
 | CF 难度（difficulty.ts） | **Candidate C 完整但未达标；provider-v1 已读到 EOF，但协议仍未通过** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate D 与恢复后的 Candidate C 请求都在旧根路径配置下返回 404；一次只读 `/v1/models` 已确认目录声明包含 flash/pro。修正 `/v1` 后的 b 单请求得到 HTTP 200，但客户端取消正文、未观察 EOF；v4 的 c 单请求安全排空到真实 EOF，固定失败阶段为 `trailing_data`。v5 的 d 单请求也是 HTTP 200、request/fetch=1、真实 EOF、未取消，但只得到粗分类 `data_after_done`。v6 的 e 单请求同样 request/fetch=1、HTTP 200、真实 EOF、未取消，并进一步固定为 `data_after_done_other_or_unclassifiable`；它仍是 `complete=false`。v7/f 只完成了代码、测试与安全枚举设计，尚未提交后绑定、尚未运行，也没有启动新的 83 题。a/b/c/d/e 证据均保留，当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
 | 思维难度（thinking.ts） | **旧实验均不可作基线** | 两份早期报告无法证明完整；后两份明确只完成 6/24、9/24，而且都缺高分段。 |
 | 代码难度（coding.ts） | **旧实验均不可作基线** | 与思维难度共用的旧实验不完整；小样本曾出现难度分段升高但代码难度均值下降，需要在完整基线上复核。 |
-| 查重判断（verdict.ts） | **旧设计不可作准确性基线** | 旧实验只有 3 个正常样本和 3 个人工重复样本；正常组只验证“不是不通过”，没有区分通过与需要修改。 |
+| 查重判断（verdict.ts） | **旧设计不可作准确性基线；新盲评/续跑基础尚未实跑** | 旧实验只有 3 个正常样本和 3 个人工重复样本；新代码已把 content-only 选择、独立 case gold、prediction-only 检查点和完整链防重放接入，但尚未用新唯一标签运行，不能声明准确率。 |
 
 这张表应该随每一次真正跑过评测脚本之后更新。只有当前代码生成、对应脱敏汇总与完成证据存在，
 并且报告明确 `eligible=true` 时，才能把结果写成合格候选；仅有完整性为真不代表准确性达标。
