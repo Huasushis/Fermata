@@ -31,7 +31,10 @@ import {
   resolveReviewFlowEvaluationCliOptions,
   runReviewFlowEvaluationCli
 } from "../experiments/eval-review-flow";
-import { createReviewFlowEvaluationAdapter } from "../experiments/lib/review-flow-evaluation-adapter";
+import {
+  createReviewFlowEvaluationAdapter,
+  reviewFlowEvaluationCodePaths
+} from "../experiments/lib/review-flow-evaluation-adapter";
 import { loadReviewFlowEvaluationConfig } from "../experiments/lib/review-flow-evaluation-config";
 import {
   loadReviewFlowEvaluationDataset,
@@ -64,6 +67,7 @@ import {
 } from "../experiments/lib/review-flow-evaluation-runner";
 import {
   loadReviewFlowEvaluationCheckpointForReveal,
+  reviewFlowEvaluationPredictionIdentityFingerprint,
   ReviewFlowEvaluationCheckpoint,
   type ReviewFlowEvaluationCheckpointState,
   type ReviewFlowEvaluationBaselineBinding,
@@ -80,6 +84,28 @@ afterEach(() => {
   for (const root of temporaryRoots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+describe("review-flow 跨阶段预测身份", () => {
+  it("完整身份覆盖 adapter/dataset/runner，任一 bundle 摘要变化都会换指纹", () => {
+    expect(reviewFlowEvaluationCodePaths).toEqual(expect.arrayContaining([
+      "experiments/eval-review-flow.ts",
+      "experiments/lib/review-flow-evaluation-adapter.ts",
+      "experiments/lib/review-flow-evaluation-dataset.ts",
+      "experiments/lib/review-flow-evaluation-runner.ts"
+    ]));
+    const original = identityFixture("development");
+    const changed: ReviewFlowEvaluationIdentity = {
+      ...original,
+      codeIdentity: {
+        ...original.codeIdentity,
+        dependencyCodeSha256: "f".repeat(64)
+      }
+    };
+    expect(reviewFlowEvaluationPredictionIdentityFingerprint(changed)).not.toBe(
+      reviewFlowEvaluationPredictionIdentityFingerprint(original)
+    );
+  });
 });
 
 describe("review-flow dataset v2 与真实 Gold 边界", () => {
@@ -777,7 +803,7 @@ describe("固定全局 registry 与 holdout 一次性账本", () => {
     registry.close();
   });
 
-  it("holdout 槽位只接受提名的生产身份，但允许纯 harness 代码身份变化", () => {
+  it("holdout 槽位拒绝 adapter/dataset/runner 等完整预测身份变化", () => {
     const fixture = createDatasetFixture("selection-production-identity");
     const blind = loadDataset(fixture, "holdout_prediction");
     const holdout = requireTestHoldoutBindings(blind);
@@ -799,7 +825,7 @@ describe("固定全局 registry 与 holdout 一次性账本", () => {
         dependencyFileCount: baseIdentity.codeIdentity.dependencyFileCount + 1
       }
     };
-    const accepted = createDatasetCheckpoint(
+    const harnessChanged = createDatasetCheckpoint(
       fixture,
       blind,
       "baseline",
@@ -808,16 +834,21 @@ describe("固定全局 registry 与 holdout 一次性账本", () => {
       "harness-only-change",
       { identity: harnessChangedIdentity }
     );
-    const acceptedClaim = claimHoldout(registry, accepted.checkpoint, blind, false);
-    accepted.checkpoint.bindGlobalClaim(acceptedClaim.sha256);
+    const harnessChangedClaim = claimHoldout(
+      registry,
+      harnessChanged.checkpoint,
+      blind,
+      false
+    );
+    harnessChanged.checkpoint.bindGlobalClaim(harnessChangedClaim.sha256);
     expect(() => registry.claimHoldoutSlot({
       plan: nomination.plan,
-      genesis: accepted.checkpoint.genesisBinding(),
-      labelClaimSha256: acceptedClaim.sha256,
+      genesis: harnessChanged.checkpoint.genesisBinding(),
+      labelClaimSha256: harnessChangedClaim.sha256,
       selectionClaimSha256: nomination.sha256,
       resume: false
-    })).not.toThrow();
-    accepted.checkpoint.close();
+    })).toThrow("REVIEW_FLOW_EVALUATION_HOLDOUT_PREDICTION_IDENTITY_MISMATCH");
+    harnessChanged.checkpoint.close();
     registry.close();
 
     const mismatchFixture = createDatasetFixture("selection-config-mismatch");
@@ -860,7 +891,7 @@ describe("固定全局 registry 与 holdout 一次性账本", () => {
       labelClaimSha256: rejectedClaim.sha256,
       selectionClaimSha256: mismatchNomination.sha256,
       resume: false
-    })).toThrow("REVIEW_FLOW_EVALUATION_HOLDOUT_PRODUCTION_IDENTITY_MISMATCH");
+    })).toThrow("REVIEW_FLOW_EVALUATION_HOLDOUT_PREDICTION_IDENTITY_MISMATCH");
     rejected.checkpoint.close();
     mismatchRegistry.close();
   });

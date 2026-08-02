@@ -660,7 +660,9 @@ Gold **之前**先永久占用 reveal claim；崩溃恢复必须是同一代码�
 并分别冻结模型/provider/提示词角色身份、运行配置和正式审题代码摘要。holdout 两个槽位必须逐一匹配；
 完整 runtime fingerprint 当前绑定 46 个登记代码文件；同一条链的 exact resume 要求这 46 个文件和提交
 身份全部不变。即使只修改 checkpoint、报告、CLI 或 bootstrap，也必须新建实验链/label，不能拿新提交
-续接旧链。较小的 production code 子集只用于比较人工选定的生产逻辑身份，不会放宽运行链本身的冻结。
+续接旧链。development 提名到 holdout 槽位也绑定同一份完整 46 文件预测身份和提交号；在另行审阅出
+可靠的语义子集前，adapter、dataset、runner、CLI、持久化或报告代码的任何变化都必须回到 development
+重新运行。较小的 production code 子集只用于 runner 的引擎构建指纹，不参与放宽跨阶段验收。
 
 所有 development 报告、揭盲后的两份 holdout 报告与 comparison 都只写到固定的
 `Fermata/private/review-flow-evaluation-registry/`（目录 `0700`、文件 `0600`），不再写

@@ -164,8 +164,16 @@ export type ReviewFlowEvaluationIdentity = z.infer<
   typeof reviewFlowEvaluationIdentitySchema
 >;
 
-export const reviewFlowEvaluationProductionIdentitySchema = z
+/**
+ * development -> holdout 必须冻结所有会参与一次预测运行的登记代码，而不只是
+ * 正式 prompt/pipeline 子集。这里故意绑定完整 46-file evaluation identity；在
+ * 尚未有经审阅的更窄语义清单前，不允许把 adapter/dataset/runner 当成纯 harness。
+ */
+export const reviewFlowEvaluationPredictionIdentitySchema = z
   .object({
+    codeVersion: z.string().regex(/^[0-9a-f]{40}$/u),
+    dependencyCodeSha256: digestSchema,
+    dependencyFileCount: z.number().int().positive(),
     productionDependencyCodeSha256: digestSchema,
     productionDependencyFileCount: z.number().int().positive(),
     configurationFingerprint: digestSchema,
@@ -177,14 +185,17 @@ export const reviewFlowEvaluationProductionIdentitySchema = z
     providerSummary: z.array(roleProviderSummarySchema).length(11)
   })
   .strict();
-export type ReviewFlowEvaluationProductionIdentity = z.infer<
-  typeof reviewFlowEvaluationProductionIdentitySchema
+export type ReviewFlowEvaluationPredictionIdentity = z.infer<
+  typeof reviewFlowEvaluationPredictionIdentitySchema
 >;
 
-export function reviewFlowEvaluationProductionIdentity(
+export function reviewFlowEvaluationPredictionIdentity(
   identity: ReviewFlowEvaluationIdentity
-): ReviewFlowEvaluationProductionIdentity {
-  return reviewFlowEvaluationProductionIdentitySchema.parse({
+): ReviewFlowEvaluationPredictionIdentity {
+  return reviewFlowEvaluationPredictionIdentitySchema.parse({
+    codeVersion: identity.codeIdentity.codeVersion,
+    dependencyCodeSha256: identity.codeIdentity.dependencyCodeSha256,
+    dependencyFileCount: identity.codeIdentity.dependencyFileCount,
     productionDependencyCodeSha256:
       identity.codeIdentity.productionDependencyCodeSha256,
     productionDependencyFileCount:
@@ -199,10 +210,10 @@ export function reviewFlowEvaluationProductionIdentity(
   });
 }
 
-export function reviewFlowEvaluationProductionIdentityFingerprint(
+export function reviewFlowEvaluationPredictionIdentityFingerprint(
   identity: ReviewFlowEvaluationIdentity
 ): string {
-  return hashCanonicalValue(reviewFlowEvaluationProductionIdentity(identity));
+  return hashCanonicalValue(reviewFlowEvaluationPredictionIdentity(identity));
 }
 
 const expectedCaseSchema = z
@@ -407,7 +418,7 @@ export interface ReviewFlowEvaluationCheckpointGenesisBinding {
   readonly purpose: "development" | "holdout";
   readonly runId: string;
   readonly identityFingerprint: string;
-  readonly productionIdentityFingerprint: string;
+  readonly predictionIdentityFingerprint: string;
   readonly expectedCasesFingerprint: string;
   readonly checkpointGenesisFingerprint: string;
   readonly stateDirectory: { readonly device: string; readonly inode: string };
@@ -981,8 +992,8 @@ function checkpointGenesisBinding(
     purpose: state.identity.purpose,
     runId: state.runId,
     identityFingerprint: state.identityFingerprint,
-    productionIdentityFingerprint:
-      reviewFlowEvaluationProductionIdentityFingerprint(state.identity),
+    predictionIdentityFingerprint:
+      reviewFlowEvaluationPredictionIdentityFingerprint(state.identity),
     expectedCasesFingerprint: hashCanonicalValue(state.expectedCases),
     stateDirectory: {
       device: status.dev.toString(10),

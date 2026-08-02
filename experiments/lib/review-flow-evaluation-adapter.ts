@@ -52,8 +52,9 @@ export const reviewFlowEvaluationCodePaths: readonly string[] =
   Object.freeze([...runtimeManifestDocument.codePaths]);
 
 /**
- * 与正式 11 角色判断、提示词、传输和证据策略直接相关的字节集合。评测 registry
- * 用它比较 development 与 holdout；纯 checkpoint/report/CLI harness 改动可不同。
+ * 与正式 11 角色判断、提示词、传输和证据策略直接相关的较窄字节集合，仅用于
+ * runner 的 engineBuildFingerprint。development -> holdout 另行绑定完整 codePaths，
+ * 不允许 adapter/dataset/runner/checkpoint/report/CLI 在两个阶段间变化。
  */
 export const reviewFlowProductionCodePaths: readonly string[] =
   Object.freeze([...runtimeManifestDocument.productionCodePaths]);

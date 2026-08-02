@@ -27,9 +27,9 @@ import {
 } from "./review-flow-evaluation-dataset";
 import {
   reviewFlowEvaluationBaselineBindingSchema,
-  reviewFlowEvaluationProductionIdentity,
-  reviewFlowEvaluationProductionIdentityFingerprint,
-  reviewFlowEvaluationProductionIdentitySchema,
+  reviewFlowEvaluationPredictionIdentity,
+  reviewFlowEvaluationPredictionIdentityFingerprint,
+  reviewFlowEvaluationPredictionIdentitySchema,
   type ReviewFlowEvaluationBaselineBinding,
   ReviewFlowEvaluationCheckpointGenesisBinding,
   ReviewFlowEvaluationCheckpointRevealSnapshot,
@@ -208,8 +208,8 @@ const developmentNominationReportSchema = z
     labelClaimSha256: digestSchema,
     publicationReceiptSha256: digestSchema,
     executionCompletionFingerprint: digestSchema,
-    productionIdentity: reviewFlowEvaluationProductionIdentitySchema,
-    productionIdentityFingerprint: digestSchema
+    predictionIdentity: reviewFlowEvaluationPredictionIdentitySchema,
+    predictionIdentityFingerprint: digestSchema
   })
   .strict();
 
@@ -254,7 +254,7 @@ export const reviewFlowEvaluationHoldoutSlotSchema = z
     checkpointGenesisFingerprint: digestSchema,
     labelClaimSha256: digestSchema,
     selectionClaimSha256: digestSchema,
-    productionIdentityFingerprint: digestSchema,
+    predictionIdentityFingerprint: digestSchema,
     stateDirectory: z
       .object({ device: decimalSchema, inode: decimalSchema })
       .strict()
@@ -803,12 +803,12 @@ export class ReviewFlowEvaluationGlobalRegistry {
       input.plan,
       input.selectionClaimSha256
     );
-    const expectedProductionIdentity = input.genesis.variant === "baseline"
-      ? selection.developmentBaseline.productionIdentityFingerprint
-      : selection.developmentCandidate.productionIdentityFingerprint;
-    if (input.genesis.productionIdentityFingerprint !== expectedProductionIdentity) {
+    const expectedPredictionIdentity = input.genesis.variant === "baseline"
+      ? selection.developmentBaseline.predictionIdentityFingerprint
+      : selection.developmentCandidate.predictionIdentityFingerprint;
+    if (input.genesis.predictionIdentityFingerprint !== expectedPredictionIdentity) {
       throw new ReviewFlowEvaluationRegistryError(
-        "REVIEW_FLOW_EVALUATION_HOLDOUT_PRODUCTION_IDENTITY_MISMATCH"
+        "REVIEW_FLOW_EVALUATION_HOLDOUT_PREDICTION_IDENTITY_MISMATCH"
       );
     }
     const labelClaimBytes = readPrivateArtifactBytes(
@@ -852,7 +852,7 @@ export class ReviewFlowEvaluationGlobalRegistry {
       checkpointGenesisFingerprint: input.genesis.checkpointGenesisFingerprint,
       labelClaimSha256: input.labelClaimSha256,
       selectionClaimSha256: input.selectionClaimSha256,
-      productionIdentityFingerprint: input.genesis.productionIdentityFingerprint,
+      predictionIdentityFingerprint: input.genesis.predictionIdentityFingerprint,
       stateDirectory: input.genesis.stateDirectory
     });
     const fileName = holdoutSlotFileName(
@@ -970,9 +970,9 @@ export class ReviewFlowEvaluationGlobalRegistry {
       holdoutSelectionFileName(input.state.holdoutIdentity),
       4 * 1024 * 1024
     );
-    const expectedProductionIdentity = input.state.variant === "baseline"
-      ? selection.developmentBaseline.productionIdentityFingerprint
-      : selection.developmentCandidate.productionIdentityFingerprint;
+    const expectedPredictionIdentity = input.state.variant === "baseline"
+      ? selection.developmentBaseline.predictionIdentityFingerprint
+      : selection.developmentCandidate.predictionIdentityFingerprint;
     if (
       sha256(slotBytes) !== input.slotClaimSha256 ||
       slot.label !== input.state.label ||
@@ -980,9 +980,9 @@ export class ReviewFlowEvaluationGlobalRegistry {
       slot.labelClaimSha256 !== input.state.globalClaimSha256 ||
       slot.identityFingerprint !== input.state.identityFingerprint ||
       slot.selectionClaimSha256 !== sha256(selectionBytes) ||
-      slot.productionIdentityFingerprint !==
-        reviewFlowEvaluationProductionIdentityFingerprint(input.state.identity) ||
-      slot.productionIdentityFingerprint !== expectedProductionIdentity
+      slot.predictionIdentityFingerprint !==
+        reviewFlowEvaluationPredictionIdentityFingerprint(input.state.identity) ||
+      slot.predictionIdentityFingerprint !== expectedPredictionIdentity
     ) {
       throw new ReviewFlowEvaluationRegistryError(
         "REVIEW_FLOW_EVALUATION_HOLDOUT_SLOT_INVALID"
@@ -1123,10 +1123,10 @@ export class ReviewFlowEvaluationGlobalRegistry {
       );
     }
     if (
-      input.baselineSnapshot.genesis.productionIdentityFingerprint !==
-        selection.developmentBaseline.productionIdentityFingerprint ||
-      input.candidateSnapshot.genesis.productionIdentityFingerprint !==
-        selection.developmentCandidate.productionIdentityFingerprint
+      input.baselineSnapshot.genesis.predictionIdentityFingerprint !==
+        selection.developmentBaseline.predictionIdentityFingerprint ||
+      input.candidateSnapshot.genesis.predictionIdentityFingerprint !==
+        selection.developmentCandidate.predictionIdentityFingerprint
     ) {
       throw new ReviewFlowEvaluationRegistryError(
         "REVIEW_FLOW_EVALUATION_REVEAL_CHAIN_MISMATCH"
@@ -1169,7 +1169,7 @@ export class ReviewFlowEvaluationGlobalRegistry {
       input.baselineSnapshot.genesis,
       baselineCompletion.completion,
       selectionClaimSha256,
-      selection.developmentBaseline.productionIdentityFingerprint
+      selection.developmentBaseline.predictionIdentityFingerprint
     );
     assertSlotForReveal(
       this.#directory,
@@ -1178,7 +1178,7 @@ export class ReviewFlowEvaluationGlobalRegistry {
       input.candidateSnapshot.genesis,
       candidateCompletion.completion,
       selectionClaimSha256,
-      selection.developmentCandidate.productionIdentityFingerprint
+      selection.developmentCandidate.predictionIdentityFingerprint
     );
     const claim = reviewFlowEvaluationRevealClaimSchema.parse({
       schemaVersion: 2,
@@ -1678,7 +1678,7 @@ function developmentNominationReport(
 } {
   try {
     const summary = parseReviewFlowEvaluationReportSummary(published.summaryBytes);
-    const productionIdentity = reviewFlowEvaluationProductionIdentity(
+    const predictionIdentity = reviewFlowEvaluationPredictionIdentity(
       summary.executionIdentity
     );
     if (
@@ -1721,9 +1721,9 @@ function developmentNominationReport(
       labelClaimSha256: sha256(published.labelClaimBytes),
       publicationReceiptSha256: sha256(published.receiptBytes),
       executionCompletionFingerprint: summary.executionCompletionFingerprint,
-      productionIdentity,
-      productionIdentityFingerprint:
-        reviewFlowEvaluationProductionIdentityFingerprint(
+      predictionIdentity,
+      predictionIdentityFingerprint:
+        reviewFlowEvaluationPredictionIdentityFingerprint(
           summary.executionIdentity
         )
     });
@@ -1841,7 +1841,7 @@ function assertSlotForReveal(
   genesis: ReviewFlowEvaluationCheckpointGenesisBinding,
   completion: ReviewFlowEvaluationPredictionCompletion,
   selectionClaimSha256: string,
-  productionIdentityFingerprint: string
+  predictionIdentityFingerprint: string
 ): void {
   try {
     const bytes = readPrivateArtifactBytes(
@@ -1864,8 +1864,8 @@ function assertSlotForReveal(
       slot.checkpointGenesisFingerprint !== genesis.checkpointGenesisFingerprint ||
       slot.labelClaimSha256 !== completion.labelClaimSha256 ||
       slot.selectionClaimSha256 !== selectionClaimSha256 ||
-      slot.productionIdentityFingerprint !== productionIdentityFingerprint ||
-      slot.productionIdentityFingerprint !== genesis.productionIdentityFingerprint ||
+      slot.predictionIdentityFingerprint !== predictionIdentityFingerprint ||
+      slot.predictionIdentityFingerprint !== genesis.predictionIdentityFingerprint ||
       slot.stateDirectory.device !== genesis.stateDirectory.device ||
       slot.stateDirectory.inode !== genesis.stateDirectory.inode
     ) {
