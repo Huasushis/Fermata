@@ -57,6 +57,27 @@ const boundedCanonicalText = (maximum: number): z.ZodType<string> =>
     .max(maximum)
     .refine((value) => value === value.trim(), "文本两端不能有空白字符。");
 
+/**
+ * Anklang v2 原始请求边界。桥接器用它核对采集时真正发送的正文，而不是
+ * 只相信响应里的 contentHash。字段集合与 Urmotiv 内置插件保持严格一致。
+ */
+export const anklangV2RequestSchema = z
+  .object({
+    apiVersion: z.literal("2"),
+    requestId: z.string().uuid(),
+    contentHash: digestSchema,
+    problem: z
+      .object({
+        title: boundedCanonicalText(200),
+        type: z.enum(["traditional", "interactive", "submit_answer"]),
+        tagIds: z.array(z.string().min(1).max(120)).min(1).max(30),
+        basicStatement: z.string().min(1).max(500_000)
+      })
+      .strict()
+  })
+  .strict();
+export type AnklangV2Request = z.infer<typeof anklangV2RequestSchema>;
+
 const safeCandidateUrlSchema = z
   .string()
   .url()

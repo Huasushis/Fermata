@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   prepareReviewFlowEvaluationDatasetBridge,
   computeUrmotivProblemContentHash,
+  reviewFlowEvaluationAnklangCaptureSetSha256,
   type PrepareReviewFlowEvaluationBridgeInput
 } from "../experiments/lib/review-flow-evaluation-bridge";
 import { loadEvaluationCodeIdentity } from "../experiments/lib/evaluation-code-identity";
@@ -103,6 +104,9 @@ describe("review-flow trusted dataset bridge", () => {
     });
     expect(data?.reuse).toEqual({ policy: "no-store" });
     expect(data?.candidates).toEqual(fixture.developmentCandidates);
+    expect(task?.reviewItems[0]?.summary).toBe(
+      "离线完整查重响应（远端语料不可复核）"
+    );
 
     const manifestText = readFileSync(result.manifestPath, "utf8");
     expect(manifestText).not.toContain("gold.private.json");
@@ -120,9 +124,12 @@ describe("review-flow trusted dataset bridge", () => {
     }) => [
       entry.upstreamEvidence.sealedEvidenceSha256,
       entry.upstreamEvidence.rowEvidenceSha256,
-      ...Object.values(entry.upstreamEvidence.bridgeEvidence).filter(
-        (value) => /^[a-f0-9]{64}$/u.test(value)
-      )
+      ...Object.entries(entry.upstreamEvidence.bridgeEvidence)
+        .filter(([key, value]) =>
+          key !== "anklangResponseSha256" &&
+          /^[a-f0-9]{64}$/u.test(value)
+        )
+        .map(([, value]) => value)
     ]);
     expect(labelSideEvidenceDigests).toContain(fixture.rowEvidenceSha256);
     expect(labelSideEvidenceDigests).toContain(fixture.upstreamMarkerSha256);
@@ -158,8 +165,8 @@ describe("review-flow trusted dataset bridge", () => {
     const prediction = manifest.partitions.development.cases[0];
     const generatedTask = readJson(join(fixture.output, prediction.content.fileName));
     expect(prediction.sourceLineageSha256).toBe(hashCanonicalValue({
-      protocol: "review-flow-evaluation-source-lineage-v3",
-      bridgeVersion: "urmotiv-review-flow-bridge-v2",
+      protocol: "review-flow-evaluation-source-lineage-v4",
+      bridgeVersion: "urmotiv-review-flow-bridge-v3",
       generator: expectedGenerator,
       identity: {
         upstreamCaseId: planCase.caseId,
@@ -175,8 +182,17 @@ describe("review-flow trusted dataset bridge", () => {
         problemHashInputSha256: planCase.problemHashInput.sha256,
         problemContentHash: generatedTask.problem.contentHash,
         outputContentSha256: prediction.content.sha256,
+        originalAnklangRequestSha256:
+          planCase.originalAnklangRequest.sha256,
         originalAnklangResponseSha256:
           planCase.originalAnklangResponse.sha256
+      },
+      anklangCapture: {
+        attestationSha256:
+          bridgePlan.anklangCaptureAttestation.sha256,
+        completionSha256:
+          bridgePlan.anklangCaptureCompletion.sha256,
+        corpusEvidenceKind: "remote_corpus_unverifiable"
       }
     }));
   });
@@ -224,6 +240,32 @@ describe("review-flow trusted dataset bridge", () => {
     expect(existsSync(
       join(changedDuringRun.output, "REVIEW_FLOW_DATASET_COMPLETE")
     )).toBe(false);
+
+    const captureChangedDuringRun = createBridgeFixture(
+      "capture-changed-during-run"
+    );
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...captureChangedDuringRun.input,
+      randomBytes: sequentialRandomBytes(),
+      hooks: {
+        beforeCompletionMarker: () => {
+          writeFileSync(
+            join(
+              captureChangedDuringRun.capturerRepository,
+              "anklang",
+              "review_flow_capture.py"
+            ),
+            "changed while publishing\n"
+          );
+        }
+      }
+    })).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_CAPTURER_IDENTITY_INVALID"
+    );
+    expect(existsSync(join(
+      captureChangedDuringRun.output,
+      "REVIEW_FLOW_DATASET_COMPLETE"
+    ))).toBe(false);
   });
 
   it("REVIEW_GOLD_COMPLETE 缺失、Gold 被改或原始 review input 未全部绑定时失败关闭", () => {
@@ -404,6 +446,142 @@ describe("review-flow trusted dataset bridge", () => {
     expect(data?.candidates).toEqual(success.developmentCandidates);
   });
 
+  it("原始 Anklang request 必须是唯一 v2 请求，并逐字段绑定 task 与重算 contentHash", () => {
+    const extraField = createBridgeFixture("anklang-request-extra");
+    rewriteBridgeInput(
+      extraField,
+      "case-0001.anklang-request.private.json",
+      (value) => ({ ...value, unexpected: true }),
+      "case-upstream-dev",
+      "originalAnklangRequest"
+    );
+    expect(() => prepare(extraField)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_REQUEST_INVALID"
+    );
+
+    const changedProblem = createBridgeFixture("anklang-request-problem");
+    rewriteBridgeInput(
+      changedProblem,
+      "case-0001.anklang-request.private.json",
+      (value) => ({
+        ...value,
+        problem: { ...value.problem, basicStatement: "different statement" }
+      }),
+      "case-upstream-dev",
+      "originalAnklangRequest"
+    );
+    expect(() => prepare(changedProblem)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_CASE_BINDING_MISMATCH"
+    );
+
+    const duplicateRequestId = createBridgeFixture("anklang-request-duplicate");
+    const firstRequestId = readJson(join(
+      duplicateRequestId.bridgeInput,
+      "case-0001.anklang-request.private.json"
+    )).requestId;
+    rewriteBridgeInput(
+      duplicateRequestId,
+      "case-9001.anklang-request.private.json",
+      (value) => ({ ...value, requestId: firstRequestId }),
+      "case-upstream-hold",
+      "originalAnklangRequest"
+    );
+    rewriteCaptureAttestation(duplicateRequestId, (attestation, plan) => ({
+      ...attestation,
+      cases: attestation.cases.map((entry: Record<string, unknown>, index: number) =>
+        index === 1
+          ? {
+              ...entry,
+              requestId: firstRequestId,
+              requestSha256: plan.cases[1].originalAnklangRequest.sha256
+            }
+          : entry)
+    }));
+    expect(() => prepare(duplicateRequestId)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_CAPTURE_MISMATCH"
+    );
+  });
+
+  it("Anklang capture 必须绑定 clean capturer、HTTP 200/attempt 1、完整批次 marker", () => {
+    const dirtyCapturer = createBridgeFixture("anklang-capturer-dirty");
+    writeFileSync(join(dirtyCapturer.capturerRepository, "untracked.txt"), "dirty\n");
+    expect(() => prepare(dirtyCapturer)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_CAPTURER_IDENTITY_INVALID"
+    );
+
+    const wrongAttempt = createBridgeFixture("anklang-attempt-two");
+    rewriteCaptureAttestation(wrongAttempt, (attestation) => ({
+      ...attestation,
+      cases: attestation.cases.map((entry: Record<string, unknown>, index: number) =>
+        index === 0 ? { ...entry, attempt: 2 } : entry)
+    }));
+    expect(() => prepare(wrongAttempt)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_CAPTURE_ATTESTATION_INVALID"
+    );
+
+    const missingCompletion = createBridgeFixture("anklang-completion-missing");
+    const missingPlan = readJson(missingCompletion.input.bridgePlanPath);
+    rmSync(join(
+      missingCompletion.bridgeInput,
+      missingPlan.anklangCaptureCompletion.fileName
+    ));
+    expect(() => prepare(missingCompletion)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_INPUT_INVALID"
+    );
+
+    const extraResponseField = createBridgeFixture("anklang-response-extra");
+    rewriteBridgeInput(
+      extraResponseField,
+      "case-0001.anklang.private.json",
+      (value) => ({ ...value, unexpected: true }),
+      "case-upstream-dev",
+      "originalAnklangResponse"
+    );
+    expect(() => prepare(extraResponseField)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_INVALID"
+    );
+
+    const falseReproducible = createBridgeFixture("anklang-false-reproducible");
+    rewriteCaptureAttestation(falseReproducible, (attestation) => ({
+      ...attestation,
+      corpus: {
+        evidenceKind: "reproducible_snapshot",
+        corpusId: "synthetic-corpus",
+        manifestSha256: sha256("manifest"),
+        snapshotSha256: sha256("snapshot"),
+        corpusRevisionSha256: sha256("revision"),
+        problemCount: 2
+      }
+    }));
+    expect(() => prepare(falseReproducible)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_CAPTURE_ATTESTATION_INVALID"
+    );
+
+    const localSnapshot = createBridgeFixture("anklang-local-snapshot");
+    rewriteCaptureAttestation(localSnapshot, (attestation) => ({
+      ...attestation,
+      backend: { ...attestation.backend, kind: "local_engine" },
+      corpus: {
+        evidenceKind: "reproducible_snapshot",
+        corpusId: "synthetic-corpus",
+        manifestSha256: sha256("manifest"),
+        snapshotSha256: sha256("snapshot"),
+        corpusRevisionSha256: sha256("revision"),
+        problemCount: 2
+      }
+    }));
+    const localResult = prepare(localSnapshot);
+    const localDataset = loadReviewFlowEvaluationDataset({
+      manifestPath: localResult.manifestPath,
+      mode: "development_identity",
+      privateRoot: localSnapshot.privateRoot,
+      containingWorkspace: localSnapshot.workspace
+    });
+    expect(localDataset.cases[0]?.task.reviewItems[0]?.summary).toBe(
+      "离线完整查重快照（语料已绑定）"
+    );
+  });
+
   it("development/holdout nonce 必须独立且恰为 256 bit", () => {
     const repeated = createBridgeFixture("nonce-repeat");
     expect(() => prepareReviewFlowEvaluationDatasetBridge({
@@ -486,6 +664,7 @@ interface BridgeFixture {
   readonly upstreamMarkerSha256: string;
   readonly verifierOutputPath: string;
   readonly generatorRepository: string;
+  readonly capturerRepository: string;
   readonly generatorIdentity: ReturnType<typeof loadEvaluationCodeIdentity>;
   readonly developmentCandidates: readonly unknown[];
 }
@@ -503,6 +682,7 @@ function createBridgeFixture(seed: string): BridgeFixture {
   const upstreamGoldFiles = mkdirPrivate(join(upstreamGold, "gold"));
   const bridgeInput = mkdirPrivate(join(privateRoot, "bridge-input"));
   const generator = createSyntheticFermataGenerator(workspace);
+  const capturer = createSyntheticAnklangCapturer(workspace);
 
   const rawInputs = [
     Buffer.from(`<Workbook seed="${seed}-old"/>`, "utf8"),
@@ -868,6 +1048,15 @@ function createBridgeFixture(seed: string): BridgeFixture {
       explanation: "synthetic second"
     }
   ];
+  const captureCases: {
+    caseId: string;
+    requestId: string;
+    requestSha256: string;
+    responseSha256: string;
+    httpStatus: 200;
+    attempt: 1;
+    responseCompletionStatus: "complete";
+  }[] = [];
   const bridgeCases = upstreamCases.map((entry, index) => {
     const safeId = index === 0 ? "case-0001" : "case-9001";
     const hashInput = problemHashInput(index + 1);
@@ -879,6 +1068,21 @@ function createBridgeFixture(seed: string): BridgeFixture {
     const taskBytes = pretty(task);
     const taskFileName = `${safeId}.task.private.json`;
     writePrivate(join(bridgeInput, taskFileName), taskBytes);
+    const requestId = `20000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`;
+    const anklangRequest = {
+      apiVersion: "2",
+      requestId,
+      contentHash,
+      problem: {
+        title: task.problem.title,
+        type: task.problem.type,
+        tagIds: task.problem.tagIds,
+        basicStatement: task.problem.content.basicStatement
+      }
+    };
+    const anklangRequestBytes = pretty(anklangRequest);
+    const anklangRequestFileName = `${safeId}.anklang-request.private.json`;
+    writePrivate(join(bridgeInput, anklangRequestFileName), anklangRequestBytes);
     const candidates = index === 0 ? developmentCandidates : [];
     const anklang = {
       apiVersion: "2",
@@ -902,6 +1106,15 @@ function createBridgeFixture(seed: string): BridgeFixture {
     const anklangBytes = pretty(anklang);
     const anklangFileName = `${safeId}.anklang.private.json`;
     writePrivate(join(bridgeInput, anklangFileName), anklangBytes);
+    captureCases.push({
+      caseId: entry.caseId,
+      requestId,
+      requestSha256: sha256(anklangRequestBytes),
+      responseSha256: sha256(anklangBytes),
+      httpStatus: 200,
+      attempt: 1,
+      responseCompletionStatus: "complete"
+    });
     const mapping = index === 0
       ? {
           schemaVersion: 1,
@@ -974,6 +1187,10 @@ function createBridgeFixture(seed: string): BridgeFixture {
       problemHashInput: {
         fileName: hashInputFileName,
         sha256: sha256(hashInputBytes)
+      },
+      originalAnklangRequest: {
+        fileName: anklangRequestFileName,
+        sha256: sha256(anklangRequestBytes)
       },
       originalAnklangResponse: {
         fileName: anklangFileName,
@@ -1052,10 +1269,89 @@ function createBridgeFixture(seed: string): BridgeFixture {
   const attestationFileName = "upstream-attestation.private.json";
   writePrivate(join(bridgeInput, attestationFileName), attestationBytes);
   writePrivate(verifier.outputPath, attestationBytes);
+  const captureAttestationWithoutFingerprint = {
+    schemaVersion: 1,
+    artifactKind: "anklang_review_flow_capture_attestation",
+    protocolVersion: "anklang-review-flow-capture-v1",
+    captureStatus: "complete",
+    captureId: `capture-${sha256(`capture-${seed}`).slice(0, 16)}`,
+    capturedAt: "2026-08-01T00:00:00.000Z",
+    capturer: {
+      repository: "Anklang",
+      codeVersion: capturer.identity.codeVersion,
+      runnerPath: "scripts/capture-review-flow-calibration.py",
+      runnerSha256: capturer.identity.runnerSha256,
+      dependencyCodeSha256: capturer.identity.dependencyCodeSha256,
+      dependencyFileCount: 4
+    },
+    configuration: {
+      apiVersion: "2",
+      endpointPath: "/api/v2/checks/similarity",
+      baseUrlSha256: sha256("https://synthetic.invalid"),
+      timeoutMs: 120_000,
+      authentication: "bearer_redacted",
+      secretsExcluded: true
+    },
+    backend: {
+      kind: "reverse_proxy",
+      configurationSha256: sha256(`backend-${seed}`),
+      secretsExcluded: true
+    },
+    corpus: {
+      evidenceKind: "remote_corpus_unverifiable",
+      serviceOriginSha256: sha256("https://synthetic.invalid"),
+      declarationSha256: sha256(`remote-corpus-${seed}`)
+    },
+    cases: captureCases,
+    counts: {
+      caseCount: captureCases.length,
+      requestCount: captureCases.length,
+      responseCount: captureCases.length,
+      http200Count: captureCases.length,
+      attemptCount: captureCases.length,
+      completeResponseCount: captureCases.length,
+      failureCount: 0
+    }
+  };
+  const captureAttestation = {
+    ...captureAttestationWithoutFingerprint,
+    captureFingerprint: hashCanonicalValue(
+      captureAttestationWithoutFingerprint
+    )
+  };
+  const captureAttestationBytes = pretty(captureAttestation);
+  const captureAttestationFileName = "anklang-capture-attestation.private.json";
+  writePrivate(
+    join(bridgeInput, captureAttestationFileName),
+    captureAttestationBytes
+  );
+  const captureCompletion = {
+    schemaVersion: 1,
+    artifactKind: "anklang_review_flow_capture_completion",
+    protocolVersion: "anklang-review-flow-capture-v1",
+    captureId: captureAttestation.captureId,
+    attestationSha256: sha256(captureAttestationBytes),
+    captureSetSha256:
+      reviewFlowEvaluationAnklangCaptureSetSha256(captureCases),
+    caseCount: captureCases.length,
+    requestCount: captureCases.length,
+    responseCount: captureCases.length,
+    http200Count: captureCases.length,
+    attemptCount: captureCases.length,
+    completeResponseCount: captureCases.length,
+    failureCount: 0,
+    complete: true
+  };
+  const captureCompletionBytes = pretty(captureCompletion);
+  const captureCompletionFileName = "anklang-capture-completion.private.json";
+  writePrivate(
+    join(bridgeInput, captureCompletionFileName),
+    captureCompletionBytes
+  );
   const bridgePlan = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     artifactKind: "review_flow_evaluation_bridge_plan",
-    bridgeVersion: "urmotiv-review-flow-bridge-v2",
+    bridgeVersion: "urmotiv-review-flow-bridge-v3",
     confirmed: true,
     upstreamDatasetId: upstreamPlan.datasetId,
     datasetId: `dataset-${sha256(seed).slice(0, 16)}`,
@@ -1066,6 +1362,14 @@ function createBridgeFixture(seed: string): BridgeFixture {
     upstreamVerificationAttestation: {
       fileName: attestationFileName,
       sha256: sha256(attestationBytes)
+    },
+    anklangCaptureAttestation: {
+      fileName: captureAttestationFileName,
+      sha256: sha256(captureAttestationBytes)
+    },
+    anklangCaptureCompletion: {
+      fileName: captureCompletionFileName,
+      sha256: sha256(captureCompletionBytes)
     },
     holdoutRegistration: {
       baselineLabel: `baseline-${safeToken(seed)}`,
@@ -1091,6 +1395,7 @@ function createBridgeFixture(seed: string): BridgeFixture {
     upstreamMarkerSha256: sha256(upstreamMarkerBytes),
     verifierOutputPath: verifier.outputPath,
     generatorRepository: generator.repository,
+    capturerRepository: capturer.repository,
     generatorIdentity: generator.identity,
     developmentCandidates,
     input: {
@@ -1189,7 +1494,11 @@ function rewriteBridgeInput(
   fileName: string,
   update: (value: Record<string, any>) => Record<string, any>,
   caseId: string,
-  bindingKey: "humanMapping" | "taskDraft" | "originalAnklangResponse"
+  bindingKey:
+    | "humanMapping"
+    | "taskDraft"
+    | "originalAnklangRequest"
+    | "originalAnklangResponse"
 ): void {
   const path = join(fixture.bridgeInput, fileName);
   const changedBytes = pretty(update(readJson(path)));
@@ -1199,6 +1508,47 @@ function rewriteBridgeInput(
   const target = plan.cases.find((entry: { caseId: string }) => entry.caseId === caseId);
   if (target === undefined) throw new Error("TEST_PLAN_CASE_MISSING");
   target[bindingKey].sha256 = sha256(changedBytes);
+  writePrivate(planPath, pretty(plan));
+}
+
+function rewriteCaptureAttestation(
+  fixture: BridgeFixture,
+  update: (
+    attestation: Record<string, any>,
+    plan: Record<string, any>
+  ) => Record<string, any>
+): void {
+  const planPath = fixture.input.bridgePlanPath;
+  const plan = readJson(planPath);
+  const attestationPath = join(
+    fixture.bridgeInput,
+    plan.anklangCaptureAttestation.fileName
+  );
+  const original = readJson(attestationPath);
+  const changed = update(original, plan);
+  const { captureFingerprint: _oldFingerprint, ...withoutFingerprint } = changed;
+  const attestation: Record<string, any> = {
+    ...withoutFingerprint,
+    captureFingerprint: hashCanonicalValue(withoutFingerprint)
+  };
+  const attestationBytes = pretty(attestation);
+  writePrivate(attestationPath, attestationBytes);
+  plan.anklangCaptureAttestation.sha256 = sha256(attestationBytes);
+
+  const completionPath = join(
+    fixture.bridgeInput,
+    plan.anklangCaptureCompletion.fileName
+  );
+  const completion = readJson(completionPath);
+  const completionBytes = pretty({
+    ...completion,
+    captureId: attestation.captureId,
+    attestationSha256: sha256(attestationBytes),
+    captureSetSha256:
+      reviewFlowEvaluationAnklangCaptureSetSha256(attestation.cases)
+  });
+  writePrivate(completionPath, completionBytes);
+  plan.anklangCaptureCompletion.sha256 = sha256(completionBytes);
   writePrivate(planPath, pretty(plan));
 }
 
@@ -1249,6 +1599,51 @@ function createSyntheticFermataGenerator(workspace: string) {
     expectedCodeVersion: codeVersion,
     runnerPath: "experiments/prepare-review-flow-dataset.ts",
     dependencyPaths: reviewFlowEvaluationCodePaths
+  });
+  return { repository, identity };
+}
+
+function createSyntheticAnklangCapturer(workspace: string) {
+  const repository = join(workspace, "Anklang");
+  const dependencyPaths = [
+    "scripts/capture-review-flow-calibration.py",
+    "anklang/__init__.py",
+    "anklang/review_flow_capture.py",
+    "anklang/contracts.py"
+  ] as const;
+  for (const path of dependencyPaths) {
+    const absolutePath = join(repository, path);
+    mkdirSync(dirname(absolutePath), { recursive: true, mode: 0o700 });
+    writeFileSync(absolutePath, `synthetic capture dependency: ${path}\n`, {
+      mode: 0o600
+    });
+  }
+  execFileSync("/usr/bin/git", ["init", "-q"], { cwd: repository });
+  execFileSync("/usr/bin/git", ["add", "."], { cwd: repository });
+  execFileSync(
+    "/usr/bin/git",
+    [
+      "-c",
+      "user.name=Synthetic Test",
+      "-c",
+      "user.email=synthetic@example.invalid",
+      "commit",
+      "-q",
+      "-m",
+      "synthetic capture"
+    ],
+    { cwd: repository }
+  );
+  const codeVersion = execFileSync(
+    "/usr/bin/git",
+    ["rev-parse", "HEAD"],
+    { cwd: repository, encoding: "utf8" }
+  ).trim();
+  const identity = loadEvaluationCodeIdentity({
+    repositoryDirectory: repository,
+    expectedCodeVersion: codeVersion,
+    runnerPath: "scripts/capture-review-flow-calibration.py",
+    dependencyPaths
   });
   return { repository, identity };
 }

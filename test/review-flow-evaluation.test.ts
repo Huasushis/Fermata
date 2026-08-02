@@ -1746,7 +1746,7 @@ function writeDatasetCase(input: {
   const rowEvidenceSha256 = sha256(`row-${input.subjectId}`);
   const originalAnklangResponseSha256 = sha256(`anklang-${input.subjectId}`);
   const bridgeEvidence = {
-    bridgeVersion: "urmotiv-review-flow-bridge-v2" as const,
+    bridgeVersion: "urmotiv-review-flow-bridge-v3" as const,
     verificationAttestationSha256: sha256(`attestation-${input.subjectId}`),
     bridgePlanSha256: sha256(`bridge-plan-${input.subjectId}`),
     reviewGoldEvidenceSha256: sha256(`review-gold-evidence-${input.subjectId}`),
@@ -1756,7 +1756,14 @@ function writeDatasetCase(input: {
     inspectionSha256: sha256(`inspection-${input.subjectId}`),
     layoutSha256: sha256(`layout-${input.subjectId}`),
     reviewInputSetSha256: sha256(`review-input-set-${input.subjectId}`),
-    humanMappingSha256: sha256(`human-mapping-${input.subjectId}`)
+    humanMappingSha256: sha256(`human-mapping-${input.subjectId}`),
+    anklangCaptureAttestationSha256:
+      sha256(`anklang-capture-attestation-${input.subjectId}`),
+    anklangCaptureCompletionSha256:
+      sha256(`anklang-capture-completion-${input.subjectId}`),
+    anklangRequestSha256: sha256(`anklang-request-${input.subjectId}`),
+    anklangResponseSha256: originalAnklangResponseSha256,
+    anklangCorpusEvidenceKind: "remote_corpus_unverifiable" as const
   };
   const gold = input.gold({
     schemaVersion: 2,
@@ -2689,9 +2696,9 @@ function writeDatasetManifestAndBridge(
   writePrivateJson(
     join(fixture.suiteDirectory, reviewFlowEvaluationBridgeCompletionFileName),
     {
-      schemaVersion: 2,
+      schemaVersion: 3,
       artifactKind: "review_flow_evaluation_dataset_bridge_completion",
-      bridgeVersion: "urmotiv-review-flow-bridge-v2",
+      bridgeVersion: "urmotiv-review-flow-bridge-v3",
       datasetId: manifest.datasetId,
       manifestFileName: basename(fixture.manifestPath),
       manifestSha256: sha256(manifestBytes),

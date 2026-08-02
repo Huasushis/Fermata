@@ -116,7 +116,7 @@ const upstreamEvidenceSchema = z
     originalAnklangResponseSha256: reviewFlowEvaluationDigestSchema,
     bridgeEvidence: z
       .object({
-        bridgeVersion: z.literal("urmotiv-review-flow-bridge-v2"),
+        bridgeVersion: z.literal("urmotiv-review-flow-bridge-v3"),
         verificationAttestationSha256: reviewFlowEvaluationDigestSchema,
         bridgePlanSha256: reviewFlowEvaluationDigestSchema,
         reviewGoldEvidenceSha256: reviewFlowEvaluationDigestSchema,
@@ -126,7 +126,15 @@ const upstreamEvidenceSchema = z
         inspectionSha256: reviewFlowEvaluationDigestSchema,
         layoutSha256: reviewFlowEvaluationDigestSchema,
         reviewInputSetSha256: reviewFlowEvaluationDigestSchema,
-        humanMappingSha256: reviewFlowEvaluationDigestSchema
+        humanMappingSha256: reviewFlowEvaluationDigestSchema,
+        anklangCaptureAttestationSha256: reviewFlowEvaluationDigestSchema,
+        anklangCaptureCompletionSha256: reviewFlowEvaluationDigestSchema,
+        anklangRequestSha256: reviewFlowEvaluationDigestSchema,
+        anklangResponseSha256: reviewFlowEvaluationDigestSchema,
+        anklangCorpusEvidenceKind: z.enum([
+          "reproducible_snapshot",
+          "remote_corpus_unverifiable"
+        ])
       })
       .strict()
   })
@@ -440,9 +448,9 @@ export type ReviewFlowEvaluationRevealDescriptor = z.infer<
 
 export const reviewFlowEvaluationBridgeCompletionSchema = z
   .object({
-    schemaVersion: z.literal(2),
+    schemaVersion: z.literal(3),
     artifactKind: z.literal("review_flow_evaluation_dataset_bridge_completion"),
-    bridgeVersion: z.literal("urmotiv-review-flow-bridge-v2"),
+    bridgeVersion: z.literal("urmotiv-review-flow-bridge-v3"),
     datasetId: reviewFlowEvaluationDatasetIdSchema,
     manifestFileName: privateFileNameSchema,
     manifestSha256: reviewFlowEvaluationDigestSchema,

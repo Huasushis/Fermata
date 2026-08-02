@@ -300,7 +300,7 @@ commitment 使用不同 nonce，development run 绝不能获得 holdout descript
         "rowEvidenceSha256": "原始审核行证据摘要",
         "originalAnklangResponseSha256": "必须与 prediction manifest 一致",
         "bridgeEvidence": {
-          "bridgeVersion": "urmotiv-review-flow-bridge-v2",
+          "bridgeVersion": "urmotiv-review-flow-bridge-v3",
           "verificationAttestationSha256": "上游验证证明原始字节摘要",
           "bridgePlanSha256": "桥接计划原始字节摘要",
           "reviewGoldEvidenceSha256": "上游 evidence 原始字节摘要",
@@ -310,7 +310,12 @@ commitment 使用不同 nonce，development run 绝不能获得 holdout descript
           "inspectionSha256": "原始表格检查报告原始字节摘要",
           "layoutSha256": "人工布局确认原始字节摘要",
           "reviewInputSetSha256": "原始审核输入集合摘要",
-          "humanMappingSha256": "本题人工映射原始字节摘要"
+          "humanMappingSha256": "本题人工映射原始字节摘要",
+          "anklangCaptureAttestationSha256": "整批采集证明原始字节摘要",
+          "anklangCaptureCompletionSha256": "整批采集完成标记原始字节摘要",
+          "anklangRequestSha256": "本题原始 v2 request 字节摘要",
+          "anklangResponseSha256": "本题原始 HTTP response 字节摘要",
+          "anklangCorpusEvidenceKind": "语料证据等级"
         }
       },
       "gold": {
@@ -338,13 +343,13 @@ schema 伪造 holdout。只有非空 holdout 才能登记标签对。
 转换器必须最后写出同目录固定文件 `REVIEW_FLOW_DATASET_COMPLETE`，loader 会在读取任何题目内容前验证它
 绑定 manifest、标签目录、逐题来源谱系集合和精确分区计数；标记缺失、截断或摘要不符的 partial 目录一律
 不能运行。它还必须绑定独立 reveal commitment，但仍不保存 reveal 文件名。标记的严格结构如下，
-转换版本当前固定为 `urmotiv-review-flow-bridge-v2`：
+转换版本当前固定为 `urmotiv-review-flow-bridge-v3`：
 
 ```jsonc
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "artifactKind": "review_flow_evaluation_dataset_bridge_completion",
-  "bridgeVersion": "urmotiv-review-flow-bridge-v2",
+  "bridgeVersion": "urmotiv-review-flow-bridge-v3",
   "datasetId": "必须与 manifest 一致",
   "manifestFileName": "manifest.private.json",
   "manifestSha256": "manifest 原始字节摘要",
@@ -366,9 +371,87 @@ schema 伪造 holdout。只有非空 holdout 才能登记标签对。
 }
 ```
 
-桥接时必须验证原始 Anklang v2 complete/contentHash，保留全部候选与判断；只允许把复用政策收紧为
-`no-store` 并令 item `expiresAt=null`，同时把原始响应字节摘要和转换版本纳入来源谱系/完成标记。不得
-伪造空候选，也不得由实验入口自动调用 Anklang。
+桥接时不能只拿一份声称 `complete` 的 Anklang 响应。bridge plan 必须逐题同时绑定实际发送的原始
+v2 request 和 HTTP 原始 response，并另外绑定整批 capture attestation 与 marker-last completion。
+request 必须是无额外字段的 v2 严格结构，`requestId` 整批唯一；`title/type/tagIds/basicStatement`
+逐字段等于 task draft，`contentHash` 等于由 problem hash input 重算的 Urmotiv 摘要。response 必须是
+HTTP 200、attempt 1 的严格 v2 `complete`，并原样回显 request 的 `contentHash`。转换器保留全部候选
+与判断，只允许把复用政策收紧为 `no-store` 并令 item `expiresAt=null`。不得伪造空候选，也不得由
+实验入口自动调用 Anklang。
+
+capture attestation 固定绑定 clean Anklang HEAD 和代码内置的 4 文件采集器身份：
+`scripts/capture-review-flow-calibration.py`、`anklang/__init__.py`、
+`anklang/review_flow_capture.py`、`anklang/contracts.py`；依赖清单不能由 attestation 自报或动态扩展。
+attestation 还必须保存不含地址明文和密钥的 v2 endpoint/config 摘要、backend 声明、corpus 声明，
+以及逐题 case/requestId/request 原始 SHA-256/response 原始 SHA-256/HTTP 200/attempt 1 和完整计数。
+顶层 `captureFingerprint` 是去掉自身后规范 JSON 的摘要；completion 再绑定 attestation 原始字节摘要、
+逐题 capture set 摘要和全部相等计数，并固定 `failureCount=0`、`complete=true`。两者都必须是规范化的
+JSON 字节，任一缺失、非完整、计数不等或 Anklang 工作树不干净都会失败关闭。
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "artifactKind": "anklang_review_flow_capture_attestation",
+  "protocolVersion": "anklang-review-flow-capture-v1",
+  "captureStatus": "complete",
+  "captureId": "capture-16位小写十六进制",
+  "capturedAt": "UTC Z 时间",
+  "capturer": {
+    "repository": "Anklang",
+    "codeVersion": "clean Anklang HEAD",
+    "runnerPath": "scripts/capture-review-flow-calibration.py",
+    "runnerSha256": "固定 runner 原始字节摘要",
+    "dependencyCodeSha256": "固定 4 文件代码包摘要",
+    "dependencyFileCount": 4
+  },
+  "configuration": {
+    "apiVersion": "2",
+    "endpointPath": "/api/v2/checks/similarity",
+    "baseUrlSha256": "不含账号密码的服务地址摘要",
+    "timeoutMs": 120000,
+    "authentication": "bearer_redacted 或 none",
+    "secretsExcluded": true
+  },
+  "backend": {
+    "kind": "local_engine 或 reverse_proxy",
+    "configurationSha256": "去密钥 backend 配置声明摘要",
+    "secretsExcluded": true
+  },
+  "corpus": {
+    "evidenceKind": "remote_corpus_unverifiable",
+    "serviceOriginSha256": "远端服务来源摘要",
+    "declarationSha256": "去密钥远端语料声明摘要"
+  },
+  "cases": [{
+    "caseId": "上游 caseId",
+    "requestId": "唯一 UUID",
+    "requestSha256": "原始 request 字节摘要",
+    "responseSha256": "原始 response 字节摘要",
+    "httpStatus": 200,
+    "attempt": 1,
+    "responseCompletionStatus": "complete"
+  }],
+  "counts": {
+    "caseCount": 36,
+    "requestCount": 36,
+    "responseCount": 36,
+    "http200Count": 36,
+    "attemptCount": 36,
+    "completeResponseCount": 36,
+    "failureCount": 0
+  },
+  "captureFingerprint": "去掉本字段后的规范 JSON 摘要"
+}
+```
+
+`reproducible_snapshot` 的 `corpus` 分支不用远端两个字段，严格改为
+`corpusId/manifestSha256/snapshotSha256/corpusRevisionSha256/problemCount`。capture completion 使用相同
+`captureId`，并严格含 `attestationSha256/captureSetSha256`、上述七个计数字段和 `complete: true`。
+
+`local_engine` 只有同时绑定 corpus manifest、实际 snapshot、语料 revision 和题目计数时才可声明
+`reproducible_snapshot`。`reverse_proxy` 固定只能声明 `remote_corpus_unverifiable`：其完整响应仍可作为
+Fermata 的查重上下文，但页面、报告和证据不得把远端语料描述成可复现或已绑定的语料证据。该等级会
+写入隐藏的 Gold bridge evidence 和来源谱系；远端上下文的 review item 摘要也明确显示“远端语料不可复核”。
 
 正式转换使用 `experiment:prepare-review-flow-dataset`。它不是“相信一份已经写好的 JSON”：每次执行都先
 要求 `--fermata-code-version` 精确等于当前干净 Fermata HEAD，并用可信 Git 快照核对固定 runner
@@ -393,9 +476,10 @@ attestation v1 必须报告两类不同摘要，不能混用：普通 `*Sha256` 
 case/subject/purpose/scope/source/path/source 摘要/row evidence/Gold 摘要和全部计数。严格结构以
 `reviewFlowEvaluationUpstreamAttestationSchema` 为准。
 
-bridge plan 同目录只放 basename 引用，并逐题绑定四份既有 `0600` 文件：不含 review item 的
-RobotReviewTask draft、`urmotiv_problem_content_hash_input`、原始 Anklang v2 complete 响应和人工
-`review_flow_evaluation_human_mapping`。problem hash input 保存 Urmotiv 计算 contentHash 所需、但 robot
+bridge plan 同目录只放 basename 引用，并逐题绑定五份既有 `0600` 文件：不含 review item 的
+RobotReviewTask draft、`urmotiv_problem_content_hash_input`、原始 Anklang v2 request、原始 HTTP 200
+complete response 和人工 `review_flow_evaluation_human_mapping`；顶层另绑定 capture attestation 与
+capture completion。problem hash input 保存 Urmotiv 计算 contentHash 所需、但 robot
 task 不可见的难度、样例 UUID、完整 judge config 和状态；转换器按 Urmotiv 的字段顺序重算 SHA-256，再
 核对 task 可见字段。人工 mapping 必须显式确认题面/题解边界来自绑定的物化源，并把 XML 意见只映射成
 稀疏观察；投稿者自报难度不能进入独立难度真值。
@@ -446,7 +530,7 @@ descriptor，再写标签目录、全部 content 和 manifest，重新核对精�
     "sourceLineageSha256": "必须与 manifest 一致",
     "originalAnklangResponseSha256": "必须与 manifest 一致",
     "bridgeEvidence": {
-      "bridgeVersion": "urmotiv-review-flow-bridge-v2",
+      "bridgeVersion": "urmotiv-review-flow-bridge-v3",
       "verificationAttestationSha256": "只在揭盲侧绑定",
       "bridgePlanSha256": "只在揭盲侧绑定",
       "reviewGoldEvidenceSha256": "只在揭盲侧绑定",
@@ -456,7 +540,12 @@ descriptor，再写标签目录、全部 content 和 manifest，重新核对精�
       "inspectionSha256": "只在揭盲侧绑定",
       "layoutSha256": "只在揭盲侧绑定",
       "reviewInputSetSha256": "只在揭盲侧绑定",
-      "humanMappingSha256": "只在揭盲侧绑定"
+      "humanMappingSha256": "只在揭盲侧绑定",
+      "anklangCaptureAttestationSha256": "只在揭盲侧绑定",
+      "anklangCaptureCompletionSha256": "只在揭盲侧绑定",
+      "anklangRequestSha256": "只在揭盲侧绑定",
+      "anklangResponseSha256": "等于 manifest 的原始响应摘要",
+      "anklangCorpusEvidenceKind": "reproducible_snapshot 或 remote_corpus_unverifiable"
     }
   },
   "evaluationScope": "verdict_and_taste",
@@ -512,7 +601,7 @@ descriptor，再写标签目录、全部 content 和 manifest，重新核对精�
     "sourceLineageSha256": "必须与 manifest 一致",
     "originalAnklangResponseSha256": "必须与 manifest 一致",
     "bridgeEvidence": {
-      "bridgeVersion": "urmotiv-review-flow-bridge-v2",
+      "bridgeVersion": "urmotiv-review-flow-bridge-v3",
       "verificationAttestationSha256": "只在揭盲侧绑定",
       "bridgePlanSha256": "只在揭盲侧绑定",
       "reviewGoldEvidenceSha256": "只在揭盲侧绑定",
@@ -522,7 +611,12 @@ descriptor，再写标签目录、全部 content 和 manifest，重新核对精�
       "inspectionSha256": "只在揭盲侧绑定",
       "layoutSha256": "只在揭盲侧绑定",
       "reviewInputSetSha256": "只在揭盲侧绑定",
-      "humanMappingSha256": "只在揭盲侧绑定"
+      "humanMappingSha256": "只在揭盲侧绑定",
+      "anklangCaptureAttestationSha256": "只在揭盲侧绑定",
+      "anklangCaptureCompletionSha256": "只在揭盲侧绑定",
+      "anklangRequestSha256": "只在揭盲侧绑定",
+      "anklangResponseSha256": "等于 manifest 的原始响应摘要",
+      "anklangCorpusEvidenceKind": "reproducible_snapshot 或 remote_corpus_unverifiable"
     }
   },
   "evaluationScope": "originality_only",
