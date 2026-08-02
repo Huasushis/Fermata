@@ -89,13 +89,57 @@ import {
 export const reviewFlowRuntimeImplementationVersion =
   "review-flow-runtime-v3-process-local-evidence" as const;
 
+export const reviewFlowInternalErrorCodeAllowlist = Object.freeze([
+  "REVIEW_FLOW_SOURCE_INVALID",
+  "REVIEW_FLOW_SUBMISSION_INVALID",
+  "REVIEW_FLOW_SUBMISSION_NOT_CREATED",
+  "REVIEW_FLOW_ROLE_FAILED",
+  "REVIEW_FLOW_EXECUTION_CONTEXT_INVALID",
+  "REVIEW_FLOW_TASK_SOURCE_UNTRUSTED",
+  "REVIEW_FLOW_TRUSTED_RUNNER_INVALID",
+  "REVIEW_FLOW_RUNNER_INVALID",
+  "REVIEW_FLOW_IDENTITY_INVALID",
+  "REVIEW_FLOW_TAG_SELECTION_INVALID",
+  "REVIEW_FLOW_REFERENCE_STATE_INVALID",
+  "REVIEW_FLOW_EVIDENCE_REFERENCE_INVALID"
+] as const);
+
+export type ReviewFlowInternalErrorCode =
+  (typeof reviewFlowInternalErrorCodeAllowlist)[number];
+
+export const reviewFlowFailureKindAllowlist = Object.freeze([
+  "input_invalid",
+  "validation",
+  "service_http",
+  "transport",
+  "timeout",
+  "cancelled",
+  "output_limit",
+  "content_filtered",
+  "protocol",
+  "schema_output",
+  "role_internal"
+] as const);
+
+export type ReviewFlowFailureKind =
+  (typeof reviewFlowFailureKindAllowlist)[number];
+
+export type ReviewFlowOutcomeErrorCode =
+  | ReviewFlowInternalErrorCode
+  | "REVIEW_FLOW_UNEXPECTED_FAILURE";
+
+const privateReviewFlowErrorFields = new WeakMap<object, {
+  readonly code: unknown;
+  readonly failureKind: unknown;
+}>();
+
 export class ReviewFlowError extends Error {
-  readonly code: string;
+  readonly code: ReviewFlowInternalErrorCode;
   readonly role: ReviewFlowRole | null;
   readonly failureKind: ReviewFlowFailureKind;
 
   constructor(
-    code: string,
+    code: ReviewFlowInternalErrorCode,
     role: ReviewFlowRole | null = null,
     failureKind: ReviewFlowFailureKind = "validation"
   ) {
@@ -104,21 +148,9 @@ export class ReviewFlowError extends Error {
     this.code = code;
     this.role = role;
     this.failureKind = failureKind;
+    privateReviewFlowErrorFields.set(this, Object.freeze({ code, failureKind }));
   }
 }
-
-export type ReviewFlowFailureKind =
-  | "input_invalid"
-  | "validation"
-  | "service_http"
-  | "transport"
-  | "timeout"
-  | "cancelled"
-  | "output_limit"
-  | "content_filtered"
-  | "protocol"
-  | "schema_output"
-  | "role_internal";
 
 export interface ReviewFlowRoles {
   readonly solver: (view: ReturnType<typeof buildStatementOnlyView>) => Promise<unknown>;
@@ -207,7 +239,7 @@ export interface ReviewFlowRoleFailureSummary {
 export interface ReviewFlowIncompleteFailure {
   readonly schemaVersion: 1;
   readonly failureId: string;
-  readonly code: string;
+  readonly code: ReviewFlowOutcomeErrorCode;
   readonly failureKind: ReviewFlowFailureKind;
   readonly sourceSnapshotHash: string | null;
   readonly runBinding: ReviewFlowSafeRunBinding | null;
@@ -394,14 +426,16 @@ export async function runReviewEvidenceFlowOutcome(
     const decision = await runReviewEvidenceFlowTracked(input, tracker);
     return deepFreeze({ status: "complete" as const, decision });
   } catch (error) {
-    const reviewError = error instanceof ReviewFlowError ? error : null;
+    const normalizedError = normalizeReviewFlowOutcomeError(error);
     const failureBase = {
       schemaVersion: 1 as const,
-      code: reviewError?.code ?? "REVIEW_FLOW_UNEXPECTED_FAILURE",
-      failureKind: reviewError?.failureKind ?? "role_internal" as const,
+      code: normalizedError.code,
+      failureKind: normalizedError.failureKind,
       sourceSnapshotHash: tracker.sourceSnapshotHash,
       runBinding: tracker.runBinding,
-      failedRoles: orderedRoleValues(tracker.failures),
+      failedRoles: orderedRoleValues(tracker.failures).map(
+        normalizeReviewFlowRoleFailureSummary
+      ),
       completedRoles: orderedRoleValues(tracker.completions)
     };
     const failure: ReviewFlowIncompleteFailure = deepFreeze({
@@ -938,8 +972,68 @@ function resolveRunner(input: ReviewFlowInput): ResolvedReviewFlowRunner {
   };
 }
 
+function normalizeReviewFlowOutcomeError(error: unknown): {
+  readonly code: ReviewFlowOutcomeErrorCode;
+  readonly failureKind: ReviewFlowFailureKind;
+} {
+  try {
+    const privateFields = typeof error === "object" && error !== null
+      ? privateReviewFlowErrorFields.get(error)
+      : undefined;
+    if (
+      error instanceof ReviewFlowError &&
+      privateFields !== undefined &&
+      error.code === privateFields.code &&
+      error.failureKind === privateFields.failureKind &&
+      isReviewFlowInternalErrorCode(privateFields.code) &&
+      isReviewFlowFailureKind(privateFields.failureKind)
+    ) {
+      return {
+        code: privateFields.code,
+        failureKind: privateFields.failureKind
+      };
+    }
+  } catch {
+    // 运行时伪造的属性访问器也只能落入固定的安全失败分类。
+  }
+  return {
+    code: "REVIEW_FLOW_UNEXPECTED_FAILURE",
+    failureKind: "role_internal"
+  };
+}
+
+function isReviewFlowInternalErrorCode(
+  value: unknown
+): value is ReviewFlowInternalErrorCode {
+  return typeof value === "string" &&
+    (reviewFlowInternalErrorCodeAllowlist as readonly string[]).includes(value);
+}
+
+function isReviewFlowFailureKind(value: unknown): value is ReviewFlowFailureKind {
+  return typeof value === "string" &&
+    (reviewFlowFailureKindAllowlist as readonly string[]).includes(value);
+}
+
+function normalizeReviewFlowRoleFailureSummary(
+  summary: ReviewFlowRoleFailureSummary
+): ReviewFlowRoleFailureSummary {
+  let failureKind: ReviewFlowFailureKind = "role_internal";
+  try {
+    if (isReviewFlowFailureKind(summary.failureKind)) {
+      failureKind = summary.failureKind;
+    }
+  } catch {
+    // 只保留固定枚举，绝不序列化运行时注入的任意值。
+  }
+  return failureKind === summary.failureKind
+    ? summary
+    : deepFreeze({ ...summary, failureKind });
+}
+
 function classifyRoleFailure(error: unknown): ReviewFlowFailureKind {
-  if (error instanceof ReviewFlowError) return error.failureKind;
+  if (error instanceof ReviewFlowError) {
+    return normalizeReviewFlowOutcomeError(error).failureKind;
+  }
   if (error instanceof z.ZodError) return "schema_output";
   const code = typeof error === "object" && error !== null && "code" in error
     ? (error as { readonly code?: unknown }).code

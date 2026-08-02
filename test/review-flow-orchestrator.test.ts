@@ -4,6 +4,7 @@ import {
   consumeReviewFlowSubmission,
   inspectReviewFlowArtifactsForTest,
   inspectReviewFlowSubmissionForTest,
+  ReviewFlowError,
   runReviewEvidenceFlow,
   runReviewEvidenceFlowOutcome,
   type ReviewFlowInput,
@@ -713,6 +714,55 @@ describe("冻结证据多角色审题编排", () => {
     ]);
     expect(JSON.stringify(outcome)).not.toContain(privateFailure);
     expect(JSON.stringify(outcome)).not.toContain(solutionSentinel);
+  });
+
+  it("运行时伪造的 ReviewFlowError 只能形成固定 unexpected 安全摘要", async () => {
+    const privateCode = "PRIVATE_ERROR_CODE_SENTINEL";
+    const privateKind = "PRIVATE_FAILURE_KIND_SENTINEL";
+    const forgedByPrototype = Object.assign(
+      Object.create(ReviewFlowError.prototype) as ReviewFlowError,
+      {
+        code: "REVIEW_FLOW_ROLE_FAILED",
+        role: "solver",
+        failureKind: "transport"
+      }
+    );
+    const forgedErrors: readonly unknown[] = [
+      new ReviewFlowError(
+        privateCode as never,
+        "solver",
+        privateKind as never
+      ),
+      new ReviewFlowError(
+        "REVIEW_FLOW_ROLE_FAILED",
+        "solver",
+        privateKind as never
+      ),
+      forgedByPrototype
+    ];
+
+    for (const forgedError of forgedErrors) {
+      const outcome = await runReviewEvidenceFlowOutcome({
+        source: source(),
+        identities: identities(),
+        roles: defaultRoles({
+          solver: async () => { throw forgedError; }
+        })
+      });
+      expect(outcome.status).toBe("incomplete");
+      if (outcome.status !== "incomplete") throw new Error("expected incomplete");
+      expect(outcome.failure).toMatchObject({
+        code: "REVIEW_FLOW_UNEXPECTED_FAILURE",
+        failureKind: "role_internal",
+        failedRoles: [{
+          role: "solver",
+          failureKind: "role_internal"
+        }]
+      });
+      const serialized = JSON.stringify(outcome);
+      expect(serialized).not.toContain(privateCode);
+      expect(serialized).not.toContain(privateKind);
+    }
   });
 
   it("可信上下文缺 receipt 或轮次不匹配都在付费工作流边界 fail-closed", async () => {
