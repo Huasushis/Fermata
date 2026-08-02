@@ -63,7 +63,7 @@ describe("verdict 合成接线诊断设计", () => {
       contentHash: "0".repeat(64),
       title: "synthetic-safe-title",
       type: "traditional",
-      tagIds: [],
+      tagIds: ["synthetic.tag"],
       basicStatement: "synthetic statement",
       basicSolution: "synthetic solution"
     };

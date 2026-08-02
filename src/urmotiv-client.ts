@@ -35,21 +35,11 @@ import {
 
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
-// 请求参数类型使用 `z.input`（解析前的类型），让 schema 自己补齐 leaseSeconds、
-// tagIds 等默认值；真正发送前仍统一经过下面的本地边界 schema 校验。
+// 请求参数类型使用 `z.input`（解析前的类型），让 schema 自己补齐 leaseSeconds 等
+// 默认值；真正发送前仍统一经过下面的本地边界 schema 校验。
 export type ClaimRobotReviewTasksRequest = z.input<typeof claimRobotReviewTasksInputSchema>;
-// Urmotiv 在滚动升级期间仍把 requestId 标成 optional；Fermata 已是新客户端，
-// 所以在自己的 HTTP 边界叠加 required 约束，不能只依赖 TypeScript 阻止 JS/any 漏传。
-const requiredRequestIdSchema = z.string().uuid();
-const fermataRenewRobotReviewTaskInputSchema = renewRobotReviewTaskInputSchema.extend({
-  requestId: requiredRequestIdSchema
-});
-const fermataCompleteRobotReviewTaskInputSchema = completeRobotReviewTaskInputSchema.extend({
-  requestId: requiredRequestIdSchema
-});
-
-export type RenewRobotReviewTaskRequest = z.input<typeof fermataRenewRobotReviewTaskInputSchema>;
-export type CompleteRobotReviewTaskRequest = z.input<typeof fermataCompleteRobotReviewTaskInputSchema>;
+export type RenewRobotReviewTaskRequest = z.input<typeof renewRobotReviewTaskInputSchema>;
+export type CompleteRobotReviewTaskRequest = z.input<typeof completeRobotReviewTaskInputSchema>;
 
 /** 与生产装配使用的默认值保持一致，供 worker 计算续租重试的最小安全预算。 */
 export const DEFAULT_URMOTIV_REQUEST_TIMEOUT_MS = 30_000;
@@ -176,7 +166,7 @@ export class UrmotivClient implements UrmotivClientLike {
     input: RenewRobotReviewTaskRequest
   ): Promise<RenewRobotReviewTaskResponse> {
     const id = assignmentIdSchema.parse(assignmentId);
-    const body = fermataRenewRobotReviewTaskInputSchema.parse(input);
+    const body = renewRobotReviewTaskInputSchema.parse(input);
     return this.requestIdempotently(
       `api/v1/robot/review-tasks/${id}/renew`,
       JSON.stringify(body),
@@ -190,7 +180,7 @@ export class UrmotivClient implements UrmotivClientLike {
     input: CompleteRobotReviewTaskRequest
   ): Promise<RobotReviewTaskCompletion> {
     const id = assignmentIdSchema.parse(assignmentId);
-    const body = fermataCompleteRobotReviewTaskInputSchema.parse(input);
+    const body = completeRobotReviewTaskInputSchema.parse(input);
     return this.requestIdempotently(
       `api/v1/robot/review-tasks/${id}/complete`,
       JSON.stringify(body),

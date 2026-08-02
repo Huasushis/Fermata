@@ -90,7 +90,7 @@ const problem: ReviewTaskProblem = {
   contentHash: "a".repeat(64),
   title: "测试题目",
   type: "traditional",
-  tagIds: ["dp"],
+  tagIds: ["dp", "graph.shortest-path"],
   basicStatement: "题面……",
   basicSolution: "题解……"
 };
@@ -140,6 +140,42 @@ describe("runVerdictPipeline：整体接线", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("付费请求前拒绝空知识点列表", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({}));
+    await expect(
+      runVerdictPipeline({
+        problem: { ...problem, tagIds: [] },
+        reviewItems: [],
+        difficulty: { rating: 1500, confidence: 0.8, rationale: "中等" },
+        thinking: {
+          level: 3,
+          signals: {
+            solved: true,
+            approachSimilarity: 0.5,
+            selfCorrections: 1,
+            keyInsightCount: 1
+          },
+          solverNarrativeLength: 100,
+          rationale: "还行"
+        },
+        coding: {
+          level: 2,
+          signals: {
+            effectiveLineCount: 20,
+            maxNestingDepth: 2,
+            detectedDataStructures: [],
+            maxDataStructureWeight: 0
+          },
+          referenceCodeLength: 200
+        },
+        expectedRound: 2,
+        duplicateSimilarityRejectThreshold: 0.9,
+        model: modelConfig(fetchMock)
+      })
+    ).rejects.toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("正常情况下透传模型的 verdict，并产出满足 reviewInputSchema 的 review", async () => {
     const fetchMock = vi.fn(async () =>
       jsonResponse({
@@ -168,7 +204,7 @@ describe("runVerdictPipeline：整体接线", () => {
       qualityLevel: 4,
       thinkingLevel: 3,
       codingLevel: 2,
-      tagIds: [],
+      tagIds: ["dp", "graph.shortest-path"],
       improvements: "建议补充边界数据范围说明。",
       privateNote: "内部备注",
       expectedRound: 2

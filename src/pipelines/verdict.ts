@@ -3,9 +3,9 @@
  * Anklang 查重给出的相似度），输出一份满足 reviewInputSchema 的审核意见。
  *
  * 注意 reviewInputSchema（packages/contracts/src/review.ts）实际字段是
- * verdict / codeforcesDifficulty / qualityLevel / thinkingLevel / codingLevel /
- * tagIds / improvements / privateNote / expectedRound，没有独立的
- * "publicComment" 字段——improvements 本身就是必填、面向审核意见的主要内容。
+ * verdict / codeforcesDifficulty / qualityLevel / originalityLevel / thinkingLevel /
+ * codingLevel / tagIds / improvements / publicComment / privateNote / expectedRound；其中
+ * improvements 是必填、面向审核意见的主要内容，publicComment 是可选公开补充。
  *
  * 阈值规则："已有审核条目显示的最高相似度超过 config/models.yaml 中
  * thresholds.duplicateSimilarityReject 的当次配置快照，
@@ -18,9 +18,9 @@
  * 就当作没有相似度信息，不会报错。等 Anklang 那边的 reviewItem 数据结构定下来，
  * 应该回来对齐这里的识别逻辑。
  *
- * 知识点标签修正：目前 Fermata 没有从机器人 API 拿到 Urmotiv 的标签词表，没办法
- * 判断自己想出来的标签 id 是不是真实存在，所以这里没有让模型自由建议标签，
- * tagIds 总是空数组。如果以后机器人 API 暴露了标签列表，可以在这里启用。
+ * 知识点标签修正：Fermata 不掌握 Urmotiv 的完整标签目录，不能让模型自由生成标签
+ * 编号。机器人任务里的当前题目标签已经由 Urmotiv 校验，因此评价原样携带这组标签；
+ * 如果以后机器人 API 提供带版本的目录快照，再单独设计标签建议。
  */
 import { z } from "zod";
 import { chatCompleteJson, type ChatMessage } from "../llm";
@@ -69,6 +69,9 @@ export async function runVerdictPipeline(input: VerdictPipelineInput): Promise<V
     duplicateSimilarityRejectThresholdSchema.parse(
       input.duplicateSimilarityRejectThreshold
     );
+  // 直接调用流水线的实验代码也可能绕过机器人任务 schema；知识点为空或超限时
+  // 必须在任何付费模型请求之前拒绝。
+  const tagIds = reviewInputSchema.shape.tagIds.parse(input.problem.tagIds);
   const highestKnownSimilarity = extractHighestDuplicateSimilarity(input.reviewItems);
   const messages = buildVerdictMessages(input, highestKnownSimilarity);
   const { data } = await chatCompleteJson(
@@ -95,7 +98,7 @@ export async function runVerdictPipeline(input: VerdictPipelineInput): Promise<V
     qualityLevel: data.qualityLevel,
     thinkingLevel: input.thinking.level,
     codingLevel: input.coding.level,
-    tagIds: [],
+    tagIds,
     improvements,
     privateNote: data.privateNote,
     expectedRound: input.expectedRound

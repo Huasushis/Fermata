@@ -9,7 +9,11 @@ import {
   UrmotivNetworkError,
   type CompleteRobotReviewTaskRequest
 } from "../src/urmotiv-client";
-import type { RobotReviewTask } from "../src/urmotiv-schemas";
+import {
+  completeRobotReviewTaskInputSchema,
+  renewRobotReviewTaskInputSchema,
+  type RobotReviewTask
+} from "../src/urmotiv-schemas";
 
 const robotToken = "urv_test_token_1234567890";
 const baseUrl = "https://urmotiv.example.test";
@@ -50,7 +54,7 @@ function validCompleteInput(): CompleteRobotReviewTaskRequest {
       qualityLevel: 3,
       thinkingLevel: 3,
       codingLevel: 2,
-      tagIds: [],
+      tagIds: ["dp"],
       improvements: "建议补充数据范围说明。",
       privateNote: "",
       expectedRound: 1
@@ -121,12 +125,34 @@ describe("UrmotivClient：正常路径", () => {
 });
 
 describe("UrmotivClient：本地校验先于网络请求", () => {
+  it("镜像契约要求 renew 和 complete 都携带请求标识", () => {
+    expect(
+      renewRobotReviewTaskInputSchema.safeParse({
+        expectedLeaseExpiresAt: "2026-07-26T00:05:00.000Z",
+        leaseSeconds: 300
+      }).success
+    ).toBe(false);
+    const { requestId: _requestId, ...withoutRequestId } = validCompleteInput();
+    expect(completeRobotReviewTaskInputSchema.safeParse(withoutRequestId).success).toBe(false);
+  });
+
   it("complete 在 review 不满足 schema 时直接抛错，不发请求", async () => {
     const fetchMock = vi.fn();
     const client = new UrmotivClient({ baseUrl, robotToken, fetch: fetchMock });
     const invalidInput = {
       ...validCompleteInput(),
       review: { ...validCompleteInput().review, codeforcesDifficulty: 1550 } // 不是整百
+    };
+    await expect(client.complete(assignmentId, invalidInput)).rejects.toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("complete 在 review 没有知识点时直接抛错，不发请求", async () => {
+    const fetchMock = vi.fn();
+    const client = new UrmotivClient({ baseUrl, robotToken, fetch: fetchMock });
+    const invalidInput = {
+      ...validCompleteInput(),
+      review: { ...validCompleteInput().review, tagIds: [] }
     };
     await expect(client.complete(assignmentId, invalidInput)).rejects.toThrow();
     expect(fetchMock).not.toHaveBeenCalled();

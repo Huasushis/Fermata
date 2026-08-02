@@ -41,10 +41,12 @@ export const reviewInputSchema = z.object({
   verdict: reviewVerdictSchema,
   codeforcesDifficulty: codeforcesDifficultySchema,
   qualityLevel: difficultyLevelSchema,
+  originalityLevel: difficultyLevelSchema.nullable().optional(),
   thinkingLevel: difficultyLevelSchema,
   codingLevel: difficultyLevelSchema,
-  tagIds: z.array(z.string().min(1).max(120)).max(30).default([]),
+  tagIds: z.array(z.string().min(1).max(120)).min(1).max(30),
   improvements: z.string().trim().min(1, "请填写主要改进点").max(20_000),
+  publicComment: z.string().trim().max(20_000).optional(),
   privateNote: z.string().trim().max(20_000).default(""),
   expectedRound: z.number().int().positive()
 });
@@ -106,7 +108,7 @@ export type ClaimRobotReviewTasksResponse = z.infer<typeof claimRobotReviewTasks
 
 export const renewRobotReviewTaskInputSchema = z
   .object({
-    requestId: z.string().uuid().optional(),
+    requestId: z.string().uuid(),
     expectedLeaseExpiresAt: z.string().datetime(),
     leaseSeconds: z.number().int().min(30).max(1_800).default(300)
   })
@@ -120,7 +122,7 @@ export type RenewRobotReviewTaskResponse = z.infer<typeof renewRobotReviewTaskRe
 
 export const completeRobotReviewTaskInputSchema = z
   .object({
-    requestId: z.string().uuid().optional(),
+    requestId: z.string().uuid(),
     expectedLeaseExpiresAt: z.string().datetime(),
     expectedProblemRevision: z.number().int().positive(),
     experimentVersion: z.string().trim().min(1).max(120),
