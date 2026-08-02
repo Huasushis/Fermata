@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { mapThinkingSignalsToLevel, runThinkingPipeline, type ThinkingSignals } from "../src/pipelines/thinking";
+import {
+  mapThinkingSignalsToLevel,
+  mergeSolverNarrative,
+  runThinkingPipeline,
+  type ThinkingSignals
+} from "../src/pipelines/thinking";
 import type { ReviewTaskProblem } from "../src/pipelines/types";
 
 describe("mapThinkingSignalsToLevel", () => {
@@ -76,7 +81,7 @@ function textResponse(content: string, reasoning?: string): Response {
 }
 
 describe("runThinkingPipeline：整体接线", () => {
-  it("solver 步骤不把题解发给模型，analyst 步骤会同时收到题解和 solver 的叙述", async () => {
+  it("solver 步骤不把题解发给模型，analyst 步骤会同时收到题解以及 solver 的思考与最终回答", async () => {
     let call = 0;
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       call += 1;
@@ -87,6 +92,7 @@ describe("runThinkingPipeline：整体接线", () => {
         return textResponse("我的解题过程：先尝试暴力……", "推理：先尝试暴力，然后优化");
       }
       expect(joined).toContain("推理：先尝试暴力，然后优化");
+      expect(joined).toContain("我的解题过程：先尝试暴力……");
       expect(joined).toContain("题解……");
       return textResponse(
         '{"solved": true, "approachSimilarity": 0.7, "selfCorrections": 1, "keyInsightCount": 2, "rationale": "基本一致"}'
@@ -115,12 +121,12 @@ describe("runThinkingPipeline：整体接线", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("solver 没有 reasoning_content 时退化为用 content 本身作为解题过程", async () => {
+  it("solver 没有有效 reasoning_content 时退化为用 content 本身作为解题过程", async () => {
     let call = 0;
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       call += 1;
       if (call === 1) {
-        return textResponse("纯 content，没有单独的 reasoning");
+        return textResponse("纯 content，没有单独的 reasoning", "   \n");
       }
       const body = JSON.parse(String(init?.body));
       const joined = body.messages.map((m: { content: string }) => m.content).join("\n");
@@ -133,5 +139,17 @@ describe("runThinkingPipeline：整体接线", () => {
       runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
     };
     await runThinkingPipeline({ problem, solverModel: modelConfig, analystModel: modelConfig });
+  });
+});
+
+describe("mergeSolverNarrative", () => {
+  it("保留互补的 reasoning 与 content，并明确区分两段", () => {
+    expect(mergeSolverNarrative({ reasoning: "先推导性质", content: "最终使用二分" })).toBe(
+      "模型思考过程：\n先推导性质\n\n模型最终回答：\n最终使用二分"
+    );
+  });
+
+  it("reasoning 为空白时只返回 content", () => {
+    expect(mergeSolverNarrative({ reasoning: " \n ", content: "完整解法" })).toBe("完整解法");
   });
 });

@@ -9,7 +9,12 @@
  * experiments/eval-difficulty.ts 的对比评估，不能凭感觉改（见 AGENTS.md）。
  */
 import { z } from "zod";
-import { chatComplete, chatCompleteJson, type ChatMessage } from "../llm";
+import {
+  chatComplete,
+  chatCompleteJson,
+  type ChatCompletionResult,
+  type ChatMessage
+} from "../llm";
 import { clampLevel, type PipelineModelConfig, type ReviewTaskProblem } from "./types";
 
 export interface ThinkingPipelineInput {
@@ -66,6 +71,21 @@ export function mapThinkingSignalsToLevel(signals: ThinkingSignals): number {
   return clampLevel(raw);
 }
 
+/**
+ * 部分供应商把思考过程和最终回答放在两个字段里。两者都可能包含后续分析
+ * 所需的信息，因此不能在 reasoning 存在时丢掉 content；空白 reasoning 则
+ * 不应制造一个假的“思考过程”段落。
+ */
+export function mergeSolverNarrative(
+  result: Pick<ChatCompletionResult, "content" | "reasoning">
+): string {
+  const reasoning = result.reasoning?.trim() ?? "";
+  const content = result.content.trim();
+  if (reasoning.length === 0) return content;
+  if (content.length === 0) return reasoning;
+  return `模型思考过程：\n${reasoning}\n\n模型最终回答：\n${content}`;
+}
+
 export async function runThinkingPipeline(input: ThinkingPipelineInput): Promise<ThinkingResult> {
   const solverMessages = buildSolverMessages(input.problem);
   const solverResult = await chatComplete(
@@ -74,7 +94,7 @@ export async function runThinkingPipeline(input: ThinkingPipelineInput): Promise
     solverMessages,
     input.solverModel.runtime
   );
-  const solverNarrative = solverResult.reasoning ?? solverResult.content;
+  const solverNarrative = mergeSolverNarrative(solverResult);
 
   const analystMessages = buildAnalystMessages(input.problem, solverNarrative);
   const { data } = await chatCompleteJson(
