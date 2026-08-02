@@ -1,7 +1,7 @@
 # Fermata
 
 USTC 算法竞赛协会的独立 AI 审题服务：用机器人令牌轮询 Urmotiv 题库里的待审
-题目，跑一套 LLM 流水线评定难度，提交结构化的审核意见，并对 Urmotiv 的
+题目，跑一套有冻结证据边界的多角色 LLM 审题流程，提交结构化审核意见，并对 Urmotiv 的
 `fermata-control` 管理插件暴露自己的健康状态和可公开设置。
 
 ## 架构
@@ -20,12 +20,10 @@ USTC 算法竞赛协会的独立 AI 审题服务：用机器人令牌轮询 Urmo
 │                              Fermata                              │
 │                                                                    │
 │  src/reviewer.ts  主循环                                           │
-│    轮询 claim → 对每个任务：                                        │
-│      ┌─ difficulty.ts（CF 难度，参考锚点题）───┐                    │
-│      ├─ thinking.ts（思维难度，解题 + 对比分析）├─ 并发跑           │
-│      └─ coding.ts（代码难度，写参考代码 + 统计）┘                    │
-│           ↓ 三者都跑完                                              │
-│      verdict.ts（综合成结构化审核意见，查重阈值规则）                  │
+│    轮询 claim → 严格完整任务快照 → 盲解冻结 → 题解/技术核验          │
+│      → 难度、命题品味、ICPC 适配、原创性、固定标签并行证据            │
+│      → critic + adversary → adjudicator                             │
+│      → 11 角色 receipt 全部完整且准确性指纹匹配                      │
 │           ↓                                                        │
 │    complete 提交回 Urmotiv；同时给每个任务挂续租定时器                │
 │                                                                    │
@@ -84,9 +82,9 @@ npm test            # vitest run
 `thinkingRequest: enabled` 时仍保留 `temperature` 配置以维持档位形状，但当前
 服务端会忽略这个字段。当前 difficulty 已恢复 Candidate C 的
 `deepseek-v4-flash`、`thinkingRequest: disabled` 请求；它会发送
-`thinking: {type: "disabled"}`，不会发送 `reasoning_effort`。同一档位的
-`thinking.solver` 和 `verdict` 仍是 `deepseek-v4-pro` 默认请求，这次恢复没有
-静默改变它们。
+`thinking: {type: "disabled"}`，不会发送 `reasoning_effort`。同一档位还保留旧流水线配置用于
+历史实验和隔离测试，但正式 worker 只读取完整的 `reviewFlow` 11 角色配置；任何角色缺槽都会在
+启动前失败。
 
 Fermata 本身不解析 `.env` 文件，只读取进程已经收到的环境变量。上面的
 `run-with-env.mjs` 只接受 `Fermata/private/` 内的绝对路径，并沿已经打开的目录描述符
@@ -254,7 +252,7 @@ npm run experiment:calibrate-levels:detached -- \
 
 正式服务已有的 `settings.json` 会保留上次保存的 `experimentVersion`，不会因为替换
 `models.yaml` 自动改变。当前配置版本是
-`experiment-2026-08-difficulty-candidate-c-provider-v1-post-done-shape-v7`。部署后必须先保持
+`experiment-2026-08-review-flow-historical-rubric-v1-eof-receipt-v2`。部署后必须先保持
 `enabled=false`；只有在没有在途任务、逐项核对整个所选档位的协议和准确性证据后，才能通过
 Urmotiv 的 Fermata 设置页或管理接口显式写入当前版本并开启。worker 还会在每轮 claim 前重新
 比较版本和生产资格证据，旧值即使同时保存了 `enabled=true` 也不会领取任务。由于当前
@@ -262,6 +260,23 @@ Urmotiv 的 Fermata 设置页或管理接口显式写入当前版本并开启。
 代码级固定封锁：即使操作员把
 settings 改成当前版本并开启，或手工放入一份声称合格的当前版本证据，也不会调用 claim。当前提交
 实际上对所有版本恒关闭；未来版本也必须等可信源证据聚合器另行实现、审阅并替换这道门。
+
+当前正式 worker 已接到 11 个相互隔离的审题角色，不再走旧的“难度、思维、代码、综合裁决”生产
+路径；续租与提交隔离测试会在 Vitest 模块边界替换整个新证据引擎，worker 源码没有切回旧流程的
+开关。新路径先严格构造完整任务快照，
+盲解完成并冻结后才允许其它角色读取题解；命题品味与 ICPC 比赛适配使用由历史人工通过/否决意见
+对照得到的版本化标准：比较时排除了已经确认原题/重复题的案例，也不把投题者自填难度当作人工
+真值。冻结摘要只发给命题品味相关角色，不进入盲解和独立难度角色。每轮模型调用必须保留真实 HTTP EOF、明确
+`finish_reason=stop`、SSE `[DONE]`、JSON 修复轮数及 429 尝试数的安全摘要；499、取消、断流、
+缺失角色或 schema 失败统一得到 `incomplete`，不会提交审核。任务里的 Anklang 条目必须同时通过
+正式内置插件编号、来源枚举、有效期、v2 完整状态和题目内容哈希校验；只有这条认证链上的
+`sameProblemSuggestion` 才能参与确定性重复题规则。准确性报告通过不可伪造的进程内 grant 独立
+绑定 runner 与 decision；报告指纹不参与 runner 身份，避免标定身份自指。当前生产资格 verifier
+仍恒拒绝。未来即使存在合格 grant，worker 也会在 claim 之前用当前 11 个槽位、provider
+凭据摘要、难度锚点、传输模式和构建摘要重算 runner 身份；任一不匹配都不领取任务。
+Anklang 证据的有效期还会在一次性提交载荷取出前再检查；运行期间过期、租约已过期或重复的
+assignment 都不会发起第二条模型流程。所以这些安全边界并不
+表示已经达到可开启自动审题的准确度。
 
 Candidate B 的协议验证使用
 `npm run experiment:probe-difficulty-thinking`。这个入口只依次检查一个人工合成的短题和三个与
@@ -368,12 +383,10 @@ failed=1、complete=false，request/fetch 都精确为 1。服务返回 HTTP 200
 前的中断、超时、取消、正文上限或分块上限只能记录 `data_after_done_tail_incomplete`。
 
 f 的唯一标签是 `difficulty-candidate-c-connectivity-probe-20260802-f`，产物 schema 是第 4 版；
-a/b/c/d/e 都列入不可重放的历史标签。**f 尚未运行，当前禁止执行。**源码不预填尚不存在的
-提交 SHA；它继续要求运行时 `EVAL_CODE_VERSION` 与干净仓库的完整 HEAD 精确一致，并核对 runner
-与 HEAD 中的字节。只有本组代码完成独立复审并提交后，才可由明确获准的操作员先运行
-`npm run experiment:update-connectivity-code-version -- --environment-file=<Fermata/private 内专用 env 绝对路径>`
-完成提交后绑定；更新绑定本身不发送模型请求。此后仍需再次取得运行 f 的明确批准，不能因为完成
-绑定就自动执行探针。
+a/b/c/d/e 都列入不可重放的历史标签。f 仍未运行，而正式 `models.yaml` 已升级到新的多角色审题
+版本；它保存的旧 v7 配置哈希与当前配置明确不同。因此 f 现已和 a–e 一样冻结为历史预登记，禁止
+更新提交绑定、修改旧配置哈希或执行探针。若需要验证当前版本，必须另建新标签、schema 与修改前
+就固定的配置身份，不能把 f 重新绑定到新配置来制造连续性。
 
 探针与 env 更新工具不从调用者 `PATH` 查找 Git，而是固定使用经系统路径权限检查的
 `/usr/bin/git`。每次仓库检查都会新建一个 `0700` 临时 Git 元数据目录；Git 只读取其中固定生成的
@@ -386,12 +399,12 @@ HEAD、引用和这些目录未并发变化，再清理唯一临时目录。临�
 外部 diff、子模块递归和可选索引写入。直接入口还会在读取私有 env 或创建探针目录前拒绝
 `GIT_DIR`、`GIT_WORK_TREE`、`GIT_INDEX_FILE` 等调用者注入。
 
-这个 connectivity 结果无论成功与否都只回答“difficulty 的这一种 flash 请求能否完成一次协议
-往返”，不能证明 `review-balanced` 整条 reviewer 可运行。尤其 `thinking.solver` 与 `verdict`
-仍使用 pro 型号；旧根路径下的 Candidate D 404 不能证明修正路径后的协议可用。后续必须为 difficulty、
-`thinking.solver`、`thinking.analyst`、coding、verdict 的每一种实际请求配置分别预登记唯一标签并完成
-协议预检，再使用相应完整人工标准集保留修改前/修改后准确性报告；至少 solver、verdict、difficulty
-三项必须单独留证。任何一项未通过时都不得把整档位写成可用，也不得开启生产领取。
+旧 connectivity 结果无论成功与否都只回答“旧 difficulty flash 请求能否完成一次协议往返”，不能
+证明当前 `review-balanced` 可运行。旧的 difficulty/thinking/coding/verdict 五槽说明只适用于 v7
+实验，不能作为当前生产资格。当前版本必须对 `reviewFlow` 的 11 个实际角色槽逐一绑定请求配置、
+协议完成证据和相应人工标准的准确性结果；相同 model spec 可以共享协议能力证据，但各角色的准确性
+不能因为模型相同就合并。任一角色缺失、取消、499、断流、跳过或未达门槛，都不得把整档位写成
+可用，也不得开启生产领取。
 
 每个固定标签一旦留下检查点、completion 或锁就不能重跑覆盖。旧 a/b/c/d/e 的失败证据必须永久保留，
 后续新标签不能读取或复用它们。若后续探针异常退出留下同标签锁，只能在同时核对记录中的 PID、
@@ -401,14 +414,18 @@ HEAD、引用和这些目录未并发变化，再清理唯一临时目录。临�
 正式领取还有一道独立于 settings 的生产资格证据门，实现在
 `src/production-eligibility.ts`。当前可信聚合器尚未实现，因此所有实验版本都固定返回
 `production_evidence_verifier_unimplemented`，并且不会读取或信任任何私有自述 JSON；即使操作员
-同时修改 settings、实验版本或放入手写“合格证书”，也不会调用 claim。日志只记录这个固定原因码。
+同时修改 settings、实验版本或放入手写“合格证书”，也不会调用 claim。合格分支使用只存在于
+进程内 WeakMap 的不透明 grant；任意 64 位摘要、`eligible=true` 同形对象或对象展开都不能伪造。
+runner 身份单独绑定精确构建摘要、11 个角色配置与 provider 凭据的不可逆摘要，准确性证据指纹
+另行进入运行上下文和 decision。日志只记录固定原因码和安全哈希。
 
 真正的生产证据聚合器必须作为后续独立工作：它要回读原始协议 probe completion 和准确性
 summary/completion，验证文件权限、排他标签、完整哈希链、当前 `experimentVersion`、profile、
 `models.yaml`、provider 身份和实际请求配置，不能只相信另一份 JSON 里的 `complete=true`。
-协议验证可以按完全相同的 distinct model spec 去重；准确性证据不能这样共用，必须按 difficulty、
-thinking solver、thinking analyst、coding、verdict 五个 pipeline slot 分别验证相应人工标准、完整性和
-门槛。该聚合器及其源证据测试通过并经单独审阅前，生产资格总门保持恒关闭。
+协议验证可以按完全相同的 distinct model spec 去重；准确性证据不能这样共用，必须按 solver、
+solutionAnalyst、technicalAuditor、difficulty、editorialJudge、contestFit、originality、tags、critic、
+adversary、adjudicator 这 11 个角色分别验证相应人工标准、完整性和门槛。该聚合器及其源证据测试
+通过并经单独审阅前，生产资格总门保持恒关闭。
 
 思维/代码标定必须先在 `experiments/data/levels/manifest.private.json` 登记私有数据集清单。
 清单逐项绑定安全编号、文件名和文件原始字节的 SHA-256 校验值；目录里漏文件、多文件、改后缀、
@@ -446,10 +463,11 @@ thinking solver、thinking analyst、coding、verdict 五个 pipeline slot 分�
 物理隔离。在完成一次私有、可核验的拆分迁移并登记全新 holdout 身份前，不得用这些旧文件发布
 “最终盲测准确率”。
 
-这层地基也不等于产品设想中的完整多角色审题流程。当前仍缺少：冻结且不可变的“只看题面”独立解题
-产物、在冻结后才读取作者/官方题解的独立核验角色、参考实现的编译与样例/正确性/复杂度验证、独立的
-质量/原创性/标签评审、冲突与反方审阅，以及最后按证据汇总的结构化裁决。在这些环节实现并分别标定
-前，现有 thinking/coding/verdict 结果只能作为开发实验，不能声称已复现完整流程。
+这层旧 thinking/coding/verdict 离线地基不等于当前正式 `reviewFlow`。正式流程已经包含冻结的
+“只看题面”独立解题产物、冻结后读取题解的核验角色、独立的命题品味/比赛适配/原创性/标签证据、
+冲突与反方审阅，以及最后按证据汇总的结构化裁决；但这些角色仍未分别完成准确性标定。机器人任务
+契约也不提供可选参考实现，因此当前不会声称已编译或执行标程。旧离线入口的结果只能作为开发实验，
+不能替代正式流程的完整修改前/后报告，也不能证明自动审题已经可用。
 
 verdict 合成诊断从报告 schema 第 4 版起，不再按 rating 排序取样；它只按预登记内容身份和固定 seed
 产生可复现的 case 顺序。normal/fabricated treatment 属于推理输入，但 rating、expected verdict 和
@@ -514,38 +532,28 @@ completion marker 表示这条执行链已完整收束并阻止重放，不等�
 
 | 流水线 | 状态 | 说明 |
 | --- | --- | --- |
-| CF 难度（difficulty.ts） | **Candidate C 完整但未达标；provider-v1 已读到 EOF，但协议仍未通过** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate D 与恢复后的 Candidate C 请求都在旧根路径配置下返回 404；一次只读 `/v1/models` 已确认目录声明包含 flash/pro。修正 `/v1` 后的 b 单请求得到 HTTP 200，但客户端取消正文、未观察 EOF；v4 的 c 单请求安全排空到真实 EOF，固定失败阶段为 `trailing_data`。v5 的 d 单请求也是 HTTP 200、request/fetch=1、真实 EOF、未取消，但只得到粗分类 `data_after_done`。v6 的 e 单请求同样 request/fetch=1、HTTP 200、真实 EOF、未取消，并进一步固定为 `data_after_done_other_or_unclassifiable`；它仍是 `complete=false`。v7/f 只完成了代码、测试与安全枚举设计，尚未提交后绑定、尚未运行，也没有启动新的 83 题。a/b/c/d/e 证据均保留，当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
+| CF 难度（旧 difficulty.ts） | **Candidate C 完整但未达标；旧 provider-v1 探针已冻结** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate D 与恢复后的 Candidate C 请求都在旧根路径配置下返回 404；一次只读 `/v1/models` 已确认目录声明包含 flash/pro。修正 `/v1` 后的 b 单请求得到 HTTP 200，但客户端取消正文、未观察 EOF；v4 的 c 单请求安全排空到真实 EOF，固定失败阶段为 `trailing_data`。v5 的 d 单请求也是 HTTP 200、request/fetch=1、真实 EOF、未取消，但只得到粗分类 `data_after_done`。v6 的 e 单请求同样 request/fetch=1、HTTP 200、真实 EOF、未取消，并进一步固定为 `data_after_done_other_or_unclassifiable`；它仍是 `complete=false`。v7/f 只完成了预登记且未运行；当前配置哈希已经变化，所以 f 永久冻结，不能更新绑定或补跑。a/b/c/d/e 证据均保留，当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
 | 思维难度（thinking.ts） | **旧实验均不可作基线** | 两份早期报告无法证明完整；后两份明确只完成 6/24、9/24，而且都缺高分段。 |
 | 代码难度（coding.ts） | **旧实验均不可作基线** | 与思维难度共用的旧实验不完整；小样本曾出现难度分段升高但代码难度均值下降，需要在完整基线上复核。 |
 | 查重判断（verdict.ts） | **旧设计不可作准确性基线；新盲评/续跑基础尚未实跑** | 旧实验只有 3 个正常样本和 3 个人工重复样本；新代码已把 content-only 选择、独立 case gold、prediction-only 检查点和完整链防重放接入，但尚未用新唯一标签运行，不能声明准确率。 |
+| 11 角色 reviewFlow | **安全边界已接线，准确性未标定，生产恒关闭** | 历史人工审核标准只进入命题品味相关角色；盲解不看题解、自报难度或历史结论。EOF receipt、失败完整性、严格任务源与安全 decision 已覆盖合成测试，但尚无合格的修改前/后完整准确性报告和可信聚合指纹。 |
 
 这张表应该随每一次真正跑过评测脚本之后更新。只有当前代码生成、对应脱敏汇总与完成证据存在，
 并且报告明确 `eligible=true` 时，才能把结果写成合格候选；仅有完整性为真不代表准确性达标。
 
-## 待确认 / 待对齐的点
+## 已对齐的跨仓库契约
 
-- **Anklang 查重条目的 `data` 形状**：`review.ts` 里 reviewItem 的 `data`
-  字段是 `z.unknown()`，`src/pipelines/verdict.ts` 里的
-  `extractSimilarityFromData` 目前尽力兼容几种可能的形状
-  （`data.similarity`/`data.topSimilarity`/`data.candidates[].similarity`），
-  等 Anklang 插件那边的实际结构定下来，应该回来对齐这段逻辑。
-- **`reviewInputSchema` 和 `docs/spec.md` 5.3 节的措辞略有出入**：spec.md
-  提到审核意见包含"公开评论"，但 `packages/contracts/src/review.ts` 实际
-  字段是 `verdict/codeforcesDifficulty/qualityLevel/thinkingLevel/
-  codingLevel/tagIds/improvements/privateNote/expectedRound`，没有独立的
-  `publicComment` 字段——`improvements`（主要改进点）本身就是必填、面向审核
-  意见的内容。Fermata 这边是按实际契约代码实现的，如果这确实是 spec.md 和
-  代码之间的用词不一致，建议回来对齐文档。
-- **知识点标签修正**：Fermata 目前没有从机器人 API 拿到 Urmotiv 的标签词表，
-  没办法判断自己想出来的标签 id 是不是真实存在，所以 `verdict.ts` 提交的
-  `tagIds` 目前总是空数组，没有启用"标签修正建议"这个能力。如果以后机器人
-  API 增加了标签列表的读取入口，可以在 `verdict.ts` 里补上。
+- 机器人任务已经携带严格的 Anklang v2 条目来源、插件编号、可见级别、有效期与内容哈希；
+  Fermata 不再兼容猜测形状，也不会把未认证建议升级为确定性重复题证据。
+- `reviewInputSchema` 已包含 `publicComment`；Fermata 镜像实际 Urmotiv 契约并在提交前再次严格校验。
+- 机器人任务已经携带版本化的活动标签目录。每题可选择多个目录内标签，`tags` 角色只能返回当前
+  活动编号；目录外、停用或重复编号都会让该次证据流不完整，不能提交。
 
 ## 项目结构
 
 ```
 config/
-  models.yaml              模型档位配置（每条流水线用什么模型/温度/是否思考，见文件内注释）
+  models.yaml              旧离线流水线及 11 个正式角色的模型/温度/思考配置
   anchors/difficulty.json  CF 难度评估的参照题（当前为 7 条 Candidate C 临时数据，见"当前校准状态"）
 scripts/
   env-file.mjs             run-with-env 和后台启动器共用的简单 env 解析规则
@@ -565,7 +573,13 @@ src/
   codeforces.ts            CF API 客户端 + 题面抓取
   settings-store.ts        运行期设置，内存 + 文件持久化，乐观锁
   production-eligibility.ts
-                           正式领取总门；可信源证据聚合器完成前所有版本恒关闭
+                           正式领取总门与不透明 grant；可信聚合器完成前零签发、恒关闭
+  review-flow/
+    task-source.ts         严格绑定 Urmotiv 任务、Anklang 来源和标签目录
+    llm-roles.ts           11 个独立模型角色、提示边界与 runner 身份
+    orchestrator.ts        冻结证据、失败收束、确定性规则和一次性提交载荷
+    schemas.ts / views.ts  完整输入、角色输出与最小可见视图
+    historical-rubric.ts  从历史通过/否决意见冻结的匿名命题品味摘要
   reviewer.ts              主循环：轮询、并发、续租、优雅停机
   server.ts                管理端口
   index.ts                 入口
