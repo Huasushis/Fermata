@@ -4,7 +4,13 @@ import {
   llmTransportProtocolVersion,
   type LlmFailureAudit
 } from "../llm";
-import { reviewInputSchema, type ReviewInput } from "../urmotiv-schemas";
+import {
+  codeforcesDifficultySchema,
+  difficultyLevelSchema,
+  reviewInputSchema,
+  reviewVerdictSchema,
+  type ReviewInput
+} from "../urmotiv-schemas";
 import {
   deepFreeze,
   hashCanonicalValue,
@@ -19,6 +25,7 @@ import {
   criticPayloadSchema,
   difficultyPayloadSchema,
   editorialPayloadSchema,
+  editorialDimensionSchema,
   hardBlockerCodeSchema,
   originalityPayloadSchema,
   reviewFlowRoleSchema,
@@ -251,6 +258,94 @@ export type ReviewFlowOutcome =
   | { readonly status: "complete"; readonly decision: ReviewFlowDecision }
   | { readonly status: "incomplete"; readonly failure: ReviewFlowIncompleteFailure };
 
+const reviewFlowCalibrationEvidenceSchema = z
+  .object({
+    dimension: editorialDimensionSchema,
+    direction: z.enum(["strength", "concern"]),
+    severity: z.enum(["note", "minor", "major", "fundamental"]),
+    confidence: z.number().finite().min(0).max(1)
+  })
+  .strict();
+
+const reviewFlowCalibrationEvidenceCoverageSchema = z
+  .object({
+    strengths: z.enum(["found", "none_found"]),
+    concerns: z.enum(["found", "none_found"])
+  })
+  .strict();
+
+/**
+ * 离线标定唯一可见的完整结果。这里只保留可计分的数值和枚举；模型生成的
+ * 解释、评论、改进建议、证据摘要以及题目材料都不属于该边界。
+ */
+export const reviewFlowCalibrationProjectionSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    verdict: reviewVerdictSchema,
+    codeforcesDifficulty: codeforcesDifficultySchema,
+    qualityLevel: difficultyLevelSchema,
+    originalityLevel: difficultyLevelSchema,
+    thinkingLevel: difficultyLevelSchema,
+    codingLevel: difficultyLevelSchema,
+    tagIds: z.array(z.string().min(1).max(120)).min(1).max(30),
+    hardBlockers: z.array(hardBlockerCodeSchema),
+    difficultyConfidence: z.number().finite().min(0).max(1),
+    editorial: z
+      .object({
+        qualityLevel: difficultyLevelSchema,
+        noveltyLevel: difficultyLevelSchema,
+        ideaDepthLevel: difficultyLevelSchema,
+        naturalnessLevel: difficultyLevelSchema,
+        contestantExperienceLevel: difficultyLevelSchema,
+        evidenceCoverage: reviewFlowCalibrationEvidenceCoverageSchema,
+        evidence: z.array(reviewFlowCalibrationEvidenceSchema).min(1).max(100)
+      })
+      .strict(),
+    contestFit: z
+      .object({
+        icpcFit: z.enum(["strong", "acceptable", "weak", "unsuitable"]),
+        implementationBurden: difficultyLevelSchema,
+        thinkingImplementationBalance: z.enum(["strong", "acceptable", "weak"]),
+        knowledgeFairness: z.enum(["fair", "questionable", "unfair"]),
+        problemsetRole: z.enum([
+          "introductory",
+          "standard",
+          "challenging",
+          "specialized",
+          "unclear"
+        ]),
+        roleConfidence: z.number().finite().min(0).max(1),
+        evidenceCoverage: reviewFlowCalibrationEvidenceCoverageSchema,
+        evidence: z.array(reviewFlowCalibrationEvidenceSchema).min(1).max(100)
+      })
+      .strict(),
+    originality: z
+      .object({
+        originalityLevel: difficultyLevelSchema,
+        sameProblemAsExisting: z.boolean(),
+        highestSimilarity: z.number().finite().min(0).max(1)
+      })
+      .strict()
+  })
+  .strict();
+
+export type ReviewFlowCalibrationProjection = z.infer<
+  typeof reviewFlowCalibrationProjectionSchema
+>;
+
+export interface ReviewFlowCalibrationInput {
+  readonly taskSource: unknown;
+  readonly trustedRunner: unknown;
+  readonly executionContext: unknown;
+}
+
+export type ReviewFlowCalibrationOutcome =
+  | {
+      readonly status: "complete";
+      readonly projection: ReviewFlowCalibrationProjection;
+    }
+  | Extract<ReviewFlowOutcome, { readonly status: "incomplete" }>;
+
 const privateArtifacts = new WeakMap<ReviewFlowDecision, ReviewFlowArtifacts>();
 const privateSubmissions = new WeakMap<
   ReviewFlowDecision,
@@ -443,6 +538,99 @@ export async function runReviewEvidenceFlowOutcome(
       failureId: hashCanonicalValue(failureBase)
     });
     return deepFreeze({ status: "incomplete" as const, failure });
+  }
+}
+
+/**
+ * 运行与正式审题完全相同的 11 角色编排，但只为离线准确性标定返回窄投影。
+ *
+ * 生产合格 bundle 在发出任何请求前就被拒绝；完整结果不暴露 decision，也会
+ * 主动销毁本次运行的私有提交引用，因此这个入口不能成为生产提交旁路。
+ * 底层 incomplete 已经是封闭安全摘要，这里保持同一对象原样返回。
+ */
+export async function runReviewEvidenceFlowCalibrationOutcome(
+  input: ReviewFlowCalibrationInput
+): Promise<ReviewFlowCalibrationOutcome> {
+  if (
+    !isBuiltReviewFlowTaskSourceResult(input.taskSource) ||
+    !isTrustedReviewFlowLlmBundle(input.trustedRunner) ||
+    isProductionEligibleReviewFlowLlmBundle(input.trustedRunner)
+  ) {
+    throw new Error("REVIEW_FLOW_CALIBRATION_INPUT_FORBIDDEN");
+  }
+
+  const outcome = await runReviewEvidenceFlowOutcome(input);
+  if (outcome.status === "incomplete") return outcome;
+
+  const { decision } = outcome;
+  const artifacts = privateArtifacts.get(decision);
+  const submission = privateSubmissions.get(decision);
+  try {
+    if (
+      artifacts === undefined ||
+      submission === undefined ||
+      decision.executionEligible ||
+      isProductionEligibleReviewFlowLlmBundle(input.trustedRunner)
+    ) {
+      throw new Error("REVIEW_FLOW_CALIBRATION_INPUT_FORBIDDEN");
+    }
+
+    const review = submission.review;
+    const editorial = artifacts.editorial.payload;
+    const contestFit = artifacts.contestFit.payload;
+    const originality = artifacts.originality.payload;
+    const projection = reviewFlowCalibrationProjectionSchema.parse({
+      schemaVersion: 1,
+      verdict: review.verdict,
+      codeforcesDifficulty: review.codeforcesDifficulty,
+      qualityLevel: review.qualityLevel,
+      originalityLevel: originality.originalityLevel,
+      thinkingLevel: review.thinkingLevel,
+      codingLevel: review.codingLevel,
+      tagIds: review.tagIds,
+      hardBlockers: decision.hardBlockers,
+      difficultyConfidence: artifacts.difficulty.payload.confidence,
+      editorial: {
+        qualityLevel: editorial.qualityLevel,
+        noveltyLevel: editorial.noveltyLevel,
+        ideaDepthLevel: editorial.ideaDepthLevel,
+        naturalnessLevel: editorial.naturalnessLevel,
+        contestantExperienceLevel: editorial.contestantExperienceLevel,
+        evidenceCoverage: editorial.evidenceCoverage,
+        evidence: editorial.evidence.map((item) => ({
+          dimension: item.dimension,
+          direction: item.direction,
+          severity: item.severity,
+          confidence: item.confidence
+        }))
+      },
+      contestFit: {
+        icpcFit: contestFit.icpcFit,
+        implementationBurden: contestFit.implementationBurden,
+        thinkingImplementationBalance: contestFit.thinkingImplementationBalance,
+        knowledgeFairness: contestFit.knowledgeFairness,
+        problemsetRole: contestFit.problemsetRole,
+        roleConfidence: contestFit.roleConfidence,
+        evidenceCoverage: contestFit.evidenceCoverage,
+        evidence: contestFit.evidence.map((item) => ({
+          dimension: item.dimension,
+          direction: item.direction,
+          severity: item.severity,
+          confidence: item.confidence
+        }))
+      },
+      originality: {
+        originalityLevel: originality.originalityLevel,
+        sameProblemAsExisting: originality.sameProblemAsExisting,
+        highestSimilarity: originality.highestSimilarity
+      }
+    });
+    return deepFreeze({ status: "complete" as const, projection });
+  } catch {
+    throw new Error("REVIEW_FLOW_CALIBRATION_INPUT_FORBIDDEN");
+  } finally {
+    privateArtifacts.delete(decision);
+    privateSubmissions.delete(decision);
   }
 }
 

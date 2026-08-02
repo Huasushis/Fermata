@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const trustedRunnerState = vi.hoisted(() => ({
-  runners: new WeakSet<object>()
+  runners: new WeakSet<object>(),
+  productionRunners: new WeakSet<object>()
 }));
 
 // 生产 grant 故意没有公开签发入口。这里只在独立测试模块替换两个品牌读取器，
@@ -14,13 +15,16 @@ vi.mock("../src/review-flow/llm-roles", async (importOriginal) => {
   return {
     ...actual,
     isTrustedReviewFlowLlmBundle: hasTestBrand,
-    isProductionEligibleReviewFlowLlmBundle: hasTestBrand
+    isProductionEligibleReviewFlowLlmBundle: (candidate: unknown): boolean =>
+      typeof candidate === "object" && candidate !== null &&
+      trustedRunnerState.productionRunners.has(candidate)
   };
 });
 
 import {
   consumeReviewFlowSubmission,
   runReviewEvidenceFlow,
+  runReviewEvidenceFlowCalibrationOutcome,
   type ReviewFlowRoles,
   type ReviewFlowSubmissionExpectation
 } from "../src/review-flow/orchestrator";
@@ -163,7 +167,10 @@ function roles(): ReviewFlowRoles {
   };
 }
 
-function runner(): ReviewFlowLlmBundle {
+function runner(options: {
+  readonly productionEligible?: boolean;
+  readonly roleOverrides?: Partial<ReviewFlowRoles>;
+} = {}): ReviewFlowLlmBundle {
   const identities = Object.freeze(Object.fromEntries(
     reviewFlowRoleSchema.options.map((role: ReviewFlowRole) => [role, {
       promptVersion: `${role}-submission-test-v1`,
@@ -171,7 +178,7 @@ function runner(): ReviewFlowLlmBundle {
     }])
   )) as ReviewFlowLlmBundle["identities"];
   const result: ReviewFlowLlmBundle = Object.freeze({
-    roles: Object.freeze(roles()),
+    roles: Object.freeze({ ...roles(), ...options.roleOverrides }),
     identities,
     runnerIdentity: "c".repeat(64),
     engineBuildFingerprint: "d".repeat(64),
@@ -179,6 +186,9 @@ function runner(): ReviewFlowLlmBundle {
     accuracyEvidenceFingerprint
   });
   trustedRunnerState.runners.add(result);
+  if (options.productionEligible ?? true) {
+    trustedRunnerState.productionRunners.add(result);
+  }
   return result;
 }
 
@@ -317,5 +327,78 @@ describe("生产审题提交的一次性来源与时效绑定", () => {
       decision,
       expectation(source)
     )).toThrow("REVIEW_FLOW_SUBMISSION_FORBIDDEN");
+  });
+
+  it("离线标定在任何角色执行前拒绝生产 bundle 与伪造来源/runner", async () => {
+    const solver = vi.fn(roles().solver);
+    const productionRunner = runner({ roleOverrides: { solver } });
+    const source = taskSource();
+    const input = {
+      taskSource: source,
+      trustedRunner: productionRunner,
+      executionContext: {
+        schemaVersion: 1,
+        runId,
+        assignmentId,
+        expectedRound: 2
+      }
+    };
+
+    await expect(runReviewEvidenceFlowCalibrationOutcome(input)).rejects.toThrow(
+      "REVIEW_FLOW_CALIBRATION_INPUT_FORBIDDEN"
+    );
+    expect(solver).not.toHaveBeenCalled();
+
+    await expect(runReviewEvidenceFlowCalibrationOutcome({
+      ...input,
+      trustedRunner: { ...productionRunner }
+    })).rejects.toThrow("REVIEW_FLOW_CALIBRATION_INPUT_FORBIDDEN");
+    await expect(runReviewEvidenceFlowCalibrationOutcome({
+      ...input,
+      taskSource: { ...source },
+      trustedRunner: runner({ productionEligible: false })
+    })).rejects.toThrow("REVIEW_FLOW_CALIBRATION_INPUT_FORBIDDEN");
+  });
+
+  it("离线可信角色缺少完成 receipt 时只返回 incomplete", async () => {
+    const offlineRunner = runner({
+      productionEligible: false,
+      roleOverrides: {
+        solver: async () => ({
+          solved: true,
+          narrative: "合成但缺少 receipt 的输出。",
+          approach: "直接处理输入。",
+          claimedComplexity: "O(1)",
+          uncertainties: []
+        })
+      }
+    });
+    const outcome = await runReviewEvidenceFlowCalibrationOutcome({
+      taskSource: taskSource(),
+      trustedRunner: offlineRunner,
+      executionContext: {
+        schemaVersion: 1,
+        runId,
+        assignmentId,
+        expectedRound: 2
+      }
+    });
+
+    expect(outcome.status).toBe("incomplete");
+    if (outcome.status !== "incomplete") throw new Error("expected incomplete");
+    expect(outcome.failure.failedRoles).toEqual([{
+      role: "solver",
+      failureKind: "schema_output",
+      httpStatus: null,
+      requestCount: 0,
+      transportAttemptCount: 0,
+      completedResponseCount: 0,
+      terminalResponseMode: null,
+      terminalEofObserved: false,
+      terminalFinishReasonStopObserved: false,
+      terminalSseDoneObserved: null
+    }]);
+    expect(JSON.stringify(outcome)).not.toContain("缺少 receipt");
+    expect(JSON.stringify(outcome)).not.toContain("projection");
   });
 });

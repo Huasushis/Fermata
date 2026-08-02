@@ -6,6 +6,7 @@ import {
   inspectReviewFlowSubmissionForTest,
   ReviewFlowError,
   runReviewEvidenceFlow,
+  runReviewEvidenceFlowCalibrationOutcome,
   runReviewEvidenceFlowOutcome,
   type ReviewFlowInput,
   type ReviewFlowDecision,
@@ -25,6 +26,7 @@ import {
 } from "../src/review-flow/schemas";
 
 const solutionSentinel = "PRIVATE_SOLUTION_SENTINEL_731";
+const modelOutputSentinel = "SYNTHETIC_PRIVATE_MODEL_OUTPUT_SENTINEL_419";
 const modelIdentity = "a".repeat(64);
 
 function source(overrides: Record<string, unknown> = {}) {
@@ -402,9 +404,9 @@ function syntheticRoleFetch(): PipelineModelConfig["runtime"]["fetch"] {
         qualityLevel: 4,
         fixability: "none",
         strengths: ["合成优点"],
-        improvements: "合成材料已满足要求。",
-        publicComment: "",
-        privateNote: "",
+        improvements: modelOutputSentinel,
+        publicComment: modelOutputSentinel,
+        privateNote: modelOutputSentinel,
         citedEvidenceIds: [evidence[0]!.evidenceId]
       };
     } else {
@@ -462,6 +464,110 @@ function submission(decision: ReviewFlowDecision) {
 }
 
 describe("冻结证据多角色审题编排", () => {
+  it("离线标定复用真实 11 角色编排且完整结果只暴露封闭机器投影", async () => {
+    const { runner, fetchImpl } = syntheticTrustedRunner();
+    const outcome = await runReviewEvidenceFlowCalibrationOutcome({
+      taskSource: trustedTaskSource(),
+      trustedRunner: runner,
+      executionContext: executionContext()
+    });
+
+    expect(outcome.status).toBe("complete");
+    if (outcome.status !== "complete") throw new Error("expected complete");
+    expect(fetchImpl).toHaveBeenCalledTimes(11);
+    expect(outcome.projection).toEqual({
+      schemaVersion: 1,
+      verdict: "approve",
+      codeforcesDifficulty: 800,
+      qualityLevel: 4,
+      originalityLevel: 4,
+      thinkingLevel: 1,
+      codingLevel: 1,
+      tagIds: ["basic.simulation", "math.counting"],
+      hardBlockers: [],
+      difficultyConfidence: 0.8,
+      editorial: {
+        qualityLevel: 4,
+        noveltyLevel: 4,
+        ideaDepthLevel: 4,
+        naturalnessLevel: 4,
+        contestantExperienceLevel: 4,
+        evidenceCoverage: { strengths: "found", concerns: "none_found" },
+        evidence: [{
+          dimension: "idea_depth",
+          direction: "strength",
+          severity: "note",
+          confidence: 0.8
+        }]
+      },
+      contestFit: {
+        icpcFit: "strong",
+        implementationBurden: 2,
+        thinkingImplementationBalance: "strong",
+        knowledgeFairness: "fair",
+        problemsetRole: "introductory",
+        roleConfidence: 0.8,
+        evidenceCoverage: { strengths: "found", concerns: "none_found" },
+        evidence: [{
+          dimension: "icpc_fit",
+          direction: "strength",
+          severity: "note",
+          confidence: 0.8
+        }]
+      },
+      originality: {
+        originalityLevel: 4,
+        sameProblemAsExisting: false,
+        highestSimilarity: 0.2
+      }
+    });
+    expect(Object.isFrozen(outcome)).toBe(true);
+    expect(Object.isFrozen(outcome.projection)).toBe(true);
+    const serialized = JSON.stringify(outcome);
+    expect(serialized).not.toContain(solutionSentinel);
+    expect(serialized).not.toContain(modelOutputSentinel);
+    for (const forbiddenField of [
+      "decision",
+      "publicComment",
+      "privateNote",
+      "improvements",
+      "rationale",
+      "narrative",
+      "summary",
+      "statement",
+      "solution"
+    ]) {
+      expect(serialized).not.toContain(forbiddenField);
+    }
+  });
+
+  it("离线标定的 499 原样保持安全 incomplete，绝不形成部分预测", async () => {
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 499 }));
+    const { runner } = syntheticTrustedRunner(fetchImpl);
+    const outcome = await runReviewEvidenceFlowCalibrationOutcome({
+      taskSource: trustedTaskSource(),
+      trustedRunner: runner,
+      executionContext: executionContext()
+    });
+
+    expect(outcome.status).toBe("incomplete");
+    if (outcome.status !== "incomplete") throw new Error("expected incomplete");
+    expect(outcome.failure.failedRoles).toEqual([{
+      role: "solver",
+      failureKind: "service_http",
+      httpStatus: 499,
+      requestCount: 1,
+      transportAttemptCount: 1,
+      completedResponseCount: 0,
+      terminalResponseMode: null,
+      terminalEofObserved: false,
+      terminalFinishReasonStopObserved: false,
+      terminalSseDoneObserved: null
+    }]);
+    expect(JSON.stringify(outcome)).not.toContain(solutionSentinel);
+    expect(JSON.stringify(outcome)).not.toContain("projection");
+  });
+
   it("solver 运行时只收到题面视图，题解、标签、查重和自报答案均不可见", async () => {
     let serializedSolverView = "";
     const decision = await runReviewEvidenceFlow({
