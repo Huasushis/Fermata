@@ -2,7 +2,7 @@
  * 离线实验与正式 11 角色实现之间的唯一 adapter。
  *
  * 这里故意不走 source+roles+identities 的宽松测试入口：每个 content 必须先经
- * buildReviewFlowTaskSource 得到进程内 branded taskSource，runner 必须由
+ * 历史结果排除策略专用 builder 得到进程内 branded taskSource，runner 必须由
  * createReviewFlowLlmBundle(productionGrant:null) 创建，最后只读取编排器提供的
  * calibration projection。测试在更外层注入假 executor，不会伪造此 adapter。
  */
@@ -19,13 +19,18 @@ import {
   type ReviewFlowModelConfigs
 } from "../../src/review-flow/llm-roles";
 import {
-  buildReviewFlowTaskSource,
+  buildHistoricalCalibrationReviewFlowTaskSource,
   type ReviewFlowTaskSourceResult
 } from "../../src/review-flow/task-source";
 import { reviewFlowRoleSchema } from "../../src/review-flow/schemas";
 import { deepFreeze, hashCanonicalValue } from "../../src/review-flow/evidence";
 import type { RobotReviewTask } from "../../src/urmotiv-schemas";
 import type { StrictDifficultyAnchors } from "./difficulty-anchors-strict";
+import {
+  reviewFlowEvaluationPlaceholderTagIdsSchema,
+  type ReviewFlowEvaluationAnklangInputPolicy,
+  type ReviewFlowEvaluationPlaceholderTagIds
+} from "./review-flow-evaluation-dataset";
 import type { EvaluationCodeIdentity } from "./evaluation-code-identity";
 import {
   getReviewFlowEvaluationProviderCredentials,
@@ -95,6 +100,8 @@ export function createReviewFlowEvaluationAdapter(input: {
   readonly difficultyAnchors: StrictDifficultyAnchors;
   readonly datasetFingerprint: string;
   readonly manifestSha256: string;
+  readonly anklangInputPolicy: ReviewFlowEvaluationAnklangInputPolicy;
+  readonly placeholderTagIds: ReviewFlowEvaluationPlaceholderTagIds;
   readonly purpose: "development" | "holdout";
   readonly concurrency: number;
   readonly proxyEnvironment: NodeJS.ProcessEnv;
@@ -105,6 +112,11 @@ export function createReviewFlowEvaluationAdapter(input: {
   const proxyEnvironmentSummary = summarizeReviewFlowEvaluationProxyEnvironment(
     input.proxyEnvironment
   );
+  const placeholderTagIds = Object.freeze([
+    ...reviewFlowEvaluationPlaceholderTagIdsSchema.parse(
+      input.placeholderTagIds
+    )
+  ]);
   const models = resolveModels(input.config);
   const engineBuildFingerprint =
     input.codeIdentity.productionDependencyCodeSha256;
@@ -139,6 +151,8 @@ export function createReviewFlowEvaluationAdapter(input: {
     timeouts: input.config.models.timeouts,
     retry: input.config.models.retry,
     concurrency: input.concurrency,
+    anklangInputPolicy: input.anklangInputPolicy,
+    placeholderTagIds,
     proxyEnvironmentFingerprint: proxyEnvironmentSummary.fingerprint,
     proxyEnvironmentKeys: [...proxyEnvironmentSummary.keys],
     difficultyAnchorsFingerprint: input.difficultyAnchors.fingerprint,
@@ -179,12 +193,29 @@ export function createReviewFlowEvaluationAdapter(input: {
   return Object.freeze({
     identity,
     prepare(preparationInput) {
-      const taskSource = buildReviewFlowTaskSource(preparationInput.task, {
-        duplicateSimilarityRejectThreshold:
-          input.config.models.thresholds.duplicateSimilarityReject
-      });
-      // 离线长实验只接受不带复用时限的完整 Anklang 快照。否则证据可能在
-      // 多小时的 11 角色流程中跨过 expiresAt，不能拿过期结果计分。
+      if (
+        input.anklangInputPolicy !==
+          "exclude_current_corpus_for_historical_outcome"
+      ) {
+        throw new Error("REVIEW_FLOW_EVALUATION_ANKLANG_INPUT_POLICY_INVALID");
+      }
+      if (
+        preparationInput.task.problem.tagIds.length !==
+          placeholderTagIds.length ||
+        preparationInput.task.problem.tagIds.some(
+          (tagId, index) => tagId !== placeholderTagIds[index]
+        )
+      ) {
+        throw new Error("REVIEW_FLOW_EVALUATION_PLACEHOLDER_TAGS_MISMATCH");
+      }
+      const taskSource = buildHistoricalCalibrationReviewFlowTaskSource(
+        preparationInput.task,
+        {
+          duplicateSimilarityRejectThreshold:
+            input.config.models.thresholds.duplicateSimilarityReject
+        }
+      );
+      // 历史结果策略不注入当前语料，因而不存在可在长实验中跨期的证据。
       if (taskSource.provenance.anklang.reviewItemExpiresAt !== null) {
         throw new Error("REVIEW_FLOW_EVALUATION_EXPIRING_SOURCE_FORBIDDEN");
       }

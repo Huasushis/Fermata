@@ -31,7 +31,10 @@ import {
 } from "../src/review-flow/orchestrator";
 import type { ReviewFlowLlmBundle } from "../src/review-flow/llm-roles";
 import { reviewFlowRoleSchema, type ReviewFlowRole } from "../src/review-flow/schemas";
-import { buildReviewFlowTaskSource } from "../src/review-flow/task-source";
+import {
+  buildHistoricalCalibrationReviewFlowTaskSource,
+  buildReviewFlowTaskSource
+} from "../src/review-flow/task-source";
 
 const assignmentId = "3fa85f64-5717-4562-b3fc-2c963f66afa7";
 const runId = "3fa85f64-5717-4562-b3fc-2c963f66afa8";
@@ -193,8 +196,8 @@ function runner(options: {
   return result;
 }
 
-function taskSource() {
-  return buildReviewFlowTaskSource({
+function taskSource(options: { readonly historical?: boolean } = {}) {
+  const task = {
     assignmentId,
     leaseExpiresAt: "2026-08-02T10:10:00.000Z",
     problem: {
@@ -231,7 +234,7 @@ function taskSource() {
         active: true
       }]
     },
-    reviewItems: [{
+    reviewItems: options.historical ? [] : [{
       id: "synthetic-anklang-v2",
       type: "org.ustc.urmotiv.anklang.similarity",
       source: "anklang",
@@ -258,10 +261,14 @@ function taskSource() {
         reuse: { policy: "allowed", expiresAt: evidenceExpiry }
       }
     }]
-  }, {
+  };
+  const buildOptions = {
     duplicateSimilarityRejectThreshold: 0.9,
     now: () => new Date(startTime.getTime())
-  });
+  };
+  return options.historical
+    ? buildHistoricalCalibrationReviewFlowTaskSource(task, buildOptions)
+    : buildReviewFlowTaskSource(task, buildOptions);
 }
 
 function expectation(source: ReturnType<typeof taskSource>): ReviewFlowSubmissionExpectation {
@@ -350,6 +357,14 @@ describe("生产审题提交的一次性来源与时效绑定", () => {
       "REVIEW_FLOW_CALIBRATION_INPUT_FORBIDDEN"
     );
     expect(solver).not.toHaveBeenCalled();
+
+    const historicalSolver = vi.fn(roles().solver);
+    await expect(runReviewEvidenceFlow({
+      taskSource: taskSource({ historical: true }),
+      trustedRunner: runner({ roleOverrides: { solver: historicalSolver } }),
+      executionContext: input.executionContext
+    })).rejects.toThrow("REVIEW_FLOW_TASK_SOURCE_UNTRUSTED");
+    expect(historicalSolver).not.toHaveBeenCalled();
 
     await expect(runReviewEvidenceFlowCalibrationOutcome({
       ...input,

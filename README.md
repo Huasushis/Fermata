@@ -183,8 +183,10 @@ shell 的 `source` 或 `.`。
 `npm run`，必须使用下文专用包装命令。它评估当前生产路径实际使用的 11 个角色，而不是旧的
 thinking/coding/verdict 流水线。这个入口只消费已经人工整理好的严格数据集，不生成题目、
 不生成 gold，也不会直接读取 Urmotiv、历史 XML 或题库目录。导入人员必须先在隔离步骤中把允许使用的
-材料整理成完整 `robotReviewTaskSchema` 快照，并确保任务里的 Anklang 证据是完整、`no-store`
-（没有过期时间）的可信快照；入口会在任何付费请求前一次性校验所有样本。
+材料整理成完整 `robotReviewTaskSchema` 快照。当前 32 题历史品味基线固定使用
+`exclude_current_corpus_for_historical_outcome`：bridge 仍逐字验证并绑定原始 Anklang request、response、
+capture 与 verifier 重放，但输出任务的 `reviewItems` 必须为空，避免已经参赛的题在当前语料中自匹配后把
+历史通过/否决结果泄漏给模型。入口会在任何付费请求前一次性校验所有样本及这项全局策略。
 
 manifest、固定标签目录、逐题 content 和逐题 gold 都必须放在 `--dataset-private-root` 明确指定的
 Git 忽略私有根内；当前桥接输出可以留在 `Urmotiv/private/`，只有 registry、检查点和报告固定写入
@@ -215,7 +217,7 @@ content 与原始 Anklang 响应摘要检查交叉污染。固定标签目录单
 ```
 
 每个 content 文件必须是完整且无额外字段的 `robotReviewTaskSchema` 文档；其中 `tagCatalog` 必须与
-上述固定目录逐字段一致。manifest v3 的两个分区都**不得**保存 Gold 文件名、逐题 Gold 摘要、
+上述固定目录逐字段一致。manifest v4 的两个分区都**不得**保存 Gold 文件名、逐题 Gold 摘要、
 原始审核行摘要、封存 Gold 证据摘要、verdict、理由、难度、比赛使用情况或任何 Gold 聚合摘要，避免
 这些低熵字段形成可枚举的哈希 oracle。只有 development 运行或一次性 reveal 真正打开
 所选分区 Gold 后，程序才在内存中计算该分区摘要。12 个品味维度键为 `novelty`、
@@ -225,8 +227,10 @@ content 与原始 Anklang 响应摘要检查交叉污染。固定标签目录单
 
 ```jsonc
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "datasetId": "dataset-16位小写十六进制",
+  "anklangInputPolicy": "exclude_current_corpus_for_historical_outcome",
+  "placeholderTagIds": ["整批统一的非 Gold 占位标签编号"],
   "tagCatalog": {
     "fileName": "固定标签目录.private.json",
     "sha256": "64位小写十六进制",
@@ -300,7 +304,7 @@ commitment 使用不同 nonce，development run 绝不能获得 holdout descript
         "rowEvidenceSha256": "原始审核行证据摘要",
         "originalAnklangResponseSha256": "必须与 prediction manifest 一致",
         "bridgeEvidence": {
-          "bridgeVersion": "urmotiv-review-flow-bridge-v3",
+          "bridgeVersion": "urmotiv-review-flow-bridge-v4",
           "verificationAttestationSha256": "上游验证证明原始字节摘要",
           "bridgePlanSha256": "桥接计划原始字节摘要",
           "reviewGoldEvidenceSha256": "上游 evidence 原始字节摘要",
@@ -310,7 +314,7 @@ commitment 使用不同 nonce，development run 绝不能获得 holdout descript
           "inspectionSha256": "原始表格检查报告原始字节摘要",
           "layoutSha256": "人工布局确认原始字节摘要",
           "reviewInputSetSha256": "原始审核输入集合摘要",
-          "humanMappingSha256": "本题人工映射原始字节摘要",
+          "sourceMappingSha256": "本题来源映射原始字节摘要",
           "anklangCaptureAttestationSha256": "整批采集证明原始字节摘要",
           "anklangCaptureCompletionSha256": "整批采集完成标记原始字节摘要",
           "anklangRequestSha256": "本题原始 v2 request 字节摘要",
@@ -329,8 +333,8 @@ commitment 使用不同 nonce，development run 绝不能获得 holdout descript
 
 上面的 JSONC 只展示字段位置，尖括号式说明和中文摘要占位必须替换为真实、满足 schema 的值，不能
 原样作为 manifest。Urmotiv `prepare-review-gold.py seal` 的输出只是上游证据，不能直接当作这里的
-manifest；必须先验证 `REVIEW_GOLD_COMPLETE`、evidence、source-bindings 和逐题 Gold 的摘要，再由人工
-复核题面/题解边界及 XML 稀疏意见映射，生成本 schema 的 content、Gold、prediction manifest 与独立
+manifest；必须先验证 `REVIEW_GOLD_COMPLETE`、evidence、source-bindings 和逐题 Gold 的摘要，再由操作员
+登记可核验的题面/题解来源投影及 XML 稀疏意见映射，生成本 schema 的 content、Gold、prediction manifest 与独立
 reveal descriptor。这里的
 `sealedEvidenceSha256` 绑定整批上游完成标记，因此同一封存批次的多题可以共享；逐题
 `rowEvidenceSha256` 和 `bridgeEvidence` 只进入受随机 nonce 保护的 reveal/Gold 材料；它们及其中任何
@@ -343,13 +347,13 @@ schema 伪造 holdout。只有非空 holdout 才能登记标签对。
 转换器必须最后写出同目录固定文件 `REVIEW_FLOW_DATASET_COMPLETE`，loader 会在读取任何题目内容前验证它
 绑定 manifest、标签目录、逐题来源谱系集合和精确分区计数；标记缺失、截断或摘要不符的 partial 目录一律
 不能运行。它还必须绑定独立 reveal commitment，但仍不保存 reveal 文件名。标记的严格结构如下，
-转换版本当前固定为 `urmotiv-review-flow-bridge-v3`：
+转换版本当前固定为 `urmotiv-review-flow-bridge-v4`：
 
 ```jsonc
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "artifactKind": "review_flow_evaluation_dataset_bridge_completion",
-  "bridgeVersion": "urmotiv-review-flow-bridge-v3",
+  "bridgeVersion": "urmotiv-review-flow-bridge-v4",
   "datasetId": "必须与 manifest 一致",
   "manifestFileName": "manifest.private.json",
   "manifestSha256": "manifest 原始字节摘要",
@@ -360,13 +364,14 @@ schema 伪造 holdout。只有非空 holdout 才能登记标签对。
     "dependencyFileCount": 46
   },
   "tagCatalogSha256": "必须与 manifest 一致",
-  "sourceLineageSetSha256": "按 v3 契约计算的全部来源谱系集合摘要",
+  "placeholderTagIds": ["必须与 manifest 顺序逐项一致"],
+  "sourceLineageSetSha256": "按 v4 契约计算并绑定全局 Anklang 输入策略的全部来源谱系集合摘要",
   "developmentPredictionBindingSha256": "无标签 development 输入集合摘要",
   "developmentRevealCommitmentSha256": "必须与 manifest 的 development commitment 一致",
   "holdoutPredictionBindingSha256": "非空 holdout 的无标签输入集合摘要；否则 null",
   "holdoutRevealCommitmentSha256": "必须与 manifest 的 opaque commitment 一致；否则 null",
-  "caseCount": 36,
-  "developmentCount": 36,
+  "caseCount": 32,
+  "developmentCount": 32,
   "holdoutCount": 0
 }
 ```
@@ -375,9 +380,9 @@ schema 伪造 holdout。只有非空 holdout 才能登记标签对。
 v2 request 和 HTTP 原始 response，并另外绑定整批 capture attestation 与 marker-last completion。
 request 必须是无额外字段的 v2 严格结构，`requestId` 整批唯一；`title/type/tagIds/basicStatement`
 逐字段等于 task draft，`contentHash` 等于由 problem hash input 重算的 Urmotiv 摘要。response 必须是
-HTTP 200、attempt 1 的严格 v2 `complete`，并原样回显 request 的 `contentHash`。转换器保留全部候选
-与判断，只允许把复用政策收紧为 `no-store` 并令 item `expiresAt=null`。不得伪造空候选，也不得由
-实验入口自动调用 Anklang。
+HTTP 200、attempt 1 的严格 v2 `complete`，并原样回显 request 的 `contentHash`。转换器必须验证原始候选
+与判断且把它们绑定进私有 capture lineage，但当前历史结果策略统一输出空 `reviewItems`，不得把这些赛后
+查重候选注入 11 角色任务，也不得由实验入口重新调用 Anklang。
 
 capture attestation 固定绑定 clean Anklang HEAD 和代码内置的 4 文件采集器身份：
 `scripts/capture-review-flow-calibration.py`、`anklang/__init__.py`、
@@ -386,7 +391,11 @@ attestation 还必须保存不含地址明文和密钥的 v2 endpoint/config 摘
 以及逐题 case/requestId/request 原始 SHA-256/response 原始 SHA-256/HTTP 200/attempt 1 和完整计数。
 顶层 `captureFingerprint` 是去掉自身后规范 JSON 的摘要；completion 再绑定 attestation 原始字节摘要、
 逐题 capture set 摘要和全部相等计数，并固定 `failureCount=0`、`complete=true`。两者都必须是规范化的
-JSON 字节，任一缺失、非完整、计数不等或 Anklang 工作树不干净都会失败关闭。
+JSON 字节，任一缺失、非完整、计数不等或 Anklang 工作树不干净都会失败关闭。bridge 不只读取手写
+attestation：它还会以固定 `/usr/bin/python3 -I -B -X pycache_prefix=/dev/null`、受限环境在同一 clean Anklang HEAD 上执行
+`capture-review-flow-calibration.py verify-capture`，传入原始 capture workspace、manifest 和三个
+`--verifier-*` 身份摘要；stdout 必须与 plan 绑定的 attestation 原始字节逐字一致，执行前后代码身份也
+必须一致。
 
 ```jsonc
 {
@@ -408,12 +417,12 @@ JSON 字节，任一缺失、非完整、计数不等或 Anklang 工作树不干
     "apiVersion": "2",
     "endpointPath": "/api/v2/checks/similarity",
     "baseUrlSha256": "不含账号密码的服务地址摘要",
-    "timeoutMs": 120000,
-    "authentication": "bearer_redacted 或 none",
+    "timeoutMs": 300000,
+    "authentication": "bearer_redacted",
     "secretsExcluded": true
   },
   "backend": {
-    "kind": "local_engine 或 reverse_proxy",
+    "kind": "reverse_proxy",
     "configurationSha256": "去密钥 backend 配置声明摘要",
     "secretsExcluded": true
   },
@@ -432,26 +441,23 @@ JSON 字节，任一缺失、非完整、计数不等或 Anklang 工作树不干
     "responseCompletionStatus": "complete"
   }],
   "counts": {
-    "caseCount": 36,
-    "requestCount": 36,
-    "responseCount": 36,
-    "http200Count": 36,
-    "attemptCount": 36,
-    "completeResponseCount": 36,
+    "caseCount": 32,
+    "requestCount": 32,
+    "responseCount": 32,
+    "http200Count": 32,
+    "attemptCount": 32,
+    "completeResponseCount": 32,
     "failureCount": 0
   },
   "captureFingerprint": "去掉本字段后的规范 JSON 摘要"
 }
 ```
 
-`reproducible_snapshot` 的 `corpus` 分支不用远端两个字段，严格改为
-`corpusId/manifestSha256/snapshotSha256/corpusRevisionSha256/problemCount`。capture completion 使用相同
-`captureId`，并严格含 `attestationSha256/captureSetSha256`、上述七个计数字段和 `complete: true`。
-
-`local_engine` 只有同时绑定 corpus manifest、实际 snapshot、语料 revision 和题目计数时才可声明
-`reproducible_snapshot`。`reverse_proxy` 固定只能声明 `remote_corpus_unverifiable`：其完整响应仍可作为
-Fermata 的查重上下文，但页面、报告和证据不得把远端语料描述成可复现或已绑定的语料证据。该等级会
-写入隐藏的 Gold bridge evidence 和来源谱系；远端上下文的 review item 摘要也明确显示“远端语料不可复核”。
+capture completion 使用相同 `captureId`，并严格含
+`attestationSha256/captureSetSha256`、上述七个计数字段和 `complete: true`。当前 bridge v4 硬限制
+`reverse_proxy + remote_corpus_unverifiable`；`local_engine`、`reproducible_snapshot` 及二者伪装组合都
+在 schema 边界拒绝，不能靠手写 corpus 摘要制造“已复现”成功路径。远端语料不可复核这一事实会进入隐藏
+Gold bridge evidence 与来源谱系，但原始响应只用于 capture 完整性验证，不注入历史结果任务。
 
 正式转换使用 `experiment:prepare-review-flow-dataset`。它不是“相信一份已经写好的 JSON”：每次执行都先
 要求 `--fermata-code-version` 精确等于当前干净 Fermata HEAD，并用可信 Git 快照核对固定 runner
@@ -461,7 +467,7 @@ reveal、content 和 manifest 写完后、完成标记发布前会再次核对�
 任何变化都只留下没有完成标记的 partial 目录。当前未提交或含任意未跟踪文件的 Fermata 工作树不能正式
 转换。
 
-转换器同时会以固定 `/usr/bin/python3` 调用干净 Urmotiv HEAD 中的
+转换器同时会以固定 `/usr/bin/python3 -I -B -X pycache_prefix=/dev/null` 调用干净 Urmotiv HEAD 中的
 `scripts/migrate-hist/prepare-review-gold.py verify-sealed`，并把安全 stdout 与 bridge plan 预先绑定的
 `urmotiv_review_gold_verification_attestation` 原始字节逐字比较。attestation 固定绑定 verifier 的 40 位
 Git HEAD、runner 摘要和 `prepare-review-gold.py`/`parse-metadata.py` 两文件代码全集；运行前后都会用隔离
@@ -476,19 +482,55 @@ attestation v1 必须报告两类不同摘要，不能混用：普通 `*Sha256` 
 case/subject/purpose/scope/source/path/source 摘要/row evidence/Gold 摘要和全部计数。严格结构以
 `reviewFlowEvaluationUpstreamAttestationSchema` 为准。
 
-bridge plan 同目录只放 basename 引用，并逐题绑定五份既有 `0600` 文件：不含 review item 的
+bridge plan v4 同目录只放 basename 引用，并逐题绑定五份既有 `0600` 文件：不含 review item 的
 RobotReviewTask draft、`urmotiv_problem_content_hash_input`、原始 Anklang v2 request、原始 HTTP 200
-complete response 和人工 `review_flow_evaluation_human_mapping`；顶层另绑定 capture attestation 与
-capture completion。problem hash input 保存 Urmotiv 计算 contentHash 所需、但 robot
+complete response 和 `review_flow_evaluation_source_mapping`；顶层另绑定 capture attestation 与
+capture completion，并固定
+`anklangInputPolicy: "exclude_current_corpus_for_historical_outcome"`。顶层还必须唯一登记一份非空、
+无重复的 `placeholderTagIds`，其顺序属于数据身份；每题 source mapping、task draft、problem hash input
+和原始 Anklang request 的 `tagIds` 都必须与它顺序逐项相等。该列表同时绑定 prediction manifest v4、
+completion、prediction binding、来源谱系集合、loader bundle 和 adapter 配置身份；loader 即使在不打开
+Gold 的 identity/prediction 模式也会确认列表全部存在于固定标签目录，并检查每份 content。该策略要求整批上游 case 都是
+`verdict_and_taste`；混入任何 `originality_only` 会在发布前失败关闭。problem hash input 保存 Urmotiv 计算 contentHash 所需、但 robot
 task 不可见的难度、样例 UUID、完整 judge config 和状态；转换器按 Urmotiv 的字段顺序重算 SHA-256，再
-核对 task 可见字段。人工 mapping 必须显式确认题面/题解边界来自绑定的物化源，并把 XML 意见只映射成
-稀疏观察；投稿者自报难度不能进入独立难度真值。
+核对 task 可见字段。source mapping 只声明实际采用的投影方法、操作员确认事项和可回查到 XML 评论下标的
+稀疏历史理由；它不接受任何 `independent_human`、标签或难度 Gold。投稿者自报难度不能进入独立难度真值。
+
+source mapping 固定为 schema v2。`titleIdentityValueIndex` 选择 worksheet 的一个原始
+`identityValues` 项；该字符串必须已经符合任务标题规范并与 task title 逐字相等，桥接器不会静默
+trim。`sourceProjection.statement` 和 `.solution` 是 UTF-8 原始字节的左闭右开区间：题面必须从 byte 0
+开始，题解必须结束于文件 EOF，两段非空、不重叠、能严格解码且逐字等于 task 的
+`basicStatement/basicSolution`。方法只能是
+`markdown_solution_heading_v1`、`last_horizontal_rule_v1`、`algorithm_heading_v1` 或
+`operator_explicit_offsets_v1`；前三种方法的 gap 必须完整由空白和恰好一个对应标题/分隔线组成，不能
+夹带正文，显式 offset 方法才允许任意 gap。所有方法都禁止省略源文件前缀或后缀。
+
+题型 provenance 固定写 `problemTypeBasis: "operator_confirmed"`。历史任务契约要求非空当前标签，
+但它不是标签准确性 Gold，因此必须写
+`currentTagIdsBasis: "calibration_placeholder_not_gold"` 和与 bridge plan 顶层顺序逐项相等的
+`placeholderTagIds`；这些编号必须存在于本次绑定且标签 id 无重复的固定标签目录。source mapping
+不提供标签准确性 Gold。除 `basicStatement/basicSolution` 外，task 的其余 content 字段必须为空，samples
+必须为空且 limits 必须为 null，避免把未经投影的内容带进受信输入。
+当前 bridge v4 不接受 `originality_only`；未来若要恢复原创性专用数据集，必须新增整批一致、带版本的
+include 策略，不能与历史结果 scope 混用。
+
+普通题历史理由映射 provenance 固定为
+`historicalReviewReasonMapping: "operator_asserted_sparse_mapping_v1"`。输入使用
+`observedHistoricalTasteReasonEvidence` 和 `observedHistoricalTechnicalReasonEvidence`；每项同时登记
+`reviewCommentIndex` 与 `reason`。桥接器只接受索引存在且对应 XML worksheet 评论非空的 evidence，再从中
+去重派生 Gold 的 taste/technical reason 数组。这个名称明确表示语义分类是操作员断言，不冒充自动 codebook；
+人工仍必须逐项核对评论确实支持所选 reason，绝不能从最终通过/否决结论反推理由。两个 evidence 数组都允许
+为空。逐题来源谱系使用
+`review-flow-evaluation-source-lineage-v6`，绑定投影区间、方法、标题索引、题型来源、非 Gold 标签占位、
+原始 capture 摘要、全局排除策略和 `reviewItemInjected:false`，但不绑定 Gold 理由字段。
 
 ```bash
 npm run experiment:prepare-review-flow-dataset -- \
   --private-root=/absolute/project/private-root \
   --fermata-code-version=当前干净Fermata_HEAD的40位小写提交号 \
   --bridge-plan=/absolute/project/private-root/bridge-input/bridge-plan.private.json \
+  --anklang-capture-workspace=/absolute/project/private-root/anklang-capture-workspace \
+  --anklang-capture-manifest=/absolute/project/private-root/anklang-capture-workspace/capture-manifest.private.json \
   --upstream-gold=/absolute/project/private-root/review-gold-sealed \
   --materialized=/absolute/project/private-root/materialized \
   --worksheet=/absolute/project/private-root/review-worksheet/review-worksheet.private.json \
@@ -510,11 +552,12 @@ descriptor，再写标签目录、全部 content 和 manifest，重新核对精�
 为 `null`。development 与 holdout descriptor 的 nonce 分别调用系统密码学随机源生成 32 字节；相同或长度
 错误固定拒绝。
 
-每个 gold 只能选择以下两个互斥范围之一。普通通过/否决题使用
-`verdict_and_taste`：历史 XML 的最终通过/否决只进入二分类 `historicalOutcome`；三态 verdict、
-穷尽品味理由、标签和可选难度必须另行人工独立标注，不能把投稿者自报难度当作 gold。XML 中明确写出的
-审核理由只是稀疏观察，只计算召回率；某个轴没写出来不等于负例。独立三态裁决和穷尽品味都可整段
-缺省；缺省样本不参与对应指标，绝不能为了凑数复制历史二元结论或伪造 `independent_human`。
+Gold schema 为未来独立标注保留两个互斥范围，但当前 bridge v4 的 32 题历史品味基线只允许
+`verdict_and_taste`：历史 XML 的最终通过/否决只进入二分类 `historicalOutcome`。XML 中明确写出的审核理由
+只是操作员绑定评论下标后的稀疏观察，只计算召回率；某个轴没写出来不等于负例。bridge v4 不从 source
+mapping 接受或生成独立三态 verdict、穷尽品味、独立原创性、标签或难度 Gold。未来若要启用这些指标，必须
+先设计独立、带版本和可核验 provenance 的标注 artifact，再升级 bridge；不能为了凑数复制历史二元结论、
+投稿者自报难度或伪造 `independent_human`。
 
 ```jsonc
 {
@@ -530,7 +573,7 @@ descriptor，再写标签目录、全部 content 和 manifest，重新核对精�
     "sourceLineageSha256": "必须与 manifest 一致",
     "originalAnklangResponseSha256": "必须与 manifest 一致",
     "bridgeEvidence": {
-      "bridgeVersion": "urmotiv-review-flow-bridge-v3",
+      "bridgeVersion": "urmotiv-review-flow-bridge-v4",
       "verificationAttestationSha256": "只在揭盲侧绑定",
       "bridgePlanSha256": "只在揭盲侧绑定",
       "reviewGoldEvidenceSha256": "只在揭盲侧绑定",
@@ -540,12 +583,12 @@ descriptor，再写标签目录、全部 content 和 manifest，重新核对精�
       "inspectionSha256": "只在揭盲侧绑定",
       "layoutSha256": "只在揭盲侧绑定",
       "reviewInputSetSha256": "只在揭盲侧绑定",
-      "humanMappingSha256": "只在揭盲侧绑定",
+      "sourceMappingSha256": "只在揭盲侧绑定",
       "anklangCaptureAttestationSha256": "只在揭盲侧绑定",
       "anklangCaptureCompletionSha256": "只在揭盲侧绑定",
       "anklangRequestSha256": "只在揭盲侧绑定",
       "anklangResponseSha256": "等于 manifest 的原始响应摘要",
-      "anklangCorpusEvidenceKind": "reproducible_snapshot 或 remote_corpus_unverifiable"
+      "anklangCorpusEvidenceKind": "remote_corpus_unverifiable"
     }
   },
   "evaluationScope": "verdict_and_taste",
@@ -554,38 +597,18 @@ descriptor，再写标签目录、全部 content 和 manifest，重新核对精�
   "observedHistoricalTasteReasons": [
     { "dimension": "icpc_fit", "direction": "strength" }
   ],
-  "observedHistoricalTechnicalReasons": ["judgeability_concern"],
-  "independentVerdict": {
-    "annotation": "independent_human_three_way",
-    "verdict": "approve"
-  },
-  "independentTaste": {
-    "annotation": "exhaustive_independent_human",
-    "reasons": [
-      { "dimension": "icpc_fit", "direction": "strength" }
-    ]
-  },
-  "independentOriginality": {
-    "annotation": "independent_human_originality",
-    "confirmedDuplicate": false
-  },
-  "expectedTagIds": ["固定标签编号"],
-  "independentDifficulty": {
-    "annotation": "independent_human_without_submitter_metadata",
-    "codeforcesDifficulty": 1800,
-    "thinkingLevel": 3,
-    "codingLevel": 2
-  }
+  "observedHistoricalTechnicalReasons": ["judgeability_concern"]
 }
 ```
 
-`independentVerdict`、`independentTaste`、`independentOriginality`、`expectedTagIds` 和
-`independentDifficulty` 都可整段省略，不能用不可靠字段补齐。稀疏技术理由只允许
+上面展示的是 bridge v4 能生成的普通题 Gold；它不会出现 `independentVerdict`、`independentTaste`、
+`independentOriginality`、`expectedTagIds` 或 `independentDifficulty`。稀疏技术理由只允许
 `statement_solution_inconsistency`、`judgeability_concern`、`sample_mismatch`、
 `constraint_insufficiency`、`official_solution_incorrect`、`complexity_unacceptable`、
 `reference_implementation_incorrect`；它们同样只计算召回，不把缺席当负例，也不要求投稿附带标程。
-确认原题/重复题只评估原创性，必须使用严格的最小 gold；普通题没有独立原创性标注时不会默认成
-“非原题”。`originality_only` 不能再携带 verdict、品味、比赛使用、标签或难度字段：
+普通题没有独立原创性标注时不会默认成“非原题”。下列 `originality_only` 是数据集 schema 为未来
+独立、整批一致的原创性标注流程保留的最小结构；当前 bridge v4 没有 include 策略，不能生成或混入
+这种 Gold。它不能携带 verdict、品味、比赛使用、标签或难度字段：
 
 ```jsonc
 {
@@ -601,7 +624,7 @@ descriptor，再写标签目录、全部 content 和 manifest，重新核对精�
     "sourceLineageSha256": "必须与 manifest 一致",
     "originalAnklangResponseSha256": "必须与 manifest 一致",
     "bridgeEvidence": {
-      "bridgeVersion": "urmotiv-review-flow-bridge-v3",
+      "bridgeVersion": "urmotiv-review-flow-bridge-v4",
       "verificationAttestationSha256": "只在揭盲侧绑定",
       "bridgePlanSha256": "只在揭盲侧绑定",
       "reviewGoldEvidenceSha256": "只在揭盲侧绑定",
@@ -611,12 +634,12 @@ descriptor，再写标签目录、全部 content 和 manifest，重新核对精�
       "inspectionSha256": "只在揭盲侧绑定",
       "layoutSha256": "只在揭盲侧绑定",
       "reviewInputSetSha256": "只在揭盲侧绑定",
-      "humanMappingSha256": "只在揭盲侧绑定",
+      "sourceMappingSha256": "只在揭盲侧绑定",
       "anklangCaptureAttestationSha256": "只在揭盲侧绑定",
       "anklangCaptureCompletionSha256": "只在揭盲侧绑定",
       "anklangRequestSha256": "只在揭盲侧绑定",
       "anklangResponseSha256": "等于 manifest 的原始响应摘要",
-      "anklangCorpusEvidenceKind": "reproducible_snapshot 或 remote_corpus_unverifiable"
+      "anklangCorpusEvidenceKind": "remote_corpus_unverifiable"
     }
   },
   "evaluationScope": "originality_only",

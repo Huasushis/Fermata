@@ -69,6 +69,29 @@ export type ReviewFlowEvaluationPurpose = z.infer<
   typeof reviewFlowEvaluationPurposeSchema
 >;
 
+/**
+ * 历史通过/否决结果发生在题目进入当前 Anklang 语料之前。校准时必须统一排除
+ * 当前语料，避免赛后同题自匹配把历史结果泄漏给 originality/裁决角色。
+ */
+export const reviewFlowEvaluationAnklangInputPolicySchema = z.literal(
+  "exclude_current_corpus_for_historical_outcome"
+);
+export type ReviewFlowEvaluationAnklangInputPolicy = z.infer<
+  typeof reviewFlowEvaluationAnklangInputPolicySchema
+>;
+
+/** 全批历史校准统一使用的非 Gold 标签占位；顺序也是输入身份的一部分。 */
+export const reviewFlowEvaluationPlaceholderTagIdsSchema = z
+  .array(z.string().min(1).max(120))
+  .min(1)
+  .max(30)
+  .refine((tagIds) => new Set(tagIds).size === tagIds.length, {
+    message: "PLACEHOLDER_TAG_IDS_DUPLICATE"
+  });
+export type ReviewFlowEvaluationPlaceholderTagIds = z.infer<
+  typeof reviewFlowEvaluationPlaceholderTagIdsSchema
+>;
+
 export const reviewFlowEvaluationLoadModeSchema = z.enum([
   "development_identity",
   "development_scored",
@@ -116,7 +139,7 @@ const upstreamEvidenceSchema = z
     originalAnklangResponseSha256: reviewFlowEvaluationDigestSchema,
     bridgeEvidence: z
       .object({
-        bridgeVersion: z.literal("urmotiv-review-flow-bridge-v3"),
+        bridgeVersion: z.literal("urmotiv-review-flow-bridge-v4"),
         verificationAttestationSha256: reviewFlowEvaluationDigestSchema,
         bridgePlanSha256: reviewFlowEvaluationDigestSchema,
         reviewGoldEvidenceSha256: reviewFlowEvaluationDigestSchema,
@@ -126,7 +149,7 @@ const upstreamEvidenceSchema = z
         inspectionSha256: reviewFlowEvaluationDigestSchema,
         layoutSha256: reviewFlowEvaluationDigestSchema,
         reviewInputSetSha256: reviewFlowEvaluationDigestSchema,
-        humanMappingSha256: reviewFlowEvaluationDigestSchema,
+        sourceMappingSha256: reviewFlowEvaluationDigestSchema,
         anklangCaptureAttestationSha256: reviewFlowEvaluationDigestSchema,
         anklangCaptureCompletionSha256: reviewFlowEvaluationDigestSchema,
         anklangRequestSha256: reviewFlowEvaluationDigestSchema,
@@ -363,7 +386,16 @@ const tagCatalogFileSchema = z
     version: z.number().int().positive(),
     tags: robotReviewTaskSchema.shape.tagCatalog.shape.tags
   })
-  .strict();
+  .strict()
+  .superRefine((catalog, context) => {
+    if (new Set(catalog.tags.map((tag) => tag.id)).size !== catalog.tags.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["tags"],
+        message: "标签编号不能重复。"
+      });
+    }
+  });
 
 export const reviewFlowEvaluationHoldoutRegistrationSchema = z
   .object({
@@ -379,8 +411,12 @@ export const reviewFlowEvaluationHoldoutRegistrationSchema = z
 
 export const reviewFlowEvaluationManifestSchema = z
   .object({
-    schemaVersion: z.literal(3),
+    schemaVersion: z.literal(4),
     datasetId: reviewFlowEvaluationDatasetIdSchema,
+    // 全数据集统一策略，不记录逐题 scope，因而不会从 prediction manifest
+    // 泄漏某一题的 Gold 类型。
+    anklangInputPolicy: reviewFlowEvaluationAnklangInputPolicySchema,
+    placeholderTagIds: reviewFlowEvaluationPlaceholderTagIdsSchema,
     tagCatalog: fileBindingSchema
       .extend({ version: z.number().int().positive() })
       .strict(),
@@ -448,9 +484,9 @@ export type ReviewFlowEvaluationRevealDescriptor = z.infer<
 
 export const reviewFlowEvaluationBridgeCompletionSchema = z
   .object({
-    schemaVersion: z.literal(3),
+    schemaVersion: z.literal(4),
     artifactKind: z.literal("review_flow_evaluation_dataset_bridge_completion"),
-    bridgeVersion: z.literal("urmotiv-review-flow-bridge-v3"),
+    bridgeVersion: z.literal("urmotiv-review-flow-bridge-v4"),
     datasetId: reviewFlowEvaluationDatasetIdSchema,
     manifestFileName: privateFileNameSchema,
     manifestSha256: reviewFlowEvaluationDigestSchema,
@@ -465,6 +501,7 @@ export const reviewFlowEvaluationBridgeCompletionSchema = z
       })
       .strict(),
     tagCatalogSha256: reviewFlowEvaluationDigestSchema,
+    placeholderTagIds: reviewFlowEvaluationPlaceholderTagIdsSchema,
     sourceLineageSetSha256: reviewFlowEvaluationDigestSchema,
     developmentPredictionBindingSha256: reviewFlowEvaluationDigestSchema,
     developmentRevealCommitmentSha256: reviewFlowEvaluationDigestSchema,
@@ -518,8 +555,10 @@ export interface ReviewFlowEvaluationDatasetCase {
 }
 
 export interface ReviewFlowEvaluationDatasetBundle {
-  readonly schemaVersion: 3;
+  readonly schemaVersion: 4;
   readonly datasetId: string;
+  readonly anklangInputPolicy: ReviewFlowEvaluationAnklangInputPolicy;
+  readonly placeholderTagIds: ReviewFlowEvaluationPlaceholderTagIds;
   readonly purpose: ReviewFlowEvaluationPurpose;
   readonly loadMode: ReviewFlowEvaluationLoadMode;
   readonly manifestSha256: string;
@@ -612,6 +651,8 @@ export function loadReviewFlowEvaluationDataset(input: {
       bridgeCompletion.manifestFileName !== basename(input.manifestPath) ||
       bridgeCompletion.manifestSha256 !== manifestSha256 ||
       bridgeCompletion.tagCatalogSha256 !== manifest.tagCatalog.sha256 ||
+      JSON.stringify(bridgeCompletion.placeholderTagIds) !==
+        JSON.stringify(manifest.placeholderTagIds) ||
       bridgeCompletion.developmentCount !==
         manifest.partitions.development.cases.length ||
       bridgeCompletion.holdoutCount !== manifest.partitions.holdout.cases.length ||
@@ -647,6 +688,14 @@ export function loadReviewFlowEvaluationDataset(input: {
         "REVIEW_FLOW_EVALUATION_TAG_CATALOG_MISMATCH"
       );
     }
+    const catalogTagIds = new Set(tagCatalog.tags.map((tag) => tag.id));
+    if (
+      manifest.placeholderTagIds.some((tagId) => !catalogTagIds.has(tagId))
+    ) {
+      throw new ReviewFlowEvaluationDatasetError(
+        "REVIEW_FLOW_EVALUATION_PLACEHOLDER_TAGS_INVALID"
+      );
+    }
 
     const descriptors = manifest.partitions[purpose].cases;
     if (descriptors.length === 0) {
@@ -676,9 +725,22 @@ export function loadReviewFlowEvaluationDataset(input: {
       directory,
       descriptors,
       tagCatalog,
+      manifest.placeholderTagIds,
       byteBudget,
       goldSource
     );
+    if (
+      goldSource !== null &&
+      manifest.anklangInputPolicy ===
+        "exclude_current_corpus_for_historical_outcome" &&
+      cases.some(
+        (entry) => entry.gold?.evaluationScope !== "verdict_and_taste"
+      )
+    ) {
+      throw new ReviewFlowEvaluationDatasetError(
+        "REVIEW_FLOW_EVALUATION_ANKLANG_INPUT_POLICY_SCOPE_INVALID"
+      );
+    }
     const summary = goldSource !== null
       ? summarizeGold(cases.map((entry) => {
           if (entry.gold === null) {
@@ -691,8 +753,10 @@ export function loadReviewFlowEvaluationDataset(input: {
       : null;
     const holdoutIdentity = purpose === "holdout"
       ? hashCanonicalValue({
-          protocol: "review-flow-evaluation-holdout-subjects-v3",
+          protocol: "review-flow-evaluation-holdout-subjects-v4",
           datasetId: manifest.datasetId,
+          anklangInputPolicy: manifest.anklangInputPolicy,
+          placeholderTagIds: manifest.placeholderTagIds,
           tagCatalogSha256: manifest.tagCatalog.sha256,
           tagCatalogVersion: manifest.tagCatalog.version,
           predictionBindingSha256:
@@ -710,15 +774,19 @@ export function loadReviewFlowEvaluationDataset(input: {
         })
       : null;
     return deepFreezePhysicalBlind({
-      schemaVersion: 3 as const,
+      schemaVersion: 4 as const,
       datasetId: manifest.datasetId,
+      anklangInputPolicy: manifest.anklangInputPolicy,
+      placeholderTagIds: manifest.placeholderTagIds,
       purpose,
       loadMode: mode,
       manifestSha256,
       bridgeCompletionSha256,
       datasetFingerprint: hashCanonicalValue({
-        protocol: "review-flow-evaluation-dataset-v3",
+        protocol: "review-flow-evaluation-dataset-v4",
         datasetId: manifest.datasetId,
+        anklangInputPolicy: manifest.anklangInputPolicy,
+        placeholderTagIds: manifest.placeholderTagIds,
         purpose,
         manifestSha256,
         bridgeCompletionSha256,
@@ -861,6 +929,7 @@ function loadSelectedPartition(
   directory: PrivateDirectoryHandle,
   descriptors: readonly ReviewFlowEvaluationCaseDescriptor[],
   tagCatalog: z.infer<typeof tagCatalogFileSchema>,
+  placeholderTagIds: ReviewFlowEvaluationPlaceholderTagIds,
   byteBudget: { remaining: number },
   goldSource: GoldSource | null
 ): readonly ReviewFlowEvaluationDatasetCase[] {
@@ -877,7 +946,11 @@ function loadSelectedPartition(
       byteBudget
     );
     const task = parseStrictRobotTask(contentBytes);
-    if (hashCanonicalValue(task.tagCatalog) !== catalogHash) {
+    if (
+      hashCanonicalValue(task.tagCatalog) !== catalogHash ||
+      JSON.stringify(task.problem.tagIds) !==
+        JSON.stringify(placeholderTagIds)
+    ) {
       throw new ReviewFlowEvaluationDatasetError(
         "REVIEW_FLOW_EVALUATION_CASE_BINDING_MISMATCH"
       );
@@ -1046,8 +1119,10 @@ function partitionPredictionBindingSha256(
   purpose: ReviewFlowEvaluationPurpose
 ): string {
   return hashCanonicalValue({
-    protocol: "review-flow-evaluation-prediction-binding-v2",
+    protocol: "review-flow-evaluation-prediction-binding-v3",
     datasetId: manifest.datasetId,
+    anklangInputPolicy: manifest.anklangInputPolicy,
+    placeholderTagIds: manifest.placeholderTagIds,
     purpose,
     tagCatalog: manifest.tagCatalog,
     registration: purpose === "holdout" ? manifest.holdoutRegistration : null,
@@ -1059,8 +1134,10 @@ function sourceLineageSetSha256(
   manifest: ReviewFlowEvaluationManifest
 ): string {
   return hashCanonicalValue({
-    protocol: "review-flow-evaluation-source-lineage-set-v3",
+    protocol: "review-flow-evaluation-source-lineage-set-v4",
     datasetId: manifest.datasetId,
+    anklangInputPolicy: manifest.anklangInputPolicy,
+    placeholderTagIds: manifest.placeholderTagIds,
     cases: ([
       ...manifest.partitions.development.cases.map((entry) => ({
         purpose: "development" as const,
@@ -1222,7 +1299,7 @@ function parseStrictDocument<T>(
       value: parsePhysicalBlindJson(decodeUtf8(bytes)),
       schema,
       // 具体 schema 仍精确限定各自版本；这里只允许当前材料使用的版本集合。
-      supportedVersions: [1, 2, 3]
+      supportedVersions: [1, 2, 3, 4]
     });
   } catch {
     throw new ReviewFlowEvaluationDatasetError(code);

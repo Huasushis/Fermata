@@ -22,7 +22,6 @@ import {
 import { hashCanonicalValue } from "../src/review-flow/evidence";
 import { reviewFlowRoleSchema } from "../src/review-flow/schemas";
 import {
-  robotAnklangPluginId,
   type RobotReviewTask
 } from "../src/urmotiv-schemas";
 import {
@@ -145,6 +144,90 @@ describe("review-flow dataset v2 与真实 Gold 边界", () => {
     expect(() => loadDataset(fixture, "holdout_reveal")).toThrow(
       "REVIEW_FLOW_EVALUATION_DATASET_INVALID"
     );
+  });
+
+  it("固定标签目录在 loader 边界拒绝重复标签编号", () => {
+    const fixture = createDatasetFixture("duplicate-tag-catalog");
+    const manifest = readManifest(fixture);
+    const catalogPath = join(
+      fixture.suiteDirectory,
+      manifest.tagCatalog.fileName
+    );
+    const catalog = JSON.parse(readFileSync(catalogPath, "utf8")) as {
+      schemaVersion: 1;
+      version: number;
+      tags: RobotReviewTask["tagCatalog"]["tags"];
+    };
+    const duplicateBytes = jsonBytes({
+      ...catalog,
+      tags: [...catalog.tags, { ...catalog.tags[0]! }]
+    });
+    writePrivateFile(catalogPath, duplicateBytes);
+    manifest.tagCatalog.sha256 = sha256(duplicateBytes);
+    writeDatasetManifestAndBridge(fixture, manifest);
+    expect(() => loadDataset(fixture, "development_identity")).toThrow(
+      "REVIEW_FLOW_EVALUATION_TAG_CATALOG_INVALID"
+    );
+  });
+
+  it("loader 在无 Gold 模式绑定全局占位标签、completion 与每份 content", () => {
+    const missingCatalogTag = createDatasetFixture("placeholder-not-in-catalog");
+    const missingCatalogManifest = readManifest(missingCatalogTag);
+    missingCatalogManifest.placeholderTagIds = ["tag-missing"];
+    writeDatasetManifestAndBridge(missingCatalogTag, missingCatalogManifest);
+    expect(() => loadDataset(
+      missingCatalogTag,
+      "development_identity"
+    )).toThrow("REVIEW_FLOW_EVALUATION_PLACEHOLDER_TAGS_INVALID");
+
+    const manifestTamper = createDatasetFixture("placeholder-manifest-tamper");
+    const changedManifest = readManifest(manifestTamper);
+    changedManifest.placeholderTagIds = ["tag-other"];
+    writeDatasetManifestAndBridge(manifestTamper, changedManifest);
+    expect(() => loadDataset(
+      manifestTamper,
+      "development_identity"
+    )).toThrow("REVIEW_FLOW_EVALUATION_CASE_BINDING_MISMATCH");
+
+    const contentTamper = createDatasetFixture("placeholder-content-tamper");
+    const contentManifest = readManifest(contentTamper);
+    const descriptor = contentManifest.partitions.development.cases[0]!;
+    const contentPath = join(
+      contentTamper.suiteDirectory,
+      descriptor.content.fileName
+    );
+    const originalContent = readJson(contentPath) as RobotReviewTask;
+    const changedContent = {
+      ...originalContent,
+      problem: {
+        ...originalContent.problem,
+        tagIds: ["tag-other"]
+      }
+    };
+    const changedContentBytes = jsonBytes(changedContent);
+    writePrivateFile(contentPath, changedContentBytes);
+    descriptor.content.sha256 = sha256(changedContentBytes);
+    writeDatasetManifestAndBridge(contentTamper, contentManifest);
+    expect(() => loadDataset(
+      contentTamper,
+      "development_identity"
+    )).toThrow("REVIEW_FLOW_EVALUATION_CASE_BINDING_MISMATCH");
+
+    const completionTamper = createDatasetFixture(
+      "placeholder-completion-tamper"
+    );
+    const completionPath = join(
+      completionTamper.suiteDirectory,
+      reviewFlowEvaluationBridgeCompletionFileName
+    );
+    writePrivateJson(completionPath, {
+      ...(readJson(completionPath) as Record<string, unknown>),
+      placeholderTagIds: ["tag-other"]
+    });
+    expect(() => loadDataset(
+      completionTamper,
+      "development_identity"
+    )).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_COMPLETION_MISMATCH");
   });
 
   it("holdout prediction 的 manifest、bundle、checkpoint 与 plan 不形成 Gold 哈希 oracle", () => {
@@ -334,16 +417,17 @@ describe("review-flow dataset v2 与真实 Gold 边界", () => {
     expect(existsSync(missingDirectory)).toBe(false);
   });
 
-  it("normal case 未独立标注原创性时不默认为 false；originality_only 保持确认正例", () => {
+  it("历史结果排除策略的所有 reveal 都保持 verdict_and_taste，不把原创性当隐含负例", () => {
     const fixture = createDatasetFixture();
     const development = loadDataset(fixture, "development_scored");
     const holdout = loadDataset(fixture, "holdout_reveal");
     expect(development.cases[1]?.gold).not.toHaveProperty("confirmedDuplicate");
     expect(holdout.cases[1]?.gold).toMatchObject({
-      evaluationScope: "originality_only",
-      originalityAnnotation: "confirmed_duplicate_evidence",
-      confirmedDuplicate: true
+      evaluationScope: "verdict_and_taste",
+      historicalOutcome: "accepted",
+      contestUse: "used"
     });
+    expect(holdout.cases[1]?.gold).not.toHaveProperty("confirmedDuplicate");
   });
 });
 
@@ -1330,6 +1414,8 @@ describe("adapter、CLI 与窄环境", () => {
       },
       datasetFingerprint: dataset.datasetFingerprint,
       manifestSha256: dataset.manifestSha256,
+      anklangInputPolicy: dataset.anklangInputPolicy,
+      placeholderTagIds: dataset.placeholderTagIds,
       purpose: dataset.purpose,
       concurrency: 2,
       proxyEnvironment: { HTTP_PROXY: "http://127.0.0.1:10808" }
@@ -1369,6 +1455,8 @@ describe("adapter、CLI 与窄环境", () => {
       },
       datasetFingerprint: dataset.datasetFingerprint,
       manifestSha256: dataset.manifestSha256,
+      anklangInputPolicy: dataset.anklangInputPolicy,
+      placeholderTagIds: dataset.placeholderTagIds,
       purpose: dataset.purpose,
       concurrency: 3,
       proxyEnvironment: { HTTP_PROXY: "http://127.0.0.1:10808" }
@@ -1384,6 +1472,8 @@ describe("adapter、CLI 与窄环境", () => {
       },
       datasetFingerprint: dataset.datasetFingerprint,
       manifestSha256: dataset.manifestSha256,
+      anklangInputPolicy: dataset.anklangInputPolicy,
+      placeholderTagIds: dataset.placeholderTagIds,
       purpose: dataset.purpose,
       concurrency: 2,
       proxyEnvironment: { HTTPS_PROXY: "http://127.0.0.1:10809" }
@@ -1394,6 +1484,30 @@ describe("adapter、CLI 与窄环境", () => {
     expect(changedProxy.identity.configurationFingerprint).not.toBe(
       adapter.identity.configurationFingerprint
     );
+    const changedPlaceholder = createReviewFlowEvaluationAdapter({
+      config,
+      codeIdentity: codeIdentityFixture(),
+      runtimeIdentity: runtimeIdentityFixture(),
+      difficultyAnchors: {
+        anchors: [],
+        provisional: true,
+        fingerprint: "4".repeat(64)
+      },
+      datasetFingerprint: dataset.datasetFingerprint,
+      manifestSha256: dataset.manifestSha256,
+      anklangInputPolicy: dataset.anklangInputPolicy,
+      placeholderTagIds: ["tag-other"],
+      purpose: dataset.purpose,
+      concurrency: 2,
+      proxyEnvironment: { HTTP_PROXY: "http://127.0.0.1:10808" }
+    });
+    expect(changedPlaceholder.identity.configurationFingerprint).not.toBe(
+      adapter.identity.configurationFingerprint
+    );
+    expect(() => changedPlaceholder.prepare({
+      safeId: dataset.cases[0]!.safeId,
+      task: dataset.cases[0]!.task
+    })).toThrow("REVIEW_FLOW_EVALUATION_PLACEHOLDER_TAGS_MISMATCH");
   });
 
   it("CLI 分离 run/reveal 参数，标记不能绕过危险/无关凭据检查", async () => {
@@ -1496,8 +1610,11 @@ interface RevealCaseMaterial extends PredictionCaseDescriptor {
 }
 
 interface ManifestDocument {
-  schemaVersion: 3;
+  schemaVersion: 4;
   datasetId: string;
+  anklangInputPolicy:
+    "exclude_current_corpus_for_historical_outcome";
+  placeholderTagIds: string[];
   tagCatalog: FileBinding & { version: number };
   holdoutRegistration: {
     baselineLabel: string;
@@ -1523,15 +1640,26 @@ function createDatasetFixture(seed = "default"): DatasetFixture {
   const catalog = {
     schemaVersion: 1 as const,
     version: 7,
-    tags: [{
-      id: "tag-basic",
-      name: "基础",
-      categoryId: "category-foundation",
-      categoryName: "基础",
-      description: "固定测试标签",
-      aliases: [],
-      active: true as const
-    }]
+    tags: [
+      {
+        id: "tag-basic",
+        name: "基础",
+        categoryId: "category-foundation",
+        categoryName: "基础",
+        description: "固定测试标签",
+        aliases: [],
+        active: true as const
+      },
+      {
+        id: "tag-other",
+        name: "其他",
+        categoryId: "category-other",
+        categoryName: "其他",
+        description: "备用占位标签",
+        aliases: [],
+        active: true as const
+      }
+    ]
   };
   const catalogBytes = jsonBytes(catalog);
   writePrivateFile(join(suiteDirectory, "tag-catalog.private.json"), catalogBytes);
@@ -1628,9 +1756,11 @@ function createDatasetFixture(seed = "default"): DatasetFixture {
       catalog,
       gold: (common) => ({
         ...common,
-        evaluationScope: "originality_only",
-        originalityAnnotation: "confirmed_duplicate_evidence",
-        confirmedDuplicate: true
+        evaluationScope: "verdict_and_taste",
+        historicalOutcome: "accepted",
+        contestUse: "used",
+        observedHistoricalTasteReasons: [],
+        observedHistoricalTechnicalReasons: []
       })
     })
   ];
@@ -1642,8 +1772,11 @@ function createDatasetFixture(seed = "default"): DatasetFixture {
     content: entry.content
   }));
   const manifest: ManifestDocument = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     datasetId: `dataset-${sha256(seed).slice(0, 16)}`,
+    anklangInputPolicy:
+      "exclude_current_corpus_for_historical_outcome",
+    placeholderTagIds: ["tag-basic"],
     tagCatalog: {
       fileName: "tag-catalog.private.json",
       sha256: sha256(catalogBytes),
@@ -1746,7 +1879,7 @@ function writeDatasetCase(input: {
   const rowEvidenceSha256 = sha256(`row-${input.subjectId}`);
   const originalAnklangResponseSha256 = sha256(`anklang-${input.subjectId}`);
   const bridgeEvidence = {
-    bridgeVersion: "urmotiv-review-flow-bridge-v3" as const,
+    bridgeVersion: "urmotiv-review-flow-bridge-v4" as const,
     verificationAttestationSha256: sha256(`attestation-${input.subjectId}`),
     bridgePlanSha256: sha256(`bridge-plan-${input.subjectId}`),
     reviewGoldEvidenceSha256: sha256(`review-gold-evidence-${input.subjectId}`),
@@ -1756,7 +1889,7 @@ function writeDatasetCase(input: {
     inspectionSha256: sha256(`inspection-${input.subjectId}`),
     layoutSha256: sha256(`layout-${input.subjectId}`),
     reviewInputSetSha256: sha256(`review-input-set-${input.subjectId}`),
-    humanMappingSha256: sha256(`human-mapping-${input.subjectId}`),
+    sourceMappingSha256: sha256(`source-mapping-${input.subjectId}`),
     anklangCaptureAttestationSha256:
       sha256(`anklang-capture-attestation-${input.subjectId}`),
     anklangCaptureCompletionSha256:
@@ -1837,7 +1970,6 @@ function taskFixture(
 ): RobotReviewTask {
   const suffix = String(numericId).padStart(12, "0").slice(-12);
   const contentHash = sha256(`problem-${numericId}`);
-  const checkedAt = "2026-08-01T00:00:00.000Z";
   return {
     assignmentId: `10000000-0000-4000-8000-${suffix}`,
     leaseExpiresAt: "2099-08-01T01:00:00.000Z",
@@ -1864,33 +1996,7 @@ function taskFixture(
       limits: { timeMs: 1000, memoryMiB: 256 }
     },
     tagCatalog: { version: catalog.version, tags: [...catalog.tags] },
-    reviewItems: [{
-      id: `anklang-private-${numericId}`,
-      type: "org.ustc.urmotiv.anklang.similarity",
-      source: "anklang",
-      sourcePluginId: robotAnklangPluginId,
-      visibility: "reviewer",
-      summary: "离线完整查重快照",
-      data: {
-        apiVersion: "2",
-        contentHash,
-        checkedAt,
-        candidates: [],
-        recommendation: {
-          blockSubmission: false,
-          message: "未发现同题候选。"
-        },
-        completion: {
-          status: "complete",
-          reasonCode: "complete",
-          retryable: false
-        },
-        reuse: { policy: "no-store" }
-      },
-      contentHash,
-      expiresAt: null,
-      createdAt: checkedAt
-    }]
+    reviewItems: []
   };
 }
 
@@ -2696,9 +2802,9 @@ function writeDatasetManifestAndBridge(
   writePrivateJson(
     join(fixture.suiteDirectory, reviewFlowEvaluationBridgeCompletionFileName),
     {
-      schemaVersion: 3,
+      schemaVersion: 4,
       artifactKind: "review_flow_evaluation_dataset_bridge_completion",
-      bridgeVersion: "urmotiv-review-flow-bridge-v3",
+      bridgeVersion: "urmotiv-review-flow-bridge-v4",
       datasetId: manifest.datasetId,
       manifestFileName: basename(fixture.manifestPath),
       manifestSha256: sha256(manifestBytes),
@@ -2709,6 +2815,7 @@ function writeDatasetManifestAndBridge(
         dependencyFileCount: 46
       },
       tagCatalogSha256: manifest.tagCatalog.sha256,
+      placeholderTagIds: manifest.placeholderTagIds,
       sourceLineageSetSha256:
         reviewFlowEvaluationSourceLineageSetSha256(manifest),
       developmentPredictionBindingSha256:

@@ -71,6 +71,7 @@ import {
 } from "./llm-roles";
 import {
   isBuiltReviewFlowTaskSourceResult,
+  isHistoricalCalibrationReviewFlowTaskSourceResult,
   type ReviewFlowTaskSourceResult
 } from "./task-source";
 import {
@@ -808,6 +809,18 @@ async function runReviewEvidenceFlowTracked(
     }
   })();
   const resolvedRunner = resolveRunner(input);
+  if (
+    taskSource !== null &&
+    isHistoricalCalibrationReviewFlowTaskSourceResult(taskSource) &&
+    resolvedRunner.trustedRunner !== null &&
+    isProductionEligibleReviewFlowLlmBundle(resolvedRunner.trustedRunner)
+  ) {
+    throw new ReviewFlowError(
+      "REVIEW_FLOW_TASK_SOURCE_UNTRUSTED",
+      null,
+      "input_invalid"
+    );
+  }
   const { roles, identities } = resolvedRunner;
   const requestStartGate = resolveRequestStartGate(input, resolvedRunner);
   const sourceSnapshotHash = hashCanonicalValue(taskSource ?? source);

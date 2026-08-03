@@ -1,9 +1,9 @@
 /**
- * Urmotiv 历史审核 Gold -> Fermata review-flow v3 数据集的可信桥接器。
+ * Urmotiv 历史审核 Gold -> Fermata review-flow 数据集的可信桥接器。
  *
- * 这个模块不解析或猜测题面/题解边界，也不调用 Anklang。人工必须先准备
- * bridge plan、逐题 task draft 与 mapping evidence；本模块只验证完整的上游
- * 哈希链、原始 XML/XLSX 输入、物化源、Gold、人工映射和原始 Anklang v2
+ * 这个模块不猜测题面/题解边界，也不调用 Anklang。操作员必须先准备
+ * bridge plan、逐题 task draft 与来源映射；本模块只验证完整的上游
+ * 哈希链、原始 XML/XLSX 输入、物化源、Gold、来源投影和原始 Anklang v2
  * complete 响应，然后以 marker-last 方式发布物理隔离的数据集。
  */
 import { createHash, randomBytes as cryptoRandomBytes } from "node:crypto";
@@ -22,18 +22,16 @@ import { hashCanonicalValue } from "../../src/review-flow/evidence";
 import { editorialDimensionSchema } from "../../src/review-flow/schemas";
 import {
   anklangV2RequestSchema,
-  anklangSimilarityReviewItemType,
   completeAnklangV2ResultSchema
 } from "../../src/review-flow/task-source";
 import {
   codeforcesDifficultySchema,
   difficultyLevelSchema,
-  reviewVerdictSchema,
-  robotAnklangPluginId,
   robotReviewTaskSchema,
   type RobotReviewTask
 } from "../../src/urmotiv-schemas";
 import {
+  reviewFlowEvaluationAnklangInputPolicySchema,
   reviewFlowEvaluationBridgeCompletionFileName,
   reviewFlowEvaluationBridgeCompletionSchema,
   reviewFlowEvaluationDatasetIdSchema,
@@ -44,6 +42,7 @@ import {
   reviewFlowEvaluationHoldoutPredictionBindingSha256,
   reviewFlowEvaluationHoldoutRegistrationSchema,
   reviewFlowEvaluationManifestSchema,
+  reviewFlowEvaluationPlaceholderTagIdsSchema,
   reviewFlowEvaluationRevealDescriptorSchema,
   reviewFlowEvaluationSafeIdSchema,
   reviewFlowEvaluationSourceLineageSetSha256,
@@ -67,7 +66,7 @@ import {
   type EvaluationCodeIdentity
 } from "./evaluation-code-identity";
 
-const bridgeVersion = "urmotiv-review-flow-bridge-v3" as const;
+const bridgeVersion = "urmotiv-review-flow-bridge-v4" as const;
 const manifestFileName = "manifest.private.json" as const;
 const tagCatalogFileName = "tag-catalog.private.json" as const;
 const revealDescriptorFileName = "reveal.private.json" as const;
@@ -141,25 +140,13 @@ const anklangCaptureCaseSchema = z
     responseCompletionStatus: z.literal("complete")
   })
   .strict();
-const anklangCaptureCorpusSchema = z.discriminatedUnion("evidenceKind", [
-  z
-    .object({
-      evidenceKind: z.literal("reproducible_snapshot"),
-      corpusId: z.string().min(1).max(160),
-      manifestSha256: reviewFlowEvaluationDigestSchema,
-      snapshotSha256: reviewFlowEvaluationDigestSchema,
-      corpusRevisionSha256: reviewFlowEvaluationDigestSchema,
-      problemCount: z.number().int().positive().max(100_000_000)
-    })
-    .strict(),
-  z
-    .object({
-      evidenceKind: z.literal("remote_corpus_unverifiable"),
-      serviceOriginSha256: reviewFlowEvaluationDigestSchema,
-      declarationSha256: reviewFlowEvaluationDigestSchema
-    })
-    .strict()
-]);
+const anklangCaptureCorpusSchema = z
+  .object({
+    evidenceKind: z.literal("remote_corpus_unverifiable"),
+    serviceOriginSha256: reviewFlowEvaluationDigestSchema,
+    declarationSha256: reviewFlowEvaluationDigestSchema
+  })
+  .strict();
 const anklangCaptureAttestationWithoutFingerprintSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -184,13 +171,13 @@ const anklangCaptureAttestationWithoutFingerprintSchema = z
         endpointPath: z.literal("/api/v2/checks/similarity"),
         baseUrlSha256: reviewFlowEvaluationDigestSchema,
         timeoutMs: z.number().int().min(1_000).max(600_000),
-        authentication: z.enum(["bearer_redacted", "none"]),
+        authentication: z.literal("bearer_redacted"),
         secretsExcluded: z.literal(true)
       })
       .strict(),
     backend: z
       .object({
-        kind: z.enum(["local_engine", "reverse_proxy"]),
+        kind: z.literal("reverse_proxy"),
         configurationSha256: reviewFlowEvaluationDigestSchema,
         secretsExcluded: z.literal(true)
       })
@@ -209,19 +196,7 @@ const anklangCaptureAttestationWithoutFingerprintSchema = z
       })
       .strict()
   })
-  .strict()
-  .superRefine((attestation, context) => {
-    const expectedEvidence = attestation.backend.kind === "local_engine"
-      ? "reproducible_snapshot"
-      : "remote_corpus_unverifiable";
-    if (attestation.corpus.evidenceKind !== expectedEvidence) {
-      context.addIssue({
-        code: "custom",
-        path: ["corpus", "evidenceKind"],
-        message: "ANKLANG_CAPTURE_CORPUS_BACKEND_MISMATCH"
-      });
-    }
-  });
+  .strict();
 export const reviewFlowEvaluationAnklangCaptureAttestationSchema =
   anklangCaptureAttestationWithoutFingerprintSchema
     .extend({ captureFingerprint: reviewFlowEvaluationDigestSchema })
@@ -712,38 +687,71 @@ const tagCatalogSchema = z
     version: z.number().int().positive(),
     tags: robotReviewTaskSchema.shape.tagCatalog.shape.tags
   })
+  .strict()
+  .superRefine((catalog, context) => {
+    if (new Set(catalog.tags.map((tag) => tag.id)).size !== catalog.tags.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["tags"],
+        message: "TAG_CATALOG_ID_DUPLICATE"
+      });
+    }
+  });
+
+const reviewCommentIndexSchema = z.number().int().nonnegative().max(31);
+const historicalTasteReasonEvidenceSchema = z
+  .object({
+    reviewCommentIndex: reviewCommentIndexSchema,
+    reason: reviewFlowEvaluationTasteReasonSchema
+  })
+  .strict();
+const historicalTechnicalReasonEvidenceSchema = z
+  .object({
+    reviewCommentIndex: reviewCommentIndexSchema,
+    reason: reviewFlowEvaluationTechnicalReasonSchema
+  })
   .strict();
 
-const independentVerdictSchema = z
+const sourceByteRangeSchema = z
   .object({
-    annotation: z.literal("independent_human_three_way"),
-    verdict: reviewVerdictSchema
+    startByte: z.number().int().nonnegative().max(2_000_000),
+    endByte: z.number().int().positive().max(2_000_000)
   })
-  .strict();
-const independentTasteSchema = z
+  .strict()
+  .superRefine((range, context) => {
+    if (range.endByte <= range.startByte) {
+      context.addIssue({
+        code: "custom",
+        path: ["endByte"],
+        message: "SOURCE_PROJECTION_RANGE_EMPTY"
+      });
+    }
+  });
+const sourceProjectionSchema = z
   .object({
-    annotation: z.literal("exhaustive_independent_human"),
-    reasons: z.array(reviewFlowEvaluationTasteReasonSchema).max(48)
+    method: z.enum([
+      "markdown_solution_heading_v1",
+      "last_horizontal_rule_v1",
+      "algorithm_heading_v1",
+      "operator_explicit_offsets_v1"
+    ]),
+    statement: sourceByteRangeSchema,
+    solution: sourceByteRangeSchema
   })
-  .strict();
-const independentOriginalitySchema = z
-  .object({
-    annotation: z.literal("independent_human_originality"),
-    confirmedDuplicate: z.boolean()
-  })
-  .strict();
-const independentDifficultySchema = z
-  .object({
-    annotation: z.literal("independent_human_without_submitter_metadata"),
-    codeforcesDifficulty: codeforcesDifficultySchema,
-    thinkingLevel: difficultyLevelSchema,
-    codingLevel: difficultyLevelSchema
-  })
-  .strict();
+  .strict()
+  .superRefine((projection, context) => {
+    if (projection.statement.endByte > projection.solution.startByte) {
+      context.addIssue({
+        code: "custom",
+        path: ["solution", "startByte"],
+        message: "SOURCE_PROJECTION_RANGES_OVERLAP"
+      });
+    }
+  });
 
 const mappingCommon = {
-  schemaVersion: z.literal(1),
-  artifactKind: z.literal("review_flow_evaluation_human_mapping"),
+  schemaVersion: z.literal(2),
+  artifactKind: z.literal("review_flow_evaluation_source_mapping"),
   confirmed: z.literal(true),
   caseId: upstreamCaseIdSchema,
   safeId: reviewFlowEvaluationSafeIdSchema,
@@ -758,11 +766,13 @@ const mappingCommon = {
   taskDraftSha256: reviewFlowEvaluationDigestSchema,
   problemHashInputSha256: reviewFlowEvaluationDigestSchema,
   problemContentHash: reviewFlowEvaluationDigestSchema,
-  statementSolutionBoundary: z.literal(
-    "independently_human_confirmed_from_materialized_source"
-  )
+  titleIdentityValueIndex: z.number().int().nonnegative().max(7),
+  sourceProjection: sourceProjectionSchema,
+  problemTypeBasis: z.literal("operator_confirmed"),
+  currentTagIdsBasis: z.literal("calibration_placeholder_not_gold"),
+  placeholderTagIds: reviewFlowEvaluationPlaceholderTagIdsSchema
 } as const;
-export const reviewFlowEvaluationHumanMappingSchema = z.discriminatedUnion(
+export const reviewFlowEvaluationSourceMappingSchema = z.discriminatedUnion(
   "evaluationScope",
   [
     z
@@ -770,23 +780,14 @@ export const reviewFlowEvaluationHumanMappingSchema = z.discriminatedUnion(
         ...mappingCommon,
         evaluationScope: z.literal("verdict_and_taste"),
         historicalReviewReasonMapping: z.literal(
-          "independently_human_confirmed_from_bound_review_row"
+          "operator_asserted_sparse_mapping_v1"
         ),
-        observedHistoricalTasteReasons: z
-          .array(reviewFlowEvaluationTasteReasonSchema)
+        observedHistoricalTasteReasonEvidence: z
+          .array(historicalTasteReasonEvidenceSchema)
           .max(48),
-        observedHistoricalTechnicalReasons: z
-          .array(reviewFlowEvaluationTechnicalReasonSchema)
-          .max(32),
-        independentVerdict: independentVerdictSchema.optional(),
-        independentTaste: independentTasteSchema.optional(),
-        independentOriginality: independentOriginalitySchema.optional(),
-        expectedTagIds: z
-          .array(z.string().min(1).max(120))
-          .min(1)
-          .max(30)
-          .optional(),
-        independentDifficulty: independentDifficultySchema.optional()
+        observedHistoricalTechnicalReasonEvidence: z
+          .array(historicalTechnicalReasonEvidenceSchema)
+          .max(32)
       })
       .strict(),
     z
@@ -813,15 +814,17 @@ const bridgePlanCaseSchema = z
     problemHashInput: fileBindingSchema,
     originalAnklangRequest: fileBindingSchema,
     originalAnklangResponse: fileBindingSchema,
-    humanMapping: fileBindingSchema
+    sourceMapping: fileBindingSchema
   })
   .strict();
 export const reviewFlowEvaluationBridgePlanSchema = z
   .object({
-    schemaVersion: z.literal(3),
+    schemaVersion: z.literal(4),
     artifactKind: z.literal("review_flow_evaluation_bridge_plan"),
     bridgeVersion: z.literal(bridgeVersion),
     confirmed: z.literal(true),
+    anklangInputPolicy: reviewFlowEvaluationAnklangInputPolicySchema,
+    placeholderTagIds: reviewFlowEvaluationPlaceholderTagIdsSchema,
     upstreamDatasetId: upstreamEvidenceSchema.shape.datasetId,
     datasetId: reviewFlowEvaluationDatasetIdSchema,
     tagCatalog: fileBindingSchema,
@@ -865,7 +868,7 @@ export const reviewFlowEvaluationBridgePlanSchema = z
         entry.originalAnklangRequest.sha256,
       (entry: z.infer<typeof bridgePlanCaseSchema>) =>
         entry.originalAnklangResponse.sha256,
-      (entry: z.infer<typeof bridgePlanCaseSchema>) => entry.humanMapping.sha256
+      (entry: z.infer<typeof bridgePlanCaseSchema>) => entry.sourceMapping.sha256
     ]) {
       if (new Set(plan.cases.map(selector)).size !== plan.cases.length) {
         context.addIssue({
@@ -904,6 +907,8 @@ export interface PrepareReviewFlowEvaluationBridgeInput {
   readonly containingWorkspace: string;
   readonly fermataCodeVersion: string;
   readonly bridgePlanPath: string;
+  readonly anklangCaptureWorkspace: string;
+  readonly anklangCaptureManifestPath: string;
   readonly upstreamGoldDirectory: string;
   readonly materializedDirectory: string;
   readonly worksheetPath: string;
@@ -1013,9 +1018,7 @@ interface PreparedCase {
 interface ValidatedAnklangCapture {
   readonly attestationSha256: string;
   readonly completionSha256: string;
-  readonly corpusEvidenceKind:
-    | "reproducible_snapshot"
-    | "remote_corpus_unverifiable";
+  readonly corpusEvidenceKind: "remote_corpus_unverifiable";
   readonly cases: ReadonlyMap<
     string,
     z.infer<typeof anklangCaptureCaseSchema>
@@ -1055,6 +1058,15 @@ function prepareBridge(
   const upstream = validateUpstream(input);
   if (bridgePlan.upstreamDatasetId !== upstream.datasetId) {
     fail("REVIEW_FLOW_EVALUATION_BRIDGE_UPSTREAM_MISMATCH");
+  }
+  if (
+    bridgePlan.anklangInputPolicy ===
+      "exclude_current_corpus_for_historical_outcome" &&
+    upstream.cases.some(
+      (entry) => entry.plan.evaluationScope !== "verdict_and_taste"
+    )
+  ) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_INPUT_POLICY_SCOPE_INVALID");
   }
 
   const bridgeInputDirectory = openExistingPrivateDirectory(
@@ -1097,6 +1109,12 @@ function prepareBridge(
       tagCatalogSchema,
       "REVIEW_FLOW_EVALUATION_BRIDGE_TAG_CATALOG_INVALID"
     );
+    const catalogTagIds = new Set(tagCatalog.tags.map((tag) => tag.id));
+    if (
+      bridgePlan.placeholderTagIds.some((tagId) => !catalogTagIds.has(tagId))
+    ) {
+      fail("REVIEW_FLOW_EVALUATION_BRIDGE_PLACEHOLDER_TAGS_INVALID");
+    }
     const anklangCapture = loadAnklangCapture({
       plan: bridgePlan,
       inputDirectory: bridgeInputDirectory,
@@ -1123,6 +1141,8 @@ function prepareBridge(
         attestationSha256:
           bridgePlan.upstreamVerificationAttestation.sha256,
         anklangCapture,
+        anklangInputPolicy: bridgePlan.anklangInputPolicy,
+        placeholderTagIds: bridgePlan.placeholderTagIds,
         generator,
         inputDirectory: bridgeInputDirectory,
         tagCatalog
@@ -1156,8 +1176,10 @@ function prepareBridge(
         }
       }));
     const bindingManifest = reviewFlowEvaluationManifestSchema.parse({
-      schemaVersion: 3,
+      schemaVersion: 4,
       datasetId: bridgePlan.datasetId,
+      anklangInputPolicy: bridgePlan.anklangInputPolicy,
+      placeholderTagIds: bridgePlan.placeholderTagIds,
       tagCatalog: {
         fileName: tagCatalogFileName,
         sha256: sha256(tagCatalogBytes),
@@ -1206,7 +1228,7 @@ function prepareBridge(
     });
     const manifestBytes = prettyJsonBytes(manifest);
     const completion = reviewFlowEvaluationBridgeCompletionSchema.parse({
-      schemaVersion: 3,
+      schemaVersion: 4,
       artifactKind: "review_flow_evaluation_dataset_bridge_completion",
       bridgeVersion,
       datasetId: manifest.datasetId,
@@ -1214,6 +1236,7 @@ function prepareBridge(
       manifestSha256: sha256(manifestBytes),
       generator,
       tagCatalogSha256: manifest.tagCatalog.sha256,
+      placeholderTagIds: manifest.placeholderTagIds,
       sourceLineageSetSha256:
         reviewFlowEvaluationSourceLineageSetSha256(manifest),
       developmentPredictionBindingSha256:
@@ -1471,6 +1494,10 @@ function validateUpstreamAttestation(input: {
     verifierOutput = execFileSync(
       "/usr/bin/python3",
       [
+        "-I",
+        "-B",
+        "-X",
+        "pycache_prefix=/dev/null",
         resolve(input.verifierRepositoryDirectory, upstreamVerifierRunnerPath),
         "verify-sealed",
         "--private-root",
@@ -1543,7 +1570,9 @@ function loadAnklangCapture(input: {
   readonly plan: ReviewFlowEvaluationBridgePlan;
   readonly inputDirectory: PrivateDirectoryHandle;
   readonly input: Pick<PrepareReviewFlowEvaluationBridgeInput,
-    "containingWorkspace">;
+    | "containingWorkspace"
+    | "anklangCaptureWorkspace"
+    | "anklangCaptureManifestPath">;
 }): ValidatedAnklangCapture {
   const attestationBytes = readBoundInput(
     input.inputDirectory,
@@ -1610,10 +1639,14 @@ function loadAnklangCapture(input: {
     fail("REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_CAPTURE_MISMATCH");
   }
   const capturer = attestation.capturer;
+  const capturerRepositoryDirectory = resolve(
+    input.input.containingWorkspace,
+    "Anklang"
+  );
   let identity: EvaluationCodeIdentity;
   try {
     identity = loadEvaluationCodeIdentity({
-      repositoryDirectory: resolve(input.input.containingWorkspace, "Anklang"),
+      repositoryDirectory: capturerRepositoryDirectory,
       expectedCodeVersion: capturer.codeVersion,
       runnerPath: anklangCaptureRunnerPath,
       dependencyPaths: anklangCaptureDependencyPaths
@@ -1626,6 +1659,65 @@ function loadAnklangCapture(input: {
     identity.dependencyCodeSha256 !== capturer.dependencyCodeSha256 ||
     identity.dependencyFileCount !== capturer.dependencyFileCount
   ) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_CAPTURER_IDENTITY_INVALID");
+  }
+  assertTrustedPythonExecutable();
+  let verifierOutput: Buffer;
+  try {
+    verifierOutput = execFileSync(
+      "/usr/bin/python3",
+      [
+        "-I",
+        "-B",
+        "-X",
+        "pycache_prefix=/dev/null",
+        resolve(capturerRepositoryDirectory, anklangCaptureRunnerPath),
+        "verify-capture",
+        "--workspace",
+        input.input.anklangCaptureWorkspace,
+        "--manifest",
+        input.input.anklangCaptureManifestPath,
+        "--verifier-code-version",
+        capturer.codeVersion,
+        "--verifier-runner-sha256",
+        capturer.runnerSha256,
+        "--verifier-dependency-code-sha256",
+        capturer.dependencyCodeSha256
+      ],
+      {
+        cwd: capturerRepositoryDirectory,
+        env: {
+          LANG: "C.UTF-8",
+          LC_ALL: "C.UTF-8",
+          PATH: "/usr/bin:/bin",
+          PYTHONDONTWRITEBYTECODE: "1",
+          PYTHONHASHSEED: "0",
+          PYTHONNOUSERSITE: "1",
+          PYTHONSAFEPATH: "1"
+        },
+        encoding: "buffer",
+        maxBuffer: 16 * 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"]
+      }
+    );
+  } catch {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_VERIFIER_EXECUTION_FAILED");
+  }
+  if (!verifierOutput.equals(attestationBytes)) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_CAPTURE_ATTESTATION_MISMATCH");
+  }
+  let afterIdentity: EvaluationCodeIdentity;
+  try {
+    afterIdentity = loadEvaluationCodeIdentity({
+      repositoryDirectory: capturerRepositoryDirectory,
+      expectedCodeVersion: capturer.codeVersion,
+      runnerPath: anklangCaptureRunnerPath,
+      dependencyPaths: anklangCaptureDependencyPaths
+    });
+  } catch {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_CAPTURER_IDENTITY_INVALID");
+  }
+  if (JSON.stringify(afterIdentity) !== JSON.stringify(identity)) {
     fail("REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_CAPTURER_IDENTITY_INVALID");
   }
   return {
@@ -2110,6 +2202,12 @@ function prepareCase(input: {
   readonly bridgePlanSha256: string;
   readonly attestationSha256: string;
   readonly anklangCapture: ValidatedAnklangCapture;
+  readonly anklangInputPolicy: z.infer<
+    typeof reviewFlowEvaluationAnklangInputPolicySchema
+  >;
+  readonly placeholderTagIds: z.infer<
+    typeof reviewFlowEvaluationPlaceholderTagIdsSchema
+  >;
   readonly generator: BridgeGeneratorIdentity;
   readonly inputDirectory: PrivateDirectoryHandle;
   readonly tagCatalog: z.infer<typeof tagCatalogSchema>;
@@ -2136,6 +2234,9 @@ function prepareCase(input: {
     robotReviewTaskSchema,
     "REVIEW_FLOW_EVALUATION_BRIDGE_TASK_INVALID"
   );
+  if (!hasCanonicalInputTitle(taskDraftBytes, taskDraft.problem.title, true)) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_TASK_INVALID");
+  }
   const problemHashInputBytes = readBoundInput(
     input.inputDirectory,
     planCase.problemHashInput,
@@ -2147,6 +2248,15 @@ function prepareCase(input: {
     reviewFlowEvaluationProblemHashInputSchema,
     "REVIEW_FLOW_EVALUATION_BRIDGE_PROBLEM_HASH_INPUT_INVALID"
   );
+  if (
+    !hasCanonicalInputTitle(
+      problemHashInputBytes,
+      problemHashInput.title,
+      false
+    )
+  ) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_PROBLEM_HASH_INPUT_INVALID");
+  }
   const computedProblemContentHash = computeUrmotivProblemContentHash(
     problemHashInput
   );
@@ -2174,15 +2284,31 @@ function prepareCase(input: {
   );
   const mappingBytes = readBoundInput(
     input.inputDirectory,
-    planCase.humanMapping,
+    planCase.sourceMapping,
     4 * 1024 * 1024,
     "REVIEW_FLOW_EVALUATION_BRIDGE_MAPPING_INVALID"
   );
   const mapping = parseStrict(
     mappingBytes,
-    reviewFlowEvaluationHumanMappingSchema,
+    reviewFlowEvaluationSourceMappingSchema,
     "REVIEW_FLOW_EVALUATION_BRIDGE_MAPPING_INVALID"
   );
+  const historicalReasons = deriveHistoricalReasons(mapping, upstream.row);
+  const sourceProjection = projectBoundSource(
+    upstream.sourceBytes,
+    mapping.sourceProjection
+  );
+  if (
+    !sameOrderedStrings(mapping.placeholderTagIds, input.placeholderTagIds) ||
+    !sameOrderedStrings(taskDraft.problem.tagIds, input.placeholderTagIds) ||
+    !sameOrderedStrings(problemHashInput.tagIds, input.placeholderTagIds) ||
+    !sameOrderedStrings(
+      anklangRequest.problem.tagIds,
+      input.placeholderTagIds
+    )
+  ) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_PLACEHOLDER_TAGS_MISMATCH");
+  }
   if (
     taskDraft.reviewItems.length !== 0 ||
     taskDraft.problem.contentHash !== computedProblemContentHash ||
@@ -2202,6 +2328,11 @@ function prepareCase(input: {
     mapping.problemHashInputSha256 !== planCase.problemHashInput.sha256 ||
     mapping.problemContentHash !== taskDraft.problem.contentHash ||
     mapping.evaluationScope !== upstream.plan.evaluationScope ||
+    upstream.row.identityValues[mapping.titleIdentityValueIndex] !==
+      taskDraft.problem.title ||
+    sourceProjection.statement !== taskDraft.problem.content.basicStatement ||
+    sourceProjection.solution !== taskDraft.problem.content.basicSolution ||
+    !taskContainsOnlyProjectedSource(taskDraft) ||
     anklangRequest.contentHash !== computedProblemContentHash ||
     anklangRequest.contentHash !== taskDraft.problem.contentHash ||
     JSON.stringify(anklangRequest.problem) !== JSON.stringify({
@@ -2229,55 +2360,17 @@ function prepareCase(input: {
   ) {
     fail("REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_CAPTURE_CASE_MISMATCH");
   }
-  if (
-    mapping.evaluationScope === "verdict_and_taste" &&
-    !upstream.row.reviewCommentPresent &&
-    (mapping.observedHistoricalTasteReasons.length > 0 ||
-      mapping.observedHistoricalTechnicalReasons.length > 0)
-  ) {
-    fail("REVIEW_FLOW_EVALUATION_BRIDGE_MAPPING_INVALID");
-  }
 
-  const normalizedAnklang = {
-    ...anklang,
-    reuse: { policy: "no-store" as const }
-  };
+  // 原始 request/response 仍在上面逐字验证并绑定 capture；但历史通过/否决
+  // 发生在题目进入当前语料之前，不能把赛后自匹配结果注入 11 角色输入。
   const task: RobotReviewTask = robotReviewTaskSchema.parse({
     ...taskDraft,
-    reviewItems: [
-      {
-        id: `anklang-${planCase.originalAnklangResponse.sha256.slice(0, 32)}`,
-        type: anklangSimilarityReviewItemType,
-        source: "anklang",
-        sourcePluginId: robotAnklangPluginId,
-        visibility: "reviewer",
-        summary: input.anklangCapture.corpusEvidenceKind ===
-            "reproducible_snapshot"
-          ? "离线完整查重快照（语料已绑定）"
-          : "离线完整查重响应（远端语料不可复核）",
-        data: normalizedAnklang,
-        contentHash: taskDraft.problem.contentHash,
-        expiresAt: null,
-        createdAt: anklang.checkedAt
-      }
-    ]
+    reviewItems: []
   });
-  const generatedAnklang = task.reviewItems[0]?.data as Record<string, unknown>;
-  if (
-    JSON.stringify(generatedAnklang.candidates) !==
-      JSON.stringify(anklang.candidates) ||
-    JSON.stringify(generatedAnklang.recommendation) !==
-      JSON.stringify(anklang.recommendation) ||
-    generatedAnklang.contentHash !== anklang.contentHash ||
-    (generatedAnklang.completion as { status?: unknown } | undefined)?.status !==
-      "complete"
-  ) {
-    fail("REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_PRESERVATION_FAILED");
-  }
   const contentBytes = prettyJsonBytes(task);
   const contentSha256 = sha256(contentBytes);
   const sourceLineageSha256 = hashCanonicalValue({
-    protocol: "review-flow-evaluation-source-lineage-v4",
+    protocol: "review-flow-evaluation-source-lineage-v6",
     bridgeVersion,
     generator: input.generator,
     identity: {
@@ -2287,7 +2380,19 @@ function prepareCase(input: {
     source: {
       sourceId: planCase.sourceId,
       sourcePath: upstream.source.sourcePath,
-      materializedSourceSha256: planCase.sourceSha256
+      materializedSourceSha256: planCase.sourceSha256,
+      projection: {
+        method: mapping.sourceProjection.method,
+        statement: mapping.sourceProjection.statement,
+        solution: mapping.sourceProjection.solution,
+        titleIdentityValueIndex: mapping.titleIdentityValueIndex
+      },
+      taskMetadata: {
+        problemType: taskDraft.problem.type,
+        problemTypeBasis: mapping.problemTypeBasis,
+        currentTagIds: input.placeholderTagIds,
+        currentTagIdsBasis: mapping.currentTagIdsBasis
+      }
     },
     task: {
       taskDraftSha256: planCase.taskDraft.sha256,
@@ -2302,7 +2407,9 @@ function prepareCase(input: {
     anklangCapture: {
       attestationSha256: input.anklangCapture.attestationSha256,
       completionSha256: input.anklangCapture.completionSha256,
-      corpusEvidenceKind: input.anklangCapture.corpusEvidenceKind
+      corpusEvidenceKind: input.anklangCapture.corpusEvidenceKind,
+      inputPolicy: input.anklangInputPolicy,
+      reviewItemInjected: false
     }
   });
   const bridgeEvidence = {
@@ -2316,7 +2423,7 @@ function prepareCase(input: {
     inspectionSha256: input.upstreamSet.inspectionSha256,
     layoutSha256: input.upstreamSet.layoutSha256,
     reviewInputSetSha256: input.upstreamSet.inputSetSha256,
-    humanMappingSha256: planCase.humanMapping.sha256,
+    sourceMappingSha256: planCase.sourceMapping.sha256,
     anklangCaptureAttestationSha256:
       input.anklangCapture.attestationSha256,
     anklangCaptureCompletionSha256:
@@ -2336,7 +2443,8 @@ function prepareCase(input: {
     rowEvidenceSha256: planCase.rowEvidenceSha256,
     bridgeEvidence,
     upstreamGold: upstream.gold,
-    mapping
+    mapping,
+    historicalReasons
   });
   const goldBytes = prettyJsonBytes(gold);
   return {
@@ -2370,7 +2478,8 @@ function buildGold(input: {
   readonly rowEvidenceSha256: string;
   readonly bridgeEvidence: ReviewFlowEvaluationGold["upstreamEvidence"]["bridgeEvidence"];
   readonly upstreamGold: z.infer<typeof upstreamGoldSchema>;
-  readonly mapping: z.infer<typeof reviewFlowEvaluationHumanMappingSchema>;
+  readonly mapping: z.infer<typeof reviewFlowEvaluationSourceMappingSchema>;
+  readonly historicalReasons: HistoricalReasons;
 }): ReviewFlowEvaluationGold {
   const common = {
     schemaVersion: 2 as const,
@@ -2411,24 +2520,9 @@ function buildGold(input: {
     historicalOutcome: input.upstreamGold.verdict,
     contestUse: input.upstreamGold.contestUse,
     observedHistoricalTasteReasons:
-      input.mapping.observedHistoricalTasteReasons,
+      input.historicalReasons.taste,
     observedHistoricalTechnicalReasons:
-      input.mapping.observedHistoricalTechnicalReasons,
-    ...(input.mapping.independentVerdict === undefined
-      ? {}
-      : { independentVerdict: input.mapping.independentVerdict }),
-    ...(input.mapping.independentTaste === undefined
-      ? {}
-      : { independentTaste: input.mapping.independentTaste }),
-    ...(input.mapping.independentOriginality === undefined
-      ? {}
-      : { independentOriginality: input.mapping.independentOriginality }),
-    ...(input.mapping.expectedTagIds === undefined
-      ? {}
-      : { expectedTagIds: input.mapping.expectedTagIds }),
-    ...(input.mapping.independentDifficulty === undefined
-      ? {}
-      : { independentDifficulty: input.mapping.independentDifficulty })
+      input.historicalReasons.technical
   });
 }
 
@@ -2466,6 +2560,123 @@ function buildRevealDescriptor(
       }
     }))
   });
+}
+
+interface HistoricalReasons {
+  readonly taste: readonly z.infer<typeof reviewFlowEvaluationTasteReasonSchema>[];
+  readonly technical: readonly z.infer<
+    typeof reviewFlowEvaluationTechnicalReasonSchema
+  >[];
+}
+
+function deriveHistoricalReasons(
+  mapping: z.infer<typeof reviewFlowEvaluationSourceMappingSchema>,
+  row: z.infer<typeof worksheetRowSchema>
+): HistoricalReasons {
+  if (mapping.evaluationScope === "originality_only") {
+    return { taste: [], technical: [] };
+  }
+  const allEvidence = [
+    ...mapping.observedHistoricalTasteReasonEvidence,
+    ...mapping.observedHistoricalTechnicalReasonEvidence
+  ];
+  if (
+    (allEvidence.length > 0 && !row.reviewCommentPresent) ||
+    allEvidence.some((evidence) => {
+      const comment = row.reviewComments[evidence.reviewCommentIndex];
+      return comment === undefined || comment.trim().length === 0;
+    })
+  ) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_MAPPING_INVALID");
+  }
+  const taste = new Map<
+    string,
+    z.infer<typeof reviewFlowEvaluationTasteReasonSchema>
+  >();
+  for (const evidence of mapping.observedHistoricalTasteReasonEvidence) {
+    taste.set(
+      `${evidence.reason.dimension}\u0000${evidence.reason.direction}`,
+      evidence.reason
+    );
+  }
+  const technical = new Map<
+    string,
+    z.infer<typeof reviewFlowEvaluationTechnicalReasonSchema>
+  >();
+  for (const evidence of mapping.observedHistoricalTechnicalReasonEvidence) {
+    technical.set(evidence.reason, evidence.reason);
+  }
+  return { taste: [...taste.values()], technical: [...technical.values()] };
+}
+
+function projectBoundSource(
+  sourceBytes: Buffer,
+  projection: z.infer<typeof sourceProjectionSchema>
+): { readonly statement: string; readonly solution: string } {
+  const statement = projection.statement;
+  const solution = projection.solution;
+  if (
+    statement.startByte !== 0 ||
+    solution.endByte !== sourceBytes.byteLength ||
+    statement.endByte > sourceBytes.byteLength ||
+    solution.endByte > sourceBytes.byteLength ||
+    statement.endByte > solution.startByte
+  ) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_SOURCE_PROJECTION_INVALID");
+  }
+  let statementText: string;
+  let solutionText: string;
+  let gapText: string;
+  try {
+    const decoder = () => new TextDecoder("utf-8", { fatal: true });
+    statementText = decoder().decode(
+      sourceBytes.subarray(statement.startByte, statement.endByte)
+    );
+    solutionText = decoder().decode(
+      sourceBytes.subarray(solution.startByte, solution.endByte)
+    );
+    gapText = decoder().decode(
+      sourceBytes.subarray(statement.endByte, solution.startByte)
+    );
+  } catch {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_SOURCE_PROJECTION_INVALID");
+  }
+  if (statementText.trim().length === 0 || solutionText.trim().length === 0) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_SOURCE_PROJECTION_INVALID");
+  }
+  const markdownSolutionHeading =
+    /^[ \t\r\n]*[ \t]{0,3}#{1,6}[ \t]+(?:题解|解法|solution)[ \t]*(?:\r\n|[\r\n])[ \t\r\n]*$/iu;
+  const algorithmHeading =
+    /^[ \t\r\n]*[ \t]{0,3}#{1,6}[ \t]+(?:算法|解题思路|algorithm)[ \t]*(?:\r\n|[\r\n])[ \t\r\n]*$/iu;
+  const horizontalRuleGap =
+    /^[ \t\r\n]*[ \t]{0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})(?:\r\n|[\r\n])[ \t\r\n]*$/u;
+  const horizontalRuleLine =
+    /(?:^|\r\n|[\r\n])[ \t]{0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})[ \t]*(?=\r\n|[\r\n]|$)/u;
+  const methodMatches = projection.method === "operator_explicit_offsets_v1" ||
+    (projection.method === "markdown_solution_heading_v1" &&
+      markdownSolutionHeading.test(gapText)) ||
+    (projection.method === "algorithm_heading_v1" &&
+      algorithmHeading.test(gapText)) ||
+    (projection.method === "last_horizontal_rule_v1" &&
+      horizontalRuleGap.test(gapText) &&
+      !horizontalRuleLine.test(solutionText));
+  if (!methodMatches) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_SOURCE_PROJECTION_INVALID");
+  }
+  return { statement: statementText, solution: solutionText };
+}
+
+function taskContainsOnlyProjectedSource(task: RobotReviewTask): boolean {
+  const content = task.problem.content;
+  return task.problem.samples.length === 0 &&
+    task.problem.limits === null &&
+    content.background === "" &&
+    content.statement === "" &&
+    content.inputFormat === "" &&
+    content.outputFormat === "" &&
+    content.constraints === "" &&
+    content.solution === "" &&
+    content.hints === "";
 }
 
 function upstreamGoldMatchesPlan(
@@ -2538,9 +2749,19 @@ function taskMatchesProblemHashInput(
     );
 }
 
+function sameOrderedStrings(
+  left: readonly string[],
+  right: readonly string[]
+): boolean {
+  return left.length === right.length &&
+    left.every((value, index) => value === right[index]);
+}
+
 function assertBridgePaths(input: PrepareReviewFlowEvaluationBridgeInput): void {
   const paths = [
     input.bridgePlanPath,
+    input.anklangCaptureWorkspace,
+    input.anklangCaptureManifestPath,
     input.upstreamGoldDirectory,
     input.materializedDirectory,
     input.worksheetPath,
@@ -2641,12 +2862,41 @@ function parseStrict<T>(
 ): T {
   try {
     const parsed = schema.safeParse(
-      parsePhysicalBlindJson(bytes.toString("utf8"))
+      parsePhysicalBlindJson(
+        new TextDecoder("utf-8", { fatal: true }).decode(bytes)
+      )
     );
     if (!parsed.success) fail(errorCode);
     return parsed.data;
   } catch {
     fail(errorCode);
+  }
+}
+
+function hasCanonicalInputTitle(
+  bytes: Buffer,
+  parsedTitle: string,
+  nestedInProblem: boolean
+): boolean {
+  try {
+    const raw = parsePhysicalBlindJson(
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes)
+    );
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      return false;
+    }
+    const rawRecord = raw as Record<string, unknown>;
+    const container = nestedInProblem ? rawRecord.problem : rawRecord;
+    if (
+      typeof container !== "object" ||
+      container === null ||
+      Array.isArray(container)
+    ) {
+      return false;
+    }
+    return (container as Record<string, unknown>).title === parsedTitle;
+  } catch {
+    return false;
   }
 }
 

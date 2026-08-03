@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
+  globSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -34,7 +35,7 @@ afterEach(() => {
 });
 
 describe("review-flow trusted dataset bridge", () => {
-  it("验证完整上游链，保留 Anklang 候选，并以不含 Gold oracle 的 v3 manifest 发布", () => {
+  it("验证完整上游链，排除赛后 Anklang 自匹配，并以不含 Gold oracle 的 v4 manifest 发布", () => {
     const fixture = createBridgeFixture("complete");
     const stages: string[] = [];
     const result = prepareReviewFlowEvaluationDatasetBridge({
@@ -91,22 +92,13 @@ describe("review-flow trusted dataset bridge", () => {
       containingWorkspace: fixture.workspace
     });
     expect(holdoutReveal.cases[0]?.gold).toMatchObject({
-      evaluationScope: "originality_only",
-      confirmedDuplicate: true
+      evaluationScope: "verdict_and_taste",
+      historicalOutcome: "accepted",
+      contestUse: "used"
     });
 
     const task = developmentIdentity.cases[0]?.task;
-    const data = task?.reviewItems[0]?.data as Record<string, unknown> | undefined;
-    expect(data?.completion).toEqual({
-      status: "complete",
-      reasonCode: "complete",
-      retryable: false
-    });
-    expect(data?.reuse).toEqual({ policy: "no-store" });
-    expect(data?.candidates).toEqual(fixture.developmentCandidates);
-    expect(task?.reviewItems[0]?.summary).toBe(
-      "离线完整查重响应（远端语料不可复核）"
-    );
+    expect(task?.reviewItems).toEqual([]);
 
     const manifestText = readFileSync(result.manifestPath, "utf8");
     expect(manifestText).not.toContain("gold.private.json");
@@ -140,6 +132,21 @@ describe("review-flow trusted dataset bridge", () => {
       holdoutDescriptor.commitmentNonce
     );
     const manifest = readJson(result.manifestPath);
+    expect(manifest).toMatchObject({
+      schemaVersion: 4,
+      anklangInputPolicy:
+        "exclude_current_corpus_for_historical_outcome",
+      placeholderTagIds: ["tag-basic"]
+    });
+    expect(developmentIdentity.placeholderTagIds).toEqual(["tag-basic"]);
+    expect(holdoutPrediction.placeholderTagIds).toEqual(["tag-basic"]);
+    for (const descriptor of [
+      ...manifest.partitions.development.cases,
+      ...manifest.partitions.holdout.cases
+    ]) {
+      expect(descriptor).not.toHaveProperty("anklangInputPolicy");
+      expect(descriptor).not.toHaveProperty("evaluationScope");
+    }
     expect(manifest.developmentRevealCommitmentSha256).toBe(
       sha256(readFileSync(result.developmentRevealDescriptorPath))
     );
@@ -156,17 +163,22 @@ describe("review-flow trusted dataset bridge", () => {
       join(fixture.output, "REVIEW_FLOW_DATASET_COMPLETE")
     );
     expect(completion.generator).toEqual(expectedGenerator);
+    expect(completion.placeholderTagIds).toEqual(["tag-basic"]);
     const bridgePlan = readJson(fixture.input.bridgePlanPath);
     const planCase = bridgePlan.cases[0];
     const sourceBindings = readJson(
       join(fixture.upstreamGold, "source-bindings.private.json")
     );
     const sourceBinding = sourceBindings.cases[0];
+    const mapping = readJson(join(
+      fixture.bridgeInput,
+      planCase.sourceMapping.fileName
+    ));
     const prediction = manifest.partitions.development.cases[0];
     const generatedTask = readJson(join(fixture.output, prediction.content.fileName));
     expect(prediction.sourceLineageSha256).toBe(hashCanonicalValue({
-      protocol: "review-flow-evaluation-source-lineage-v4",
-      bridgeVersion: "urmotiv-review-flow-bridge-v3",
+      protocol: "review-flow-evaluation-source-lineage-v6",
+      bridgeVersion: "urmotiv-review-flow-bridge-v4",
       generator: expectedGenerator,
       identity: {
         upstreamCaseId: planCase.caseId,
@@ -175,7 +187,19 @@ describe("review-flow trusted dataset bridge", () => {
       source: {
         sourceId: planCase.sourceId,
         sourcePath: sourceBinding.sourcePath,
-        materializedSourceSha256: planCase.sourceSha256
+        materializedSourceSha256: planCase.sourceSha256,
+        projection: {
+          method: mapping.sourceProjection.method,
+          statement: mapping.sourceProjection.statement,
+          solution: mapping.sourceProjection.solution,
+          titleIdentityValueIndex: mapping.titleIdentityValueIndex
+        },
+        taskMetadata: {
+          problemType: generatedTask.problem.type,
+          problemTypeBasis: mapping.problemTypeBasis,
+          currentTagIds: mapping.placeholderTagIds,
+          currentTagIdsBasis: mapping.currentTagIdsBasis
+        }
       },
       task: {
         taskDraftSha256: planCase.taskDraft.sha256,
@@ -192,9 +216,33 @@ describe("review-flow trusted dataset bridge", () => {
           bridgePlan.anklangCaptureAttestation.sha256,
         completionSha256:
           bridgePlan.anklangCaptureCompletion.sha256,
-        corpusEvidenceKind: "remote_corpus_unverifiable"
+        corpusEvidenceKind: "remote_corpus_unverifiable",
+        inputPolicy:
+          "exclude_current_corpus_for_historical_outcome",
+        reviewItemInjected: false
       }
     }));
+  });
+
+  it("历史结果排除策略要求整批都是 verdict_and_taste，混合 scope 在发布前拒绝", () => {
+    const mixed = createBridgeFixture("mixed-evaluation-scope", {
+      holdoutEvaluationScope: "originality_only"
+    });
+    expect(() => prepare(mixed)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_INPUT_POLICY_SCOPE_INVALID"
+    );
+  });
+
+  it("整批只能使用同一组占位标签，两题不一致时在创建任何发布目录前拒绝", () => {
+    const fixture = createBridgeFixture("placeholder-batch-mismatch", {
+      secondPlaceholderTagIds: ["tag-other"]
+    });
+    expect(() => prepare(fixture)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_PLACEHOLDER_TAGS_MISMATCH"
+    );
+    expect(existsSync(fixture.output)).toBe(false);
+    expect(existsSync(fixture.input.developmentRevealDirectory)).toBe(false);
+    expect(existsSync(fixture.input.holdoutRevealDirectory!)).toBe(false);
   });
 
   it("生成器必须来自显式 clean Fermata HEAD，且生成期间身份不能变化", () => {
@@ -334,12 +382,91 @@ describe("review-flow trusted dataset bridge", () => {
     );
   });
 
-  it("人工 XML 行映射、source binding 与 task contentHash 任一错配都拒绝", () => {
+  it("hardened bridge 忽略默认 importer 会执行的 unchecked-hash pyc，且不改写仓库 bytecode", () => {
+    const fixture = createBridgeFixture("unchecked-hash-pyc");
+    const anklangRepository = fixture.capturerRepository;
+    const urmotivRepository = join(fixture.workspace, "Urmotiv");
+    const anklangMarker = join(fixture.workspace, "anklang-malicious.marker");
+    const urmotivMarker = join(fixture.workspace, "urmotiv-malicious.marker");
+    installUncheckedHashPyc(
+      join(anklangRepository, "anklang", "review_flow_capture.py"),
+      anklangMarker
+    );
+    installUncheckedHashPyc(
+      join(
+        urmotivRepository,
+        "scripts",
+        "migrate-hist",
+        "parse-metadata.py"
+      ),
+      urmotivMarker
+    );
+
+    const captureManifest = readJson(fixture.captureVerifierManifestPath);
+    const defaultAnklangStdout = execFileSync(
+      "/usr/bin/python3",
+      [
+        join(
+          anklangRepository,
+          "scripts",
+          "capture-review-flow-calibration.py"
+        ),
+        "verify-capture",
+        "--workspace",
+        captureManifest.workspace,
+        "--manifest",
+        fixture.captureVerifierManifestPath,
+        "--verifier-code-version",
+        captureManifest.verifierCodeVersion,
+        "--verifier-runner-sha256",
+        captureManifest.verifierRunnerSha256,
+        "--verifier-dependency-code-sha256",
+        captureManifest.verifierDependencyCodeSha256
+      ],
+      { cwd: anklangRepository, encoding: "buffer" }
+    );
+    expect(defaultAnklangStdout).toEqual(
+      readFileSync(fixture.captureVerifierAttestationPath)
+    );
+    expect(existsSync(anklangMarker)).toBe(true);
+
+    const defaultUrmotivStdout = execFileSync(
+      "/usr/bin/python3",
+      [
+        join(
+          urmotivRepository,
+          "scripts",
+          "migrate-hist",
+          "prepare-review-gold.py"
+        ),
+        "verify-sealed"
+      ],
+      { cwd: urmotivRepository, encoding: "buffer" }
+    );
+    expect(defaultUrmotivStdout).toEqual(
+      readFileSync(fixture.verifierOutputPath)
+    );
+    expect(existsSync(urmotivMarker)).toBe(true);
+
+    rmSync(anklangMarker);
+    rmSync(urmotivMarker);
+    const before = {
+      anklang: snapshotPycFiles(anklangRepository),
+      urmotiv: snapshotPycFiles(urmotivRepository)
+    };
+    expect(() => prepare(fixture)).not.toThrow();
+    expect(existsSync(anklangMarker)).toBe(false);
+    expect(existsSync(urmotivMarker)).toBe(false);
+    expect(snapshotPycFiles(anklangRepository)).toEqual(before.anklang);
+    expect(snapshotPycFiles(urmotivRepository)).toEqual(before.urmotiv);
+  }, 30_000);
+
+  it("XML 行来源映射、source binding 与 task contentHash 任一错配都拒绝", () => {
     const mappingMismatch = createBridgeFixture("mapping-mismatch");
     rewriteBridgeInput(mappingMismatch, "case-0001.mapping.private.json", (value) => ({
       ...value,
       sourceRowNumber: 999
-    }), "case-upstream-dev", "humanMapping");
+    }), "case-upstream-dev", "sourceMapping");
     expect(() => prepare(mappingMismatch)).toThrow(
       "REVIEW_FLOW_EVALUATION_BRIDGE_CASE_BINDING_MISMATCH"
     );
@@ -399,14 +526,327 @@ describe("review-flow trusted dataset bridge", () => {
     if (developmentCase === undefined) throw new Error("TEST_PLAN_CASE_MISSING");
     developmentCase.taskDraft.sha256 = sha256(changedTaskBytes);
     developmentCase.originalAnklangResponse.sha256 = sha256(changedAnklangBytes);
-    developmentCase.humanMapping.sha256 = sha256(changedMappingBytes);
+    developmentCase.sourceMapping.sha256 = sha256(changedMappingBytes);
     writePrivate(coordinatedSelfReport.input.bridgePlanPath, pretty(bridgePlan));
     expect(() => prepare(coordinatedSelfReport)).toThrow(
       "REVIEW_FLOW_EVALUATION_BRIDGE_CASE_BINDING_MISMATCH"
     );
   });
 
-  it("只接受 complete 且 contentHash 一致的原始 Anklang v2；输出候选不丢失不重排", () => {
+  it("稀疏历史理由逐项绑定非空 XML 评论，并去重派生 Gold", () => {
+    const invalidIndex = createBridgeFixture("reason-index-missing");
+    rewriteBridgeInput(invalidIndex, "case-0001.mapping.private.json", (value) => ({
+      ...value,
+      observedHistoricalTasteReasonEvidence: [{
+        ...value.observedHistoricalTasteReasonEvidence[0],
+        reviewCommentIndex: 31
+      }]
+    }), "case-upstream-dev", "sourceMapping");
+    expect(() => prepare(invalidIndex)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_MAPPING_INVALID"
+    );
+
+    const emptyComment = createBridgeFixture("reason-index-empty");
+    rewriteBridgeInput(emptyComment, "case-0001.mapping.private.json", (value) => ({
+      ...value,
+      observedHistoricalTasteReasonEvidence: [{
+        ...value.observedHistoricalTasteReasonEvidence[0],
+        reviewCommentIndex: 1
+      }]
+    }), "case-upstream-dev", "sourceMapping");
+    expect(() => prepare(emptyComment)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_MAPPING_INVALID"
+    );
+
+    const derived = createBridgeFixture("reason-derived-unique");
+    rewriteBridgeInput(derived, "case-0001.mapping.private.json", (value) => ({
+      ...value,
+      observedHistoricalTasteReasonEvidence: [
+        value.observedHistoricalTasteReasonEvidence[0],
+        value.observedHistoricalTasteReasonEvidence[0]
+      ],
+      observedHistoricalTechnicalReasonEvidence: [{
+        reviewCommentIndex: 0,
+        reason: "judgeability_concern"
+      }]
+    }), "case-upstream-dev", "sourceMapping");
+    const result = prepare(derived);
+    const dataset = loadReviewFlowEvaluationDataset({
+      manifestPath: result.manifestPath,
+      revealDescriptorPath: result.developmentRevealDescriptorPath,
+      mode: "development_scored",
+      privateRoot: derived.privateRoot,
+      containingWorkspace: derived.workspace
+    });
+    expect(dataset.cases[0]?.gold).toMatchObject({
+      observedHistoricalTasteReasons: [{
+        dimension: "icpc_fit",
+        direction: "concern"
+      }],
+      observedHistoricalTechnicalReasons: ["judgeability_concern"]
+    });
+
+    const forgedIndependent = createBridgeFixture("reason-independent-forbidden");
+    rewriteBridgeInput(
+      forgedIndependent,
+      "case-0001.mapping.private.json",
+      (value) => ({
+        ...value,
+        independentVerdict: {
+          annotation: "independent_human_three_way",
+          verdict: "approve"
+        }
+      }),
+      "case-upstream-dev",
+      "sourceMapping"
+    );
+    expect(() => prepare(forgedIndependent)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_MAPPING_INVALID"
+    );
+  }, 30_000);
+
+  it("四种来源投影方法都接受各自的完整 UTF-8 源结构", () => {
+    const headingAndRule = createBridgeFixture("projection-positive-heading-rule", {
+      projectionMethods: [
+        "markdown_solution_heading_v1",
+        "last_horizontal_rule_v1"
+      ]
+    });
+    expect(() => prepare(headingAndRule)).not.toThrow();
+
+    const algorithmAndOperator = createBridgeFixture(
+      "projection-positive-algorithm-operator",
+      {
+        projectionMethods: [
+          "algorithm_heading_v1",
+          "operator_explicit_offsets_v1"
+        ]
+      }
+    );
+    expect(() => prepare(algorithmAndOperator)).not.toThrow();
+  }, 30_000);
+
+  it("来源投影拒绝错位、UTF-8 半字符、伪造方法、遗漏首尾和边界夹带正文", () => {
+    const wrongOffset = createBridgeFixture("projection-wrong-offset");
+    rewriteBridgeInput(wrongOffset, "case-9001.mapping.private.json", (value) => ({
+      ...value,
+      sourceProjection: {
+        ...value.sourceProjection,
+        solution: {
+          ...value.sourceProjection.solution,
+          startByte: value.sourceProjection.solution.startByte + 3
+        }
+      }
+    }), "case-upstream-hold", "sourceMapping");
+    expect(() => prepare(wrongOffset)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_CASE_BINDING_MISMATCH"
+    );
+
+    const utf8Midpoint = createBridgeFixture("projection-utf8-midpoint");
+    rewriteBridgeInput(utf8Midpoint, "case-9001.mapping.private.json", (value) => ({
+      ...value,
+      sourceProjection: {
+        ...value.sourceProjection,
+        statement: { ...value.sourceProjection.statement, endByte: 1 }
+      }
+    }), "case-upstream-hold", "sourceMapping");
+    expect(() => prepare(utf8Midpoint)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_SOURCE_PROJECTION_INVALID"
+    );
+
+    const titleMisalignment = createBridgeFixture("projection-title-index");
+    rewriteBridgeInput(
+      titleMisalignment,
+      "case-0001.mapping.private.json",
+      (value) => ({ ...value, titleIdentityValueIndex: 1 }),
+      "case-upstream-dev",
+      "sourceMapping"
+    );
+    expect(() => prepare(titleMisalignment)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_CASE_BINDING_MISMATCH"
+    );
+
+    const falseMethod = createBridgeFixture("projection-false-method");
+    rewriteBridgeInput(falseMethod, "case-0001.mapping.private.json", (value) => ({
+      ...value,
+      sourceProjection: {
+        ...value.sourceProjection,
+        method: "algorithm_heading_v1"
+      }
+    }), "case-upstream-dev", "sourceMapping");
+    expect(() => prepare(falseMethod)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_SOURCE_PROJECTION_INVALID"
+    );
+
+    const nonLastHorizontalRule = createBridgeFixture(
+      "projection-non-last-horizontal-rule",
+      {
+        projectionMethods: [
+          "last_horizontal_rule_v1",
+          "operator_explicit_offsets_v1"
+        ],
+        solutionSuffixes: ["\r---\rtrailing solution", ""]
+      }
+    );
+    expect(() => prepare(nonLastHorizontalRule)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_SOURCE_PROJECTION_INVALID"
+    );
+
+    const omittedPrefix = createBridgeFixture("projection-omitted-prefix");
+    rewriteBridgeInput(omittedPrefix, "case-9001.mapping.private.json", (value) => ({
+      ...value,
+      sourceProjection: {
+        ...value.sourceProjection,
+        statement: { ...value.sourceProjection.statement, startByte: 3 }
+      }
+    }), "case-upstream-hold", "sourceMapping");
+    expect(() => prepare(omittedPrefix)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_SOURCE_PROJECTION_INVALID"
+    );
+
+    const omittedSuffix = createBridgeFixture("projection-omitted-suffix");
+    rewriteBridgeInput(omittedSuffix, "case-9001.mapping.private.json", (value) => ({
+      ...value,
+      sourceProjection: {
+        ...value.sourceProjection,
+        solution: {
+          ...value.sourceProjection.solution,
+          endByte: value.sourceProjection.solution.endByte - 1
+        }
+      }
+    }), "case-upstream-hold", "sourceMapping");
+    expect(() => prepare(omittedSuffix)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_SOURCE_PROJECTION_INVALID"
+    );
+
+    const hiddenGapBody = createBridgeFixture("projection-hidden-gap-body");
+    rewriteBridgeInput(hiddenGapBody, "case-0001.mapping.private.json", (value) => ({
+      ...value,
+      sourceProjection: {
+        ...value.sourceProjection,
+        statement: {
+          ...value.sourceProjection.statement,
+          endByte: value.sourceProjection.statement.endByte - 1
+        }
+      }
+    }), "case-upstream-dev", "sourceMapping");
+    expect(() => prepare(hiddenGapBody)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_SOURCE_PROJECTION_INVALID"
+    );
+  }, 20_000);
+
+  it("来源投影拒绝自洽内容伪造和基本题面/题解之外的额外任务内容", () => {
+    const forgedStatement = createBridgeFixture("projection-content-forgery");
+    rewriteCoherentDevelopmentContent(forgedStatement, (hashInput) => ({
+      ...hashInput,
+      content: {
+        ...hashInput.content,
+        basicStatement: `${hashInput.content.basicStatement} forged`
+      }
+    }));
+    expect(() => prepare(forgedStatement)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_CASE_BINDING_MISMATCH"
+    );
+
+    const extraContent = createBridgeFixture("projection-extra-content");
+    rewriteCoherentDevelopmentContent(extraContent, (hashInput) => ({
+      ...hashInput,
+      content: { ...hashInput.content, background: "forged background" }
+    }));
+    expect(() => prepare(extraContent)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_CASE_BINDING_MISMATCH"
+    );
+  });
+
+  it("标题输入必须已规范化，当前标签只能是目录内明确声明的非 Gold 占位", () => {
+    const nonCanonicalTitle = createBridgeFixture("mapping-title-canonical");
+    rewriteBridgeInput(
+      nonCanonicalTitle,
+      "case-0001.task.private.json",
+      (value) => ({
+        ...value,
+        problem: { ...value.problem, title: ` ${value.problem.title} ` }
+      }),
+      "case-upstream-dev",
+      "taskDraft"
+    );
+    const nonCanonicalPlan = readJson(nonCanonicalTitle.input.bridgePlanPath);
+    const nonCanonicalCase = nonCanonicalPlan.cases.find(
+      (entry: { caseId: string }) => entry.caseId === "case-upstream-dev"
+    );
+    if (nonCanonicalCase === undefined) throw new Error("TEST_PLAN_CASE_MISSING");
+    rewriteBridgeInput(
+      nonCanonicalTitle,
+      "case-0001.mapping.private.json",
+      (value) => ({
+        ...value,
+        taskDraftSha256: nonCanonicalCase.taskDraft.sha256
+      }),
+      "case-upstream-dev",
+      "sourceMapping"
+    );
+    expect(() => prepare(nonCanonicalTitle)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_TASK_INVALID"
+    );
+
+    const unboundPlaceholder = createBridgeFixture("mapping-placeholder");
+    rewriteCoherentDevelopmentContent(unboundPlaceholder, (hashInput) => ({
+      ...hashInput,
+      tagIds: ["missing-tag"]
+    }));
+    expect(() => prepare(unboundPlaceholder)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_PLACEHOLDER_TAGS_MISMATCH"
+    );
+
+    const duplicateCatalog = createBridgeFixture("mapping-catalog-duplicate");
+    const duplicatePlan = readJson(duplicateCatalog.input.bridgePlanPath);
+    const catalogPath = join(
+      duplicateCatalog.bridgeInput,
+      duplicatePlan.tagCatalog.fileName
+    );
+    const catalog = readJson(catalogPath);
+    const duplicateCatalogBytes = pretty({
+      ...catalog,
+      tags: [...catalog.tags, { ...catalog.tags[0] }]
+    });
+    writePrivate(catalogPath, duplicateCatalogBytes);
+    duplicatePlan.tagCatalog.sha256 = sha256(duplicateCatalogBytes);
+    writePrivate(duplicateCatalog.input.bridgePlanPath, pretty(duplicatePlan));
+    expect(() => prepare(duplicateCatalog)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_TAG_CATALOG_INVALID"
+    );
+  });
+
+  it("所有严格 JSON 输入都拒绝非法 UTF-8，而不做替换字符规范化", () => {
+    const fixture = createBridgeFixture("task-invalid-utf8");
+    const taskPath = join(fixture.bridgeInput, "case-0001.task.private.json");
+    const taskBytes = Buffer.from(readFileSync(taskPath));
+    const statementMarker = Buffer.from("题面 Synthetic statement 1", "utf8");
+    const statementOffset = taskBytes.indexOf(statementMarker);
+    if (statementOffset < 0) throw new Error("TEST_TASK_STATEMENT_MISSING");
+    taskBytes[statementOffset + Buffer.from("题面 ", "utf8").byteLength] = 0xff;
+    writePrivate(taskPath, taskBytes);
+
+    const plan = readJson(fixture.input.bridgePlanPath);
+    const planCase = plan.cases.find(
+      (entry: { caseId: string }) => entry.caseId === "case-upstream-dev"
+    );
+    if (planCase === undefined) throw new Error("TEST_PLAN_CASE_MISSING");
+    planCase.taskDraft.sha256 = sha256(taskBytes);
+    writePrivate(fixture.input.bridgePlanPath, pretty(plan));
+    rewriteBridgeInput(
+      fixture,
+      "case-0001.mapping.private.json",
+      (value) => ({ ...value, taskDraftSha256: sha256(taskBytes) }),
+      "case-upstream-dev",
+      "sourceMapping"
+    );
+    expect(() => prepare(fixture)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_TASK_INVALID"
+    );
+  });
+
+  it("只接受 complete 且 contentHash 一致的原始 Anklang v2，但历史结果任务统一不注入候选", () => {
     const incomplete = createBridgeFixture("anklang-incomplete");
     rewriteBridgeInput(incomplete, "case-0001.anklang.private.json", (value) => ({
       ...value,
@@ -440,10 +880,10 @@ describe("review-flow trusted dataset bridge", () => {
       privateRoot: success.privateRoot,
       containingWorkspace: success.workspace
     });
-    const data = dataset.cases[0]?.task.reviewItems[0]?.data as {
-      candidates?: unknown[];
-    } | undefined;
-    expect(data?.candidates).toEqual(success.developmentCandidates);
+    expect(dataset.cases[0]?.task.reviewItems).toEqual([]);
+    expect(readFileSync(result.manifestPath, "utf8")).not.toContain(
+      "sameProblemSuggestion"
+    );
   });
 
   it("原始 Anklang request 必须是唯一 v2 请求，并逐字段绑定 task 与重算 contentHash", () => {
@@ -570,15 +1010,50 @@ describe("review-flow trusted dataset bridge", () => {
         problemCount: 2
       }
     }));
-    const localResult = prepare(localSnapshot);
-    const localDataset = loadReviewFlowEvaluationDataset({
-      manifestPath: localResult.manifestPath,
-      mode: "development_identity",
-      privateRoot: localSnapshot.privateRoot,
-      containingWorkspace: localSnapshot.workspace
-    });
-    expect(localDataset.cases[0]?.task.reviewItems[0]?.summary).toBe(
-      "离线完整查重快照（语料已绑定）"
+    expect(() => prepare(localSnapshot)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_CAPTURE_ATTESTATION_INVALID"
+    );
+  }, 15_000);
+
+  it("手写 Anklang attestation 不能替代 verifier 重放，输出不一致和执行失败都关闭", () => {
+    const handwritten = createBridgeFixture("anklang-handwritten-attestation");
+    rewriteCaptureAttestation(
+      handwritten,
+      (attestation) => ({
+        ...attestation,
+        capturedAt: "2026-08-01T00:00:01.000Z"
+      }),
+      false
+    );
+    expect(() => prepare(handwritten)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_CAPTURE_ATTESTATION_MISMATCH"
+    );
+
+    const mismatchedIdentity = createBridgeFixture(
+      "anklang-verifier-identity-mismatch"
+    );
+    const mismatchedManifest = readJson(
+      mismatchedIdentity.captureVerifierManifestPath
+    );
+    writePrivate(
+      mismatchedIdentity.captureVerifierManifestPath,
+      pretty({
+        ...mismatchedManifest,
+        verifierRunnerSha256: "f".repeat(64)
+      })
+    );
+    expect(() => prepare(mismatchedIdentity)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_VERIFIER_EXECUTION_FAILED"
+    );
+
+    const failed = createBridgeFixture("anklang-verifier-failed");
+    const failedManifest = readJson(failed.captureVerifierManifestPath);
+    writePrivate(
+      failed.captureVerifierManifestPath,
+      pretty({ ...failedManifest, mode: "fail" })
+    );
+    expect(() => prepare(failed)).toThrow(
+      "REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_VERIFIER_EXECUTION_FAILED"
     );
   });
 
@@ -620,6 +1095,8 @@ describe("review-flow trusted dataset bridge", () => {
       "--private-root=/private",
       `--fermata-code-version=${"1".repeat(40)}`,
       "--bridge-plan=/private/input/bridge.json",
+      "--anklang-capture-workspace=/private/anklang-capture",
+      "--anklang-capture-manifest=/private/anklang-capture/manifest.json",
       "--upstream-gold=/private/upstream",
       "--materialized=/private/materialized",
       "--worksheet=/private/worksheet.json",
@@ -665,11 +1142,49 @@ interface BridgeFixture {
   readonly verifierOutputPath: string;
   readonly generatorRepository: string;
   readonly capturerRepository: string;
+  readonly captureVerifierAttestationPath: string;
+  readonly captureVerifierManifestPath: string;
   readonly generatorIdentity: ReturnType<typeof loadEvaluationCodeIdentity>;
   readonly developmentCandidates: readonly unknown[];
 }
 
-function createBridgeFixture(seed: string): BridgeFixture {
+type SourceProjectionMethod =
+  | "markdown_solution_heading_v1"
+  | "last_horizontal_rule_v1"
+  | "algorithm_heading_v1"
+  | "operator_explicit_offsets_v1";
+
+interface BridgeFixtureOptions {
+  readonly projectionMethods?: readonly [
+    SourceProjectionMethod,
+    SourceProjectionMethod
+  ];
+  readonly solutionSuffixes?: readonly [string, string];
+  readonly holdoutEvaluationScope?:
+    | "verdict_and_taste"
+    | "originality_only";
+  readonly secondPlaceholderTagIds?: readonly string[];
+}
+
+function createBridgeFixture(
+  seed: string,
+  options: BridgeFixtureOptions = {}
+): BridgeFixture {
+  const projectionMethods = options.projectionMethods ?? [
+    "markdown_solution_heading_v1",
+    "operator_explicit_offsets_v1"
+  ] as const;
+  const solutionSuffixes = options.solutionSuffixes ?? ["", ""] as const;
+  const holdoutOriginalityOnly =
+    options.holdoutEvaluationScope === "originality_only";
+  const problemInputs = [
+    problemHashInput(1, solutionSuffixes[0]),
+    problemHashInput(
+      2,
+      solutionSuffixes[1],
+      options.secondPlaceholderTagIds ?? ["tag-basic"]
+    )
+  ] as const;
   const workspace = mkdtempSync(join(tmpdir(), `fermata-bridge-${seed}-`));
   temporaryRoots.push(workspace);
   chmodSync(workspace, 0o700);
@@ -729,13 +1244,13 @@ function createBridgeFixture(seed: string): BridgeFixture {
       sourceId: "source-000001",
       sourcePath: "source-000001.md",
       metadataNumber: "101",
-      content: Buffer.from(`synthetic statement and solution ${seed} development`)
+      content: sourceBytes(problemInputs[0], projectionMethods[0])
     },
     {
       sourceId: "source-000002",
       sourcePath: "source-000002.md",
       metadataNumber: "102",
-      content: Buffer.from(`synthetic statement and solution ${seed} holdout`)
+      content: sourceBytes(problemInputs[1], projectionMethods[1])
     }
   ];
   for (const source of sourceDefinitions) {
@@ -804,10 +1319,10 @@ function createBridgeFixture(seed: string): BridgeFixture {
       worksheetId: "worksheet-000001",
       sourceRowNumber: 2,
       metadataNumber: "101",
-      identityValues: ["synthetic-development"],
+      identityValues: ["Synthetic 1"],
       finalDecisionText: "synthetic rejected",
       contestUseText: "synthetic not used",
-      reviewComments: ["synthetic style concern"],
+      reviewComments: ["synthetic style concern", ""],
       reviewCommentPresent: true
     },
     {
@@ -816,9 +1331,9 @@ function createBridgeFixture(seed: string): BridgeFixture {
       worksheetId: "worksheet-000001",
       sourceRowNumber: 2,
       metadataNumber: "102",
-      identityValues: ["synthetic-holdout"],
-      finalDecisionText: "",
-      contestUseText: "",
+      identityValues: ["Synthetic 2"],
+      finalDecisionText: holdoutOriginalityOnly ? "" : "synthetic accepted",
+      contestUseText: holdoutOriginalityOnly ? "" : "synthetic used",
       reviewComments: [""],
       reviewCommentPresent: false
     }
@@ -886,7 +1401,7 @@ function createBridgeFixture(seed: string): BridgeFixture {
       contestUse: "not_used",
       confirmed: true
     },
-    {
+    holdoutOriginalityOnly ? {
       caseId: "case-upstream-hold",
       subjectId: "subject-synthetic-holdout",
       rowId: rows[1]!.rowId,
@@ -895,6 +1410,17 @@ function createBridgeFixture(seed: string): BridgeFixture {
       purpose: "holdout",
       evaluationScope: "originality_only",
       sameProblemAsExisting: true,
+      confirmed: true
+    } : {
+      caseId: "case-upstream-hold",
+      subjectId: "subject-synthetic-holdout",
+      rowId: rows[1]!.rowId,
+      sourceId: sourceDefinitions[1]!.sourceId,
+      sourceSha256: sha256(sourceDefinitions[1]!.content),
+      purpose: "holdout",
+      evaluationScope: "verdict_and_taste",
+      verdict: "accepted",
+      contestUse: "used",
       confirmed: true
     }
   ];
@@ -929,13 +1455,21 @@ function createBridgeFixture(seed: string): BridgeFixture {
       verdict: "rejected",
       contestUse: "not_used"
     },
-    {
+    holdoutOriginalityOnly ? {
       version: 2,
       artifactKind: "historical_review_gold",
       caseId: upstreamCases[1]!.caseId,
       reviewCommentPresent: false,
       evaluationScope: "originality_only",
       sameProblemAsExisting: true
+    } : {
+      version: 2,
+      artifactKind: "historical_review_gold",
+      caseId: upstreamCases[1]!.caseId,
+      reviewCommentPresent: false,
+      evaluationScope: "verdict_and_taste",
+      verdict: "accepted",
+      contestUse: "used"
     }
   ];
   const upstreamGoldBytes = upstreamGoldValues.map(pretty);
@@ -1008,8 +1542,8 @@ function createBridgeFixture(seed: string): BridgeFixture {
     caseCount: 2,
     developmentCount: 1,
     holdoutCount: 1,
-    verdictAndTasteCount: 1,
-    originalityOnlyCount: 1
+    verdictAndTasteCount: holdoutOriginalityOnly ? 1 : 2,
+    originalityOnlyCount: holdoutOriginalityOnly ? 1 : 0
   };
   const upstreamMarkerBytes = pretty(upstreamMarker);
   writePrivate(join(upstreamGold, "REVIEW_GOLD_COMPLETE"), upstreamMarkerBytes);
@@ -1017,15 +1551,26 @@ function createBridgeFixture(seed: string): BridgeFixture {
   const catalog = {
     schemaVersion: 1,
     version: 7,
-    tags: [{
-      id: "tag-basic",
-      name: "基础",
-      categoryId: "category-basic",
-      categoryName: "基础",
-      description: "synthetic tag",
-      aliases: [],
-      active: true as const
-    }]
+    tags: [
+      {
+        id: "tag-basic",
+        name: "基础",
+        categoryId: "category-basic",
+        categoryName: "基础",
+        description: "synthetic tag",
+        aliases: [],
+        active: true as const
+      },
+      {
+        id: "tag-other",
+        name: "其他",
+        categoryId: "category-other",
+        categoryName: "其他",
+        description: "synthetic alternate tag",
+        aliases: [],
+        active: true as const
+      }
+    ]
   };
   const catalogBytes = pretty(catalog);
   writePrivate(join(bridgeInput, "tag-catalog.private.json"), catalogBytes);
@@ -1059,7 +1604,7 @@ function createBridgeFixture(seed: string): BridgeFixture {
   }[] = [];
   const bridgeCases = upstreamCases.map((entry, index) => {
     const safeId = index === 0 ? "case-0001" : "case-9001";
-    const hashInput = problemHashInput(index + 1);
+    const hashInput = problemInputs[index]!;
     const contentHash = computeUrmotivProblemContentHash(hashInput);
     const hashInputBytes = pretty(hashInput);
     const hashInputFileName = `${safeId}.problem-hash-input.private.json`;
@@ -1115,43 +1660,34 @@ function createBridgeFixture(seed: string): BridgeFixture {
       attempt: 1,
       responseCompletionStatus: "complete"
     });
-    const mapping = index === 0
-      ? {
-          schemaVersion: 1,
-          artifactKind: "review_flow_evaluation_human_mapping",
-          confirmed: true,
-          caseId: entry.caseId,
-          safeId,
-          subjectId: entry.subjectId,
-          purpose: entry.purpose,
-          sourceId: entry.sourceId,
-          sourceSha256: entry.sourceSha256,
-          rowEvidenceSha256: rows[index]!.rowEvidenceSha256,
-          reviewInputId: rows[index]!.inputId,
-          worksheetId: rows[index]!.worksheetId,
-          sourceRowNumber: rows[index]!.sourceRowNumber,
-          taskDraftSha256: sha256(taskBytes),
-          problemHashInputSha256: sha256(hashInputBytes),
-          problemContentHash: contentHash,
-          statementSolutionBoundary:
-            "independently_human_confirmed_from_materialized_source",
-          evaluationScope: "verdict_and_taste",
-          historicalReviewReasonMapping:
-            "independently_human_confirmed_from_bound_review_row",
-          observedHistoricalTasteReasons: [{
-            dimension: "icpc_fit",
-            direction: "concern"
-          }],
-          observedHistoricalTechnicalReasons: [],
-          independentVerdict: {
-            annotation: "independent_human_three_way",
-            verdict: "reject"
-          },
-          expectedTagIds: ["tag-basic"]
+    const statementBytes = Buffer.from(task.problem.content.basicStatement);
+    const solutionBytes = Buffer.from(task.problem.content.basicSolution);
+    const sourceBytes = sourceDefinitions[index]!.content;
+    const statementStartByte = sourceBytes.indexOf(statementBytes);
+    const solutionStartByte = sourceBytes.indexOf(solutionBytes);
+    if (statementStartByte < 0 || solutionStartByte < 0) {
+      throw new Error("TEST_SOURCE_PROJECTION_MISSING");
+    }
+    const projectionFields = {
+      titleIdentityValueIndex: 0,
+      sourceProjection: {
+        method: projectionMethods[index]!,
+        statement: {
+          startByte: statementStartByte,
+          endByte: statementStartByte + statementBytes.byteLength
+        },
+        solution: {
+          startByte: solutionStartByte,
+          endByte: solutionStartByte + solutionBytes.byteLength
         }
-      : {
-          schemaVersion: 1,
-          artifactKind: "review_flow_evaluation_human_mapping",
+      },
+      problemTypeBasis: "operator_confirmed",
+      currentTagIdsBasis: "calibration_placeholder_not_gold",
+      placeholderTagIds: hashInput.tagIds
+    } as const;
+    const mapping = holdoutOriginalityOnly && index === 1 ? {
+          schemaVersion: 2,
+          artifactKind: "review_flow_evaluation_source_mapping",
           confirmed: true,
           caseId: entry.caseId,
           safeId,
@@ -1166,11 +1702,39 @@ function createBridgeFixture(seed: string): BridgeFixture {
           taskDraftSha256: sha256(taskBytes),
           problemHashInputSha256: sha256(hashInputBytes),
           problemContentHash: contentHash,
-          statementSolutionBoundary:
-            "independently_human_confirmed_from_materialized_source",
+          ...projectionFields,
           evaluationScope: "originality_only",
           originalityAnnotation: "confirmed_duplicate_evidence",
           confirmedDuplicate: true
+        } : {
+          schemaVersion: 2,
+          artifactKind: "review_flow_evaluation_source_mapping",
+          confirmed: true,
+          caseId: entry.caseId,
+          safeId,
+          subjectId: entry.subjectId,
+          purpose: entry.purpose,
+          sourceId: entry.sourceId,
+          sourceSha256: entry.sourceSha256,
+          rowEvidenceSha256: rows[index]!.rowEvidenceSha256,
+          reviewInputId: rows[index]!.inputId,
+          worksheetId: rows[index]!.worksheetId,
+          sourceRowNumber: rows[index]!.sourceRowNumber,
+          taskDraftSha256: sha256(taskBytes),
+          problemHashInputSha256: sha256(hashInputBytes),
+          problemContentHash: contentHash,
+          ...projectionFields,
+          evaluationScope: "verdict_and_taste",
+          historicalReviewReasonMapping:
+            "operator_asserted_sparse_mapping_v1",
+          observedHistoricalTasteReasonEvidence: index === 0 ? [{
+              reviewCommentIndex: 0,
+              reason: {
+                dimension: "icpc_fit",
+                direction: "concern"
+              }
+            }] : [],
+          observedHistoricalTechnicalReasonEvidence: []
         };
     const mappingBytes = pretty(mapping);
     const mappingFileName = `${safeId}.mapping.private.json`;
@@ -1196,7 +1760,7 @@ function createBridgeFixture(seed: string): BridgeFixture {
         fileName: anklangFileName,
         sha256: sha256(anklangBytes)
       },
-      humanMapping: {
+      sourceMapping: {
         fileName: mappingFileName,
         sha256: sha256(mappingBytes)
       }
@@ -1255,8 +1819,8 @@ function createBridgeFixture(seed: string): BridgeFixture {
       caseCount: 2,
       developmentCount: 1,
       holdoutCount: 1,
-      verdictAndTasteCount: 1,
-      originalityOnlyCount: 1,
+      verdictAndTasteCount: holdoutOriginalityOnly ? 1 : 2,
+      originalityOnlyCount: holdoutOriginalityOnly ? 1 : 0,
       reviewInputCount: 2,
       materializedSourceCount: 2
     }
@@ -1288,7 +1852,7 @@ function createBridgeFixture(seed: string): BridgeFixture {
       apiVersion: "2",
       endpointPath: "/api/v2/checks/similarity",
       baseUrlSha256: sha256("https://synthetic.invalid"),
-      timeoutMs: 120_000,
+      timeoutMs: 300_000,
       authentication: "bearer_redacted",
       secretsExcluded: true
     },
@@ -1325,6 +1889,28 @@ function createBridgeFixture(seed: string): BridgeFixture {
     join(bridgeInput, captureAttestationFileName),
     captureAttestationBytes
   );
+  const captureVerifierWorkspace = mkdirPrivate(
+    join(privateRoot, "anklang-capture-workspace")
+  );
+  const captureVerifierAttestationPath = join(
+    captureVerifierWorkspace,
+    "verified-attestation.private.json"
+  );
+  writePrivate(captureVerifierAttestationPath, captureAttestationBytes);
+  const captureVerifierManifestPath = join(
+    captureVerifierWorkspace,
+    "capture-manifest.private.json"
+  );
+  writePrivate(captureVerifierManifestPath, pretty({
+    schemaVersion: 1,
+    workspace: captureVerifierWorkspace,
+    attestationFileName: "verified-attestation.private.json",
+    verifierCodeVersion: capturer.identity.codeVersion,
+    verifierRunnerSha256: capturer.identity.runnerSha256,
+    verifierDependencyCodeSha256:
+      capturer.identity.dependencyCodeSha256,
+    mode: "success"
+  }));
   const captureCompletion = {
     schemaVersion: 1,
     artifactKind: "anklang_review_flow_capture_completion",
@@ -1349,10 +1935,13 @@ function createBridgeFixture(seed: string): BridgeFixture {
     captureCompletionBytes
   );
   const bridgePlan = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     artifactKind: "review_flow_evaluation_bridge_plan",
-    bridgeVersion: "urmotiv-review-flow-bridge-v3",
+    bridgeVersion: "urmotiv-review-flow-bridge-v4",
     confirmed: true,
+    anklangInputPolicy:
+      "exclude_current_corpus_for_historical_outcome",
+    placeholderTagIds: ["tag-basic"],
     upstreamDatasetId: upstreamPlan.datasetId,
     datasetId: `dataset-${sha256(seed).slice(0, 16)}`,
     tagCatalog: {
@@ -1396,6 +1985,8 @@ function createBridgeFixture(seed: string): BridgeFixture {
     verifierOutputPath: verifier.outputPath,
     generatorRepository: generator.repository,
     capturerRepository: capturer.repository,
+    captureVerifierAttestationPath,
+    captureVerifierManifestPath,
     generatorIdentity: generator.identity,
     developmentCandidates,
     input: {
@@ -1403,6 +1994,8 @@ function createBridgeFixture(seed: string): BridgeFixture {
       containingWorkspace: workspace,
       fermataCodeVersion: generator.identity.codeVersion,
       bridgePlanPath,
+      anklangCaptureWorkspace: captureVerifierWorkspace,
+      anklangCaptureManifestPath: captureVerifierManifestPath,
       upstreamGoldDirectory: upstreamGold,
       materializedDirectory: materialized,
       worksheetPath,
@@ -1444,26 +2037,30 @@ function taskDraft(
         output: sample.output,
         explanation: sample.explanation
       })),
-      limits: hashInput.judgeConfig.limits
+      limits: null
     },
     tagCatalog: { version: catalog.version, tags: [...catalog.tags] },
     reviewItems: []
   };
 }
 
-function problemHashInput(index: number) {
+function problemHashInput(
+  index: number,
+  solutionSuffix = "",
+  tagIds: readonly string[] = ["tag-basic"]
+) {
   return {
     schemaVersion: 1 as const,
     artifactKind: "urmotiv_problem_content_hash_input" as const,
     title: `Synthetic ${index}`,
     type: "traditional" as const,
-    tagIds: ["tag-basic"],
+    tagIds: [...tagIds],
     codeforcesDifficulty: null,
     thinkingLevel: null,
     codingLevel: null,
     content: {
-      basicStatement: `Synthetic statement ${index}`,
-      basicSolution: `Synthetic solution ${index}`,
+      basicStatement: `题面 Synthetic statement ${index}`,
+      basicSolution: `题解 Synthetic solution ${index}${solutionSuffix}`,
       background: "",
       statement: "",
       inputFormat: "",
@@ -1478,15 +2075,26 @@ function problemHashInput(index: number) {
       output: string;
       explanation: string;
     }[],
-    judgeConfig: {
-      version: 1 as const,
-      limits: { timeMs: 1_000, memoryMiB: 256 },
-      scoring: { total: 100, subtaskMode: "sum" as const },
-      subtasks: [],
-      testcases: []
-    },
+    judgeConfig: null,
     status: "pending_review" as const
   };
+}
+
+function sourceBytes(
+  input: ReturnType<typeof problemHashInput>,
+  method: SourceProjectionMethod
+): Buffer {
+  const gap = method === "markdown_solution_heading_v1"
+    ? "\n\n# 题解\n\n"
+    : method === "algorithm_heading_v1"
+    ? "\r\n\r\n# 算法\r\n\r\n"
+    : method === "last_horizontal_rule_v1"
+    ? "\n\n---\n\n"
+    : "\n\noperator confirmed boundary\n\n";
+  return Buffer.from(
+    `${input.content.basicStatement}${gap}${input.content.basicSolution}`,
+    "utf8"
+  );
 }
 
 function rewriteBridgeInput(
@@ -1495,7 +2103,7 @@ function rewriteBridgeInput(
   update: (value: Record<string, any>) => Record<string, any>,
   caseId: string,
   bindingKey:
-    | "humanMapping"
+    | "sourceMapping"
     | "taskDraft"
     | "originalAnklangRequest"
     | "originalAnklangResponse"
@@ -1511,12 +2119,117 @@ function rewriteBridgeInput(
   writePrivate(planPath, pretty(plan));
 }
 
+function rewriteCoherentDevelopmentContent(
+  fixture: BridgeFixture,
+  update: (
+    value: ReturnType<typeof problemHashInput>
+  ) => ReturnType<typeof problemHashInput>
+): void {
+  const hashInputPath = join(
+    fixture.bridgeInput,
+    "case-0001.problem-hash-input.private.json"
+  );
+  const taskPath = join(fixture.bridgeInput, "case-0001.task.private.json");
+  const requestPath = join(
+    fixture.bridgeInput,
+    "case-0001.anklang-request.private.json"
+  );
+  const responsePath = join(
+    fixture.bridgeInput,
+    "case-0001.anklang.private.json"
+  );
+  const mappingPath = join(
+    fixture.bridgeInput,
+    "case-0001.mapping.private.json"
+  );
+  const changedHashInput = update(
+    readJson(hashInputPath) as ReturnType<typeof problemHashInput>
+  );
+  const contentHash = computeUrmotivProblemContentHash(changedHashInput);
+  const hashInputBytes = pretty(changedHashInput);
+  writePrivate(hashInputPath, hashInputBytes);
+
+  const originalTask = readJson(taskPath);
+  const changedTask = {
+    ...originalTask,
+    problem: {
+      ...originalTask.problem,
+      contentHash,
+      title: changedHashInput.title,
+      type: changedHashInput.type,
+      tagIds: changedHashInput.tagIds,
+      content: changedHashInput.content
+    }
+  };
+  const taskBytes = pretty(changedTask);
+  writePrivate(taskPath, taskBytes);
+
+  const changedRequest = {
+    ...readJson(requestPath),
+    contentHash,
+    problem: {
+      title: changedTask.problem.title,
+      type: changedTask.problem.type,
+      tagIds: changedTask.problem.tagIds,
+      basicStatement: changedTask.problem.content.basicStatement
+    }
+  };
+  const requestBytes = pretty(changedRequest);
+  writePrivate(requestPath, requestBytes);
+  const responseBytes = pretty({
+    ...readJson(responsePath),
+    contentHash
+  });
+  writePrivate(responsePath, responseBytes);
+
+  const mappingBytes = pretty({
+    ...readJson(mappingPath),
+    taskDraftSha256: sha256(taskBytes),
+    problemHashInputSha256: sha256(hashInputBytes),
+    problemContentHash: contentHash,
+    placeholderTagIds: changedHashInput.tagIds
+  });
+  writePrivate(mappingPath, mappingBytes);
+
+  const planPath = fixture.input.bridgePlanPath;
+  const plan = readJson(planPath);
+  const planCase = plan.cases.find(
+    (entry: { caseId: string }) => entry.caseId === "case-upstream-dev"
+  );
+  if (planCase === undefined) throw new Error("TEST_PLAN_CASE_MISSING");
+  planCase.problemHashInput.sha256 = sha256(hashInputBytes);
+  planCase.taskDraft.sha256 = sha256(taskBytes);
+  planCase.originalAnklangRequest.sha256 = sha256(requestBytes);
+  planCase.originalAnklangResponse.sha256 = sha256(responseBytes);
+  planCase.sourceMapping.sha256 = sha256(mappingBytes);
+  writePrivate(planPath, pretty(plan));
+
+  rewriteCaptureAttestation(fixture, (attestation, currentPlan) => {
+    const currentCase = currentPlan.cases.find(
+      (entry: { caseId: string }) => entry.caseId === "case-upstream-dev"
+    );
+    if (currentCase === undefined) throw new Error("TEST_PLAN_CASE_MISSING");
+    return {
+      ...attestation,
+      cases: attestation.cases.map((entry: Record<string, any>) =>
+        entry.caseId === "case-upstream-dev"
+          ? {
+              ...entry,
+              requestSha256: currentCase.originalAnklangRequest.sha256,
+              responseSha256: currentCase.originalAnklangResponse.sha256
+            }
+          : entry)
+    };
+  });
+}
+
 function rewriteCaptureAttestation(
   fixture: BridgeFixture,
   update: (
     attestation: Record<string, any>,
     plan: Record<string, any>
-  ) => Record<string, any>
+  ) => Record<string, any>,
+  syncVerifier = true
 ): void {
   const planPath = fixture.input.bridgePlanPath;
   const plan = readJson(planPath);
@@ -1533,6 +2246,9 @@ function rewriteCaptureAttestation(
   };
   const attestationBytes = pretty(attestation);
   writePrivate(attestationPath, attestationBytes);
+  if (syncVerifier) {
+    writePrivate(fixture.captureVerifierAttestationPath, attestationBytes);
+  }
   plan.anklangCaptureAttestation.sha256 = sha256(attestationBytes);
 
   const completionPath = join(
@@ -1611,12 +2327,58 @@ function createSyntheticAnklangCapturer(workspace: string) {
     "anklang/review_flow_capture.py",
     "anklang/contracts.py"
   ] as const;
+  mkdirSync(repository, { recursive: true, mode: 0o700 });
+  writeFileSync(join(repository, ".gitignore"), "__pycache__/\n", {
+    mode: 0o600
+  });
   for (const path of dependencyPaths) {
     const absolutePath = join(repository, path);
     mkdirSync(dirname(absolutePath), { recursive: true, mode: 0o700 });
-    writeFileSync(absolutePath, `synthetic capture dependency: ${path}\n`, {
-      mode: 0o600
-    });
+    const contents = path === dependencyPaths[0]
+      ? `#!/usr/bin/python3
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY_ROOT))
+from anklang.review_flow_capture import read_attestation
+
+parser = argparse.ArgumentParser()
+subparsers = parser.add_subparsers(dest="command", required=True)
+verify = subparsers.add_parser("verify-capture")
+verify.add_argument("--workspace", required=True)
+verify.add_argument("--manifest", required=True)
+verify.add_argument("--verifier-code-version", required=True)
+verify.add_argument("--verifier-runner-sha256", required=True)
+verify.add_argument("--verifier-dependency-code-sha256", required=True)
+args = parser.parse_args()
+with open(args.manifest, "r", encoding="utf-8") as handle:
+    manifest = json.load(handle)
+if manifest.get("mode") == "fail":
+    raise SystemExit(19)
+if (
+    os.path.realpath(args.workspace) != os.path.realpath(manifest["workspace"])
+    or args.verifier_code_version != manifest["verifierCodeVersion"]
+    or args.verifier_runner_sha256 != manifest["verifierRunnerSha256"]
+    or args.verifier_dependency_code_sha256 != manifest["verifierDependencyCodeSha256"]
+):
+    raise SystemExit(20)
+name = manifest["attestationFileName"]
+if os.path.basename(name) != name:
+    raise SystemExit(21)
+sys.stdout.buffer.write(read_attestation(Path(args.workspace) / name))
+`
+      : path === "anklang/review_flow_capture.py"
+      ? `from pathlib import Path
+
+def read_attestation(path: Path) -> bytes:
+    return path.read_bytes()
+`
+      : `# synthetic capture dependency: ${path}\n`;
+    writeFileSync(absolutePath, contents, { mode: 0o600 });
   }
   execFileSync("/usr/bin/git", ["init", "-q"], { cwd: repository });
   execFileSync("/usr/bin/git", ["add", "."], { cwd: repository });
@@ -1656,24 +2418,36 @@ function createSyntheticVerifier(workspace: string) {
   });
   writeFileSync(
     join(repository, ".gitignore"),
-    ".synthetic-attestation-output\n",
+    ".synthetic-attestation-output\n__pycache__/\n",
     { mode: 0o600 }
   );
   writeFileSync(
     join(repository, "scripts", "migrate-hist", "prepare-review-gold.py"),
     [
+      "import importlib.util",
       "from pathlib import Path",
       "import sys",
       "if len(sys.argv) < 2 or sys.argv[1] != 'verify-sealed':",
       "    raise SystemExit(2)",
-      "sys.stdout.buffer.write(Path('.synthetic-attestation-output').read_bytes())",
+      "dependency_path = Path(__file__).with_name('parse-metadata.py')",
+      "spec = importlib.util.spec_from_file_location('synthetic_parse_metadata', dependency_path)",
+      "if spec is None or spec.loader is None:",
+      "    raise SystemExit(3)",
+      "module = importlib.util.module_from_spec(spec)",
+      "spec.loader.exec_module(module)",
+      "sys.stdout.buffer.write(module.read_attestation(Path('.synthetic-attestation-output')))",
       ""
     ].join("\n"),
     { mode: 0o600 }
   );
   writeFileSync(
     join(repository, "scripts", "migrate-hist", "parse-metadata.py"),
-    "# synthetic trusted dependency\n",
+    [
+      "from pathlib import Path",
+      "def read_attestation(path: Path) -> bytes:",
+      "    return path.read_bytes()",
+      ""
+    ].join("\n"),
     { mode: 0o600 }
   );
   execFileSync("/usr/bin/git", ["init", "-q"], { cwd: repository });
@@ -1710,6 +2484,59 @@ function createSyntheticVerifier(workspace: string) {
     identity,
     outputPath: join(repository, ".synthetic-attestation-output")
   };
+}
+
+function installUncheckedHashPyc(
+  sourcePath: string,
+  markerPath: string
+): void {
+  const maliciousSourcePath = join(
+    dirname(dirname(dirname(sourcePath))),
+    `.malicious-${sha256(sourcePath).slice(0, 12)}.py`
+  );
+  writeFileSync(
+    maliciousSourcePath,
+    [
+      "from pathlib import Path",
+      `Path(${JSON.stringify(markerPath)}).write_text('executed', encoding='utf-8')`,
+      "def read_attestation(path: Path) -> bytes:",
+      "    return path.read_bytes()",
+      ""
+    ].join("\n"),
+    { mode: 0o600 }
+  );
+  try {
+    execFileSync(
+      "/usr/bin/python3",
+      [
+        "-c",
+        [
+          "import importlib.util",
+          "import py_compile",
+          "import sys",
+          "py_compile.compile(",
+          "    sys.argv[1],",
+          "    cfile=importlib.util.cache_from_source(sys.argv[2]),",
+          "    dfile=sys.argv[2],",
+          "    doraise=True,",
+          "    invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,",
+          ")"
+        ].join("\n"),
+        maliciousSourcePath,
+        sourcePath
+      ]
+    );
+  } finally {
+    rmSync(maliciousSourcePath, { force: true });
+  }
+}
+
+function snapshotPycFiles(repository: string): Readonly<Record<string, string>> {
+  return Object.fromEntries(
+    globSync("**/*.pyc", { cwd: repository })
+      .sort()
+      .map((path) => [path, sha256(readFileSync(join(repository, path)))])
+  );
 }
 
 function mkdirPrivate(path: string): string {

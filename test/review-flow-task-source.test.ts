@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   anklangSimilarityReviewItemType,
+  buildHistoricalCalibrationReviewFlowTaskSource,
   buildReviewFlowTaskSource,
   isBuiltReviewFlowTaskSourceResult,
+  isHistoricalCalibrationReviewFlowTaskSourceResult,
   ReviewFlowTaskSourceError,
   type ReviewFlowTaskSourceErrorCode
 } from "../src/review-flow/task-source";
@@ -243,6 +245,31 @@ describe("robot review task 到可信审题 source 的严格适配", () => {
     expect(result.source.duplicateEvidence).toEqual([]);
     expect(result.provenance.anklang.evidence).toEqual([]);
     expect(result.provenance.anklang.completionStatus).toBe("complete");
+  });
+
+  it("历史结果校准品牌只接受空 reviewItems，并生成不可用于确定性查重的空证据", () => {
+    const task = completeTask();
+    task.reviewItems = [];
+    const result = buildHistoricalCalibrationReviewFlowTaskSource(task, {
+      duplicateSimilarityRejectThreshold: 0.9
+    });
+    expect(result.source.duplicateEvidence).toEqual([]);
+    expect(result.provenance.anklang).toEqual({
+      inputPolicy: "exclude_current_corpus_for_historical_outcome",
+      completionStatus: "excluded",
+      reviewItemInjection: "excluded",
+      reviewItemExpiresAt: null,
+      deterministicConfirmationAllowed: false,
+      evidence: []
+    });
+    expect(isBuiltReviewFlowTaskSourceResult(result)).toBe(true);
+    expect(isHistoricalCalibrationReviewFlowTaskSourceResult(result)).toBe(true);
+    expect(isHistoricalCalibrationReviewFlowTaskSourceResult({ ...result }))
+      .toBe(false);
+    expect(() => buildHistoricalCalibrationReviewFlowTaskSource(
+      completeTask(),
+      { duplicateSimilarityRejectThreshold: 0.9 }
+    )).toThrow("REVIEW_FLOW_TASK_ANKLANG_EXCLUSION_INVALID");
   });
 
   it("缺失或多条同类型 Anklang 条目都 fail closed", () => {

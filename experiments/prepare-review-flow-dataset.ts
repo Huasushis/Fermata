@@ -10,6 +10,8 @@ interface BridgeCliOptions {
   readonly privateRoot: string;
   readonly fermataCodeVersion: string;
   readonly bridgePlan: string;
+  readonly anklangCaptureWorkspace: string;
+  readonly anklangCaptureManifest: string;
   readonly upstreamGold: string;
   readonly materialized: string;
   readonly worksheet: string;
@@ -28,6 +30,8 @@ const singletonOptions = new Set([
   "private-root",
   "fermata-code-version",
   "bridge-plan",
+  "anklang-capture-workspace",
+  "anklang-capture-manifest",
   "upstream-gold",
   "materialized",
   "worksheet",
@@ -71,6 +75,8 @@ export function parseReviewFlowDatasetBridgeArguments(
     privateRoot: required("private-root"),
     fermataCodeVersion,
     bridgePlan: required("bridge-plan"),
+    anklangCaptureWorkspace: required("anklang-capture-workspace"),
+    anklangCaptureManifest: required("anklang-capture-manifest"),
     upstreamGold: required("upstream-gold"),
     materialized: required("materialized"),
     worksheet: required("worksheet"),
@@ -97,6 +103,8 @@ export function runReviewFlowDatasetBridgeCli(
     containingWorkspace: workspaceRoot,
     fermataCodeVersion: options.fermataCodeVersion,
     bridgePlanPath: options.bridgePlan,
+    anklangCaptureWorkspace: options.anklangCaptureWorkspace,
+    anklangCaptureManifestPath: options.anklangCaptureManifest,
     upstreamGoldDirectory: options.upstreamGold,
     materializedDirectory: options.materialized,
     worksheetPath: options.worksheet,

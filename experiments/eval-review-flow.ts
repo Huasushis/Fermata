@@ -382,6 +382,8 @@ async function runPredictionOrDevelopment(input: {
       difficultyAnchors,
       datasetFingerprint: dataset.datasetFingerprint,
       manifestSha256: dataset.manifestSha256,
+      anklangInputPolicy: dataset.anklangInputPolicy,
+      placeholderTagIds: dataset.placeholderTagIds,
       purpose: dataset.purpose,
       concurrency,
       proxyEnvironment: input.env

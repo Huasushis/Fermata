@@ -32,6 +32,7 @@ export type ReviewFlowTaskSourceErrorCode =
   | "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID"
   | "REVIEW_FLOW_TASK_ANKLANG_RESULT_INCOMPLETE"
   | "REVIEW_FLOW_TASK_ANKLANG_CONTENT_HASH_MISMATCH"
+  | "REVIEW_FLOW_TASK_ANKLANG_EXCLUSION_INVALID"
   | "REVIEW_FLOW_TASK_SOURCE_INVALID";
 
 /** 固定错误码不携带题面、题解、候选详情或 zod 的原始校验输入。 */
@@ -265,29 +266,47 @@ const anklangEvidenceProvenanceSchema = z
   })
   .strict();
 
+const authenticatedAnklangProvenanceSchema = z
+  .object({
+    reviewItemType: z.literal(anklangSimilarityReviewItemType),
+    reviewItemId: z.string().min(1).max(200),
+    reviewItemCreatedAt: z.string().datetime(),
+    reviewItemSource: z.literal("anklang"),
+    sourcePluginId: z.literal(robotAnklangPluginId),
+    reviewItemVisibility: z.enum(["author", "reviewer", "administrator"]),
+    reviewItemExpiresAt: z.string().datetime({ offset: true }).nullable(),
+    apiVersion: z.literal("2"),
+    checkedAt: utcDateTimeSchema,
+    completionStatus: z.literal("complete"),
+    contentHash: digestSchema,
+    resultHash: digestSchema,
+    contentHashBinding: z.literal("matched"),
+    authenticationStatus: z.literal("authenticated_builtin_anklang_plugin"),
+    reportedBlockSubmission: z.boolean(),
+    deterministicConfirmationAllowed: z.literal(true),
+    evidence: z.array(anklangEvidenceProvenanceSchema).max(50)
+  })
+  .strict();
+
+const historicalCalibrationAnklangProvenanceSchema = z
+  .object({
+    inputPolicy: z.literal(
+      "exclude_current_corpus_for_historical_outcome"
+    ),
+    completionStatus: z.literal("excluded"),
+    reviewItemInjection: z.literal("excluded"),
+    reviewItemExpiresAt: z.null(),
+    deterministicConfirmationAllowed: z.literal(false),
+    evidence: z.array(z.never()).length(0)
+  })
+  .strict();
+
 const taskSourceProvenanceSchema = z
   .object({
-    anklang: z
-      .object({
-        reviewItemType: z.literal(anklangSimilarityReviewItemType),
-        reviewItemId: z.string().min(1).max(200),
-        reviewItemCreatedAt: z.string().datetime(),
-        reviewItemSource: z.literal("anklang"),
-        sourcePluginId: z.literal(robotAnklangPluginId),
-        reviewItemVisibility: z.enum(["author", "reviewer", "administrator"]),
-        reviewItemExpiresAt: z.string().datetime({ offset: true }).nullable(),
-        apiVersion: z.literal("2"),
-        checkedAt: utcDateTimeSchema,
-        completionStatus: z.literal("complete"),
-        contentHash: digestSchema,
-        resultHash: digestSchema,
-        contentHashBinding: z.literal("matched"),
-        authenticationStatus: z.literal("authenticated_builtin_anklang_plugin"),
-        reportedBlockSubmission: z.boolean(),
-        deterministicConfirmationAllowed: z.literal(true),
-        evidence: z.array(anklangEvidenceProvenanceSchema).max(50)
-      })
-      .strict(),
+    anklang: z.union([
+      authenticatedAnklangProvenanceSchema,
+      historicalCalibrationAnklangProvenanceSchema
+    ]),
     referenceImplementation: z
       .object({
         status: z.literal("not_provided_by_robot_task_contract")
@@ -309,12 +328,22 @@ export type ReviewFlowTaskBinding = z.infer<typeof taskBindingSchema>;
 export type ReviewFlowTaskSourceProvenance = z.infer<typeof taskSourceProvenanceSchema>;
 export type ReviewFlowTaskSourceResult = z.infer<typeof taskSourceResultSchema>;
 const builtTaskSourceResults = new WeakSet<object>();
+const historicalCalibrationTaskSourceResults = new WeakSet<object>();
 
 /** 生产编排只接收由本模块完成所有严格校验并登记的进程内结果。 */
 export function isBuiltReviewFlowTaskSourceResult(
   value: unknown
 ): value is ReviewFlowTaskSourceResult {
   return typeof value === "object" && value !== null && builtTaskSourceResults.has(value);
+}
+
+/** 只用于离线历史结果校准；生产 runner 必须拒绝这一来源。 */
+export function isHistoricalCalibrationReviewFlowTaskSourceResult(
+  value: unknown
+): value is ReviewFlowTaskSourceResult {
+  return typeof value === "object" &&
+    value !== null &&
+    historicalCalibrationTaskSourceResults.has(value);
 }
 
 export interface BuildReviewFlowTaskSourceOptions {
@@ -436,6 +465,84 @@ export function buildReviewFlowTaskSource(
       }
     }));
     builtTaskSourceResults.add(result);
+    return result;
+  } catch {
+    throw new ReviewFlowTaskSourceError("REVIEW_FLOW_TASK_SOURCE_INVALID");
+  }
+}
+
+/**
+ * 为“历史通过/否决”准确性基线构造不含当前语料查重结果的 branded source。
+ * 这不是生产降级路径：任务必须完全没有 reviewItems，且编排器会拒绝把该品牌
+ * 与 production-eligible runner 组合使用。
+ */
+export function buildHistoricalCalibrationReviewFlowTaskSource(
+  taskCandidate: unknown,
+  options: BuildReviewFlowTaskSourceOptions
+): ReviewFlowTaskSourceResult {
+  const task = parseTask(taskCandidate);
+  assertCoreMaterials(task.problem);
+  assertProblemTagsExist(task);
+  if (task.reviewItems.length !== 0) {
+    throw new ReviewFlowTaskSourceError(
+      "REVIEW_FLOW_TASK_ANKLANG_EXCLUSION_INVALID"
+    );
+  }
+
+  let source: ReviewFlowSource;
+  try {
+    source = reviewFlowSourceSchema.parse({
+      schemaVersion: 1,
+      problemContentHash: task.problem.contentHash,
+      problemRevision: task.problem.revision,
+      expectedRound: task.problem.reviewRound,
+      type: task.problem.type,
+      statement: buildCompleteStatement(task.problem),
+      solution: buildCompleteSolution(task.problem),
+      constraints: task.problem.content.constraints,
+      samples: task.problem.samples,
+      limits: task.problem.limits,
+      referenceImplementation: null,
+      tagCatalogVersion: task.tagCatalog.version,
+      tagCatalog: task.tagCatalog.tags,
+      duplicateEvidence: [],
+      duplicateSimilarityRejectThreshold:
+        options.duplicateSimilarityRejectThreshold
+    });
+  } catch {
+    throw new ReviewFlowTaskSourceError("REVIEW_FLOW_TASK_SOURCE_INVALID");
+  }
+
+  try {
+    const result = deepFreeze(taskSourceResultSchema.parse({
+      schemaVersion: 1,
+      taskBinding: {
+        assignmentId: task.assignmentId,
+        leaseExpiresAt: task.leaseExpiresAt,
+        problemId: task.problem.id,
+        problemRevision: task.problem.revision,
+        expectedRound: task.problem.reviewRound,
+        problemContentHash: task.problem.contentHash,
+        tagCatalogVersion: task.tagCatalog.version,
+        currentTagIds: task.problem.tagIds
+      },
+      source,
+      provenance: {
+        anklang: {
+          inputPolicy: "exclude_current_corpus_for_historical_outcome",
+          completionStatus: "excluded",
+          reviewItemInjection: "excluded",
+          reviewItemExpiresAt: null,
+          deterministicConfirmationAllowed: false,
+          evidence: []
+        },
+        referenceImplementation: {
+          status: "not_provided_by_robot_task_contract"
+        }
+      }
+    }));
+    builtTaskSourceResults.add(result);
+    historicalCalibrationTaskSourceResults.add(result);
     return result;
   } catch {
     throw new ReviewFlowTaskSourceError("REVIEW_FLOW_TASK_SOURCE_INVALID");
