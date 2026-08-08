@@ -53,9 +53,6 @@ export const reviewFlowEvaluationProxyEnvironmentKeys = [
   "no_proxy"
 ] as const;
 
-export const reviewFlowEvaluationCodePaths: readonly string[] =
-  Object.freeze([...runtimeManifestDocument.codePaths]);
-
 /**
  * 与正式 11 角色判断、提示词、传输和证据策略直接相关的较窄字节集合，仅用于
  * runner 的 engineBuildFingerprint。development -> holdout 另行绑定完整 codePaths，

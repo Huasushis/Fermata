@@ -57,7 +57,7 @@ import {
   readPrivateArtifactBytes,
   writePrivateArtifactExclusive
 } from "./private-artifact-io";
-import { reviewFlowEvaluationCodePaths } from "./review-flow-evaluation-adapter";
+import { reviewFlowEvaluationCodePaths } from "./review-flow-bridge-repositories";
 import {
   parsePhysicalBlindJson
 } from "./physical-blind-common";
@@ -66,7 +66,11 @@ import {
   type EvaluationCodeIdentity
 } from "./evaluation-code-identity";
 
-const bridgeVersion = "urmotiv-review-flow-bridge-v4" as const;
+const bridgeVersion = "urmotiv-review-flow-bridge-v5" as const;
+export const historicalInputPreparationVersion =
+  "urmotiv-historical-review-input-preparation-v1" as const;
+export const historicalInputPreparationCompletionFileName =
+  "REVIEW_FLOW_HISTORICAL_INPUTS_COMPLETE" as const;
 const manifestFileName = "manifest.private.json" as const;
 const tagCatalogFileName = "tag-catalog.private.json" as const;
 const revealDescriptorFileName = "reveal.private.json" as const;
@@ -75,22 +79,26 @@ const upstreamEvidenceFileName = "review-gold-evidence.private.json" as const;
 const upstreamBindingsFileName = "source-bindings.private.json" as const;
 const upstreamTuningAdditionsFileName =
   "tuning-history-additions.private.json" as const;
-const upstreamVerifierRunnerPath =
-  "scripts/migrate-hist/prepare-review-gold.py" as const;
-const bridgeGeneratorRunnerPath =
-  "experiments/prepare-review-flow-dataset.ts" as const;
-const upstreamVerifierDependencyPaths = [
-  upstreamVerifierRunnerPath,
-  "scripts/migrate-hist/parse-metadata.py"
-] as const;
-const anklangCaptureRunnerPath =
-  "scripts/capture-review-flow-calibration.py" as const;
-const anklangCaptureDependencyPaths = [
+export {
+  anklangCaptureDependencyPaths,
   anklangCaptureRunnerPath,
-  "anklang/__init__.py",
-  "anklang/review_flow_capture.py",
-  "anklang/contracts.py"
-] as const;
+  bridgeGeneratorRunnerPath,
+  historicalInputPreparationCodePaths,
+  historicalRepositoryPreparationSetSchema,
+  repositoryPreparationIdentitySchema,
+  upstreamVerifierDependencyPaths,
+  upstreamVerifierRunnerPath
+} from "./review-flow-bridge-repositories";
+import {
+  anklangCaptureDependencyPaths,
+  anklangCaptureRunnerPath,
+  bridgeGeneratorRunnerPath,
+  historicalInputPreparationCodePaths,
+  historicalRepositoryPreparationSetSchema,
+  repositoryPreparationIdentitySchema,
+  upstreamVerifierDependencyPaths,
+  upstreamVerifierRunnerPath
+} from "./review-flow-bridge-repositories";
 
 const upstreamCaseIdSchema = z
   .string()
@@ -117,12 +125,13 @@ const privateFileNameSchema = z
       !value.includes("\0"),
     "PRIVATE_FILE_NAME_INVALID"
   );
-const fileBindingSchema = z
+export const reviewFlowEvaluationFileBindingSchema = z
   .object({
     fileName: privateFileNameSchema,
     sha256: reviewFlowEvaluationDigestSchema
   })
   .strict();
+const fileBindingSchema = reviewFlowEvaluationFileBindingSchema;
 
 const captureIdSchema = z.string().regex(/^capture-[0-9a-f]{16}$/u);
 const captureTimestampSchema = z
@@ -681,7 +690,7 @@ export const reviewFlowEvaluationUpstreamAttestationSchema =
     })
     .strict();
 
-const tagCatalogSchema = z
+export const reviewFlowEvaluationTagCatalogSchema = z
   .object({
     schemaVersion: z.literal(1),
     version: z.number().int().positive(),
@@ -697,6 +706,7 @@ const tagCatalogSchema = z
       });
     }
   });
+const tagCatalogSchema = reviewFlowEvaluationTagCatalogSchema;
 
 const reviewCommentIndexSchema = z.number().int().nonnegative().max(31);
 const historicalTasteReasonEvidenceSchema = z
@@ -711,6 +721,114 @@ const historicalTechnicalReasonEvidenceSchema = z
     reason: reviewFlowEvaluationTechnicalReasonSchema
   })
   .strict();
+
+const historicalPreparationCaseSchema = z
+  .object({
+    caseId: upstreamCaseIdSchema,
+    safeId: reviewFlowEvaluationSafeIdSchema,
+    subjectId: reviewFlowEvaluationSubjectIdSchema,
+    purpose: z.literal("development"),
+    sourceId: upstreamSourceIdSchema,
+    sourceSha256: reviewFlowEvaluationDigestSchema,
+    rowEvidenceSha256: reviewFlowEvaluationDigestSchema,
+    taskDraft: fileBindingSchema,
+    problemHashInput: fileBindingSchema,
+    originalAnklangRequest: fileBindingSchema,
+    sourceMapping: fileBindingSchema
+  })
+  .strict();
+
+const historicalPreparationExcludedCaseSchema = z
+  .object({
+    caseId: upstreamCaseIdSchema,
+    subjectId: upstreamSubjectIdSchema,
+    sourceId: upstreamSourceIdSchema,
+    sourceSha256: reviewFlowEvaluationDigestSchema,
+    exclusion: z.enum(["originality_only", "solution_missing"])
+  })
+  .strict();
+
+export const reviewFlowHistoricalInputPreparationCompletionSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    artifactKind: z.literal(
+      "review_flow_historical_input_preparation_completion"
+    ),
+    preparationVersion: z.literal(historicalInputPreparationVersion),
+    complete: z.literal(true),
+    preparationId: z
+      .string()
+      .regex(/^preparation-[0-9a-f]{16}$/u),
+    upstreamDatasetId: upstreamEvidenceSchema.shape.datasetId,
+    datasetId: reviewFlowEvaluationDatasetIdSchema,
+    operatorConfirmationSha256: reviewFlowEvaluationDigestSchema,
+    upstreamVerificationAttestation: fileBindingSchema,
+    tagCatalog: fileBindingSchema,
+    placeholderTagIds: reviewFlowEvaluationPlaceholderTagIdsSchema,
+    anklangCaptureManifest: fileBindingSchema,
+    bridgePlanDraft: fileBindingSchema,
+    repositories: historicalRepositoryPreparationSetSchema,
+    counts: z
+      .object({
+        upstreamCaseCount: z.literal(36),
+        upstreamDevelopmentCount: z.literal(36),
+        upstreamHoldoutCount: z.literal(0),
+        upstreamVerdictAndTasteCount: z.literal(33),
+        upstreamOriginalityOnlyCount: z.literal(3),
+        excludedOriginalityOnlyCount: z.literal(3),
+        excludedMissingSolutionCount: z.literal(1),
+        includedCaseCount: z.literal(32),
+        acceptedCount: z.literal(20),
+        rejectedCount: z.literal(12),
+        holdoutCount: z.literal(0)
+      })
+      .strict(),
+    cases: z.array(historicalPreparationCaseSchema).length(32),
+    excludedCases: z
+      .array(historicalPreparationExcludedCaseSchema)
+      .length(4),
+    preparationFingerprint: reviewFlowEvaluationDigestSchema
+  })
+  .strict()
+  .superRefine((completion, context) => {
+    const included = completion.cases;
+    const excluded = completion.excludedCases;
+    const allCaseIds = [
+      ...included.map((entry) => entry.caseId),
+      ...excluded.map((entry) => entry.caseId)
+    ];
+    const selectors = [
+      included.map((entry) => entry.safeId),
+      included.map((entry) => entry.subjectId),
+      included.map((entry) => entry.sourceId),
+      included.map((entry) => entry.sourceSha256),
+      included.map((entry) => entry.rowEvidenceSha256),
+      included.map((entry) => entry.taskDraft.sha256),
+      included.map((entry) => entry.problemHashInput.sha256),
+      included.map((entry) => entry.originalAnklangRequest.sha256),
+      included.map((entry) => entry.sourceMapping.sha256),
+      allCaseIds
+    ];
+    if (selectors.some((values) => new Set(values).size !== values.length)) {
+      context.addIssue({
+        code: "custom",
+        path: ["cases"],
+        message: "HISTORICAL_PREPARATION_IDENTITY_DUPLICATE"
+      });
+    }
+    if (
+      excluded.filter((entry) => entry.exclusion === "originality_only")
+        .length !== 3 ||
+      excluded.filter((entry) => entry.exclusion === "solution_missing")
+        .length !== 1
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["excludedCases"],
+        message: "HISTORICAL_PREPARATION_EXCLUSION_COUNT_INVALID"
+      });
+    }
+  });
 
 const sourceByteRangeSchema = z
   .object({
@@ -727,7 +845,7 @@ const sourceByteRangeSchema = z
       });
     }
   });
-const sourceProjectionSchema = z
+export const reviewFlowEvaluationSourceProjectionSchema = z
   .object({
     method: z.enum([
       "markdown_solution_heading_v1",
@@ -748,6 +866,7 @@ const sourceProjectionSchema = z
       });
     }
   });
+const sourceProjectionSchema = reviewFlowEvaluationSourceProjectionSchema;
 
 const mappingCommon = {
   schemaVersion: z.literal(2),
@@ -819,10 +938,11 @@ const bridgePlanCaseSchema = z
   .strict();
 export const reviewFlowEvaluationBridgePlanSchema = z
   .object({
-    schemaVersion: z.literal(4),
+    schemaVersion: z.literal(5),
     artifactKind: z.literal("review_flow_evaluation_bridge_plan"),
     bridgeVersion: z.literal(bridgeVersion),
     confirmed: z.literal(true),
+    historicalInputPreparationCompletion: fileBindingSchema,
     anklangInputPolicy: reviewFlowEvaluationAnklangInputPolicySchema,
     placeholderTagIds: reviewFlowEvaluationPlaceholderTagIdsSchema,
     upstreamDatasetId: upstreamEvidenceSchema.shape.datasetId,
@@ -854,7 +974,21 @@ export const reviewFlowEvaluationBridgePlanSchema = z
         message: "BRIDGE_HOLDOUT_REGISTRATION_MISMATCH"
       });
     }
-    for (const selector of [
+    if (
+      plan.cases.length !== 32 ||
+      developmentCount !== 32 ||
+      holdoutCount !== 0 ||
+      plan.holdoutRegistration !== null ||
+      plan.anklangInputPolicy !==
+        "exclude_current_corpus_for_historical_outcome"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["cases"],
+        message: "BRIDGE_HISTORICAL_SELECTION_INVALID"
+      });
+    }
+    for (const [selectorIndex, selector] of [
       (entry: z.infer<typeof bridgePlanCaseSchema>) => entry.caseId,
       (entry: z.infer<typeof bridgePlanCaseSchema>) => entry.safeId,
       (entry: z.infer<typeof bridgePlanCaseSchema>) => entry.subjectId,
@@ -869,7 +1003,7 @@ export const reviewFlowEvaluationBridgePlanSchema = z
       (entry: z.infer<typeof bridgePlanCaseSchema>) =>
         entry.originalAnklangResponse.sha256,
       (entry: z.infer<typeof bridgePlanCaseSchema>) => entry.sourceMapping.sha256
-    ]) {
+    ].entries()) {
       if (new Set(plan.cases.map(selector)).size !== plan.cases.length) {
         context.addIssue({
           code: "custom",
@@ -925,6 +1059,20 @@ export interface PrepareReviewFlowEvaluationBridgeInput {
   readonly hooks?: ReviewFlowEvaluationBridgeHooks;
 }
 
+export interface ReviewFlowEvaluationUpstreamSourceInput {
+  readonly privateRoot: string;
+  readonly containingWorkspace: string;
+  readonly upstreamGoldDirectory: string;
+  readonly materializedDirectory: string;
+  readonly worksheetPath: string;
+  readonly worksheetCompletionPath: string;
+  readonly inspectionPath: string;
+  readonly layoutPath: string;
+  readonly upstreamPlanPath: string;
+  readonly tuningHistoryPath: string;
+  readonly reviewInputPaths: readonly string[];
+}
+
 export interface PreparedReviewFlowEvaluationBridge {
   readonly datasetId: string;
   readonly manifestPath: string;
@@ -959,7 +1107,7 @@ type BridgeGeneratorIdentity = Readonly<Pick<
   | "dependencyFileCount"
 >>;
 
-interface ValidatedUpstreamCase {
+export interface ValidatedReviewFlowEvaluationUpstreamCase {
   readonly plan: z.infer<typeof upstreamPlanCaseSchema>;
   readonly evidence: z.infer<typeof upstreamEvidenceEntrySchema>;
   readonly binding: z.infer<typeof upstreamBindingCaseSchema>;
@@ -970,7 +1118,7 @@ interface ValidatedUpstreamCase {
   readonly sourceBytes: Buffer;
 }
 
-interface ValidatedUpstream {
+export interface ValidatedReviewFlowEvaluationUpstream {
   readonly markerSha256: string;
   readonly evidenceSha256: string;
   readonly bindingsSha256: string;
@@ -994,8 +1142,11 @@ interface ValidatedUpstream {
   readonly materializedSourceCount: number;
   readonly counts: z.infer<typeof attestationCountsSchema>;
   readonly datasetId: string;
-  readonly cases: readonly ValidatedUpstreamCase[];
+  readonly cases: readonly ValidatedReviewFlowEvaluationUpstreamCase[];
 }
+
+type ValidatedUpstreamCase = ValidatedReviewFlowEvaluationUpstreamCase;
+type ValidatedUpstream = ValidatedReviewFlowEvaluationUpstream;
 
 interface PreparedCase {
   readonly purpose: ReviewFlowEvaluationPurpose;
@@ -1022,6 +1173,13 @@ interface ValidatedAnklangCapture {
   readonly cases: ReadonlyMap<
     string,
     z.infer<typeof anklangCaptureCaseSchema>
+  >;
+}
+
+interface ValidatedHistoricalInputPreparation {
+  readonly completionSha256: string;
+  readonly completion: z.infer<
+    typeof reviewFlowHistoricalInputPreparationCompletionSchema
   >;
 }
 
@@ -1059,16 +1217,10 @@ function prepareBridge(
   if (bridgePlan.upstreamDatasetId !== upstream.datasetId) {
     fail("REVIEW_FLOW_EVALUATION_BRIDGE_UPSTREAM_MISMATCH");
   }
-  if (
-    bridgePlan.anklangInputPolicy ===
-      "exclude_current_corpus_for_historical_outcome" &&
-    upstream.cases.some(
-      (entry) => entry.plan.evaluationScope !== "verdict_and_taste"
-    )
-  ) {
-    fail("REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_INPUT_POLICY_SCOPE_INVALID");
-  }
-
+  // v5：上游合法地携带 3 个 originality_only 与 1 个 solution_missing 案例，
+  // 全部由历史输入准备阶段排除；set 范围纪律由
+  // loadHistoricalInputPreparation（prepared 必须为 verdict_and_taste）把关，
+  // 因此这里不再按整批 scope 拒绝。
   const bridgeInputDirectory = openExistingPrivateDirectory(
     dirname(input.bridgePlanPath),
     runtimeOptions(input)
@@ -1115,6 +1267,14 @@ function prepareBridge(
     ) {
       fail("REVIEW_FLOW_EVALUATION_BRIDGE_PLACEHOLDER_TAGS_INVALID");
     }
+    const historicalPreparation = loadHistoricalInputPreparation({
+      plan: bridgePlan,
+      inputDirectory: bridgeInputDirectory,
+      input,
+      upstream,
+      upstreamAttestationBytes: attestationBytes,
+      tagCatalogBytes
+    });
     const anklangCapture = loadAnklangCapture({
       plan: bridgePlan,
       inputDirectory: bridgeInputDirectory,
@@ -1126,7 +1286,8 @@ function prepareBridge(
       "REVIEW_FLOW_EVALUATION_BRIDGE_UPSTREAM_MISMATCH"
     );
     if (
-      upstreamByCase.size !== bridgePlan.cases.length ||
+      upstreamByCase.size !== upstream.counts.caseCount ||
+      upstream.counts.caseCount !== 36 ||
       bridgePlan.cases.some((entry) => !upstreamByCase.has(entry.caseId))
     ) {
       fail("REVIEW_FLOW_EVALUATION_BRIDGE_UPSTREAM_MISMATCH");
@@ -1143,6 +1304,10 @@ function prepareBridge(
         anklangCapture,
         anklangInputPolicy: bridgePlan.anklangInputPolicy,
         placeholderTagIds: bridgePlan.placeholderTagIds,
+        historicalPreparationCompletionSha256:
+          historicalPreparation.completionSha256,
+        historicalPreparationRepositories:
+          historicalPreparation.completion.repositories,
         generator,
         inputDirectory: bridgeInputDirectory,
         tagCatalog
@@ -1228,13 +1393,16 @@ function prepareBridge(
     });
     const manifestBytes = prettyJsonBytes(manifest);
     const completion = reviewFlowEvaluationBridgeCompletionSchema.parse({
-      schemaVersion: 4,
+      schemaVersion: 5,
       artifactKind: "review_flow_evaluation_dataset_bridge_completion",
       bridgeVersion,
       datasetId: manifest.datasetId,
       manifestFileName,
       manifestSha256: sha256(manifestBytes),
       generator,
+      historicalInputPreparationCompletionSha256:
+        historicalPreparation.completionSha256,
+      repositories: historicalPreparation.completion.repositories,
       tagCatalogSha256: manifest.tagCatalog.sha256,
       placeholderTagIds: manifest.placeholderTagIds,
       sourceLineageSetSha256:
@@ -1413,7 +1581,7 @@ function validateUpstreamAttestation(input: {
   >;
   readonly attestationBytes: Buffer;
   readonly upstream: ValidatedUpstream;
-  readonly input: PrepareReviewFlowEvaluationBridgeInput;
+  readonly input: ReviewFlowEvaluationUpstreamSourceInput;
   readonly verifierRepositoryDirectory: string;
 }): void {
   const { verificationFingerprint: _fingerprint, ...withoutFingerprint } =
@@ -1557,6 +1725,55 @@ function validateUpstreamAttestation(input: {
   }
 }
 
+export interface VerifiedReviewFlowEvaluationUpstreamSource {
+  readonly upstream: ValidatedReviewFlowEvaluationUpstream;
+  readonly attestation: z.infer<
+    typeof reviewFlowEvaluationUpstreamAttestationSchema
+  >;
+  readonly attestationBytes: Buffer;
+  readonly attestationSha256: string;
+}
+
+/**
+ * 供历史输入准备器复用的完整上游验证入口。它会重放 Urmotiv sealed verifier；
+ * 返回的题面、题解和评论仅可在私有准备流程内使用，不得写入终端或日志。
+ */
+export function loadVerifiedReviewFlowEvaluationUpstreamSource(
+  input: ReviewFlowEvaluationUpstreamSourceInput & {
+    readonly upstreamVerificationAttestationPath: string;
+  }
+): VerifiedReviewFlowEvaluationUpstreamSource {
+  try {
+    const upstream = validateUpstream(input);
+    const attestationFile = readAbsoluteJson(
+      input.upstreamVerificationAttestationPath,
+      reviewFlowEvaluationUpstreamAttestationSchema,
+      input,
+      10 * 1024 * 1024,
+      "REVIEW_FLOW_EVALUATION_BRIDGE_ATTESTATION_INVALID"
+    );
+    validateUpstreamAttestation({
+      attestation: attestationFile.value,
+      attestationBytes: attestationFile.bytes,
+      upstream,
+      input,
+      verifierRepositoryDirectory: resolve(
+        input.containingWorkspace,
+        "Urmotiv"
+      )
+    });
+    return {
+      upstream,
+      attestation: attestationFile.value,
+      attestationBytes: attestationFile.bytes,
+      attestationSha256: attestationFile.sha256
+    };
+  } catch (error) {
+    if (error instanceof ReviewFlowEvaluationBridgeError) throw error;
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_UPSTREAM_INVALID");
+  }
+}
+
 export function reviewFlowEvaluationAnklangCaptureSetSha256(
   cases: readonly z.infer<typeof anklangCaptureCaseSchema>[]
 ): string {
@@ -1564,6 +1781,214 @@ export function reviewFlowEvaluationAnklangCaptureSetSha256(
     protocol: "anklang-review-flow-capture-set-v1",
     cases
   });
+}
+
+function loadHistoricalInputPreparation(input: {
+  readonly plan: ReviewFlowEvaluationBridgePlan;
+  readonly inputDirectory: PrivateDirectoryHandle;
+  readonly input: PrepareReviewFlowEvaluationBridgeInput;
+  readonly upstream: ValidatedUpstream;
+  readonly upstreamAttestationBytes: Buffer;
+  readonly tagCatalogBytes: Buffer;
+}): ValidatedHistoricalInputPreparation {
+  const completionBytes = readBoundInput(
+    input.inputDirectory,
+    input.plan.historicalInputPreparationCompletion,
+    16 * 1024 * 1024,
+    "REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_INVALID"
+  );
+  const completion = parseStrict(
+    completionBytes,
+    reviewFlowHistoricalInputPreparationCompletionSchema,
+    "REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_INVALID"
+  );
+  const {
+    preparationFingerprint: _preparationFingerprint,
+    ...withoutFingerprint
+  } = completion;
+  if (
+    !completionBytes.equals(prettyJsonBytes(completion)) ||
+    completion.preparationFingerprint !==
+      hashCanonicalValue(withoutFingerprint) ||
+    completion.upstreamDatasetId !== input.upstream.datasetId ||
+    completion.datasetId !== input.plan.datasetId ||
+    completion.upstreamVerificationAttestation.sha256 !==
+      input.plan.upstreamVerificationAttestation.sha256 ||
+    completion.upstreamVerificationAttestation.sha256 !==
+      sha256(input.upstreamAttestationBytes) ||
+    completion.tagCatalog.sha256 !== input.plan.tagCatalog.sha256 ||
+    completion.tagCatalog.sha256 !== sha256(input.tagCatalogBytes) ||
+    !sameOrderedStrings(
+      completion.placeholderTagIds,
+      input.plan.placeholderTagIds
+    )
+  ) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_MISMATCH");
+  }
+
+  // draft 不是正式 plan，但其原始字节必须仍存在并保持准备时的绑定。
+  readBoundInput(
+    input.inputDirectory,
+    completion.bridgePlanDraft,
+    16 * 1024 * 1024,
+    "REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_INVALID"
+  );
+  const captureManifestBytes = readAbsoluteBytes(
+    input.input.anklangCaptureManifestPath,
+    input.input,
+    8 * 1024 * 1024
+  );
+  if (
+    basename(input.input.anklangCaptureManifestPath) !==
+      completion.anklangCaptureManifest.fileName ||
+    sha256(captureManifestBytes) !==
+      completion.anklangCaptureManifest.sha256
+  ) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_MISMATCH");
+  }
+
+  const expectedRepositories = completion.repositories;
+  const actualFermata = loadBoundPreparationIdentity({
+    repositoryDirectory: resolve(input.input.containingWorkspace, "Fermata"),
+    expectedCodeVersion: expectedRepositories.fermata.codeVersion,
+    runnerPath: "experiments/prepare-review-flow-historical-inputs.ts",
+    dependencyPaths: historicalInputPreparationCodePaths
+  });
+  const actualUrmotiv = loadBoundPreparationIdentity({
+    repositoryDirectory: resolve(input.input.containingWorkspace, "Urmotiv"),
+    expectedCodeVersion: expectedRepositories.urmotiv.codeVersion,
+    runnerPath: upstreamVerifierRunnerPath,
+    dependencyPaths: upstreamVerifierDependencyPaths
+  });
+  const actualAnklang = loadBoundPreparationIdentity({
+    repositoryDirectory: resolve(input.input.containingWorkspace, "Anklang"),
+    expectedCodeVersion: expectedRepositories.anklang.codeVersion,
+    runnerPath: anklangCaptureRunnerPath,
+    dependencyPaths: anklangCaptureDependencyPaths
+  });
+  if (
+    !preparationIdentityMatches(expectedRepositories.fermata, actualFermata) ||
+    !preparationIdentityMatches(expectedRepositories.urmotiv, actualUrmotiv) ||
+    !preparationIdentityMatches(expectedRepositories.anklang, actualAnklang)
+  ) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_IDENTITY_INVALID");
+  }
+
+  const upstreamByCase = uniqueMap(
+    input.upstream.cases,
+    (entry) => entry.plan.caseId,
+    "REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_MISMATCH"
+  );
+  const includedIds = new Set(completion.cases.map((entry) => entry.caseId));
+  const excludedByCase = uniqueMap(
+    completion.excludedCases,
+    (entry) => entry.caseId,
+    "REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_MISMATCH"
+  );
+  const preparedByCase = uniqueMap(
+    completion.cases,
+    (entry) => entry.caseId,
+    "REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_MISMATCH"
+  );
+  if (
+    input.upstream.counts.caseCount !== 36 ||
+    input.upstream.counts.developmentCount !== 36 ||
+    input.upstream.counts.holdoutCount !== 0 ||
+    input.upstream.counts.verdictAndTasteCount !== 33 ||
+    input.upstream.counts.originalityOnlyCount !== 3 ||
+    upstreamByCase.size !== 36 ||
+    preparedByCase.size !== 32 ||
+    excludedByCase.size !== 4 ||
+    input.plan.cases.length !== 32
+  ) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_COUNT_INVALID");
+  }
+
+  let acceptedCount = 0;
+  let rejectedCount = 0;
+  for (const upstream of input.upstream.cases) {
+    const prepared = preparedByCase.get(upstream.plan.caseId);
+    const excluded = excludedByCase.get(upstream.plan.caseId);
+    if ((prepared === undefined) === (excluded === undefined)) {
+      fail("REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_MISMATCH");
+    }
+    if (prepared !== undefined) {
+      if (
+        upstream.plan.purpose !== "development" ||
+        upstream.plan.evaluationScope !== "verdict_and_taste" ||
+        prepared.subjectId !== upstream.plan.subjectId ||
+        prepared.sourceId !== upstream.plan.sourceId ||
+        prepared.sourceSha256 !== upstream.plan.sourceSha256 ||
+        prepared.rowEvidenceSha256 !== upstream.binding.rowEvidenceSha256
+      ) {
+        fail("REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_MISMATCH");
+      }
+      if (upstream.plan.verdict === "accepted") acceptedCount += 1;
+      else rejectedCount += 1;
+      continue;
+    }
+    if (
+      excluded === undefined ||
+      excluded.subjectId !== upstream.plan.subjectId ||
+      excluded.sourceId !== upstream.plan.sourceId ||
+      excluded.sourceSha256 !== upstream.plan.sourceSha256 ||
+      (excluded.exclusion === "originality_only") !==
+        (upstream.plan.evaluationScope === "originality_only") ||
+      (excluded.exclusion === "solution_missing" &&
+        upstream.plan.evaluationScope !== "verdict_and_taste")
+    ) {
+      fail("REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_MISMATCH");
+    }
+  }
+  if (acceptedCount !== 20 || rejectedCount !== 12) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_COUNT_INVALID");
+  }
+  for (const planCase of input.plan.cases) {
+    const prepared = preparedByCase.get(planCase.caseId);
+    if (
+      prepared === undefined ||
+      !includedIds.has(planCase.caseId) ||
+      JSON.stringify({
+        caseId: planCase.caseId,
+        safeId: planCase.safeId,
+        subjectId: planCase.subjectId,
+        purpose: planCase.purpose,
+        sourceId: planCase.sourceId,
+        sourceSha256: planCase.sourceSha256,
+        rowEvidenceSha256: planCase.rowEvidenceSha256,
+        taskDraft: planCase.taskDraft,
+        problemHashInput: planCase.problemHashInput,
+        originalAnklangRequest: planCase.originalAnklangRequest,
+        sourceMapping: planCase.sourceMapping
+      }) !== JSON.stringify(prepared)
+    ) {
+      fail("REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_MISMATCH");
+    }
+  }
+  return { completionSha256: sha256(completionBytes), completion };
+}
+
+function loadBoundPreparationIdentity(input: {
+  readonly repositoryDirectory: string;
+  readonly expectedCodeVersion: string;
+  readonly runnerPath: string;
+  readonly dependencyPaths: readonly string[];
+}): EvaluationCodeIdentity {
+  try {
+    return loadEvaluationCodeIdentity(input);
+  } catch {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_IDENTITY_INVALID");
+  }
+}
+
+function preparationIdentityMatches(
+  expected: z.infer<typeof repositoryPreparationIdentitySchema>,
+  actual: EvaluationCodeIdentity
+): boolean {
+  return expected.codeVersion === actual.codeVersion &&
+    expected.runnerSha256 === actual.runnerSha256 &&
+    expected.dependencyCodeSha256 === actual.dependencyCodeSha256 &&
+    expected.dependencyFileCount === actual.dependencyFileCount;
 }
 
 function loadAnklangCapture(input: {
@@ -1782,7 +2207,7 @@ function assertTrustedPythonExecutable(): void {
 }
 
 function validateUpstream(
-  input: PrepareReviewFlowEvaluationBridgeInput
+  input: ReviewFlowEvaluationUpstreamSourceInput
 ): ValidatedUpstream {
   const upstreamDirectory = openExistingPrivateDirectory(
     input.upstreamGoldDirectory,
@@ -2208,6 +2633,10 @@ function prepareCase(input: {
   readonly placeholderTagIds: z.infer<
     typeof reviewFlowEvaluationPlaceholderTagIdsSchema
   >;
+  readonly historicalPreparationCompletionSha256: string;
+  readonly historicalPreparationRepositories: z.infer<
+    typeof reviewFlowHistoricalInputPreparationCompletionSchema
+  >["repositories"];
   readonly generator: BridgeGeneratorIdentity;
   readonly inputDirectory: PrivateDirectoryHandle;
   readonly tagCatalog: z.infer<typeof tagCatalogSchema>;
@@ -2294,7 +2723,7 @@ function prepareCase(input: {
     "REVIEW_FLOW_EVALUATION_BRIDGE_MAPPING_INVALID"
   );
   const historicalReasons = deriveHistoricalReasons(mapping, upstream.row);
-  const sourceProjection = projectBoundSource(
+  const sourceProjection = projectReviewFlowEvaluationBoundSource(
     upstream.sourceBytes,
     mapping.sourceProjection
   );
@@ -2370,9 +2799,13 @@ function prepareCase(input: {
   const contentBytes = prettyJsonBytes(task);
   const contentSha256 = sha256(contentBytes);
   const sourceLineageSha256 = hashCanonicalValue({
-    protocol: "review-flow-evaluation-source-lineage-v6",
+    protocol: "review-flow-evaluation-source-lineage-v7",
     bridgeVersion,
     generator: input.generator,
+    preparation: {
+      preparationVersion: historicalInputPreparationVersion,
+      repositories: input.historicalPreparationRepositories
+    },
     identity: {
       upstreamCaseId: planCase.caseId,
       subjectId: planCase.subjectId
@@ -2414,6 +2847,8 @@ function prepareCase(input: {
   });
   const bridgeEvidence = {
     bridgeVersion,
+    historicalInputPreparationCompletionSha256:
+      input.historicalPreparationCompletionSha256,
     verificationAttestationSha256: input.attestationSha256,
     bridgePlanSha256: input.bridgePlanSha256,
     reviewGoldEvidenceSha256: input.upstreamSet.evidenceSha256,
@@ -2609,7 +3044,7 @@ function deriveHistoricalReasons(
   return { taste: [...taste.values()], technical: [...technical.values()] };
 }
 
-function projectBoundSource(
+export function projectReviewFlowEvaluationBoundSource(
   sourceBytes: Buffer,
   projection: z.infer<typeof sourceProjectionSchema>
 ): { readonly statement: string; readonly solution: string } {
@@ -2866,7 +3301,9 @@ function parseStrict<T>(
         new TextDecoder("utf-8", { fatal: true }).decode(bytes)
       )
     );
-    if (!parsed.success) fail(errorCode);
+    if (!parsed.success) {
+      fail(errorCode);
+    }
     return parsed.data;
   } catch {
     fail(errorCode);

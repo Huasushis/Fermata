@@ -26,7 +26,9 @@
     "experiment:verify-legacy-reports": "node scripts/verify-legacy-report-registry.mjs",
     "experiment:eval-verdict": "tsx experiments/eval-verdict.ts",
     "experiment:eval-review-flow": "node scripts/review-flow-evaluation-bootstrap.mjs",
-    "experiment:prepare-review-flow-dataset": "tsx experiments/prepare-review-flow-dataset.ts"
+    "experiment:prepare-review-flow-dataset": "tsx experiments/prepare-review-flow-dataset.ts",
+    "experiment:prepare-review-flow-historical-inputs": "tsx experiments/prepare-review-flow-historical-inputs.ts",
+    "experiment:finalise-review-flow-bridge-plan": "tsx experiments/finalise-review-flow-bridge-plan.ts"
   },
   "dependencies": {
     "undici": "8.9.0",

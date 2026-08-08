@@ -26,6 +26,7 @@ import {
   type RobotReviewTask
 } from "../../src/urmotiv-schemas";
 import { readPrivateArtifactBytes } from "./private-artifact-io";
+import { historicalRepositoryPreparationSetSchema } from "./review-flow-bridge-repositories";
 import {
   deepFreezePhysicalBlind,
   parsePhysicalBlindJson,
@@ -139,7 +140,9 @@ const upstreamEvidenceSchema = z
     originalAnklangResponseSha256: reviewFlowEvaluationDigestSchema,
     bridgeEvidence: z
       .object({
-        bridgeVersion: z.literal("urmotiv-review-flow-bridge-v4"),
+        bridgeVersion: z.literal("urmotiv-review-flow-bridge-v5"),
+        historicalInputPreparationCompletionSha256:
+          reviewFlowEvaluationDigestSchema,
         verificationAttestationSha256: reviewFlowEvaluationDigestSchema,
         bridgePlanSha256: reviewFlowEvaluationDigestSchema,
         reviewGoldEvidenceSha256: reviewFlowEvaluationDigestSchema,
@@ -484,9 +487,9 @@ export type ReviewFlowEvaluationRevealDescriptor = z.infer<
 
 export const reviewFlowEvaluationBridgeCompletionSchema = z
   .object({
-    schemaVersion: z.literal(4),
+    schemaVersion: z.literal(5),
     artifactKind: z.literal("review_flow_evaluation_dataset_bridge_completion"),
-    bridgeVersion: z.literal("urmotiv-review-flow-bridge-v4"),
+    bridgeVersion: z.literal("urmotiv-review-flow-bridge-v5"),
     datasetId: reviewFlowEvaluationDatasetIdSchema,
     manifestFileName: privateFileNameSchema,
     manifestSha256: reviewFlowEvaluationDigestSchema,
@@ -500,6 +503,9 @@ export const reviewFlowEvaluationBridgeCompletionSchema = z
         )
       })
       .strict(),
+    historicalInputPreparationCompletionSha256:
+      reviewFlowEvaluationDigestSchema,
+    repositories: historicalRepositoryPreparationSetSchema,
     tagCatalogSha256: reviewFlowEvaluationDigestSchema,
     placeholderTagIds: reviewFlowEvaluationPlaceholderTagIdsSchema,
     sourceLineageSetSha256: reviewFlowEvaluationDigestSchema,
@@ -1299,7 +1305,7 @@ function parseStrictDocument<T>(
       value: parsePhysicalBlindJson(decodeUtf8(bytes)),
       schema,
       // 具体 schema 仍精确限定各自版本；这里只允许当前材料使用的版本集合。
-      supportedVersions: [1, 2, 3, 4]
+      supportedVersions: [1, 2, 3, 4, 5]
     });
   } catch {
     throw new ReviewFlowEvaluationDatasetError(code);

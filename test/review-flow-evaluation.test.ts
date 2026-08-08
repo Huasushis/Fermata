@@ -31,9 +31,16 @@ import {
   runReviewFlowEvaluationCli
 } from "../experiments/eval-review-flow";
 import {
-  createReviewFlowEvaluationAdapter,
-  reviewFlowEvaluationCodePaths
+  createReviewFlowEvaluationAdapter
 } from "../experiments/lib/review-flow-evaluation-adapter";
+import {
+  anklangCaptureDependencyPaths,
+  anklangCaptureRunnerPath,
+  historicalInputPreparationCodePaths,
+  upstreamVerifierDependencyPaths,
+  upstreamVerifierRunnerPath
+} from "../experiments/lib/review-flow-bridge-repositories";
+import { reviewFlowEvaluationCodePaths } from "../experiments/lib/review-flow-bridge-repositories";
 import { loadReviewFlowEvaluationConfig } from "../experiments/lib/review-flow-evaluation-config";
 import {
   loadReviewFlowEvaluationDataset,
@@ -1879,7 +1886,9 @@ function writeDatasetCase(input: {
   const rowEvidenceSha256 = sha256(`row-${input.subjectId}`);
   const originalAnklangResponseSha256 = sha256(`anklang-${input.subjectId}`);
   const bridgeEvidence = {
-    bridgeVersion: "urmotiv-review-flow-bridge-v4" as const,
+    bridgeVersion: "urmotiv-review-flow-bridge-v5" as const,
+    historicalInputPreparationCompletionSha256:
+      sha256(`preparation-completion-${input.subjectId}`),
     verificationAttestationSha256: sha256(`attestation-${input.subjectId}`),
     bridgePlanSha256: sha256(`bridge-plan-${input.subjectId}`),
     reviewGoldEvidenceSha256: sha256(`review-gold-evidence-${input.subjectId}`),
@@ -2802,17 +2811,45 @@ function writeDatasetManifestAndBridge(
   writePrivateJson(
     join(fixture.suiteDirectory, reviewFlowEvaluationBridgeCompletionFileName),
     {
-      schemaVersion: 4,
+      schemaVersion: 5,
       artifactKind: "review_flow_evaluation_dataset_bridge_completion",
-      bridgeVersion: "urmotiv-review-flow-bridge-v4",
+      bridgeVersion: "urmotiv-review-flow-bridge-v5",
       datasetId: manifest.datasetId,
       manifestFileName: basename(fixture.manifestPath),
       manifestSha256: sha256(manifestBytes),
+      historicalInputPreparationCompletionSha256:
+        sha256(`preparation-completion-${manifest.datasetId}`),
       generator: {
         codeVersion: "1".repeat(40),
         runnerSha256: sha256("synthetic-bridge-runner"),
         dependencyCodeSha256: sha256("synthetic-bridge-dependencies"),
         dependencyFileCount: 46
+      },
+      repositories: {
+        fermata: {
+          repository: "Fermata",
+          codeVersion: "2".repeat(40),
+          runnerPath: "experiments/prepare-review-flow-historical-inputs.ts",
+          runnerSha256: sha256("synthetic-fermata-runner"),
+          dependencyCodeSha256: sha256("synthetic-fermata-dependencies"),
+          dependencyFileCount: historicalInputPreparationCodePaths.length
+        },
+        urmotiv: {
+          repository: "Urmotiv",
+          codeVersion: "2".repeat(40),
+          runnerPath: upstreamVerifierRunnerPath,
+          runnerSha256: sha256("synthetic-urmotiv-runner"),
+          dependencyCodeSha256: sha256("synthetic-urmotiv-dependencies"),
+          dependencyFileCount: upstreamVerifierDependencyPaths.length
+        },
+        anklang: {
+          repository: "Anklang",
+          codeVersion: "2".repeat(40),
+          runnerPath: anklangCaptureRunnerPath,
+          runnerSha256: sha256("synthetic-anklang-runner"),
+          dependencyCodeSha256: sha256("synthetic-anklang-dependencies"),
+          dependencyFileCount: anklangCaptureDependencyPaths.length
+        }
       },
       tagCatalogSha256: manifest.tagCatalog.sha256,
       placeholderTagIds: manifest.placeholderTagIds,
