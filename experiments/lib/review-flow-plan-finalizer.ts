@@ -66,7 +66,11 @@ const anklangResponseMetadataSchema = z
     caseId: z
       .string()
       .regex(/^case-[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/u),
-    caseIndex: z.number().int().positive().max(2_000),
+    // Anklang capture-review-flow-calibration.py 写入的 caseIndex 是
+    // enumerate(manifest.cases) 的 0 起始序号（checkpoint/审计均按同一语义），
+    // 运行目录文件名则是 1 起始的 case-{index+1:04d} 标签；本 schema 与绑定
+    // 采用 0 起始的 caseIndex，与文件名的 1 起始 position 区分开。
+    caseIndex: z.number().int().min(0).max(2_000),
     attempt: z.literal(1),
     httpStatus: z.literal(200),
     contentType: z.string().nullable(),
@@ -523,7 +527,7 @@ function collectRunResponses(
     const requestSha256 = sha256(requestBytes);
     if (
       metadata.caseId !== attestationCase.caseId ||
-      metadata.caseIndex !== position ||
+      metadata.caseIndex !== index ||
       metadata.bodySha256 !== responseSha256 ||
       responseSha256 !== attestationCase.responseSha256 ||
       requestSha256 !== attestationCase.requestSha256 ||
