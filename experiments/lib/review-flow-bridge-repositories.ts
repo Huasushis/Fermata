@@ -11,6 +11,67 @@ import runtimeManifestDocument from "../../config/review-flow-runtime.json" with
 export const reviewFlowEvaluationCodePaths: readonly string[] =
   Object.freeze([...runtimeManifestDocument.codePaths]);
 
+/**
+ * v1 历史输入准备所绑定的 sealed Fermata 代码路径清单（显式不可变清单）。
+ *
+ * 该清单在 b4b594a 完成标记中被密封，dependencyFileCount=48、
+ * dependencyCodeSha256 已固定。即使后续 runtime codePaths 增长
+ * （例如新增 review-flow-bridge-repositories.ts），v1 provenance 仍须
+ * 保持冻结——不得重新密封或更改已签发的操作者制品。
+ *
+ * 此处使用显式冻结的 46 条路径元组，完全独立于当前 runtime manifest，
+ * 不做任何 spread/filter/引用——确保未来对 runtime codePaths 的
+ * 新增/删除/重命名都不会静默改变 supposedly frozen v1 provenance。
+ */
+const sealedHistoricalInputPreparationBaseCodePaths = [
+  "config/anchors/difficulty.json",
+  "config/models.yaml",
+  "config/review-flow-runtime.json",
+  "experiments/eval-review-flow.ts",
+  "experiments/prepare-review-flow-dataset.ts",
+  "experiments/lib/difficulty-anchors-strict.ts",
+  "experiments/lib/evaluation-code-identity.ts",
+  "experiments/lib/evaluation-integrity.ts",
+  "experiments/lib/physical-blind-common.ts",
+  "experiments/lib/private-artifact-io.ts",
+  "experiments/lib/review-flow-evaluation-adapter.ts",
+  "experiments/lib/review-flow-evaluation-bridge.ts",
+  "experiments/lib/review-flow-evaluation-config.ts",
+  "experiments/lib/review-flow-evaluation-dataset.ts",
+  "experiments/lib/review-flow-evaluation-registry.ts",
+  "experiments/lib/review-flow-evaluation-report.ts",
+  "experiments/lib/review-flow-evaluation-runner.ts",
+  "experiments/lib/review-flow-evaluation-state.ts",
+  "experiments/lib/review-flow-runtime-attestation.ts",
+  "package-lock.json",
+  "package.json",
+  "scripts/env-file.d.mts",
+  "scripts/env-file.mjs",
+  "scripts/private-runtime.d.mts",
+  "scripts/private-runtime.mjs",
+  "scripts/review-flow-evaluation-bootstrap.mjs",
+  "scripts/run-with-env.d.mts",
+  "scripts/run-with-env.mjs",
+  "scripts/trusted-git-state.d.mts",
+  "scripts/trusted-git-state.mjs",
+  "src/config.ts",
+  "src/llm.ts",
+  "src/logger.ts",
+  "src/pipelines/difficulty.ts",
+  "src/pipelines/types.ts",
+  "src/production-eligibility.ts",
+  "src/review-flow/evidence.ts",
+  "src/review-flow/historical-rubric.ts",
+  "src/review-flow/llm-roles.ts",
+  "src/review-flow/orchestrator.ts",
+  "src/review-flow/schemas.ts",
+  "src/review-flow/task-source.ts",
+  "src/review-flow/views.ts",
+  "src/urmotiv-schemas.ts",
+  "src/yaml-lite.ts",
+  "tsconfig.json"
+] as const;
+
 export const upstreamVerifierRunnerPath =
   "scripts/migrate-hist/prepare-review-gold.py" as const;
 
@@ -34,7 +95,7 @@ export const bridgeGeneratorRunnerPath =
 
 export const historicalInputPreparationCodePaths: readonly string[] =
   Object.freeze([
-    ...reviewFlowEvaluationCodePaths,
+    ...sealedHistoricalInputPreparationBaseCodePaths,
     "experiments/prepare-review-flow-historical-inputs.ts",
     "experiments/lib/review-flow-historical-input-preparer.ts"
   ]);

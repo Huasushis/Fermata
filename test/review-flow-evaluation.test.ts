@@ -46,6 +46,7 @@ import {
   loadReviewFlowEvaluationDataset,
   reviewFlowEvaluationBridgeCompletionFileName,
   reviewFlowEvaluationDevelopmentPredictionBindingSha256,
+  reviewFlowEvaluationGeneratorDependencyFileCount,
   reviewFlowEvaluationHoldoutPredictionBindingSha256,
   reviewFlowEvaluationRevealDescriptorSchema,
   reviewFlowEvaluationSourceLineageSetSha256,
@@ -2823,7 +2824,7 @@ function writeDatasetManifestAndBridge(
         codeVersion: "1".repeat(40),
         runnerSha256: sha256("synthetic-bridge-runner"),
         dependencyCodeSha256: sha256("synthetic-bridge-dependencies"),
-        dependencyFileCount: 46
+        dependencyFileCount: reviewFlowEvaluationGeneratorDependencyFileCount
       },
       repositories: {
         fermata: {

@@ -13,7 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   prepareReviewFlowEvaluationDatasetBridge,
   computeUrmotivProblemContentHash,
@@ -23,10 +23,20 @@ import {
   historicalInputPreparationVersion,
   type PrepareReviewFlowEvaluationBridgeInput
 } from "../experiments/lib/review-flow-evaluation-bridge";
-import { loadEvaluationCodeIdentity } from "../experiments/lib/evaluation-code-identity";
-import { reviewFlowEvaluationCodePaths } from "../experiments/lib/review-flow-bridge-repositories";
+import {
+  hashEvaluationCodeBundle,
+  loadEvaluationCodeIdentity,
+  type EvaluationCodeIdentity
+} from "../experiments/lib/evaluation-code-identity";
+import {
+  bridgeGeneratorRunnerPath,
+  reviewFlowEvaluationCodePaths
+} from "../experiments/lib/review-flow-bridge-repositories";
 import { hashCanonicalValue } from "../src/review-flow/evidence";
-import { loadReviewFlowEvaluationDataset } from "../experiments/lib/review-flow-evaluation-dataset";
+import {
+  loadReviewFlowEvaluationDataset,
+  reviewFlowEvaluationGeneratorDependencyFileCount
+} from "../experiments/lib/review-flow-evaluation-dataset";
 import { parseReviewFlowDatasetBridgeArguments } from "../experiments/prepare-review-flow-dataset";
 import type { RobotReviewTask } from "../src/urmotiv-schemas";
 
@@ -1665,6 +1675,198 @@ describe("review-flow trusted dataset bridge", () => {
       randomBytes: sequentialRandomBytes()
     })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_INPUT_INVALID");
   });
+
+  // ── 回归：runtime codePaths 闭包与 v1 历史准备路径解耦 ──────────────
+
+  it("当前 runtime codePaths 闭包包含 review-flow-bridge-repositories.ts（snapshot 可加载传递依赖）", () => {
+    expect(
+      reviewFlowEvaluationCodePaths.includes(
+        "experiments/lib/review-flow-bridge-repositories.ts"
+      )
+    ).toBe(true);
+    expect(reviewFlowEvaluationCodePaths.length).toBe(
+      reviewFlowEvaluationGeneratorDependencyFileCount
+    );
+  });
+
+  it("v1 历史准备身份跨当前 runtime 变异不变：动态重载生产模块验证冻结元组独立性", async () => {
+    // 本测试通过 vi.resetModules + vi.doMock 动态替换 runtime JSON，
+    // 重新导入生产模块 review-flow-bridge-repositories，获取每个变体实例的
+    // reviewFlowEvaluationCodePaths 和 historicalInputPreparationCodePaths，
+    // 然后用生产 loadEvaluationCodeIdentity 对同一合成 git 仓库计算身份。
+    //
+    // 关键验证点：
+    //   1) 当前 runtime 路径的新增/删除/重命名确实改变当前身份（count/digest）
+    //   2) 对每种变异，historicalInputPreparationCodePaths 及其身份恒定不变
+    //   3) 旧的 filter 实现会使 historicalInputPreparationCodePaths 随 mock 变化，
+    //      本测试在旧实现下会失败——证明显式冻结元组的必要性
+
+    // ── 读取实际 runtime JSON 作为基线 ──
+    const realManifest = JSON.parse(
+      readFileSync(join(process.cwd(), "config/review-flow-runtime.json"), "utf8")
+    ) as { codePaths: string[]; [k: string]: unknown };
+    const baselineCodePaths = [...realManifest.codePaths]; // 47 (含 bridge-repositories)
+    expect(baselineCodePaths.length).toBe(47);
+
+    // ── 创建合成 git 仓库（一次性）──
+    const variantExtraPaths = [
+      "experiments/lib/future-new-file.ts",
+      "src/llm-renamed.ts"
+    ];
+    const allRepoPaths = new Set<string>([
+      ...baselineCodePaths,
+      ...historicalInputPreparationCodePaths,
+      ...variantExtraPaths
+    ]);
+    const workspace = join(tmpdir(), `fermata-v1-mock-${Date.now()}`);
+    temporaryRoots.push(workspace);
+    const repository = join(workspace, "Fermata");
+    for (const p of allRepoPaths) {
+      const abs = join(repository, p);
+      mkdirSync(dirname(abs), { recursive: true, mode: 0o700 });
+      writeFileSync(abs, `synthetic content: ${p}\n`, { mode: 0o600 });
+    }
+    execFileSync("/usr/bin/git", ["init", "-q"], { cwd: repository });
+    execFileSync("/usr/bin/git", ["add", "."], { cwd: repository });
+    execFileSync("/usr/bin/git", [
+      "-c", "user.name=Synthetic Test",
+      "-c", "user.email=synthetic@example.invalid",
+      "commit", "-q", "-m", "synthetic v1 mock invariance"
+    ], { cwd: repository });
+    const codeVersion = execFileSync("/usr/bin/git", ["rev-parse", "HEAD"], {
+      cwd: repository, encoding: "utf8"
+    }).trim();
+
+    // ── 定义四种 runtime manifest 变体 ──
+    const manifestPath = "../config/review-flow-runtime.json";
+    const makeVariant = (codePaths: string[]) => ({
+      ...realManifest,
+      codePaths
+    });
+    const variants = {
+      baseline: makeVariant(baselineCodePaths),
+      addition: makeVariant([...baselineCodePaths, "experiments/lib/future-new-file.ts"]),
+      removal: makeVariant(baselineCodePaths.filter((p) => p !== "src/llm.ts")),
+      rename: makeVariant(baselineCodePaths.map((p) =>
+        p === "src/llm.ts" ? "src/llm-renamed.ts" : p
+      ))
+    };
+
+    // ── 动态导入辅助：mock JSON → resetModules → import ──
+    // 动态 import 是故意的：测试目的就是重载生产模块并替换 runtime JSON。
+    const importWithManifest = async (manifest: typeof variants.baseline) => {
+      vi.doMock(manifestPath, () => ({ default: manifest }));
+      vi.resetModules();
+      const mod = await import("../experiments/lib/review-flow-bridge-repositories");
+      return mod;
+    };
+
+    // ── 收集每种变体的生产模块实例和身份 ──
+    // 用 try/finally 确保 mock/reset 清理即使断言抛出也一定执行，
+    // 避免污染后续测试的模块缓存。
+    const results: Record<string, {
+      current: EvaluationCodeIdentity;
+      historical: EvaluationCodeIdentity;
+      currentPaths: readonly string[];
+      historicalPaths: readonly string[];
+    }> = {};
+
+    try {
+      for (const [name, manifest] of Object.entries(variants)) {
+        const mod = await importWithManifest(manifest);
+        const currentPaths = mod.reviewFlowEvaluationCodePaths;
+        const historicalPaths = mod.historicalInputPreparationCodePaths;
+        const current = loadEvaluationCodeIdentity({
+          repositoryDirectory: repository,
+          expectedCodeVersion: codeVersion,
+          runnerPath: bridgeGeneratorRunnerPath,
+          dependencyPaths: currentPaths
+        });
+        const historical = loadEvaluationCodeIdentity({
+          repositoryDirectory: repository,
+          expectedCodeVersion: codeVersion,
+          runnerPath: bridgeGeneratorRunnerPath,
+          dependencyPaths: historicalPaths
+        });
+        results[name] = { current, historical, currentPaths, historicalPaths };
+      }
+
+      // ── 断言：当前身份随变体改变 ──
+      expect(results.baseline.current.dependencyFileCount).toBe(47);
+      expect(results.addition.current.dependencyFileCount).toBe(48);
+      expect(results.removal.current.dependencyFileCount).toBe(46);
+      expect(results.rename.current.dependencyFileCount).toBe(47);
+      // addition/removal/rename 的 digest 都与 baseline 不同
+      expect(results.addition.current.dependencyCodeSha256)
+        .not.toBe(results.baseline.current.dependencyCodeSha256);
+      expect(results.removal.current.dependencyCodeSha256)
+        .not.toBe(results.baseline.current.dependencyCodeSha256);
+      expect(results.rename.current.dependencyCodeSha256)
+        .not.toBe(results.baseline.current.dependencyCodeSha256);
+      // runner 不变（runnerPath 未变，同一仓库）
+      expect(results.addition.current.runnerSha256)
+        .toBe(results.baseline.current.runnerSha256);
+      expect(results.removal.current.runnerSha256)
+        .toBe(results.baseline.current.runnerSha256);
+      expect(results.rename.current.runnerSha256)
+        .toBe(results.baseline.current.runnerSha256);
+
+      // ── 断言：历史身份跨所有变体恒定 ──
+      const baselineHist = results.baseline.historical;
+      expect(baselineHist.dependencyFileCount).toBe(48);
+      for (const name of ["addition", "removal", "rename"]) {
+        const h = results[name].historical;
+        expect(h.dependencyFileCount).toBe(48);
+        expect(h.dependencyCodeSha256).toBe(baselineHist.dependencyCodeSha256);
+        expect(h.runnerSha256).toBe(baselineHist.runnerSha256);
+        expect(h.codeVersion).toBe(baselineHist.codeVersion);
+        expect(h.productionDependencyCodeSha256)
+          .toBe(baselineHist.productionDependencyCodeSha256);
+        expect(h.productionDependencyFileCount)
+          .toBe(baselineHist.productionDependencyFileCount);
+      }
+
+      // ── 断言：冻结历史路径集合跨变体不变 ──
+      const baselineHistPaths = [...results.baseline.historicalPaths];
+      expect(baselineHistPaths.length).toBe(48);
+      expect(
+        baselineHistPaths.includes("experiments/lib/review-flow-bridge-repositories.ts")
+      ).toBe(false);
+      for (const name of ["addition", "removal", "rename"]) {
+        expect([...results[name].historicalPaths]).toEqual(baselineHistPaths);
+        expect(Object.isFrozen(results[name].historicalPaths)).toBe(true);
+      }
+
+      // ── 为什么旧的 mutable filter 实现会失败 ──
+      // 旧实现：historicalInputPreparationBaseCodePaths = reviewFlowEvaluationCodePaths
+      //   .filter(p => !excludedSet[p])
+      // 当 mock 改变 codePaths 时，reviewFlowEvaluationCodePaths 随之变化，
+      // filter 产生的 historicalInputPreparationBaseCodePaths 也变化，
+      // 导致 historicalInputPreparationCodePaths 的 count 和 digest 改变。
+      // 例如 removal 变体下旧实现的 historical count 会从 48 降到 47，
+      // 上面的 "expect(h.dependencyFileCount).toBe(48)" 会失败。
+      // 新实现使用显式 as const 冻结元组，不引用 runtime manifest，
+      // 因此 historical 路径集和身份跨所有变体恒定。
+    } finally {
+      // ── 恢复模块缓存（确定性清理，即使断言抛出也执行）──
+      vi.doUnmock(manifestPath);
+      vi.resetModules();
+    }
+  });
+
+  it("clean old-Fermata preparation override 仍能验证 historical v1 身份", () => {
+    const fixture = createBridgeFixture("decoupling-verification");
+    expect(fixture.generatorIdentity.dependencyFileCount).toBe(47);
+    const result = prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      randomBytes: sequentialRandomBytes()
+    });
+    expect(result.caseCount).toBe(32);
+    const completion = readJson(
+      join(fixture.output, "REVIEW_FLOW_DATASET_COMPLETE")
+    );
+    expect(completion.repositories.fermata.dependencyFileCount).toBe(48);
+  });
 });
 
 interface BridgeFixture {
@@ -3091,7 +3293,14 @@ function recursiveDirectoryInventory(root: string): string[] {
 
 function createSyntheticFermataGenerator(workspace: string) {
   const repository = join(workspace, "Fermata");
-  for (const path of historicalInputPreparationCodePaths) {
+  // 同一 synthetic repo 同时用作 generator（reviewFlowEvaluationCodePaths, 47）
+  // 和 historical preparation（historicalInputPreparationCodePaths, 48），
+  // 因此须创建两者的并集，使两套身份校验都能通过。
+  const allSyntheticPaths = new Set<string>([
+    ...reviewFlowEvaluationCodePaths,
+    ...historicalInputPreparationCodePaths
+  ]);
+  for (const path of allSyntheticPaths) {
     const absolutePath = join(repository, path);
     mkdirSync(dirname(absolutePath), { recursive: true, mode: 0o700 });
     writeFileSync(absolutePath, `synthetic generator dependency: ${path}\n`, {
