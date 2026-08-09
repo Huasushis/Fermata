@@ -1043,6 +1043,7 @@ export interface PrepareReviewFlowEvaluationBridgeInput {
   readonly bridgePlanPath: string;
   readonly anklangCaptureWorkspace: string;
   readonly anklangCaptureManifestPath: string;
+  readonly anklangVerifierManifestPath?: string;
   readonly upstreamGoldDirectory: string;
   readonly materializedDirectory: string;
   readonly worksheetPath: string;
@@ -1999,7 +2000,8 @@ function loadAnklangCapture(input: {
   readonly input: Pick<PrepareReviewFlowEvaluationBridgeInput,
     | "containingWorkspace"
     | "anklangCaptureWorkspace"
-    | "anklangCaptureManifestPath">;
+    | "anklangCaptureManifestPath"
+    | "anklangVerifierManifestPath">;
 }): ValidatedAnklangCapture {
   const attestationBytes = readBoundInput(
     input.inputDirectory,
@@ -2103,7 +2105,8 @@ function loadAnklangCapture(input: {
         "--workspace",
         input.input.anklangCaptureWorkspace,
         "--manifest",
-        input.input.anklangCaptureManifestPath,
+        input.input.anklangVerifierManifestPath
+          ?? input.input.anklangCaptureManifestPath,
         "--verifier-code-version",
         capturer.codeVersion,
         "--verifier-runner-sha256",
@@ -3226,6 +3229,12 @@ function assertBridgePaths(input: PrepareReviewFlowEvaluationBridgeInput): void 
   if (
     input.preparationFermataRepositoryDirectory !== undefined &&
     !isAbsolute(input.preparationFermataRepositoryDirectory)
+  ) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_PATH_INVALID");
+  }
+  if (
+    input.anklangVerifierManifestPath !== undefined &&
+    !isAbsolute(input.anklangVerifierManifestPath)
   ) {
     fail("REVIEW_FLOW_EVALUATION_BRIDGE_PATH_INVALID");
   }

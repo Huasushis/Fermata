@@ -1474,6 +1474,197 @@ describe("review-flow trusted dataset bridge", () => {
       randomBytes: sequentialRandomBytes()
     })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_IDENTITY_INVALID");
   });
+  // ── --anklang-verifier-manifest split-path override ─────────────────────
+
+  it("CLI --anklang-verifier-manifest 可选：省略时 anklangVerifierManifest 为 undefined，提供时回传绝对路径", () => {
+    const baseArguments = [
+      "--private-root=/private",
+      `--fermata-code-version=${"1".repeat(40)}`,
+      "--bridge-plan=/private/input/bridge.json",
+      "--anklang-capture-workspace=/private/anklang-capture",
+      "--anklang-capture-manifest=/private/anklang-capture/manifest.json",
+      "--upstream-gold=/private/upstream",
+      "--materialized=/private/materialized",
+      "--worksheet=/private/worksheet.json",
+      "--worksheet-completion=/private/REVIEW_WORKSHEET_COMPLETE",
+      "--inspection=/private/inspection.json",
+      "--layout=/private/layout.json",
+      "--upstream-plan=/private/plan.json",
+      "--tuning-history=/private/tuning.json",
+      "--review-input=/private/old.xml",
+      "--review-input=/private/new.xml",
+      "--out=/private/output",
+      "--development-reveal-out=/private/dev-reveal"
+    ];
+    expect(
+      parseReviewFlowDatasetBridgeArguments(baseArguments).anklangVerifierManifest
+    ).toBeUndefined();
+    expect(
+      parseReviewFlowDatasetBridgeArguments([
+        ...baseArguments,
+        "--anklang-verifier-manifest=/private/anklang-repo/manifest.json"
+      ]).anklangVerifierManifest
+    ).toBe("/private/anklang-repo/manifest.json");
+    expect(() => parseReviewFlowDatasetBridgeArguments([
+      ...baseArguments,
+      "--anklang-verifier-manifest=/private/a",
+      "--anklang-verifier-manifest=/private/b"
+    ])).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_ARGUMENT_INVALID");
+  });
+
+  it("--anklang-verifier-manifest 覆盖：split-path 覆盖产出与默认逐字节相同", () => {
+    const fixture = createBridgeFixture("verifier-manifest-split");
+
+    // Run with default (manifest == sealed copy inside privateRoot).
+    const directResult = prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      randomBytes: sequentialRandomBytes()
+    });
+    const directOutputFiles = recursiveDirectoryInventory(fixture.output);
+    const directRevealFiles = recursiveDirectoryInventory(
+      fixture.input.developmentRevealDirectory
+    );
+
+    // Create a split verifier-manifest copy inside the Anklang repo's
+    // gitignored private area — outside privateRoot but inside the
+    // capturer repository, as required by the real Python verifier.
+    const anklangPrivateDir = join(
+      fixture.capturerRepository,
+      "private",
+      "capture-manifest-copy"
+    );
+    mkdirSync(anklangPrivateDir, { recursive: true, mode: 0o700 });
+    const splitManifestPath = join(
+      anklangPrivateDir,
+      "capture-manifest.private.json"
+    );
+    writeFileSync(
+      splitManifestPath,
+      readFileSync(fixture.captureVerifierManifestPath),
+      { mode: 0o600 }
+    );
+
+    // Fresh output dirs for the split-path run.
+    const splitOutput = join(fixture.privateRoot, "split-output");
+    const splitReveal = join(fixture.privateRoot, "split-reveal");
+
+    const splitResult = prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      outputDirectory: splitOutput,
+      developmentRevealDirectory: splitReveal,
+      anklangVerifierManifestPath: splitManifestPath,
+      randomBytes: sequentialRandomBytes()
+    });
+    expect(splitResult.caseCount).toBe(directResult.caseCount);
+    expect(splitResult.developmentCount).toBe(directResult.developmentCount);
+    expect(splitResult.holdoutCount).toBe(directResult.holdoutCount);
+
+    // Byte-identical output and reveal trees.
+    const splitOutputFiles = recursiveDirectoryInventory(splitOutput);
+    const splitRevealFiles = recursiveDirectoryInventory(splitReveal);
+    expect(splitOutputFiles).toEqual(directOutputFiles);
+    expect(splitRevealFiles).toEqual(directRevealFiles);
+    for (const relPath of directOutputFiles) {
+      expect(readFileSync(join(splitOutput, relPath))).toEqual(
+        readFileSync(join(fixture.output, relPath))
+      );
+    }
+    for (const relPath of directRevealFiles) {
+      expect(readFileSync(join(splitReveal, relPath))).toEqual(
+        readFileSync(join(fixture.input.developmentRevealDirectory, relPath))
+      );
+    }
+  });
+
+  it("--anklang-verifier-manifest 覆盖：不提供覆盖时 Python verifier 使用 sealed manifest（与默认行为一致）", () => {
+    const fixture = createBridgeFixture("verifier-manifest-default");
+    // No anklangVerifierManifestPath — should behave identically to before.
+    const result = prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      randomBytes: sequentialRandomBytes()
+    });
+    expect(result.caseCount).toBe(32);
+    expect(result.developmentCount).toBe(32);
+    expect(result.holdoutCount).toBe(0);
+    expect(existsSync(join(fixture.output, "REVIEW_FLOW_DATASET_COMPLETE")))
+      .toBe(true);
+  });
+
+  it("--anklang-verifier-manifest 覆盖：split manifest 内容与 sealed 不匹配时以固定错误码失败关闭", () => {
+    const fixture = createBridgeFixture("verifier-manifest-mismatch");
+
+    // Create a split manifest with a different workspace path.
+    const anklangPrivateDir = join(
+      fixture.capturerRepository,
+      "private",
+      "capture-manifest-wrong"
+    );
+    mkdirSync(anklangPrivateDir, { recursive: true, mode: 0o700 });
+    const wrongManifestPath = join(
+      anklangPrivateDir,
+      "capture-manifest.private.json"
+    );
+    const wrongManifest = readJson(fixture.captureVerifierManifestPath);
+    wrongManifest.workspace = join(fixture.privateRoot, "nonexistent-workspace");
+    writePrivate(wrongManifestPath, pretty(wrongManifest));
+
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      anklangVerifierManifestPath: wrongManifestPath,
+      randomBytes: sequentialRandomBytes()
+    })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_VERIFIER_EXECUTION_FAILED");
+  });
+
+  it("--anklang-verifier-manifest 覆盖：不存在的 verifier manifest 路径以固定错误码失败关闭", () => {
+    const fixture = createBridgeFixture("verifier-manifest-missing");
+    const missingPath = join(
+      fixture.capturerRepository,
+      "private",
+      "does-not-exist.json"
+    );
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      anklangVerifierManifestPath: missingPath,
+      randomBytes: sequentialRandomBytes()
+    })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_ANKLANG_VERIFIER_EXECUTION_FAILED");
+  });
+
+  it("--anklang-verifier-manifest 覆盖：相对路径以 PATH_INVALID 失败关闭", () => {
+    const fixture = createBridgeFixture("verifier-manifest-relative");
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      anklangVerifierManifestPath: "relative/manifest.json",
+      randomBytes: sequentialRandomBytes()
+    })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_PATH_INVALID");
+  });
+
+  it("--anklang-verifier-manifest 覆盖：Urmotiv privateRoot 封闭性不变（sealed manifest 仍在 privateRoot 内）", () => {
+    const fixture = createBridgeFixture("verifier-manifest-confinement");
+
+    // The sealed anklangCaptureManifestPath is still inside privateRoot
+    // and read via readAbsoluteBytes — outside privateRoot fails closed.
+    const outsideManifest = join(
+      fixture.workspace,
+      "outside-private",
+      "capture-manifest.private.json"
+    );
+    mkdirSync(join(fixture.workspace, "outside-private"), {
+      recursive: true,
+      mode: 0o700
+    });
+    writeFileSync(
+      outsideManifest,
+      readFileSync(fixture.captureVerifierManifestPath),
+      { mode: 0o600 }
+    );
+
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      anklangCaptureManifestPath: outsideManifest,
+      anklangVerifierManifestPath: fixture.captureVerifierManifestPath,
+      randomBytes: sequentialRandomBytes()
+    })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_INPUT_INVALID");
+  });
 });
 
 interface BridgeFixture {
@@ -2946,7 +3137,7 @@ function createSyntheticAnklangCapturer(workspace: string) {
     "anklang/contracts.py"
   ] as const;
   mkdirSync(repository, { recursive: true, mode: 0o700 });
-  writeFileSync(join(repository, ".gitignore"), "__pycache__/\n", {
+  writeFileSync(join(repository, ".gitignore"), "__pycache__/\nprivate/\n", {
     mode: 0o600
   });
   for (const path of dependencyPaths) {

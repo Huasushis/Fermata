@@ -12,6 +12,7 @@ interface BridgeCliOptions {
   readonly bridgePlan: string;
   readonly anklangCaptureWorkspace: string;
   readonly anklangCaptureManifest: string;
+  readonly anklangVerifierManifest?: string;
   readonly upstreamGold: string;
   readonly materialized: string;
   readonly worksheet: string;
@@ -34,6 +35,7 @@ const singletonOptions = new Set([
   "bridge-plan",
   "anklang-capture-workspace",
   "anklang-capture-manifest",
+  "anklang-verifier-manifest",
   "upstream-gold",
   "materialized",
   "worksheet",
@@ -77,6 +79,7 @@ export function parseReviewFlowDatasetBridgeArguments(
   const optionalHoldout = values.get("holdout-reveal-out");
   const optionalUrmotivRepo = values.get("urmotiv-repo");
   const optionalPreparationFermataRepo = values.get("preparation-fermata-repo");
+  const optionalAnklangVerifierManifest = values.get("anklang-verifier-manifest");
   return {
     privateRoot: required("private-root"),
     fermataCodeVersion,
@@ -102,7 +105,10 @@ export function parseReviewFlowDatasetBridgeArguments(
       : { urmotivRepo: optionalUrmotivRepo }),
     ...(optionalPreparationFermataRepo === undefined
       ? {}
-      : { preparationFermataRepo: optionalPreparationFermataRepo })
+      : { preparationFermataRepo: optionalPreparationFermataRepo }),
+    ...(optionalAnklangVerifierManifest === undefined
+      ? {}
+      : { anklangVerifierManifest: optionalAnklangVerifierManifest })
   };
 }
 
@@ -136,7 +142,10 @@ export function runReviewFlowDatasetBridgeCli(
       : { urmotivRepositoryDirectory: options.urmotivRepo }),
     ...(options.preparationFermataRepo === undefined
       ? {}
-      : { preparationFermataRepositoryDirectory: options.preparationFermataRepo })
+      : { preparationFermataRepositoryDirectory: options.preparationFermataRepo }),
+    ...(options.anklangVerifierManifest === undefined
+      ? {}
+      : { anklangVerifierManifestPath: options.anklangVerifierManifest })
   });
   process.stdout.write(`${JSON.stringify({
     datasetId: result.datasetId,
