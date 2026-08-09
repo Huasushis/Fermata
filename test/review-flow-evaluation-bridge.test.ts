@@ -1035,6 +1035,41 @@ describe("review-flow trusted dataset bridge", () => {
       "--urmotiv-repo=/private/b"
     ])).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_ARGUMENT_INVALID");
   });
+  it("CLI --preparation-fermata-repo 可选：省略时 preparationFermataRepo 为 undefined，提供时回传绝对路径", () => {
+    const baseArguments = [
+      "--private-root=/private",
+      `--fermata-code-version=${"1".repeat(40)}`,
+      "--bridge-plan=/private/input/bridge.json",
+      "--anklang-capture-workspace=/private/anklang-capture",
+      "--anklang-capture-manifest=/private/anklang-capture/manifest.json",
+      "--upstream-gold=/private/upstream",
+      "--materialized=/private/materialized",
+      "--worksheet=/private/worksheet.json",
+      "--worksheet-completion=/private/REVIEW_WORKSHEET_COMPLETE",
+      "--inspection=/private/inspection.json",
+      "--layout=/private/layout.json",
+      "--upstream-plan=/private/plan.json",
+      "--tuning-history=/private/tuning.json",
+      "--review-input=/private/old.xml",
+      "--review-input=/private/new.xml",
+      "--out=/private/output",
+      "--development-reveal-out=/private/dev-reveal"
+    ];
+    expect(
+      parseReviewFlowDatasetBridgeArguments(baseArguments).preparationFermataRepo
+    ).toBeUndefined();
+    expect(
+      parseReviewFlowDatasetBridgeArguments([
+        ...baseArguments,
+        "--preparation-fermata-repo=/private/fermata-old"
+      ]).preparationFermataRepo
+    ).toBe("/private/fermata-old");
+    expect(() => parseReviewFlowDatasetBridgeArguments([
+      ...baseArguments,
+      "--preparation-fermata-repo=/private/a",
+      "--preparation-fermata-repo=/private/b"
+    ])).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_ARGUMENT_INVALID");
+  });
 
   it("--urmotiv-repo 覆盖：主 Urmotiv 脏时，干净精确 pinned 覆盖通过且产出与无覆盖逐字节相同", () => {
     const fixture = createBridgeFixture("override-clean-clone");
@@ -1250,6 +1285,194 @@ describe("review-flow trusted dataset bridge", () => {
       urmotivRepositoryDirectory: cleanClone,
       randomBytes: sequentialRandomBytes()
     })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_INPUT_INVALID");
+  });
+  it("--preparation-fermata-repo 覆盖：当前 Fermata 前进时，旧 pinned 覆盖通过且 generator identity 保持新 commit", () => {
+    const fixture = createBridgeFixture("override-prep-fermata");
+    const primaryFermata = join(fixture.workspace, "Fermata");
+    const originalCommit = execFileSync(
+      "/usr/bin/git", ["rev-parse", "HEAD"],
+      { cwd: primaryFermata, encoding: "utf8" }
+    ).trim();
+
+    // Clone the original Fermata at the pinned commit (not worktree).
+    const oldFermata = join(fixture.workspace, "Fermata-prep-old");
+    execFileSync("/usr/bin/git", ["clone", "-q", primaryFermata, oldFermata]);
+    execFileSync("/usr/bin/git", ["checkout", "-q", originalCommit], {
+      cwd: oldFermata
+    });
+
+    // Advance the primary Fermata with a new commit that changes a code path.
+    writeFileSync(
+      join(primaryFermata, "experiments", "prepare-review-flow-dataset.ts"),
+      "synthetic generator dependency: experiments/prepare-review-flow-dataset.ts\n// advanced\n",
+      { mode: 0o600 }
+    );
+    execFileSync("/usr/bin/git", ["add", "."], { cwd: primaryFermata });
+    execFileSync("/usr/bin/git", [
+      "-c", "user.name=Synthetic Test",
+      "-c", "user.email=synthetic@example.invalid",
+      "commit", "-q", "-m", "advance generator"
+    ], { cwd: primaryFermata });
+    const newCommit = execFileSync(
+      "/usr/bin/git", ["rev-parse", "HEAD"],
+      { cwd: primaryFermata, encoding: "utf8" }
+    ).trim();
+    expect(newCommit).not.toBe(originalCommit);
+
+    // Use the new commit for loadBridgeGeneratorIdentity (current Fermata)
+    // and the old clone for loadBoundPreparationIdentity (sealed preparation).
+    const overrideOutput = join(fixture.privateRoot, "prep-ferm-output");
+    const overrideReveal = join(fixture.privateRoot, "prep-ferm-reveal");
+    const result = prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      fermataCodeVersion: newCommit,
+      outputDirectory: overrideOutput,
+      developmentRevealDirectory: overrideReveal,
+      preparationFermataRepositoryDirectory: oldFermata,
+      randomBytes: sequentialRandomBytes()
+    });
+    expect(result.caseCount).toBe(32);
+    expect(result.developmentCount).toBe(32);
+    expect(result.holdoutCount).toBe(0);
+    expect(existsSync(join(overrideOutput, "REVIEW_FLOW_DATASET_COMPLETE"))).toBe(true);
+  });
+
+  it("--preparation-fermata-repo 覆盖：不提供覆盖且 Fermata 前进时以固定错误码失败关闭", () => {
+    const fixture = createBridgeFixture("override-prep-fermata-no-override");
+    const primaryFermata = join(fixture.workspace, "Fermata");
+
+    // Advance the primary Fermata with a new commit.
+    writeFileSync(
+      join(primaryFermata, "experiments", "prepare-review-flow-dataset.ts"),
+      "synthetic generator dependency: experiments/prepare-review-flow-dataset.ts\n// advanced\n",
+      { mode: 0o600 }
+    );
+    execFileSync("/usr/bin/git", ["add", "."], { cwd: primaryFermata });
+    execFileSync("/usr/bin/git", [
+      "-c", "user.name=Synthetic Test",
+      "-c", "user.email=synthetic@example.invalid",
+      "commit", "-q", "-m", "advance generator"
+    ], { cwd: primaryFermata });
+    const newCommit = execFileSync(
+      "/usr/bin/git", ["rev-parse", "HEAD"],
+      { cwd: primaryFermata, encoding: "utf8" }
+    ).trim();
+
+    // Without the override, loadBoundPreparationIdentity checks the current
+    // Fermata at newCommit against the completion marker's original commit —
+    // HEAD mismatch → fail closed.
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      fermataCodeVersion: newCommit,
+      randomBytes: sequentialRandomBytes()
+    })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_IDENTITY_INVALID");
+  });
+
+  it("--preparation-fermata-repo 覆盖：旧 pinned 覆盖不能满足当前 generator identity", () => {
+    const fixture = createBridgeFixture("override-prep-fermata-wrong-gen");
+    const primaryFermata = join(fixture.workspace, "Fermata");
+    const originalCommit = execFileSync(
+      "/usr/bin/git", ["rev-parse", "HEAD"],
+      { cwd: primaryFermata, encoding: "utf8" }
+    ).trim();
+
+    const oldFermata = join(fixture.workspace, "Fermata-prep-wrong-gen");
+    execFileSync("/usr/bin/git", ["clone", "-q", primaryFermata, oldFermata]);
+    execFileSync("/usr/bin/git", ["checkout", "-q", originalCommit], {
+      cwd: oldFermata
+    });
+
+    // Advance the primary Fermata.
+    writeFileSync(
+      join(primaryFermata, "experiments", "prepare-review-flow-dataset.ts"),
+      "synthetic generator dependency: experiments/prepare-review-flow-dataset.ts\n// advanced\n",
+      { mode: 0o600 }
+    );
+    execFileSync("/usr/bin/git", ["add", "."], { cwd: primaryFermata });
+    execFileSync("/usr/bin/git", [
+      "-c", "user.name=Synthetic Test",
+      "-c", "user.email=synthetic@example.invalid",
+      "commit", "-q", "-m", "advance generator"
+    ], { cwd: primaryFermata });
+
+    // Try to use the OLD commit as fermataCodeVersion (generator identity).
+    // loadBridgeGeneratorIdentity checks resolve(containingWorkspace, "Fermata")
+    // which is at the NEW commit — HEAD mismatch → fail closed.
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      fermataCodeVersion: originalCommit,
+      preparationFermataRepositoryDirectory: oldFermata,
+      randomBytes: sequentialRandomBytes()
+    })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_GENERATOR_IDENTITY_INVALID");
+  });
+
+  it("--preparation-fermata-repo 覆盖：脏旧 Fermata 覆盖以固定错误码失败关闭", () => {
+    const fixture = createBridgeFixture("override-prep-fermata-dirty");
+    const primaryFermata = join(fixture.workspace, "Fermata");
+    const originalCommit = execFileSync(
+      "/usr/bin/git", ["rev-parse", "HEAD"],
+      { cwd: primaryFermata, encoding: "utf8" }
+    ).trim();
+    const oldFermata = join(fixture.workspace, "Fermata-prep-dirty");
+    execFileSync("/usr/bin/git", ["clone", "-q", primaryFermata, oldFermata]);
+    execFileSync("/usr/bin/git", ["checkout", "-q", originalCommit], {
+      cwd: oldFermata
+    });
+    // Dirty the old clone.
+    writeFileSync(
+      join(oldFermata, "experiments", "prepare-review-flow-dataset.ts"),
+      "dirty\n",
+      { mode: 0o600 }
+    );
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      preparationFermataRepositoryDirectory: oldFermata,
+      randomBytes: sequentialRandomBytes()
+    })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_IDENTITY_INVALID");
+  });
+
+  it("--preparation-fermata-repo 覆盖：错误 commit 旧 Fermata 覆盖以固定错误码失败关闭", () => {
+    const fixture = createBridgeFixture("override-prep-fermata-wrong-commit");
+    const primaryFermata = join(fixture.workspace, "Fermata");
+    const oldFermata = join(fixture.workspace, "Fermata-prep-wrong-commit");
+    execFileSync("/usr/bin/git", ["clone", "-q", primaryFermata, oldFermata]);
+    // Make a divergent commit.
+    writeFileSync(
+      join(oldFermata, "experiments", "eval-review-flow.ts"),
+      "divergent\n",
+      { mode: 0o600 }
+    );
+    execFileSync("/usr/bin/git", ["add", "."], { cwd: oldFermata });
+    execFileSync("/usr/bin/git", [
+      "-c", "user.name=Test",
+      "-c", "user.email=test@example.invalid",
+      "commit", "-q", "-m", "divergent"
+    ], { cwd: oldFermata });
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      preparationFermataRepositoryDirectory: oldFermata,
+      randomBytes: sequentialRandomBytes()
+    })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_IDENTITY_INVALID");
+  });
+
+  it("--preparation-fermata-repo 覆盖：不存在的目录以固定错误码失败关闭", () => {
+    const fixture = createBridgeFixture("override-prep-fermata-missing");
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      preparationFermataRepositoryDirectory: join(fixture.workspace, "does-not-exist"),
+      randomBytes: sequentialRandomBytes()
+    })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_IDENTITY_INVALID");
+  });
+
+  it("--preparation-fermata-repo 覆盖：非 Git 仓库以固定错误码失败关闭", () => {
+    const fixture = createBridgeFixture("override-prep-fermata-non-repo");
+    const notARepo = join(fixture.workspace, "not-a-repo-fermata");
+    mkdirSync(join(notARepo, "experiments"), { recursive: true, mode: 0o700 });
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      preparationFermataRepositoryDirectory: notARepo,
+      randomBytes: sequentialRandomBytes()
+    })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_PREPARATION_IDENTITY_INVALID");
   });
 });
 

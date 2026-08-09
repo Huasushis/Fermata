@@ -25,6 +25,7 @@ interface BridgeCliOptions {
   readonly developmentRevealOutput: string;
   readonly holdoutRevealOutput?: string;
   readonly urmotivRepo?: string;
+  readonly preparationFermataRepo?: string;
 }
 
 const singletonOptions = new Set([
@@ -45,6 +46,7 @@ const singletonOptions = new Set([
   "development-reveal-out",
   "holdout-reveal-out",
   "urmotiv-repo",
+  "preparation-fermata-repo",
 ]);
 
 export function parseReviewFlowDatasetBridgeArguments(
@@ -74,6 +76,7 @@ export function parseReviewFlowDatasetBridgeArguments(
   if (!/^(?!0{40}$)[0-9a-f]{40}$/u.test(fermataCodeVersion)) failArguments();
   const optionalHoldout = values.get("holdout-reveal-out");
   const optionalUrmotivRepo = values.get("urmotiv-repo");
+  const optionalPreparationFermataRepo = values.get("preparation-fermata-repo");
   return {
     privateRoot: required("private-root"),
     fermataCodeVersion,
@@ -96,7 +99,10 @@ export function parseReviewFlowDatasetBridgeArguments(
       : { holdoutRevealOutput: optionalHoldout }),
     ...(optionalUrmotivRepo === undefined
       ? {}
-      : { urmotivRepo: optionalUrmotivRepo })
+      : { urmotivRepo: optionalUrmotivRepo }),
+    ...(optionalPreparationFermataRepo === undefined
+      ? {}
+      : { preparationFermataRepo: optionalPreparationFermataRepo })
   };
 }
 
@@ -127,7 +133,10 @@ export function runReviewFlowDatasetBridgeCli(
       : { holdoutRevealDirectory: options.holdoutRevealOutput }),
     ...(options.urmotivRepo === undefined
       ? {}
-      : { urmotivRepositoryDirectory: options.urmotivRepo })
+      : { urmotivRepositoryDirectory: options.urmotivRepo }),
+    ...(options.preparationFermataRepo === undefined
+      ? {}
+      : { preparationFermataRepositoryDirectory: options.preparationFermataRepo })
   });
   process.stdout.write(`${JSON.stringify({
     datasetId: result.datasetId,

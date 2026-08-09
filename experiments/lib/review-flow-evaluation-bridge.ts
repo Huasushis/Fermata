@@ -1056,6 +1056,7 @@ export interface PrepareReviewFlowEvaluationBridgeInput {
   readonly developmentRevealDirectory: string;
   readonly holdoutRevealDirectory?: string;
   readonly urmotivRepositoryDirectory?: string;
+  readonly preparationFermataRepositoryDirectory?: string;
   readonly randomBytes?: (size: number) => Uint8Array;
   readonly hooks?: ReviewFlowEvaluationBridgeHooks;
 }
@@ -1848,7 +1849,8 @@ function loadHistoricalInputPreparation(input: {
 
   const expectedRepositories = completion.repositories;
   const actualFermata = loadBoundPreparationIdentity({
-    repositoryDirectory: resolve(input.input.containingWorkspace, "Fermata"),
+    repositoryDirectory: input.input.preparationFermataRepositoryDirectory
+      ?? resolve(input.input.containingWorkspace, "Fermata"),
     expectedCodeVersion: expectedRepositories.fermata.codeVersion,
     runnerPath: "experiments/prepare-review-flow-historical-inputs.ts",
     dependencyPaths: historicalInputPreparationCodePaths
@@ -3218,6 +3220,12 @@ function assertBridgePaths(input: PrepareReviewFlowEvaluationBridgeInput): void 
   if (
     input.urmotivRepositoryDirectory !== undefined &&
     !isAbsolute(input.urmotivRepositoryDirectory)
+  ) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_PATH_INVALID");
+  }
+  if (
+    input.preparationFermataRepositoryDirectory !== undefined &&
+    !isAbsolute(input.preparationFermataRepositoryDirectory)
   ) {
     fail("REVIEW_FLOW_EVALUATION_BRIDGE_PATH_INVALID");
   }
