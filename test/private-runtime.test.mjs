@@ -83,6 +83,7 @@ describe("Fermata 私有运行路径", () => {
   it("只读打开同样拒绝过宽权限与末级符号链接", () => {
     const broad = join(privateRoot, "broad-input");
     mkdirSync(broad, { mode: 0o755 });
+    chmodSync(broad, 0o755); // umask 可能把 mkdir 模式收窄成 0700，显式固定
     expect(() => openExistingPrivateDirectory(broad, options)).toThrow(
       "PRIVATE_DIRECTORY_INVALID_MODE"
     );
