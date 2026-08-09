@@ -24,6 +24,7 @@ interface BridgeCliOptions {
   readonly output: string;
   readonly developmentRevealOutput: string;
   readonly holdoutRevealOutput?: string;
+  readonly urmotivRepo?: string;
 }
 
 const singletonOptions = new Set([
@@ -42,7 +43,8 @@ const singletonOptions = new Set([
   "tuning-history",
   "out",
   "development-reveal-out",
-  "holdout-reveal-out"
+  "holdout-reveal-out",
+  "urmotiv-repo",
 ]);
 
 export function parseReviewFlowDatasetBridgeArguments(
@@ -71,6 +73,7 @@ export function parseReviewFlowDatasetBridgeArguments(
   const fermataCodeVersion = required("fermata-code-version");
   if (!/^(?!0{40}$)[0-9a-f]{40}$/u.test(fermataCodeVersion)) failArguments();
   const optionalHoldout = values.get("holdout-reveal-out");
+  const optionalUrmotivRepo = values.get("urmotiv-repo");
   return {
     privateRoot: required("private-root"),
     fermataCodeVersion,
@@ -90,7 +93,10 @@ export function parseReviewFlowDatasetBridgeArguments(
     developmentRevealOutput: required("development-reveal-out"),
     ...(optionalHoldout === undefined
       ? {}
-      : { holdoutRevealOutput: optionalHoldout })
+      : { holdoutRevealOutput: optionalHoldout }),
+    ...(optionalUrmotivRepo === undefined
+      ? {}
+      : { urmotivRepo: optionalUrmotivRepo })
   };
 }
 
@@ -118,7 +124,10 @@ export function runReviewFlowDatasetBridgeCli(
     developmentRevealDirectory: options.developmentRevealOutput,
     ...(options.holdoutRevealOutput === undefined
       ? {}
-      : { holdoutRevealDirectory: options.holdoutRevealOutput })
+      : { holdoutRevealDirectory: options.holdoutRevealOutput }),
+    ...(options.urmotivRepo === undefined
+      ? {}
+      : { urmotivRepositoryDirectory: options.urmotivRepo })
   });
   process.stdout.write(`${JSON.stringify({
     datasetId: result.datasetId,

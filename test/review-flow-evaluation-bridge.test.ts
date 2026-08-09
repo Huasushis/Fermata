@@ -7,11 +7,12 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   prepareReviewFlowEvaluationDatasetBridge,
@@ -998,6 +999,257 @@ describe("review-flow trusted dataset bridge", () => {
         "--fermata-code-version="
       ) ? "--fermata-code-version=not-a-commit" : argument)
     )).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_ARGUMENT_INVALID");
+  });
+  it("CLI --urmotiv-repo 可选：省略时 urmotivRepo 为 undefined，提供时回传绝对路径", () => {
+    const baseArguments = [
+      "--private-root=/private",
+      `--fermata-code-version=${"1".repeat(40)}`,
+      "--bridge-plan=/private/input/bridge.json",
+      "--anklang-capture-workspace=/private/anklang-capture",
+      "--anklang-capture-manifest=/private/anklang-capture/manifest.json",
+      "--upstream-gold=/private/upstream",
+      "--materialized=/private/materialized",
+      "--worksheet=/private/worksheet.json",
+      "--worksheet-completion=/private/REVIEW_WORKSHEET_COMPLETE",
+      "--inspection=/private/inspection.json",
+      "--layout=/private/layout.json",
+      "--upstream-plan=/private/plan.json",
+      "--tuning-history=/private/tuning.json",
+      "--review-input=/private/old.xml",
+      "--review-input=/private/new.xml",
+      "--out=/private/output",
+      "--development-reveal-out=/private/dev-reveal"
+    ];
+    expect(
+      parseReviewFlowDatasetBridgeArguments(baseArguments).urmotivRepo
+    ).toBeUndefined();
+    expect(
+      parseReviewFlowDatasetBridgeArguments([
+        ...baseArguments,
+        "--urmotiv-repo=/private/urmotiv-clean"
+      ]).urmotivRepo
+    ).toBe("/private/urmotiv-clean");
+    expect(() => parseReviewFlowDatasetBridgeArguments([
+      ...baseArguments,
+      "--urmotiv-repo=/private/a",
+      "--urmotiv-repo=/private/b"
+    ])).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_ARGUMENT_INVALID");
+  });
+
+  it("--urmotiv-repo 覆盖：主 Urmotiv 脏时，干净精确 pinned 覆盖通过且产出与无覆盖逐字节相同", () => {
+    const fixture = createBridgeFixture("override-clean-clone");
+    const primaryUrmotiv = join(fixture.workspace, "Urmotiv");
+
+    // Run without override first (primary is clean) — capture bytes.
+    const directResult = prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      randomBytes: sequentialRandomBytes()
+    });
+    // Recursively inventory the direct output and reveal trees.
+    const directOutputFiles = recursiveDirectoryInventory(fixture.output);
+    const directRevealFiles = recursiveDirectoryInventory(
+      fixture.input.developmentRevealDirectory
+    );
+
+    // Fresh output directories for the override run (same fixture, same seed).
+    const overrideOutput = join(fixture.privateRoot, "override-output");
+    const overrideReveal = join(fixture.privateRoot, "override-reveal");
+
+    // Clone the primary Urmotiv to a clean independent checkout (not worktree).
+    const cleanClone = join(fixture.workspace, "Urmotiv-clean");
+    execFileSync("/usr/bin/git", ["clone", "-q", primaryUrmotiv, cleanClone]);
+    const pinnedCommit = execFileSync(
+      "/usr/bin/git", ["rev-parse", "HEAD"],
+      { cwd: primaryUrmotiv, encoding: "utf8" }
+    ).trim();
+    execFileSync("/usr/bin/git", ["checkout", "-q", pinnedCommit], {
+      cwd: cleanClone
+    });
+    // The synthetic verifier reads .synthetic-attestation-output from its cwd
+    // (the repo dir).  This file is gitignored so the clone lacks it; write
+    // the same synthetic attestation bytes into the clone.
+    writeFileSync(
+      join(cleanClone, ".synthetic-attestation-output"),
+      readFileSync(fixture.verifierOutputPath),
+      { mode: 0o600 }
+    );
+
+    // Dirty the primary Urmotiv so the default path would fail.
+    mutateWorktreeFile(
+      join(primaryUrmotiv, "scripts", "migrate-hist", "prepare-review-gold.py"),
+      "dirty\n"
+    );
+    expect(
+      execFileSync("/usr/bin/git", ["status", "--porcelain"], {
+        cwd: primaryUrmotiv, encoding: "utf8"
+      }).trim().length
+    ).toBeGreaterThan(0);
+
+    // The override must point at the clean clone and still succeed.
+    const overrideResult = prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      outputDirectory: overrideOutput,
+      developmentRevealDirectory: overrideReveal,
+      urmotivRepositoryDirectory: cleanClone,
+      randomBytes: sequentialRandomBytes()
+    });
+    expect(overrideResult.caseCount).toBe(32);
+    expect(overrideResult.developmentCount).toBe(32);
+    expect(overrideResult.holdoutCount).toBe(0);
+
+    // Recursively inventory the override output and reveal trees.
+    const overrideOutputFiles = recursiveDirectoryInventory(overrideOutput);
+    const overrideRevealFiles = recursiveDirectoryInventory(overrideReveal);
+
+    // Assert identical file sets — no extras, no missing.
+    expect(overrideOutputFiles).toEqual(directOutputFiles);
+    expect(overrideRevealFiles).toEqual(directRevealFiles);
+
+    // Assert every corresponding file's bytes are equal.
+    for (const relPath of directOutputFiles) {
+      expect(readFileSync(join(overrideOutput, relPath))).toEqual(
+        readFileSync(join(fixture.output, relPath))
+      );
+    }
+    for (const relPath of directRevealFiles) {
+      expect(readFileSync(join(overrideReveal, relPath))).toEqual(
+        readFileSync(join(fixture.input.developmentRevealDirectory, relPath))
+      );
+    }
+  });
+
+  it("--urmotiv-repo 覆盖：脏覆盖以固定错误码失败关闭", () => {
+    const fixture = createBridgeFixture("override-dirty-clone");
+    const primaryUrmotiv = join(fixture.workspace, "Urmotiv");
+    const dirtyClone = join(fixture.workspace, "Urmotiv-dirty");
+    execFileSync("/usr/bin/git", ["clone", "-q", primaryUrmotiv, dirtyClone]);
+    const pinnedCommit = execFileSync(
+      "/usr/bin/git", ["rev-parse", "HEAD"],
+      { cwd: primaryUrmotiv, encoding: "utf8" }
+    ).trim();
+    execFileSync("/usr/bin/git", ["checkout", "-q", pinnedCommit], {
+      cwd: dirtyClone
+    });
+    // Make the clone dirty.
+    writeFileSync(
+      join(dirtyClone, "scripts", "migrate-hist", "prepare-review-gold.py"),
+      "dirty\n",
+      { mode: 0o600 }
+    );
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      urmotivRepositoryDirectory: dirtyClone,
+      randomBytes: sequentialRandomBytes()
+    })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_INPUT_INVALID");
+  });
+
+  it("--urmotiv-repo 覆盖：错误 commit 覆盖以固定错误码失败关闭", () => {
+    const fixture = createBridgeFixture("override-wrong-commit");
+    const primaryUrmotiv = join(fixture.workspace, "Urmotiv");
+    const wrongCommitClone = join(fixture.workspace, "Urmotiv-wrong-commit");
+    execFileSync("/usr/bin/git", ["clone", "-q", primaryUrmotiv, wrongCommitClone]);
+    // Create a second commit so HEAD diverges from the pinned version.
+    writeFileSync(
+      join(wrongCommitClone, "scripts", "migrate-hist", "extra.txt"),
+      "extra\n",
+      { mode: 0o600 }
+    );
+    execFileSync("/usr/bin/git", ["add", "."], { cwd: wrongCommitClone });
+    execFileSync("/usr/bin/git", [
+      "-c", "user.name=Test",
+      "-c", "user.email=test@example.invalid",
+      "commit", "-q", "-m", "divergent"
+    ], { cwd: wrongCommitClone });
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      urmotivRepositoryDirectory: wrongCommitClone,
+      randomBytes: sequentialRandomBytes()
+    })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_INPUT_INVALID");
+  });
+
+  it("--urmotiv-repo 覆盖：不存在的目录以固定错误码失败关闭", () => {
+    const fixture = createBridgeFixture("override-missing");
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      urmotivRepositoryDirectory: join(fixture.workspace, "does-not-exist"),
+      randomBytes: sequentialRandomBytes()
+    })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_INPUT_INVALID");
+  });
+
+  it("--urmotiv-repo 覆盖：非 Git 仓库以固定错误码失败关闭", () => {
+    const fixture = createBridgeFixture("override-non-repo");
+    const notARepo = join(fixture.workspace, "not-a-repo");
+    mkdirSync(join(notARepo, "scripts", "migrate-hist"), {
+      recursive: true, mode: 0o700
+    });
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      urmotivRepositoryDirectory: notARepo,
+      randomBytes: sequentialRandomBytes()
+    })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_INPUT_INVALID");
+  });
+
+  it("--urmotiv-repo 覆盖：私有输入路径越出 privateRoot 时以路径约束错误码失败关闭", () => {
+    const fixture = createBridgeFixture("override-private-escape");
+    const primaryUrmotiv = join(fixture.workspace, "Urmotiv");
+    const cleanClone = join(fixture.workspace, "Urmotiv-clean-escape");
+    execFileSync("/usr/bin/git", ["clone", "-q", primaryUrmotiv, cleanClone]);
+    const pinnedCommit = execFileSync(
+      "/usr/bin/git", ["rev-parse", "HEAD"],
+      { cwd: primaryUrmotiv, encoding: "utf8" }
+    ).trim();
+    execFileSync("/usr/bin/git", ["checkout", "-q", pinnedCommit], {
+      cwd: cleanClone
+    });
+    writeFileSync(
+      join(cleanClone, ".synthetic-attestation-output"),
+      readFileSync(fixture.verifierOutputPath),
+      { mode: 0o600 }
+    );
+    // Point the bridgePlanPath outside privateRoot — under the clean clone,
+    // which is inside containingWorkspace but outside privateRoot.
+    // The bridge must reject this for path confinement, not follow the path.
+    const escapedBridgePlan = join(cleanClone, "bridge-plan.private.json");
+    writeFileSync(escapedBridgePlan, readFileSync(fixture.input.bridgePlanPath));
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      bridgePlanPath: escapedBridgePlan,
+      urmotivRepositoryDirectory: cleanClone,
+      randomBytes: sequentialRandomBytes()
+    })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_INPUT_INVALID");
+  });
+
+  it("--urmotiv-repo 覆盖：私有输入路径越出 containingWorkspace 时以路径约束错误码失败关闭", () => {
+    const fixture = createBridgeFixture("override-private-escape-workspace");
+    const primaryUrmotiv = join(fixture.workspace, "Urmotiv");
+    const cleanClone = join(fixture.workspace, "Urmotiv-clean-escape-ws");
+    execFileSync("/usr/bin/git", ["clone", "-q", primaryUrmotiv, cleanClone]);
+    const pinnedCommit = execFileSync(
+      "/usr/bin/git", ["rev-parse", "HEAD"],
+      { cwd: primaryUrmotiv, encoding: "utf8" }
+    ).trim();
+    execFileSync("/usr/bin/git", ["checkout", "-q", pinnedCommit], {
+      cwd: cleanClone
+    });
+    writeFileSync(
+      join(cleanClone, ".synthetic-attestation-output"),
+      readFileSync(fixture.verifierOutputPath),
+      { mode: 0o600 }
+    );
+    // Create a separate absolute temporary root that is neither inside
+    // fixture.workspace (containingWorkspace) nor privateRoot.
+    const externalRoot = mkdtempSync(join(tmpdir(), "fermata-escape-"));
+    temporaryRoots.push(externalRoot);
+    const escapedBridgePlan = join(externalRoot, "bridge-plan.private.json");
+    writeFileSync(escapedBridgePlan, readFileSync(fixture.input.bridgePlanPath), {
+      mode: 0o600
+    });
+    expect(() => prepareReviewFlowEvaluationDatasetBridge({
+      ...fixture.input,
+      bridgePlanPath: escapedBridgePlan,
+      urmotivRepositoryDirectory: cleanClone,
+      randomBytes: sequentialRandomBytes()
+    })).toThrow("REVIEW_FLOW_EVALUATION_BRIDGE_INPUT_INVALID");
   });
 });
 
@@ -2404,6 +2656,23 @@ function prepare(fixture: BridgeFixture) {
 function sequentialRandomBytes(): (size: number) => Uint8Array {
   let call = 0;
   return (size) => Buffer.alloc(size, ++call);
+}
+
+/** Recursively list all regular files under `root` as POSIX-style relative paths. */
+function recursiveDirectoryInventory(root: string): string[] {
+  const entries: string[] = [];
+  function walk(dir: string): void {
+    for (const name of readdirSync(dir, { withFileTypes: true })) {
+      const abs = join(dir, name.name);
+      if (name.isDirectory()) {
+        walk(abs);
+      } else if (name.isFile()) {
+        entries.push(relative(root, abs).split(sep).join("/"));
+      }
+    }
+  }
+  walk(root);
+  return entries.sort();
 }
 
 function createSyntheticFermataGenerator(workspace: string) {

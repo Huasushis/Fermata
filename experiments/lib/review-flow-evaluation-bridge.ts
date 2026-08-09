@@ -1055,6 +1055,7 @@ export interface PrepareReviewFlowEvaluationBridgeInput {
   readonly outputDirectory: string;
   readonly developmentRevealDirectory: string;
   readonly holdoutRevealDirectory?: string;
+  readonly urmotivRepositoryDirectory?: string;
   readonly randomBytes?: (size: number) => Uint8Array;
   readonly hooks?: ReviewFlowEvaluationBridgeHooks;
 }
@@ -1245,10 +1246,8 @@ function prepareBridge(
       attestationBytes,
       upstream,
       input,
-      verifierRepositoryDirectory: resolve(
-        input.containingWorkspace,
-        "Urmotiv"
-      )
+      verifierRepositoryDirectory: input.urmotivRepositoryDirectory
+        ?? resolve(input.containingWorkspace, "Urmotiv")
     });
     const tagCatalogBytes = readBoundInput(
       bridgeInputDirectory,
@@ -1855,7 +1854,8 @@ function loadHistoricalInputPreparation(input: {
     dependencyPaths: historicalInputPreparationCodePaths
   });
   const actualUrmotiv = loadBoundPreparationIdentity({
-    repositoryDirectory: resolve(input.input.containingWorkspace, "Urmotiv"),
+    repositoryDirectory: input.input.urmotivRepositoryDirectory
+      ?? resolve(input.input.containingWorkspace, "Urmotiv"),
     expectedCodeVersion: expectedRepositories.urmotiv.codeVersion,
     runnerPath: upstreamVerifierRunnerPath,
     dependencyPaths: upstreamVerifierDependencyPaths
@@ -3213,6 +3213,12 @@ function assertBridgePaths(input: PrepareReviewFlowEvaluationBridgeInput): void 
       : [input.holdoutRevealDirectory])
   ];
   if (paths.some((path) => !isAbsolute(path))) {
+    fail("REVIEW_FLOW_EVALUATION_BRIDGE_PATH_INVALID");
+  }
+  if (
+    input.urmotivRepositoryDirectory !== undefined &&
+    !isAbsolute(input.urmotivRepositoryDirectory)
+  ) {
     fail("REVIEW_FLOW_EVALUATION_BRIDGE_PATH_INVALID");
   }
   const outputs = [
