@@ -32,9 +32,62 @@ export const anklangCaptureDependencyPaths = [
 export const bridgeGeneratorRunnerPath =
   "experiments/prepare-review-flow-dataset.ts" as const;
 
+/**
+ * 冻结的 v1 历史输入准备基础代码路径清单（46 条），独立于可变的 runtime manifest
+ * codePaths —— 新增/删除/重命名都不会静默改变 supposedly frozen v1 provenance。
+ */
+const sealedHistoricalInputPreparationBaseCodePaths = [
+  "config/anchors/difficulty.json",
+  "config/models.yaml",
+  "config/review-flow-runtime.json",
+  "experiments/eval-review-flow.ts",
+  "experiments/prepare-review-flow-dataset.ts",
+  "experiments/lib/difficulty-anchors-strict.ts",
+  "experiments/lib/evaluation-code-identity.ts",
+  "experiments/lib/evaluation-integrity.ts",
+  "experiments/lib/physical-blind-common.ts",
+  "experiments/lib/private-artifact-io.ts",
+  "experiments/lib/review-flow-evaluation-adapter.ts",
+  "experiments/lib/review-flow-evaluation-bridge.ts",
+  "experiments/lib/review-flow-evaluation-config.ts",
+  "experiments/lib/review-flow-evaluation-dataset.ts",
+  "experiments/lib/review-flow-evaluation-registry.ts",
+  "experiments/lib/review-flow-evaluation-report.ts",
+  "experiments/lib/review-flow-evaluation-runner.ts",
+  "experiments/lib/review-flow-evaluation-state.ts",
+  "experiments/lib/review-flow-runtime-attestation.ts",
+  "package-lock.json",
+  "package.json",
+  "scripts/env-file.d.mts",
+  "scripts/env-file.mjs",
+  "scripts/private-runtime.d.mts",
+  "scripts/private-runtime.mjs",
+  "scripts/review-flow-evaluation-bootstrap.mjs",
+  "scripts/run-with-env.d.mts",
+  "scripts/run-with-env.mjs",
+  "scripts/trusted-git-state.d.mts",
+  "scripts/trusted-git-state.mjs",
+  "src/config.ts",
+  "src/llm.ts",
+  "src/logger.ts",
+  "src/pipelines/difficulty.ts",
+  "src/pipelines/types.ts",
+  "src/production-eligibility.ts",
+  "src/review-flow/evidence.ts",
+  "src/review-flow/historical-rubric.ts",
+  "src/review-flow/llm-roles.ts",
+  "src/review-flow/orchestrator.ts",
+  "src/review-flow/schemas.ts",
+  "src/review-flow/task-source.ts",
+  "src/review-flow/views.ts",
+  "src/urmotiv-schemas.ts",
+  "src/yaml-lite.ts",
+  "tsconfig.json"
+] as const;
+
 export const historicalInputPreparationCodePaths: readonly string[] =
   Object.freeze([
-    ...reviewFlowEvaluationCodePaths,
+    ...sealedHistoricalInputPreparationBaseCodePaths,
     "experiments/prepare-review-flow-historical-inputs.ts",
     "experiments/lib/review-flow-historical-input-preparer.ts"
   ]);
