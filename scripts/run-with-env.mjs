@@ -189,7 +189,7 @@ export function buildReviewFlowEvaluationRunEnvironment(
   }
   if (
     !/^(?!0{40}$)[0-9a-f]{40}$/u.test(fileEnvironment.EVAL_CODE_VERSION) ||
-    !/^(?:[1-9]|[12][0-9]|3[0-2])$/u.test(fileEnvironment.EVAL_CONCURRENCY)
+    !/^(?:[1-4])$/u.test(fileEnvironment.EVAL_CONCURRENCY)
   ) {
     throw new Error("REVIEW_FLOW_EVALUATION_ENV_FILE_INCOMPLETE");
   }
