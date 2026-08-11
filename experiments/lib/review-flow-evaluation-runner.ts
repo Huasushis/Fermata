@@ -1,4 +1,4 @@
-/** 并发执行器：首个不完整样本后不再启动新样本，但等待所有已发请求真正结束。 */
+/** 并发执行器：单题失败不阻止其它题目启动；最终封存仍要求 32 题全部完成。 */
 import type { ReviewFlowCalibrationProjection } from "../../src/review-flow/orchestrator";
 import { LlmRequestStartGate } from "../../src/llm";
 import type {
@@ -32,36 +32,34 @@ export type ReviewFlowEvaluationTerminationSignal =
 /** 信号只关闭新请求闸门；从不创建 AbortSignal，也不取消已经付费的流。 */
 export class ReviewFlowEvaluationStartGate {
   readonly #checkpoint: ReviewFlowEvaluationCheckpoint;
-  readonly #requestStartGate: LlmRequestStartGate;
   #closed = false;
   #persistenceFailed = false;
 
   public constructor(
-    checkpoint: ReviewFlowEvaluationCheckpoint,
-    requestStartGate = new LlmRequestStartGate()
+    checkpoint: ReviewFlowEvaluationCheckpoint
   ) {
     this.#checkpoint = checkpoint;
-    this.#requestStartGate = requestStartGate;
   }
 
   public canStart(): boolean {
     return !this.#closed &&
-      this.#requestStartGate.canStartRequest() &&
       this.#checkpoint.startGateOpen();
   }
 
-  public requestStartGate(): LlmRequestStartGate {
-    return this.#requestStartGate;
+  /**
+   * 为单个案例创建独立的请求闸门。一个案例内某角色失败时只会关闭该案例
+   * 自己的闸门，阻止同案例后续角色启动；不会影响其它并发案例。
+   */
+  public createCaseRequestStartGate(): LlmRequestStartGate {
+    return new LlmRequestStartGate();
   }
 
-  public closeForFailure(): void {
+  public closeForTermination(): void {
     this.#closed = true;
-    this.#requestStartGate.close();
   }
 
   public requestTermination(signal: ReviewFlowEvaluationTerminationSignal): void {
     this.#closed = true;
-    this.#requestStartGate.close();
     try {
       this.#checkpoint.markTerminationRequested(signal);
     } catch {
@@ -144,7 +142,7 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
   const workerCount = Math.min(input.concurrency, pending.length);
   const workers = Array.from({ length: workerCount }, async () => {
     try {
-      while (!stopStarting && startGate.canStart()) {
+      while (!stopStarting && !localFatal && startGate.canStart()) {
         const index = nextIndex;
         nextIndex += 1;
         const safeId = pending[index];
@@ -172,34 +170,29 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
           outcome = await input.executor.execute(
             evaluationCase.prepared,
             initial.runId,
-            startGate.requestStartGate()
+            startGate.createCaseRequestStartGate()
           );
         } catch {
-          startGate.closeForFailure();
           const failure = unexpectedFailure();
           try {
             input.checkpoint.markFailed(safeId, failure);
           } catch {
             localFatal = true;
           }
-          stopStarting = true;
-          return;
+          continue;
         }
 
         if (outcome.status === "incomplete") {
-          startGate.closeForFailure();
           try {
             input.checkpoint.markFailed(safeId, outcome.failure);
           } catch {
             localFatal = true;
           }
-          stopStarting = true;
-          return;
+          continue;
         }
         try {
           markCompleted(input.checkpoint, safeId, outcome.projection);
         } catch {
-          startGate.closeForFailure();
           throw new Error("REVIEW_FLOW_EVALUATION_LOCAL_STATE_FAILURE");
         }
       }
@@ -207,7 +200,7 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
       // 本地检查点/校验故障不能取消其它已经付费的 worker。只阻止继续启动，
       // 等全部 worker 收口后再向 CLI 抛一个固定错误。
       stopStarting = true;
-      startGate.closeForFailure();
+      startGate.closeForTermination();
       localFatal = true;
     }
   });

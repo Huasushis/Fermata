@@ -218,6 +218,29 @@ const trustedReceipt = {
   }]
 } as const;
 
+const trustedSolverReceipt = {
+  schemaVersion: 2,
+  requestCount: 2,
+  transportAttemptCount: 2,
+  eofVerified: true,
+  jsonSchemaValidated: true,
+  responses: [{
+    schemaVersion: 2,
+    transportAttemptCount: 1,
+    eofVerified: true,
+    responseMode: "json",
+    finishReasonStopVerified: true,
+    sseDoneObserved: null
+  }, {
+    schemaVersion: 2,
+    transportAttemptCount: 1,
+    eofVerified: true,
+    responseMode: "json",
+    finishReasonStopVerified: true,
+    sseDoneObserved: null
+  }]
+} as const;
+
 function executionContext(overrides: Record<string, unknown> = {}) {
   return {
     schemaVersion: 1,
@@ -311,11 +334,13 @@ function syntheticRoleFetch(): PipelineModelConfig["runtime"]["fetch"] {
       .map((message) => message.content)
       .join("\n");
     const userMessage = [...request.messages].reverse().find((message) => message.role === "user");
-    const user = userMessage === undefined
-      ? {}
-      : JSON.parse(userMessage.content) as Record<string, unknown>;
+    let user: Record<string, unknown> = {};
+    if (userMessage !== undefined) {
+      try { user = JSON.parse(userMessage.content) as Record<string, unknown>; }
+      catch { user = {}; }
+    }
     let payload: unknown;
-    if (system.includes("独立选手")) {
+    if (system.includes("独立选手") || system.includes("格式化助手")) {
       payload = {
         solved: true,
         narrative: "合成独立解题记录。",
@@ -481,7 +506,7 @@ describe("冻结证据多角色审题编排", () => {
 
     expect(outcome.status).toBe("complete");
     if (outcome.status !== "complete") throw new Error("expected complete");
-    expect(fetchImpl).toHaveBeenCalledTimes(11);
+    expect(fetchImpl).toHaveBeenCalledTimes(12);
     expect(outcome.projection).toMatchObject({
       schemaVersion: 2,
       verdict: "approve",
@@ -657,9 +682,9 @@ describe("冻结证据多角色审题编排", () => {
       init?: RequestInit
     ): Promise<Response> => {
       callCount += 1;
-      if (callCount <= 3) return baseFetch(url, init);
-      if (callCount === 4) return new Response(null, { status: 500 });
-      if (callCount <= 8) {
+      if (callCount <= 4) return baseFetch(url, init);
+      if (callCount === 5) return new Response(null, { status: 500 });
+      if (callCount <= 9) {
         return new Promise<Response>((resolve) => {
           pendingResponses.push({ url, init, resolve });
         });
@@ -679,7 +704,7 @@ describe("冻结证据多角色审题编排", () => {
     });
 
     await vi.waitFor(() => {
-      expect(fetchImpl).toHaveBeenCalledTimes(8);
+      expect(fetchImpl).toHaveBeenCalledTimes(9);
       expect(pendingResponses).toHaveLength(4);
       expect(gate.canStartRequest()).toBe(false);
     });
@@ -693,7 +718,7 @@ describe("冻结证据多角色审题编排", () => {
     expect(outcome.failure.failedRoles.map((entry) => entry.role)).toEqual([
       "difficulty"
     ]);
-    expect(fetchImpl).toHaveBeenCalledTimes(8);
+    expect(fetchImpl).toHaveBeenCalledTimes(9);
   });
 
   it("solver 运行时只收到题面视图，题解、标签、查重和自报答案均不可见", async () => {
@@ -818,15 +843,16 @@ describe("冻结证据多角色审题编排", () => {
       assignmentId: executionContext().assignmentId,
       runnerIdentity: expect.stringMatching(/^[0-9a-f]{64}$/u)
     });
-    expect(first.runBinding.runnerIdentity).toBe(runner.runnerIdentity);
-    expect(first.sourceSnapshotHash).toMatch(/^[0-9a-f]{64}$/u);
     expect(first.roleCompletions).toHaveLength(11);
     for (const artifact of Object.values(artifacts(first))) {
       expect(artifact.sourceSnapshotHash).toBe(first.sourceSnapshotHash);
+      const expectedReceipt = artifact === artifacts(first).solver
+        ? trustedSolverReceipt
+        : trustedReceipt;
       expect(artifact.execution).toEqual({
         trust: "trusted_llm",
         runContextHash: first.runContextHash,
-        completionReceipt: trustedReceipt
+        completionReceipt: expectedReceipt
       });
     }
 

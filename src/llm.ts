@@ -57,15 +57,19 @@ export interface ChatCompletionWithReceipt extends ChatCompletionResult {
 
 export interface LlmJsonCompletionReceipt {
   readonly schemaVersion: 2;
-  /** JSON 首轮成功为 1；触发唯一一次修复轮时为 2。 */
-  readonly requestCount: 1 | 2;
+  /**
+   * 请求次数：1 = 首轮直接成功；2 = 触发修复轮或两轮设计（语义+格式）的第二轮；
+   * 3 = 两轮设计中格式轮再触发修复。
+   */
+  readonly requestCount: 1 | 2 | 3;
   readonly transportAttemptCount: number;
   readonly eofVerified: true;
   readonly jsonSchemaValidated: true;
   /** 每一轮生成各自的传输完成证据；长度必须等于 requestCount。 */
   readonly responses:
     | readonly [LlmTransportReceipt]
-    | readonly [LlmTransportReceipt, LlmTransportReceipt];
+    | readonly [LlmTransportReceipt, LlmTransportReceipt]
+    | readonly [LlmTransportReceipt, LlmTransportReceipt, LlmTransportReceipt];
 }
 
 /**
@@ -75,7 +79,7 @@ export interface LlmJsonCompletionReceipt {
  */
 export interface LlmFailureAudit {
   readonly schemaVersion: 1;
-  readonly requestCount: 1 | 2;
+  readonly requestCount: 1 | 2 | 3;
   readonly transportAttemptCount: number;
   readonly completedResponses: readonly LlmTransportReceipt[];
   readonly terminal: {
@@ -745,6 +749,121 @@ export async function chatCompleteJsonWithReceipt<T>(
   throw error;
 }
 
+/**
+ * 两轮 JSON 设计：第一轮让模型用自然语言完成语义判断（不强制 JSON），
+ * 第二轮只做格式化——把第一轮的文本转换为满足 schema 的 JSON，不重新判断。
+ * 两轮都使用相同的模型配置（含 thinking/reasoning_effort）。
+ * 适用于 thinking=max 时模型推理 token 量大、与 JSON 输出争用 max_tokens 的情况。
+ */
+export async function chatCompleteTwoRoundJsonWithReceipt<T>(
+  provider: ProviderCredentialsLike,
+  spec: ModelCallSpec,
+  semanticMessages: ChatMessage[],
+  formatterMessages: (semanticOutput: string, semanticReasoning: string | null) => ChatMessage[],
+  schema: z.ZodType<T>,
+  runtime: LlmRuntimeOptions,
+  options: ChatCompletionJsonOptions = {}
+): Promise<{ data: T; reasoning: string | null; receipt: LlmJsonCompletionReceipt }> {
+  let semantic: ChatCompletionWithReceipt;
+  try {
+    semantic = await chatCompleteWithReceipt(provider, spec, semanticMessages, runtime, {
+      requestJson: false,
+      maxOutputTokens: options.maxOutputTokens
+    });
+    assertStructuredCompletionTransport(semantic.receipt);
+  } catch (error) {
+    promoteJsonFailureAudit(error, 1, [], 0);
+    throw error;
+  }
+
+  const formatMessages = formatterMessages(semantic.content, semantic.reasoning);
+  const jsonInstruction: ChatMessage = {
+    role: "system",
+    content: "只输出一个满足要求的 JSON 对象本身，不要输出任何解释、前后缀文字，也不要用 Markdown 代码块包裹。"
+  };
+  const firstFormatMessages: ChatMessage[] = [jsonInstruction, ...formatMessages];
+  let firstFormat: ChatCompletionWithReceipt;
+  try {
+    firstFormat = await chatCompleteWithReceipt(provider, spec, firstFormatMessages, runtime, {
+      requestJson: false,
+      maxOutputTokens: options.maxOutputTokens
+    });
+    assertStructuredCompletionTransport(firstFormat.receipt);
+  } catch (error) {
+    promoteJsonFailureAudit(error, 2, [semantic.receipt], semantic.receipt.transportAttemptCount);
+    throw error;
+  }
+  const firstAttempt = tryParseAndValidate(firstFormat.content, schema);
+  if (firstAttempt.success) {
+    return {
+      data: firstAttempt.data,
+      reasoning: semantic.reasoning ?? firstFormat.reasoning,
+      receipt: {
+        schemaVersion: 2,
+        requestCount: 2,
+        transportAttemptCount:
+          semantic.receipt.transportAttemptCount + firstFormat.receipt.transportAttemptCount,
+        eofVerified: true,
+        jsonSchemaValidated: true,
+        responses: [semantic.receipt, firstFormat.receipt]
+      }
+    };
+  }
+
+  const repairMessages: ChatMessage[] = [
+    ...firstFormatMessages,
+    { role: "assistant", content: firstFormat.content },
+    {
+      role: "user",
+      content: `上一条回复不满足要求：${firstAttempt.error}。请只重新输出一个满足要求的 JSON 对象，不要包含任何其它文字或代码块标记。`
+    }
+  ];
+  let secondFormat: ChatCompletionWithReceipt;
+  try {
+    secondFormat = await chatCompleteWithReceipt(provider, spec, repairMessages, runtime, {
+      requestJson: false,
+      maxOutputTokens: options.maxOutputTokens
+    });
+    assertStructuredCompletionTransport(secondFormat.receipt);
+  } catch (error) {
+    promoteJsonFailureAudit(
+      error, 3,
+      [semantic.receipt, firstFormat.receipt],
+      semantic.receipt.transportAttemptCount + firstFormat.receipt.transportAttemptCount
+    );
+    throw error;
+  }
+  const secondAttempt = tryParseAndValidate(secondFormat.content, schema);
+  if (secondAttempt.success) {
+    return {
+      data: secondAttempt.data,
+      reasoning: semantic.reasoning ?? firstFormat.reasoning ?? secondFormat.reasoning,
+      receipt: {
+        schemaVersion: 2,
+        requestCount: 3,
+        transportAttemptCount:
+          semantic.receipt.transportAttemptCount +
+          firstFormat.receipt.transportAttemptCount +
+          secondFormat.receipt.transportAttemptCount,
+        eofVerified: true,
+        jsonSchemaValidated: true,
+        responses: [semantic.receipt, firstFormat.receipt, secondFormat.receipt]
+      }
+    };
+  }
+
+  const error = new LlmJsonOutputError();
+  rememberLlmFailureAudit(error, {
+    requestCount: 3,
+    requestAudit: mutableAuditFromReceipt(secondFormat.receipt),
+    completedResponses: [semantic.receipt, firstFormat.receipt, secondFormat.receipt],
+    priorTransportAttemptCount:
+      semantic.receipt.transportAttemptCount + firstFormat.receipt.transportAttemptCount,
+    jsonSchemaValidated: false
+  });
+  throw error;
+}
+
 // ---------------------------------------------------------------------------
 // 内部实现
 // ---------------------------------------------------------------------------
@@ -821,7 +940,7 @@ function resetMutableLlmRequestAuditForAttempt(
 function rememberLlmFailureAudit(
   error: unknown,
   input: {
-    readonly requestCount: 1 | 2;
+    readonly requestCount: 1 | 2 | 3;
     readonly requestAudit: MutableLlmRequestAudit;
     readonly completedResponses?: readonly LlmTransportReceipt[];
     readonly priorTransportAttemptCount?: number;
@@ -880,7 +999,7 @@ function assertStructuredCompletionTransport(
 
 function promoteJsonFailureAudit(
   error: unknown,
-  requestCount: 1 | 2,
+  requestCount: 1 | 2 | 3,
   completedResponses: readonly LlmTransportReceipt[],
   priorTransportAttemptCount: number
 ): void {

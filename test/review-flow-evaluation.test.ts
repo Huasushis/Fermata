@@ -517,9 +517,10 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
     expect(state.executionSeal?.complete).toBe(false);
     expect(state.entries.map((entry) => entry.status)).toEqual([
       "failed",
-      "pending",
-      "pending"
+      "failed",
+      "failed"
     ]);
+    expect(execute).toHaveBeenCalledTimes(3);
     checkpoint.close();
 
     const resumed = openCheckpoint(fixture, { resume: true });
@@ -535,7 +536,7 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
     resumed.close();
   });
 
-  it("首个样本失败后共享请求闸门阻止另一在途样本的下一角色", async () => {
+  it("单题失败不阻止其它题目启动；每题拥有独立请求闸门", async () => {
     const fixture = createStateFixture(2);
     const checkpoint = openCheckpoint(fixture, { bindClaim: true });
     const siblingFirstRequest = deferred<void>();
@@ -558,7 +559,7 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
           }
           return {
             status: "incomplete" as const,
-            failure: fixedFailure("REVIEW_FLOW_REQUEST_START_GATE_CLOSED", null)
+            failure: fixedFailure("REVIEW_FLOW_HTTP_499", 499)
           };
         }
       },
@@ -570,7 +571,7 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
     });
     siblingFirstRequest.resolve();
     const state = await run;
-    expect(started).not.toContain("case-0002:second");
+    expect(started).toContain("case-0002:second");
     expect(state.entries.map((entry) => entry.status)).toEqual([
       "failed",
       "failed"
@@ -784,7 +785,7 @@ describe("32 案例 × 11 角色 = 352 收据封存契约", () => {
     checkpoint.close();
   });
 
-  it("缺失样本令封存 complete=false 且终态不可恢复", async () => {
+  it("全部样本失败时封存 complete=false 且终态不可恢复（非 fail-fast）", async () => {
     const fixture = createStateFixture(32);
     const checkpoint = openCheckpoint(fixture, { bindClaim: true });
     const execute = vi.fn(async () => ({
@@ -801,6 +802,7 @@ describe("32 案例 × 11 角色 = 352 收据封存契约", () => {
     expect(checkpoint.terminallyContaminated()).toBe(true);
     expect(state.entries.some((e) => e.status === "failed")).toBe(true);
     expect(state.entries.filter((e) => e.status === "completed")).toHaveLength(0);
+    expect(execute).toHaveBeenCalledTimes(32);
     checkpoint.close();
   });
 

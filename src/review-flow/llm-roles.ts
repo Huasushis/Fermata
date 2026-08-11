@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   chatCompleteJsonWithReceipt,
+  chatCompleteTwoRoundJsonWithReceipt,
   llmTransportProtocolVersion,
   type ChatMessage,
   type LlmJsonCompletionReceipt
@@ -159,11 +160,14 @@ export function createReviewFlowLlmBundle(input: {
 
   const roles: ReviewFlowRoles = {
     solver: async (view) => {
-      const { data, reasoning, receipt } = await runJson(
-        models.solver,
-        buildSolverMessages(view),
+      const { data, reasoning, receipt } = await chatCompleteTwoRoundJsonWithReceipt(
+        models.solver.credentials,
+        models.solver.spec,
+        buildSolverSemanticMessages(view),
+        buildSolverFormatterMessages,
         solverPayloadSchema,
-        1_000_000
+        models.solver.runtime,
+        { maxOutputTokens: 1_000_000 }
       );
       const narrative = mergeNarrative(reasoning, data.narrative);
       return trustedRoleExecution({ ...data, narrative }, receipt);
@@ -409,6 +413,54 @@ export function buildSolverMessages(
       ].join(""))
     },
     { role: "user", content: privateContext(view) }
+  ];
+}
+
+/**
+ * 两轮设计的语义轮：让模型用自然语言解题，不强制 JSON 输出。
+ * 这样 thinking=max 的推理 token 不会与 JSON 结构化输出争用 max_tokens 预算。
+ */
+export function buildSolverSemanticMessages(
+  view: Parameters<ReviewFlowRoles["solver"]>[0]
+): ChatMessage[] {
+  return [
+    {
+      role: "system",
+      content: guardedSystemPrompt("solver", [
+        "你是正在参加算法竞赛的独立选手。你只能依据题面、约束和样例解题；你看不到官方题解、投稿者自报难度、",
+        "历史审核结论、知识点标签或查重结果。不得假装见过标准答案，也不得用题号、作者或来源猜测难度。\n\n",
+        "先澄清目标与边界，再尝试可行思路；记录真正需要的观察、失败路线和修正。最后给出能够覆盖边界情况的算法、",
+        "正确性理由与复杂度。若无法完整解决，要明确停在哪一步和不确定性，不能为了显得成功而补写结论。\n\n",
+        "用自然语言输出你的解题过程，包含以下内容（不需要 JSON 格式）：\n",
+        "1. solved：你是否解出了这道题（是/否）\n",
+        "2. narrative：完整独立的解题记录，包括观察、失败路线、修正和最终思路\n",
+        "3. approach：精炼的算法概述\n",
+        "4. claimedComplexity：算法复杂度\n",
+        "5. uncertainties：你不确定的地方（如果有）\n\n",
+        "不要评价题目质量、比赛适配或官方题解。"
+      ].join(""))
+    },
+    { role: "user", content: privateContext(view) }
+  ];
+}
+
+/**
+ * 两轮设计的格式化轮：把语义轮的自然语言输出转换为满足 schema 的 JSON。
+ * 只做格式转换，不重新判断或修改语义内容。
+ */
+export function buildSolverFormatterMessages(
+  semanticOutput: string,
+  _semanticReasoning: string | null
+): ChatMessage[] {
+  return [
+    {
+      role: "system",
+      content: "你是格式化助手。下面是选手的解题记录。请将其转换为严格的 JSON 对象，不要改变任何语义内容。"
+    },
+    {
+      role: "user",
+      content: `以下是选手的解题记录，请转换为严格 JSON 对象，包含字段：solved（布尔值）、narrative（字符串，完整解题记录）、approach（字符串，精炼算法概述）、claimedComplexity（字符串，复杂度）、uncertainties（字符串数组，不确定的地方，没有则空数组）。不要改变任何语义判断，只做格式转换。\n\n${semanticOutput}`
+    }
   ];
 }
 
@@ -697,7 +749,7 @@ function guardedSystemPrompt(role: ReviewFlowRole, roleInstructions: string): st
  */
 function promptImplementationDigest(role: ReviewFlowRole): string {
   const builders: Readonly<Record<ReviewFlowRole, (...args: never[]) => ChatMessage[]>> = {
-    solver: buildSolverMessages as (...args: never[]) => ChatMessage[],
+    solver: buildSolverSemanticMessages as (...args: never[]) => ChatMessage[],
     solution_analyst: buildSolutionAnalystMessages as (...args: never[]) => ChatMessage[],
     technical_auditor: buildTechnicalAuditorMessages as (...args: never[]) => ChatMessage[],
     difficulty: buildDifficultyMessages as (...args: never[]) => ChatMessage[],
@@ -709,6 +761,9 @@ function promptImplementationDigest(role: ReviewFlowRole): string {
     adversary: buildAdversaryMessages as (...args: never[]) => ChatMessage[],
     adjudicator: buildAdjudicatorMessages as (...args: never[]) => ChatMessage[]
   };
+  const solverFormatterSource = role === "solver"
+    ? buildSolverFormatterMessages.toString()
+    : null;
   return hashCanonicalValue({
     builderSource: builders[role].toString(),
     guardSource: guardedSystemPrompt.toString(),
@@ -716,7 +771,8 @@ function promptImplementationDigest(role: ReviewFlowRole): string {
     rubricDigest: tasteRubricRoles.has(role) ? historicalReviewRubricDigest : null,
     rubricPromptDigest: tasteRubricRoles.has(role)
       ? historicalReviewRubricPromptDigest
-      : null
+      : null,
+    solverFormatterSource
   });
 }
 
