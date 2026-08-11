@@ -89,7 +89,7 @@ export type ProductionEligibilityDecision =
     };
 
 export const currentBlockedProductionExperimentVersion =
-  "experiment-2026-08-review-flow-historical-rubric-v1-eof-receipt-v2";
+  "experiment-2026-08-review-flow-historical-rubric-v1-eof-receipt-v3";
 
 export interface ProductionEligibilityVerifier {
   verify(profileName: string): ProductionEligibilityDecision;

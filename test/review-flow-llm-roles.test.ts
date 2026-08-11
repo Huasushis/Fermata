@@ -657,4 +657,79 @@ describe("历史人工标准驱动的多角色提示词", () => {
       Object.freeze({}) as ProductionReviewGrant
     )).toThrow("REVIEW_FLOW_PRODUCTION_GRANT_INVALID");
   });
+
+  it("所有 11 个角色的 maxOutputTokens 均为 131072", async () => {
+    const roleByModel = new Map<string, ReviewFlowRole>(
+      reviewFlowRoleSchema.options.map((role) => [`cap-test-${role}`, role] as const)
+    );
+    const observedMaxTokens: Record<string, number> = {};
+    const fetchImpl = vi.fn(async (
+      _url: string | URL | Request,
+      init?: RequestInit
+    ) => {
+      const body = JSON.parse(String(init?.body)) as { readonly model?: unknown; readonly max_tokens?: unknown };
+      const model = typeof body.model === "string" ? body.model : "unknown";
+      if (typeof body.max_tokens === "number") {
+        observedMaxTokens[model] = body.max_tokens;
+      }
+      const role = roleByModel.get(model);
+      const payload = role !== undefined ? wireRolePayloads[role] : wireRolePayloads.solver;
+      return new Response(JSON.stringify({
+        choices: [{
+          message: { content: JSON.stringify(payload) },
+          finish_reason: "stop"
+        }]
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    const models = Object.fromEntries(reviewFlowRoleSchema.options.map((role) => {
+      const config = modelConfig(`cap-test-${role}`);
+      return [role, {
+        ...config,
+        runtime: { ...config.runtime, fetch: fetchImpl }
+      }];
+    })) as unknown as ReviewFlowModelConfigs;
+    const bundle = createReviewFlowLlmBundle({
+      models,
+      difficultyAnchors: [],
+      profileName: "synthetic-profile",
+      experimentVersion: "synthetic-experiment",
+      engineBuildFingerprint: "c".repeat(64),
+      productionGrant: null
+    });
+    const views = flowViews();
+    const difficulty = syntheticArtifact("difficulty", difficultyPayloadSchema, wireRolePayloads.difficulty);
+    const editorial = syntheticArtifact("editorial_judge", editorialPayloadSchema, wireRolePayloads.editorial_judge);
+    const contestFit = syntheticArtifact("contest_fit", contestFitPayloadSchema, wireRolePayloads.contest_fit);
+    const originality = syntheticArtifact("originality", originalityPayloadSchema, wireRolePayloads.originality);
+    const tags = syntheticArtifact("tags", tagsPayloadSchema, wireRolePayloads.tags);
+    const coreEvidence: EvidenceArtifact<unknown>[] = [
+      views.artifacts.solver, views.artifacts.solutionAnalyst, views.artifacts.technicalAudit,
+      difficulty, editorial, contestFit, originality, tags
+    ];
+    const criticView = buildCriticView(problemContentHash, coreEvidence);
+    const adversaryView = buildAdversaryView(criticView);
+    const critic = syntheticArtifact("critic", criticPayloadSchema, wireRolePayloads.critic);
+    const adversary = syntheticArtifact("adversary", adversaryPayloadSchema, wireRolePayloads.adversary);
+    const adjudicatorView = buildAdjudicatorView(criticView, critic, adversary);
+    const invocations: Readonly<Record<ReviewFlowRole, () => Promise<unknown>>> = {
+      solver: () => bundle.roles.solver(views.statement),
+      solution_analyst: () => bundle.roles.solutionAnalyst(views.solutionAnalyst),
+      technical_auditor: () => bundle.roles.technicalAuditor(views.technical),
+      difficulty: () => bundle.roles.difficulty(views.difficulty),
+      editorial_judge: () => bundle.roles.editorialJudge(views.editorial),
+      contest_fit: () => bundle.roles.contestFit(views.contestFit),
+      originality: () => bundle.roles.originality(views.originality),
+      tags: () => bundle.roles.tags(views.tags),
+      critic: () => bundle.roles.critic(criticView),
+      adversary: () => bundle.roles.adversary(adversaryView),
+      adjudicator: () => bundle.roles.adjudicator(adjudicatorView)
+    };
+    for (const role of reviewFlowRoleSchema.options) {
+      await invocations[role]();
+    }
+    expect(fetchImpl).toHaveBeenCalledTimes(reviewFlowRoleSchema.options.length);
+    for (const role of reviewFlowRoleSchema.options) {
+      expect(observedMaxTokens[`cap-test-${role}`]).toBe(131_072);
+    }
+  });
 });

@@ -137,9 +137,9 @@ describe("parseYamlLite：解析真实的 config/models.yaml", () => {
       model: "deepseek-v4-flash",
       temperature: 0.2,
       thinking: false,
-      thinkingRequest: "disabled"
+      thinkingRequest: "enabled",
+      reasoningEffort: "max"
     });
-    expect(defaultProfile.difficulty).not.toHaveProperty("reasoningEffort");
     expect(defaultProfile.thinking).toMatchObject({
       solver: expect.any(Object),
       analyst: expect.any(Object)
@@ -152,7 +152,7 @@ describe("parseYamlLite：解析真实的 config/models.yaml", () => {
       llmMaximumDurationMs: 14_400_000
     });
     expect(parsed.experimentVersion).toBe(
-      "experiment-2026-08-review-flow-historical-rubric-v1-eof-receipt-v2"
+      "experiment-2026-08-review-flow-historical-rubric-v1-eof-receipt-v3"
     );
   });
 });

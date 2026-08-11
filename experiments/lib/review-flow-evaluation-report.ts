@@ -261,7 +261,8 @@ export const reviewFlowEvaluationReportSummarySchema = z
     receiptCoverage: z
       .object({
         completedCaseCount: z.number().int().nonnegative(),
-        completeElevenRoleReceiptCaseCount: z.number().int().nonnegative()
+        completeElevenRoleReceiptCaseCount: z.number().int().nonnegative(),
+        totalReceiptCount: z.number().int().nonnegative()
       })
       .strict(),
     failures: z.array(failureRowSchema),
@@ -441,7 +442,14 @@ export function buildReviewFlowEvaluationReport(input: {
           entry.status === "completed" &&
           reviewFlowCalibrationProjectionSchema.safeParse(entry.projection).success &&
           entry.projection.roleReceipts.length === 11
-      ).length
+      ).length,
+      totalReceiptCount: input.checkpoint.entries.reduce(
+        (sum, entry) =>
+          entry.status === "completed"
+            ? sum + entry.projection.roleReceipts.length
+            : sum,
+        0
+      )
     },
     failures: aggregateFailures(input.checkpoint.entries, input.checkpoint.termination),
     caseResults,

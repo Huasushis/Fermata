@@ -62,7 +62,8 @@ const spec: ModelSpec = {
   model: "deepseek-v4-flash",
   temperature: 0.2,
   thinking: false,
-  thinkingRequest: "disabled"
+  thinkingRequest: "enabled",
+  reasoningEffort: "max"
 };
 const credentials: ProviderCredentials = {
   baseUrl: "https://aether.example.test/v1",
@@ -86,13 +87,13 @@ const problem: ReviewTaskProblem = {
   basicStatement: "synthetic statement",
   basicSolution: "synthetic solution"
 };
-
 const validRequestBody = {
   model: "deepseek-v4-flash",
   temperature: 0.2,
   stream: true,
   messages: [{ role: "user", content: "synthetic" }],
-  thinking: { type: "disabled" },
+  thinking: { type: "enabled" },
+  reasoning_effort: "max",
   max_tokens: 2_048
 };
 
@@ -125,9 +126,9 @@ function validCommonEvidence() {
       difficultyConnectivityExpectedCandidateCAnchorsSha256,
     providerIdentitySha256:
       difficultyConnectivityExpectedProviderIdentitySha256,
-    model: "deepseek-v4-flash" as const,
     thinking: false as const,
-    thinkingRequest: "disabled" as const,
+    thinkingRequest: "enabled" as const,
+    reasoningEffort: "max" as const,
     maxOutputTokens: 2_048 as const,
     maximumPaidRequests: 1 as const,
     expected: 1 as const,
@@ -206,15 +207,16 @@ describe("Candidate C 连通性请求契约", () => {
     );
   });
 
-  it("只接受 flash、thinking false 对应的 disabled 请求且没有 reasoning_effort", () => {
+  it("只接受 flash、thinking enabled + reasoning_effort max 的请求", () => {
     expect(difficultyConnectivityProbeRequestBodySchema.parse(validRequestBody)).toEqual(
       validRequestBody
     );
     for (const invalid of [
       { ...validRequestBody, model: "deepseek-v4-pro" },
       { ...validRequestBody, thinking: undefined },
-      { ...validRequestBody, thinking: { type: "enabled" } },
+      { ...validRequestBody, thinking: { type: "disabled" } },
       { ...validRequestBody, reasoning_effort: "low" },
+      { ...validRequestBody, reasoning_effort: undefined },
       { ...validRequestBody, max_tokens: 4_096 }
     ]) {
       expect(() => difficultyConnectivityProbeRequestBodySchema.parse(invalid)).toThrow();
@@ -339,10 +341,10 @@ describe("Candidate C 单请求与真实 EOF", () => {
     expect(settled).toBe(false);
     expect(requestBody).toMatchObject({
       model: "deepseek-v4-flash",
-      thinking: { type: "disabled" },
+      thinking: { type: "enabled" },
+      reasoning_effort: "max",
       max_tokens: 2_048
     });
-    expect(requestBody).not.toHaveProperty("reasoning_effort");
 
     streamController.close();
     await expect(pending).resolves.toEqual(validResult());

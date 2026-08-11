@@ -367,6 +367,125 @@ describe("LLM 生产 HTTP 传输层", () => {
     expect(observed.uncaughtExceptions).toEqual([]);
     expect(observed.unhandledRejections).toEqual([]);
   });
+
+  it("DeepSeek V4 thinking 请求通过真实 HTTP 传输发送 thinking.type=enabled、reasoning_effort=max、max_tokens=131072", async () => {
+    let observedBody: Record<string, unknown> | undefined;
+    const server = createServer((_request, response) => {
+      let chunks = "";
+      _request.on("data", (chunk: Buffer) => { chunks += chunk.toString(); });
+      _request.on("end", () => {
+        observedBody = JSON.parse(chunks) as Record<string, unknown>;
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({
+          choices: [{
+            message: { role: "assistant", content: "合成回答" },
+            finish_reason: "stop"
+          }]
+        }));
+      });
+    });
+    const baseUrl = await listen(server);
+    const dispatcher = new Agent({ connectTimeout: 1_000 });
+    dispatchers.push(dispatcher);
+
+    const result = await chatComplete(
+      { baseUrl: `${baseUrl}/v1`, apiKey: "local-test-key" },
+      {
+        provider: "aether",
+        model: "deepseek-v4-pro",
+        temperature: 0.1,
+        thinking: true,
+        thinkingRequest: "enabled",
+        reasoningEffort: "max"
+      },
+      [{ role: "user", content: "合成测试" }],
+      {
+        outputIdleTimeoutMs: 1_000,
+        firstOutputTimeoutMs: 1_000,
+        maximumDurationMs: 2_000,
+        maxAttempts: 1,
+        baseDelayMs: 1,
+        fetch: createUndiciLlmFetch(dispatcher)
+      },
+      { maxOutputTokens: 131_072 }
+    );
+
+    expect(result).toEqual({ content: "合成回答", reasoning: null });
+    expect(observedBody).toBeDefined();
+    expect(observedBody?.thinking).toEqual({ type: "enabled" });
+    expect(observedBody?.reasoning_effort).toBe("max");
+    expect(observedBody?.max_tokens).toBe(131_072);
+    expect(observedBody?.stream).toBe(true);
+  });
+
+  it("DeepSeek V4 缺少 thinkingRequest 在 HTTP 请求前被拒绝", async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        choices: [{ message: { role: "assistant", content: "不应到达" }, finish_reason: "stop" }]
+      }));
+    });
+    const baseUrl = await listen(server);
+    const dispatcher = new Agent({ connectTimeout: 1_000 });
+    dispatchers.push(dispatcher);
+
+    await expect(
+      chatComplete(
+        { baseUrl: `${baseUrl}/v1`, apiKey: "local-test-key" },
+        {
+          provider: "aether",
+          model: "deepseek-v4-pro",
+          temperature: 0.1,
+          thinking: true
+        },
+        [{ role: "user", content: "合成测试" }],
+        {
+          outputIdleTimeoutMs: 1_000,
+          firstOutputTimeoutMs: 1_000,
+          maximumDurationMs: 2_000,
+          maxAttempts: 1,
+          baseDelayMs: 1,
+          fetch: createUndiciLlmFetch(dispatcher)
+        },
+        { maxOutputTokens: 131_072 }
+      )
+    ).rejects.toBeInstanceOf(TypeError);
+  });
+
+  it("DeepSeek V4 enabled 但缺少 max reasoningEffort 在 HTTP 请求前被拒绝", async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        choices: [{ message: { role: "assistant", content: "不应到达" }, finish_reason: "stop" }]
+      }));
+    });
+    const baseUrl = await listen(server);
+    const dispatcher = new Agent({ connectTimeout: 1_000 });
+    dispatchers.push(dispatcher);
+
+    await expect(
+      chatComplete(
+        { baseUrl: `${baseUrl}/v1`, apiKey: "local-test-key" },
+        {
+          provider: "aether",
+          model: "deepseek-v4-pro",
+          temperature: 0.1,
+          thinking: true,
+          thinkingRequest: "enabled"
+        },
+        [{ role: "user", content: "合成测试" }],
+        {
+          outputIdleTimeoutMs: 1_000,
+          firstOutputTimeoutMs: 1_000,
+          maximumDurationMs: 2_000,
+          maxAttempts: 1,
+          baseDelayMs: 1,
+          fetch: createUndiciLlmFetch(dispatcher)
+        },
+        { maxOutputTokens: 131_072 }
+      )
+    ).rejects.toBeInstanceOf(TypeError);
+  });
 });
 
 async function captureProcessAsyncFailures<T>(

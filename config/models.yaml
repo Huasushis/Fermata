@@ -14,7 +14,7 @@
 # 分别对应 .env 里的 AETHER_* 和 DASHSCOPE_* 变量，具体 baseUrl/apiKey 从环境
 # 变量读取，不写在这个文件里。
 
-experimentVersion: "experiment-2026-08-review-flow-historical-rubric-v1-eof-receipt-v2"
+experimentVersion: "experiment-2026-08-review-flow-historical-rubric-v1-eof-receipt-v3"
 
 defaults:
   modelProfileName: review-balanced
@@ -24,10 +24,9 @@ defaults:
 # profiles 下每个 key 是一个"模型档位"的名字，供 modelProfileName 引用。
 # 每个档位为四条旧流水线（difficulty / thinking / coding / verdict）以及新的
 # 多角色审题流分别指定 provider、model、temperature，以及是否保留模型返回的思考过程。`thinking: true`
-# 只表示读取响应里的 reasoning_content，不控制模型是否进行深度思考。当前只允许
-# Aether 的 deepseek-v4-flash 配置 `thinkingRequest: enabled/disabled`。enabled
-# 必须同时配置 `reasoningEffort: low`，按 DeepSeek 当前 OpenAI-compatible 格式发送
-# `thinking: {type: "enabled"}` 和 `reasoning_effort: "low"`；disabled 只发送
+# Aether 的 deepseek-v4-flash 和 deepseek-v4-pro 都支持配置 `thinkingRequest: enabled`，
+# 必须同时配置 `reasoningEffort: max`，按 DeepSeek 当前 OpenAI-compatible 格式发送
+# `thinking: {type: "enabled"}` 和 `reasoning_effort: "max"`；disabled 只发送
 # `thinking: {type: "disabled"}`。留空时两个请求字段都不发送。thinking 流水线本身
 # 分两步，所以下面有 solver 和 analyst 两个子配置。reviewFlow 必须逐项配置全部
 # 11 个角色，不接受一个“综合审题模型”字段代替这些角色。
@@ -41,87 +40,115 @@ profiles:
       model: deepseek-v4-flash
       temperature: 0.2
       thinking: false
-      thinkingRequest: disabled
+      thinkingRequest: enabled
+      reasoningEffort: max
     thinking:
       solver:
         provider: aether
         model: deepseek-v4-pro
         temperature: 0.4
         thinking: true
+        thinkingRequest: enabled
+        reasoningEffort: max
       analyst:
         provider: aether
         model: deepseek-v4-flash
         temperature: 0.1
         thinking: false
+        thinkingRequest: enabled
+        reasoningEffort: max
     coding:
       provider: aether
       model: deepseek-v4-flash
       temperature: 0.3
       thinking: false
+      thinkingRequest: enabled
+      reasoningEffort: max
     verdict:
       provider: aether
       model: deepseek-v4-pro
       temperature: 0.1
       thinking: false
+      thinkingRequest: enabled
+      reasoningEffort: max
     reviewFlow:
       solver:
         provider: aether
         model: deepseek-v4-pro
         temperature: 0.4
         thinking: true
+        thinkingRequest: enabled
+        reasoningEffort: max
       solutionAnalyst:
         provider: aether
         model: deepseek-v4-pro
         temperature: 0.2
         thinking: true
+        thinkingRequest: enabled
+        reasoningEffort: max
       technicalAuditor:
         provider: aether
         model: deepseek-v4-pro
         temperature: 0.1
         thinking: true
+        thinkingRequest: enabled
+        reasoningEffort: max
       difficulty:
         provider: aether
         model: deepseek-v4-flash
         temperature: 0.2
         thinking: false
-        thinkingRequest: disabled
+        thinkingRequest: enabled
+        reasoningEffort: max
       editorialJudge:
         provider: aether
         model: deepseek-v4-pro
         temperature: 0.1
         thinking: true
+        thinkingRequest: enabled
+        reasoningEffort: max
       contestFit:
         provider: aether
         model: deepseek-v4-pro
         temperature: 0.1
         thinking: true
+        thinkingRequest: enabled
+        reasoningEffort: max
       originality:
         provider: aether
         model: deepseek-v4-flash
         temperature: 0.1
         thinking: false
-        thinkingRequest: disabled
+        thinkingRequest: enabled
+        reasoningEffort: max
       tags:
         provider: aether
         model: deepseek-v4-flash
         temperature: 0.1
         thinking: false
-        thinkingRequest: disabled
+        thinkingRequest: enabled
+        reasoningEffort: max
       critic:
         provider: aether
         model: deepseek-v4-pro
         temperature: 0.2
         thinking: true
+        thinkingRequest: enabled
+        reasoningEffort: max
       adversary:
         provider: aether
         model: deepseek-v4-pro
         temperature: 0.2
         thinking: true
+        thinkingRequest: enabled
+        reasoningEffort: max
       adjudicator:
         provider: aether
         model: deepseek-v4-pro
         temperature: 0.1
         thinking: true
+        thinkingRequest: enabled
+        reasoningEffort: max
 
 retry:
   maxAttempts: 3

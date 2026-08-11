@@ -116,7 +116,7 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
   if (
     !Number.isSafeInteger(input.concurrency) ||
     input.concurrency < 1 ||
-    input.concurrency > 32
+    input.concurrency > 4
   ) {
     throw new Error("REVIEW_FLOW_EVALUATION_CONCURRENCY_INVALID");
   }

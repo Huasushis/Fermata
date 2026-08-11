@@ -84,7 +84,7 @@ const thinkingRequestBodySchema = z
     stream: z.literal(true),
     messages: z.array(z.unknown()).min(1),
     thinking: z.object({ type: z.literal("enabled") }).strict(),
-    reasoning_effort: z.literal("low"),
+    reasoning_effort: z.literal("max"),
     max_tokens: z.literal(4096)
   })
   .strict();
@@ -416,7 +416,7 @@ async function main(): Promise<void> {
     profile.difficulty.model !== "deepseek-v4-flash" ||
     profile.difficulty.thinking !== false ||
     profile.difficulty.thinkingRequest !== "enabled" ||
-    profile.difficulty.reasoningEffort !== "low"
+    profile.difficulty.reasoningEffort !== "max"
   ) {
     throw new Error("PROBE_CONFIGURATION_INVALID");
   }

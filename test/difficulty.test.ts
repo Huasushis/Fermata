@@ -54,7 +54,7 @@ describe("runDifficultyPipeline：整体接线", () => {
       expect(body).toMatchObject({
         max_tokens: 2_048,
         thinking: { type: "enabled" },
-        reasoning_effort: "low"
+        reasoning_effort: "max"
       });
       expect(body).not.toHaveProperty("response_format");
       return completionResponse('{"rating": 1730, "confidence": 0.8, "rationale": "中等题"}');
@@ -69,7 +69,7 @@ describe("runDifficultyPipeline：整体接线", () => {
           temperature: 0.2,
           thinking: false,
           thinkingRequest: "enabled" as const,
-          reasoningEffort: "low" as const
+          reasoningEffort: "max" as const
         },
         credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
         runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
@@ -111,7 +111,7 @@ describe("runDifficultyPipeline：整体接线", () => {
           temperature: 0.2,
           thinking: false,
           thinkingRequest: "enabled" as const,
-          reasoningEffort: "low" as const
+          reasoningEffort: "max" as const
         },
         credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
         runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
@@ -123,7 +123,7 @@ describe("runDifficultyPipeline：整体接线", () => {
     expect(requestBody).toBeDefined();
     expect(requestBody?.max_tokens).toBe(2_048);
     expect(requestBody?.thinking).toEqual({ type: "enabled" });
-    expect(requestBody?.reasoning_effort).toBe("low");
+    expect(requestBody?.reasoning_effort).toBe("max");
     expect(requestBody).not.toHaveProperty("response_format");
 
     const system =
@@ -167,7 +167,7 @@ describe("runDifficultyPipeline：整体接线", () => {
           temperature: 0.2,
           thinking: false,
           thinkingRequest: "enabled" as const,
-          reasoningEffort: "low" as const
+          reasoningEffort: "max" as const
         },
         credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
         runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
@@ -197,7 +197,7 @@ describe("runDifficultyPipeline：整体接线", () => {
           temperature: 0.2,
           thinking: false,
           thinkingRequest: "enabled" as const,
-          reasoningEffort: "low" as const
+          reasoningEffort: "max" as const
         },
         credentials: { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" },
         runtime: { outputIdleTimeoutMs: 5_000, maxAttempts: 1, baseDelayMs: 1, fetch: fetchMock }
@@ -211,7 +211,7 @@ describe("runDifficultyPipeline：整体接线", () => {
       { type: "enabled" },
       { type: "enabled" }
     ]);
-    expect(requestBodies.map((body) => body.reasoning_effort)).toEqual(["low", "low"]);
+    expect(requestBodies.map((body) => body.reasoning_effort)).toEqual(["max", "max"]);
     expect(requestBodies.every((body) => !("response_format" in body))).toBe(true);
   });
 });

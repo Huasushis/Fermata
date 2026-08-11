@@ -121,9 +121,9 @@ describe("review-flow dataset v2 与真实 Gold 边界", () => {
     const dataset = loadDataset(fixture, "development_scored");
 
     expect(dataset.summary).toMatchObject({
-      caseCount: 2,
-      historicalOutcomeCounts: { accepted: 1, rejected: 1 },
-      contestUseCounts: { used: 1, not_used: 1, unknown: 0 },
+      caseCount: 32,
+      historicalOutcomeCounts: { accepted: 31, rejected: 1 },
+      contestUseCounts: { used: 1, not_used: 31, unknown: 0 },
       independentVerdictLabeledCaseCount: 1,
       independentTasteLabeledCaseCount: 1,
       independentOriginalityLabeledCaseCount: 1,
@@ -381,7 +381,7 @@ describe("review-flow dataset v2 与真实 Gold 边界", () => {
     writePrivateFile(fixture.developmentRevealDescriptorPath, jsonBytes(reveal));
     writeDatasetManifestAndBridge(fixture, manifest);
 
-    expect(loadDataset(fixture, "development_scored").cases).toHaveLength(2);
+    expect(loadDataset(fixture, "development_scored").cases).toHaveLength(32);
   });
 
   it("真实 development-only 集允许空 holdout/null 注册，holdout 操作严格拒绝", () => {
@@ -393,7 +393,7 @@ describe("review-flow dataset v2 与真实 Gold 边界", () => {
     writeDatasetManifestAndBridge(fixture, manifest);
 
     const development = loadDataset(fixture, "development_scored");
-    expect(development.cases).toHaveLength(2);
+    expect(development.cases).toHaveLength(32);
     expect(development.holdoutIdentity).toBeNull();
     expect(development.holdoutRegistration).toBeNull();
     expect(() => loadDataset(fixture, "holdout_prediction")).toThrow(
@@ -631,6 +631,224 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
   );
 });
 
+describe("32 案例 × 11 角色 = 352 收据封存契约", () => {
+  function uniqueProjection(safeId: string): ReviewFlowCalibrationProjection {
+    const caseIndex = Number.parseInt(safeId.slice(-4), 10) - 1;
+    const roleReceipts = reviewFlowRoleSchema.options.map((role, index) => {
+      const attemptCount = caseIndex * 11 + index + 1;
+      const response = {
+        responseMode: index % 2 === 0 ? "sse" as const : "json" as const,
+        transportAttemptCount: attemptCount,
+        eofVerified: true as const,
+        finishReasonStopVerified: true as const,
+        sseDoneObserved: index % 2 === 0 ? true as const : null
+      };
+      return {
+        role,
+        receiptHash: hashCanonicalValue({
+          schemaVersion: 2,
+          requestCount: 1,
+          transportAttemptCount: attemptCount,
+          eofVerified: true,
+          jsonSchemaValidated: true,
+          responses: [{
+            schemaVersion: 2,
+            transportAttemptCount: attemptCount,
+            eofVerified: true,
+            responseMode: response.responseMode,
+            finishReasonStopVerified: response.finishReasonStopVerified,
+            sseDoneObserved: response.sseDoneObserved
+          }]
+        }),
+        requestCount: 1 as const,
+        transportAttemptCount: attemptCount,
+        responses: [response]
+      };
+    });
+    return reviewFlowCalibrationProjectionSchema.parse({
+      schemaVersion: 2,
+      verdict: "approve",
+      codeforcesDifficulty: 1800,
+      qualityLevel: 3,
+      originalityLevel: 4,
+      thinkingLevel: 3,
+      codingLevel: 2,
+      tagIds: ["tag-basic"],
+      hardBlockers: [],
+      difficultyConfidence: 0.8,
+      technical: {
+        officialSolutionCorrect: true,
+        statementSolutionConsistency: "verified",
+        judgeability: "verified",
+        sampleConsistency: "verified",
+        constraintSufficiency: "verified",
+        referenceImplementation: {
+          provided: false,
+          status: "unavailable",
+          complexityAcceptable: null
+        }
+      },
+      editorial: {
+        qualityLevel: 3,
+        noveltyLevel: 4,
+        ideaDepthLevel: 3,
+        naturalnessLevel: 4,
+        contestantExperienceLevel: 4,
+        evidenceCoverage: { strengths: "found", concerns: "none_found" },
+        evidence: [{
+          dimension: "novelty",
+          direction: "strength",
+          severity: "note",
+          confidence: 0.8
+        }]
+      },
+      contestFit: {
+        icpcFit: "strong",
+        implementationBurden: 2,
+        thinkingImplementationBalance: "strong",
+        knowledgeFairness: "fair",
+        problemsetRole: "standard",
+        roleConfidence: 0.8,
+        evidenceCoverage: { strengths: "found", concerns: "none_found" },
+        evidence: [{
+          dimension: "icpc_fit",
+          direction: "strength",
+          severity: "note",
+          confidence: 0.8
+        }]
+      },
+      originality: {
+        originalityLevel: 4,
+        sameProblemAsExisting: false,
+        highestSimilarity: 0.1
+      },
+      roleReceipts,
+      receiptSetHash: hashCanonicalValue(roleReceipts)
+    });
+  }
+
+  it("32 案例 × 11 角色 = 352 唯一 (safeId, role, receiptHash) 元组，角色顺序严格匹配 schema", () => {
+    const fixture = createStateFixture(32);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const safeIds = fixture.expectedCases.map((e) => e.safeId);
+    completeAll(checkpoint, safeIds, uniqueProjection);
+    const state = checkpoint.sealExecution();
+    expect(state.executionSeal?.complete).toBe(true);
+    expect(state.entries).toHaveLength(32);
+    expect(state.entries.every((e) => e.status === "completed")).toBe(true);
+
+    let totalReceipts = 0;
+    const tupleSet = new Set<string>();
+    for (const entry of state.entries) {
+      if (entry.status !== "completed") continue;
+      expect(entry.projection.roleReceipts).toHaveLength(11);
+      expect(
+        entry.projection.roleReceipts.map((r) => r.role)
+      ).toEqual(reviewFlowRoleSchema.options);
+      for (const receipt of entry.projection.roleReceipts) {
+        totalReceipts += 1;
+        const tuple = `${entry.safeId}|${receipt.role}|${receipt.receiptHash}`;
+        expect(tupleSet.has(tuple)).toBe(false);
+        tupleSet.add(tuple);
+      }
+    }
+    expect(totalReceipts).toBe(352);
+    expect(tupleSet.size).toBe(352);
+    checkpoint.close();
+  });
+
+  it("32/352 完成封存摘要可由 executionCompletionFingerprint 重算且唯一", () => {
+    const fixture = createStateFixture(32);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const safeIds = fixture.expectedCases.map((e) => e.safeId);
+    completeAll(checkpoint, safeIds, uniqueProjection);
+    const state = checkpoint.sealExecution();
+    expect(state.executionSeal?.completionFingerprint).toMatch(/^[0-9a-f]{64}$/u);
+    // Re-sealing is idempotent — same fingerprint.
+    const resealed = checkpoint.sealExecution();
+    expect(resealed.executionSeal?.completionFingerprint).toBe(
+      state.executionSeal?.completionFingerprint
+    );
+    checkpoint.close();
+  });
+
+  it("重复角色收据被 checkpoint 拒绝", () => {
+    const fixture = createStateFixture(1);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    checkpoint.markActive("case-0001");
+    const dup = structuredClone(projection("approve")) as unknown as {
+      roleReceipts: Array<{ role: string }>;
+    };
+    dup.roleReceipts[1]!.role = dup.roleReceipts[0]!.role;
+    expect(() => checkpoint.markCompleted("case-0001", dup as never)).toThrow();
+    checkpoint.close();
+  });
+
+  it("缺失样本令封存 complete=false 且终态不可恢复", async () => {
+    const fixture = createStateFixture(32);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const execute = vi.fn(async () => ({
+      status: "incomplete" as const,
+      failure: fixedFailure("REVIEW_FLOW_HTTP_499", 499)
+    }));
+    const state = await runReviewFlowEvaluationCases({
+      checkpoint,
+      cases: preparedStateCases(fixture),
+      executor: { execute },
+      concurrency: 1
+    });
+    expect(state.executionSeal?.complete).toBe(false);
+    expect(checkpoint.terminallyContaminated()).toBe(true);
+    expect(state.entries.some((e) => e.status === "failed")).toBe(true);
+    expect(state.entries.filter((e) => e.status === "completed")).toHaveLength(0);
+    checkpoint.close();
+  });
+
+  it("残留 active 条目阻止 complete 封存", () => {
+    const fixture = createStateFixture(32);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const safeIds = fixture.expectedCases.map((e) => e.safeId);
+    // Complete 31 cases, leave one active.
+    completeAll(checkpoint, safeIds.slice(0, 31), uniqueProjection);
+    checkpoint.markActive(safeIds[31]!);
+    const state = checkpoint.sealExecution();
+    expect(state.executionSeal?.complete).toBe(false);
+    expect(state.entries.filter((e) => e.status === "completed")).toHaveLength(31);
+    expect(state.entries.filter((e) => e.status === "active")).toHaveLength(1);
+    checkpoint.close();
+  });
+
+  it("31 完成 + 1 失败导致 complete=false 且终态被污染", () => {
+    const fixture = createStateFixture(32);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const safeIds = fixture.expectedCases.map((e) => e.safeId);
+    completeAll(checkpoint, safeIds.slice(0, 31), uniqueProjection);
+    checkpoint.markActive(safeIds[31]!);
+    checkpoint.markFailed(safeIds[31]!, fixedFailure("REVIEW_FLOW_HTTP_499", 499));
+    const state = checkpoint.sealExecution();
+    expect(state.executionSeal?.complete).toBe(false);
+    expect(state.entries.filter((e) => e.status === "completed")).toHaveLength(31);
+    expect(state.entries.filter((e) => e.status === "failed")).toHaveLength(1);
+    expect(checkpoint.terminallyContaminated()).toBe(true);
+    checkpoint.close();
+  });
+
+  it("全部失败时封存摘要 receiptTuples 为空", () => {
+    const fixture = createStateFixture(32);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    for (const expectedCase of fixture.expectedCases) {
+      checkpoint.markActive(expectedCase.safeId);
+      checkpoint.markFailed(expectedCase.safeId, fixedFailure("REVIEW_FLOW_HTTP_499", 499));
+    }
+    const state = checkpoint.sealExecution();
+    expect(state.executionSeal?.complete).toBe(false);
+    expect(state.entries.filter((e) => e.status === "completed")).toHaveLength(0);
+    expect(state.entries.filter((e) => e.status === "failed")).toHaveLength(32);
+    expect(checkpoint.terminallyContaminated()).toBe(true);
+    checkpoint.close();
+  });
+});
+
 describe("固定全局 registry 与 holdout 一次性账本", () => {
   it("同 label 跨 private-dir 或并发 registry 永久拒绝，付费 executor 为 0", () => {
     const root = createPrivateWorkspace("registry-label");
@@ -716,7 +934,7 @@ describe("固定全局 registry 与 holdout 一次性账本", () => {
 
     const newVersionFixture = createDatasetFixture("usage-development-v2");
     rewriteDatasetCaseBinding(newVersionFixture, "development", 0, {
-      safeId: "case-0003",
+      safeId: "case-0033",
       subjectId: developmentDescriptor.subjectId
     });
     const newVersion = loadDataset(newVersionFixture, "development_identity");
@@ -724,7 +942,7 @@ describe("固定全局 registry 与 holdout 一次性账本", () => {
 
     const holdoutFixture = createDatasetFixture("usage-holdout-subject");
     rewriteDatasetCaseBinding(holdoutFixture, "holdout", 0, {
-      safeId: "case-9003",
+      safeId: "case-9033",
       subjectId: developmentDescriptor.subjectId
     });
     const holdout = loadDataset(holdoutFixture, "holdout_prediction");
@@ -748,7 +966,7 @@ describe("固定全局 registry 与 holdout 一次性账本", () => {
 
     const lineageFixture = createDatasetFixture("usage-lineage-replay");
     rewriteDatasetCaseBinding(lineageFixture, "holdout", 0, {
-      safeId: "case-9003",
+      safeId: "case-9033",
       sourceLineageSha256: sourceDescriptor.sourceLineageSha256
     });
     expect(() => registry.registerHoldoutPlan(
@@ -757,7 +975,7 @@ describe("固定全局 registry 与 holdout 一次性账本", () => {
 
     const contentFixture = createDatasetFixture("usage-content-replay");
     rewriteDatasetCaseBinding(contentFixture, "holdout", 0, {
-      safeId: "case-9003",
+      safeId: "case-9033",
       contentFrom: {
         fixture: sourceFixture,
         partition: "development",
@@ -781,7 +999,7 @@ describe("固定全局 registry 与 holdout 一次性账本", () => {
 
     const developmentFixture = createDatasetFixture("usage-development-replay");
     rewriteDatasetCaseBinding(developmentFixture, "development", 0, {
-      safeId: "case-0003",
+      safeId: "case-0033",
       subjectId: holdoutDescriptor.subjectId
     });
     expect(() => registry.registerDevelopmentUse(
@@ -1128,19 +1346,17 @@ describe("严格私有报告、恢复与计分", () => {
       "dev-report"
     );
     chain.checkpoint.bindGlobalClaim("a".repeat(64));
-    chain.checkpoint.markActive("case-0001");
-    chain.checkpoint.markCompleted("case-0001", projection("approve"));
-    chain.checkpoint.markActive("case-0002");
-    chain.checkpoint.markCompleted(
-      "case-0002",
-      projection("reject", { judgeabilityConcern: true, contestUse: "not_used" })
-    );
+    completeAll(chain.checkpoint, dataset.cases.map((entry) => entry.safeId), (safeId) => {
+      if (safeId === "case-0001") return projection("approve");
+      if (safeId === "case-0002") return projection("reject", { judgeabilityConcern: true, contestUse: "not_used" });
+      return projection("approve", { contestUse: "not_used" });
+    });
     const state = chain.checkpoint.sealExecution();
     const report = buildReviewFlowEvaluationReport({ dataset, checkpoint: state });
     expect(report.summary.complete).toBe(true);
     expect(report.summary.eligible).toBe(false);
     expect(report.summary.scoring.historicalOutcomeBinary).toMatchObject({
-      scoredCaseCount: 2,
+      scoredCaseCount: 32,
       accuracy: 1
     });
     expect(report.summary.scoring.independentThreeWayVerdict).toMatchObject({
@@ -1152,12 +1368,13 @@ describe("严格私有报告、恢复与计分", () => {
     expect(report.summary.scoring.observedHistoricalTechnicalReasons.recall).toBe(1);
     expect(report.summary.scoring.contestUse.coverage).toMatchObject({
       used: 1,
-      not_used: 1,
-      historicalAccepted: 1,
+      not_used: 31,
+      historicalAccepted: 31,
       historicalRejected: 1
     });
     expect(report.summary.scoring.contestUse.knownUseBinary.accuracy).toBe(1);
-    expect(report.summary.receiptCoverage.completeElevenRoleReceiptCaseCount).toBe(2);
+    expect(report.summary.receiptCoverage.completeElevenRoleReceiptCaseCount).toBe(32);
+    expect(report.summary.receiptCoverage.totalReceiptCount).toBe(352);
     expect(report.summary.generatedAt).toBe(state.executionSeal?.sealedAt);
     expect(report.json).not.toContain("PRIVATE_STATEMENT_SENTINEL");
     expect(report.json).not.toContain("PRIVATE_SOLUTION_SENTINEL");
@@ -1731,6 +1948,28 @@ function createDatasetFixture(seed = "default"): DatasetFixture {
       })
     })
   ];
+  for (let extraIndex = 3; extraIndex <= 32; extraIndex++) {
+    const padded = String(extraIndex).padStart(4, "0");
+    developmentMaterials.push(
+      writeDatasetCase({
+        directory: suiteDirectory,
+        goldDirectory: developmentRevealDirectory,
+        partition: "development",
+        safeId: `case-${padded}`,
+        subjectId: `subject-${safeToken(seed)}-dev-${padded}`,
+        numericId: numericSeed(seed, extraIndex),
+        catalog,
+        gold: (common) => ({
+          ...common,
+          evaluationScope: "verdict_and_taste",
+          historicalOutcome: "accepted",
+          contestUse: "not_used",
+          observedHistoricalTasteReasons: [],
+          observedHistoricalTechnicalReasons: []
+        })
+      })
+    );
+  }
   const development = developmentMaterials.map(toPredictionDescriptor);
   const holdoutMaterials = [
     writeDatasetCase({
@@ -1771,6 +2010,28 @@ function createDatasetFixture(seed = "default"): DatasetFixture {
       })
     })
   ];
+  for (let extraHoldoutIndex = 3; extraHoldoutIndex <= 32; extraHoldoutIndex++) {
+    const holdoutId = String(9000 + extraHoldoutIndex);
+    holdoutMaterials.push(
+      writeDatasetCase({
+        directory: suiteDirectory,
+        goldDirectory: revealDirectory,
+        partition: "holdout",
+        safeId: `case-${holdoutId}`,
+        subjectId: `subject-${safeToken(seed)}-hold-${holdoutId}`,
+        numericId: numericSeed(seed, 90 + extraHoldoutIndex),
+        catalog,
+        gold: (common) => ({
+          ...common,
+          evaluationScope: "verdict_and_taste",
+          historicalOutcome: "accepted",
+          contestUse: "not_used",
+          observedHistoricalTasteReasons: [],
+          observedHistoricalTechnicalReasons: []
+        })
+      })
+    );
+  }
   const holdout = holdoutMaterials.map((entry) => ({
     safeId: entry.safeId,
     subjectId: entry.subjectId,

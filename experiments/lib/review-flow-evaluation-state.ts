@@ -119,7 +119,7 @@ export const reviewFlowEvaluationIdentitySchema = z
         llmMaximumDurationMs: z.number().int().positive(),
         maxAttempts: z.number().int().min(1).max(10),
         baseDelayMs: z.number().int().positive(),
-        concurrency: z.number().int().min(1).max(32),
+        concurrency: z.number().int().min(1).max(4),
         proxyEnvironmentFingerprint: digestSchema,
         proxyEnvironmentKeys: z
           .array(z.enum([
@@ -381,15 +381,18 @@ export const reviewFlowEvaluationCheckpointSchema = z
     }
     if (state.executionSeal !== null) {
       const expectedFingerprint = executionCompletionFingerprint(state);
+      const receiptSeal = buildExecutionReceiptSeal(state.entries);
       const actuallyComplete =
         state.termination === null &&
-        state.entries.every((entry) => entry.status === "completed");
+        state.entries.length === 32 &&
+        state.entries.every((entry) => entry.status === "completed") &&
+        receiptSeal.receiptTuples.length === 352;
       if (
         state.executionSeal.completionFingerprint !== expectedFingerprint ||
         state.executionSeal.complete !== actuallyComplete
       ) {
         context.addIssue({
-          code: "custom",
+          code: z.ZodIssueCode.custom,
           path: ["executionSeal"],
           message: "执行封存摘要与检查点终态不一致。"
         });
@@ -734,13 +737,17 @@ export class ReviewFlowEvaluationCheckpoint {
     }
     if (this.#state.executionSeal !== null) return this.snapshot();
     const sealedAt = this.#now().toISOString();
+    const receiptSeal = buildExecutionReceiptSeal(this.#state.entries);
+    const complete =
+      this.#state.termination === null &&
+      this.#state.entries.length === 32 &&
+      this.#state.entries.every((entry) => entry.status === "completed") &&
+      receiptSeal.receiptTuples.length === 352;
     const draft = {
       ...this.#state,
       executionSeal: {
         sealedAt,
-        complete:
-          this.#state.termination === null &&
-          this.#state.entries.every((entry) => entry.status === "completed"),
+        complete,
         completionFingerprint: executionCompletionFingerprint(this.#state)
       },
       revision: this.#state.revision + 1,
@@ -969,15 +976,76 @@ function executionCompletionFingerprint(
     | "termination"
   >
 ): string {
+  const receiptSeal = buildExecutionReceiptSeal(state.entries);
   return hashCanonicalValue({
-    protocol: "review-flow-evaluation-execution-completion-v2",
+    protocol: "review-flow-evaluation-execution-completion-v3",
     runId: state.runId,
     identityFingerprint: state.identityFingerprint,
     expectedCases: state.expectedCases,
     entries: state.entries,
+    receiptSeal,
     globalClaimSha256: state.globalClaimSha256,
     termination: state.termination
   });
+}
+
+/**
+ * 构造 32 案例 × 11 角色 = 352 条唯一 (safeId, role, receiptHash) 元组的封存摘要。
+ * 仅当所有条目均为 completed 且恰好 32 条、每条恰好 11 个角色收据时返回非空摘要；
+ * 否则返回空摘要（与终态不一致检查配合使用）。
+ */
+function buildExecutionReceiptSeal(
+  entries: readonly ReviewFlowEvaluationEntry[]
+): {
+  readonly protocol: "review-flow-evaluation-receipt-seal-v1";
+  readonly expectedCaseCount: number;
+  readonly expectedRoleCountPerCase: number;
+  readonly expectedReceiptCount: number;
+  readonly actualCaseCount: number;
+  readonly actualReceiptCount: number;
+  readonly receiptTuples: readonly {
+    readonly safeId: string;
+    readonly role: string;
+    readonly receiptHash: string;
+  }[];
+} {
+  const expectedCaseCount = 32;
+  const expectedRoleCountPerCase = 11;
+  const expectedReceiptCount = expectedCaseCount * expectedRoleCountPerCase;
+  const expectedRoles = reviewFlowRoleSchema.options;
+  const receiptTuples: { safeId: string; role: string; receiptHash: string }[] = [];
+  for (const entry of entries) {
+    if (entry.status !== "completed") continue;
+    const projection = entry.projection;
+    for (const receipt of projection.roleReceipts) {
+      receiptTuples.push({
+        safeId: entry.safeId,
+        role: receipt.role,
+        receiptHash: receipt.receiptHash
+      });
+    }
+  }
+  return {
+    protocol: "review-flow-evaluation-receipt-seal-v1",
+    expectedCaseCount,
+    expectedRoleCountPerCase,
+    expectedReceiptCount,
+    actualCaseCount: entries.filter((e) => e.status === "completed").length,
+    actualReceiptCount: receiptTuples.length,
+    receiptTuples: entries.length === expectedCaseCount &&
+      receiptTuples.length === expectedReceiptCount &&
+      receiptTuples.every((t) =>
+        expectedRoles.includes(t.role as never)
+      ) &&
+      new Set(receiptTuples.map((t) => `${t.safeId}|${t.role}|${t.receiptHash}`)).size === expectedReceiptCount &&
+      entries.every((entry) => {
+        if (entry.status !== "completed") return true;
+        return entry.projection.roleReceipts.length === expectedRoleCountPerCase &&
+          entry.projection.roleReceipts.every((r, i) => r.role === expectedRoles[i]);
+      })
+      ? receiptTuples
+      : []
+  };
 }
 
 function checkpointGenesisBinding(

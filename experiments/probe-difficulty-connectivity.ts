@@ -104,7 +104,8 @@ export const difficultyConnectivityProbeRequestBodySchema = z
     temperature: z.literal(0.2),
     stream: z.literal(true),
     messages: z.array(z.unknown()).min(1),
-    thinking: z.object({ type: z.literal("disabled") }).strict(),
+    thinking: z.object({ type: z.literal("enabled") }).strict(),
+    reasoning_effort: z.literal("max"),
     max_tokens: z.literal(difficultyConnectivityProbeMaxOutputTokens)
   })
   .strict();
@@ -310,9 +311,9 @@ export const difficultyConnectivityCommonEvidenceSchema = z
     providerIdentitySha256: z.literal(
       difficultyConnectivityExpectedProviderIdentitySha256
     ),
-    model: z.literal("deepseek-v4-flash"),
     thinking: z.literal(false),
-    thinkingRequest: z.literal("disabled"),
+    thinkingRequest: z.literal("enabled"),
+    reasoningEffort: z.literal("max"),
     maxOutputTokens: z.literal(difficultyConnectivityProbeMaxOutputTokens),
     maximumPaidRequests: z.literal(1),
     expected: z.literal(1),
@@ -461,10 +462,9 @@ export function assertDifficultyConnectivityConfiguration(
     config.models.defaults.modelProfileName !== "review-balanced" ||
     spec.provider !== "aether" ||
     spec.model !== "deepseek-v4-flash" ||
-    spec.temperature !== 0.2 ||
     spec.thinking !== false ||
-    spec.thinkingRequest !== "disabled" ||
-    spec.reasoningEffort !== undefined ||
+    spec.thinkingRequest !== "enabled" ||
+    spec.reasoningEffort !== "max" ||
     config.models.retry.maxAttempts !== 3 ||
     config.models.retry.baseDelayMs !== 500 ||
     config.models.timeouts.llmFirstOutputMs !== 1_800_000 ||
@@ -1263,7 +1263,8 @@ async function main(): Promise<void> {
       providerIdentitySha256,
       model: "deepseek-v4-flash",
       thinking: false,
-      thinkingRequest: "disabled",
+      thinkingRequest: "enabled",
+      reasoningEffort: "max",
       maxOutputTokens: difficultyConnectivityProbeMaxOutputTokens,
       maximumPaidRequests: 1,
       expected: 1,

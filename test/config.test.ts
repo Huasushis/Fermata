@@ -58,7 +58,7 @@ profiles:
       temperature: 0.2
       thinking: false
       thinkingRequest: enabled
-      reasoningEffort: low
+      reasoningEffort: max
     thinking:
       solver:
         provider: aether
@@ -158,7 +158,7 @@ describe("loadConfig：正常路径", () => {
     expect(config.models.thresholds.duplicateSimilarityReject).toBe(0.9);
     expect(config.models.profiles["test-profile"]?.difficulty).toMatchObject({
       thinkingRequest: "enabled",
-      reasoningEffort: "low"
+      reasoningEffort: "max"
     });
     expect(config.models.profiles["test-profile"]?.reviewFlow.adjudicator).toMatchObject({
       provider: "dashscope",
@@ -182,7 +182,7 @@ describe("loadConfig：正常路径", () => {
     const source = readFileSync(new URL("../config/models.yaml", import.meta.url), "utf8");
     const config = loadConfig({ env: validEnv, modelsYamlSource: source });
     expect(config.models.experimentVersion).toBe(
-      "experiment-2026-08-review-flow-historical-rubric-v1-eof-receipt-v2"
+      "experiment-2026-08-review-flow-historical-rubric-v1-eof-receipt-v3"
     );
     expect(config.models.experimentVersion).toBe(currentBlockedProductionExperimentVersion);
     expect(config.models.profiles["review-balanced"]?.difficulty).toEqual({
@@ -190,7 +190,8 @@ describe("loadConfig：正常路径", () => {
       model: "deepseek-v4-flash",
       temperature: 0.2,
       thinking: false,
-      thinkingRequest: "disabled"
+      thinkingRequest: "enabled",
+      reasoningEffort: "max"
     });
     expect(
       Object.keys(config.models.profiles["review-balanced"]!.reviewFlow).sort()
@@ -301,30 +302,33 @@ profiles:
     })).toThrow(ConfigError);
   });
 
-  it("thinkingRequest 可以留空，disabled 不携带 effort 时也合法", () => {
-    const withoutRequest = validYaml.replace(
-      "      thinkingRequest: enabled\n      reasoningEffort: low\n",
+  it("Aether V4 缺少 thinkingRequest 或 disabled 时拒绝", () => {
+    const missingRequest = validYaml.replace(
+      "      thinkingRequest: enabled\n      reasoningEffort: max\n",
       ""
     );
-    const defaultConfig = loadConfig({ env: validEnv, modelsYamlSource: withoutRequest });
-    expect(defaultConfig.models.profiles["test-profile"]?.difficulty.thinkingRequest).toBeUndefined();
-    expect(defaultConfig.models.profiles["test-profile"]?.difficulty.reasoningEffort).toBeUndefined();
+    expect(() => loadConfig({ env: validEnv, modelsYamlSource: missingRequest })).toThrow(ConfigError);
 
     const disabled = validYaml.replace(
-      "thinkingRequest: enabled\n      reasoningEffort: low",
+      "thinkingRequest: enabled\n      reasoningEffort: max",
       "thinkingRequest: disabled"
     );
-    const disabledConfig = loadConfig({ env: validEnv, modelsYamlSource: disabled });
-    expect(disabledConfig.models.profiles["test-profile"]?.difficulty).toMatchObject({
-      thinkingRequest: "disabled"
-    });
-    expect(disabledConfig.models.profiles["test-profile"]?.difficulty.reasoningEffort).toBeUndefined();
+    expect(() => loadConfig({ env: validEnv, modelsYamlSource: disabled })).toThrow(ConfigError);
+  });
+
+  it("非 V4 模型不携带 thinkingRequest/reasoningEffort 时合法", () => {
+    const nonV4 = validYaml
+      .replace("provider: aether\n      model: deepseek-v4-flash", "provider: dashscope\n      model: qwen-max")
+      .replace("      thinkingRequest: enabled\n      reasoningEffort: max\n", "");
+    const config = loadConfig({ env: validEnv, modelsYamlSource: nonV4 });
+    expect(config.models.profiles["test-profile"]?.difficulty.thinkingRequest).toBeUndefined();
+    expect(config.models.profiles["test-profile"]?.difficulty.reasoningEffort).toBeUndefined();
   });
 
   it.each([
     [
-      "enabled 缺少 low",
-      (yaml: string) => yaml.replace("      reasoningEffort: low\n", "")
+      "enabled 缺少 max",
+      (yaml: string) => yaml.replace("      reasoningEffort: max\n", "")
     ],
     [
       "disabled 携带 effort",
@@ -336,7 +340,7 @@ profiles:
     ],
     [
       "未支持的 effort",
-      (yaml: string) => yaml.replace("reasoningEffort: low", "reasoningEffort: medium")
+      (yaml: string) => yaml.replace("reasoningEffort: max", "reasoningEffort: medium")
     ],
     [
       "未支持的请求模式",
@@ -351,15 +355,11 @@ profiles:
         )
     ],
     [
-      "deepseek-v4-pro 不允许显式 thinkingRequest",
-      (yaml: string) => yaml.replace("model: deepseek-v4-flash", "model: deepseek-v4-pro")
-    ],
-    [
       "disabled 但使用其它 provider",
       (yaml: string) =>
         yaml
           .replace(
-            "thinkingRequest: enabled\n      reasoningEffort: low",
+            "thinkingRequest: enabled\n      reasoningEffort: max",
             "thinkingRequest: disabled"
           )
           .replace(
@@ -368,14 +368,8 @@ profiles:
           )
     ],
     [
-      "disabled 但使用其它 model",
-      (yaml: string) =>
-        yaml
-          .replace(
-            "thinkingRequest: enabled\n      reasoningEffort: low",
-            "thinkingRequest: disabled"
-          )
-          .replace("model: deepseek-v4-flash", "model: deepseek-v4-pro")
+      "enabled 但使用 low effort（已废弃）",
+      (yaml: string) => yaml.replace("reasoningEffort: max", "reasoningEffort: low")
     ]
   ])("拒绝 thinkingRequest/reasoningEffort 无效组合：%s", (_name, mutate) => {
     expect(() => loadConfig({ env: validEnv, modelsYamlSource: mutate(validYaml) })).toThrow(

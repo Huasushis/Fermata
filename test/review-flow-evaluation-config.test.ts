@@ -47,10 +47,15 @@ describe("review-flow 评估专用配置", () => {
   });
 
   it("不要求同档位旧流水线使用、但 11 角色未使用的 provider", () => {
-    const sourceWithLegacyDashscope = modelsYamlSource.replace(
-      "    thinking:\n      solver:\n        provider: aether",
-      "    thinking:\n      solver:\n        provider: dashscope"
-    );
+    const sourceWithLegacyDashscope = modelsYamlSource
+      .replace(
+        "    thinking:\n      solver:\n        provider: aether",
+        "    thinking:\n      solver:\n        provider: dashscope"
+      )
+      .replace(
+        "        thinkingRequest: enabled\n        reasoningEffort: max\n      analyst:",
+        "      analyst:"
+      );
     expect(sourceWithLegacyDashscope).not.toBe(modelsYamlSource);
 
     const config = loadReviewFlowEvaluationConfig({
@@ -61,10 +66,15 @@ describe("review-flow 评估专用配置", () => {
   });
 
   it("11 角色实际使用的每个 provider 都必须有合法成对凭据", () => {
-    const sourceWithReviewDashscope = modelsYamlSource.replace(
-      "    reviewFlow:\n      solver:\n        provider: aether",
-      "    reviewFlow:\n      solver:\n        provider: dashscope"
-    );
+    const sourceWithReviewDashscope = modelsYamlSource
+      .replace(
+        "    reviewFlow:\n      solver:\n        provider: aether",
+        "    reviewFlow:\n      solver:\n        provider: dashscope"
+      )
+      .replace(
+        "        thinkingRequest: enabled\n        reasoningEffort: max\n      solutionAnalyst:",
+        "      solutionAnalyst:"
+      );
     expect(sourceWithReviewDashscope).not.toBe(modelsYamlSource);
 
     expect(() =>

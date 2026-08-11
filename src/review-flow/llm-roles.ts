@@ -163,7 +163,7 @@ export function createReviewFlowLlmBundle(input: {
         models.solver,
         buildSolverMessages(view),
         solverPayloadSchema,
-        16_384
+        131_072
       );
       const narrative = mergeNarrative(reasoning, data.narrative);
       return trustedRoleExecution({ ...data, narrative }, receipt);
@@ -172,14 +172,14 @@ export function createReviewFlowLlmBundle(input: {
       models.solution_analyst,
       buildSolutionAnalystMessages(view),
       solutionAnalystPayloadSchema,
-      8_192
+      131_072
     ),
     technicalAuditor: async (view) => {
       const { data, receipt } = await runJson(
         models.technical_auditor,
         buildTechnicalAuditorMessages(view),
         technicalModelPayloadSchema,
-        8_192
+        131_072
       );
       const provided = view.referenceImplementation.provided;
       return trustedRoleExecution({
@@ -217,49 +217,49 @@ export function createReviewFlowLlmBundle(input: {
       models.difficulty,
       buildDifficultyMessages(view, anchors),
       difficultyPayloadSchema,
-      8_192
+      131_072
     ),
     editorialJudge: async (view) => runJsonRole(
       models.editorial_judge,
       buildEditorialJudgeMessages(view),
       editorialPayloadSchema,
-      12_288
+      131_072
     ),
     contestFit: async (view) => runJsonRole(
       models.contest_fit,
       buildContestFitMessages(view),
       contestFitPayloadSchema,
-      12_288
+      131_072
     ),
     originality: async (view) => runJsonRole(
       models.originality,
       buildOriginalityMessages(view),
       originalityPayloadSchema,
-      8_192
+      131_072
     ),
     tags: async (view) => runJsonRole(
       models.tags,
       buildTagsMessages(view),
       tagsPayloadSchema,
-      8_192
+      131_072
     ),
     critic: async (view) => runJsonRole(
       models.critic,
       buildCriticMessages(view),
       criticPayloadSchema,
-      12_288
+      131_072
     ),
     adversary: async (view) => runJsonRole(
       models.adversary,
       buildAdversaryMessages(view),
       adversaryPayloadSchema,
-      12_288
+      131_072
     ),
     adjudicator: async (view) => runJsonRole(
       models.adjudicator,
       buildAdjudicatorMessages(view),
       adjudicatorPayloadSchema,
-      16_384
+      131_072
     )
   };
 

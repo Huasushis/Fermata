@@ -343,7 +343,7 @@ describe("chatComplete：正常路径", () => {
         model: "deepseek-v4-flash",
         thinking: true,
         thinkingRequest: "enabled",
-        reasoningEffort: "low"
+        reasoningEffort: "max"
       },
       [],
       { ...runtime, fetch: fetchMock }
@@ -356,18 +356,7 @@ describe("chatComplete：正常路径", () => {
         model: "deepseek-v4-flash",
         thinking: false,
         thinkingRequest: "enabled",
-        reasoningEffort: "low"
-      },
-      [],
-      { ...runtime, fetch: fetchMock }
-    );
-    await chatComplete(
-      provider,
-      {
-        ...spec,
-        provider: "aether",
-        model: "deepseek-v4-flash",
-        thinkingRequest: "disabled"
+        reasoningEffort: "max"
       },
       [],
       { ...runtime, fetch: fetchMock }
@@ -380,17 +369,10 @@ describe("chatComplete：正常路径", () => {
       stream: true,
       messages: [],
       thinking: { type: "enabled" },
-      reasoning_effort: "low"
+      reasoning_effort: "max"
     });
     expect(requestBodies[1]).toEqual(requestBodies[0]);
     expect(requestBodies[2]).toEqual({
-      model: "deepseek-v4-flash",
-      temperature: 0.2,
-      stream: true,
-      messages: [],
-      thinking: { type: "disabled" }
-    });
-    expect(requestBodies[3]).toEqual({
       model: "test-model",
       temperature: 0.2,
       stream: true,
@@ -402,12 +384,36 @@ describe("chatComplete：正常路径", () => {
 
   it.each([
     [
-      "开启时缺 low",
+      "V4 flash 缺少 thinkingRequest",
+      { ...spec, provider: "aether", model: "deepseek-v4-flash", reasoningEffort: "max" }
+    ],
+    [
+      "V4 flash 缺少 reasoningEffort",
       { ...spec, provider: "aether", model: "deepseek-v4-flash", thinkingRequest: "enabled" }
     ],
     [
-      "开启时缺 provider",
-      { ...spec, model: "deepseek-v4-flash", thinkingRequest: "enabled", reasoningEffort: "low" }
+      "V4 flash 使用 disabled",
+      { ...spec, provider: "aether", model: "deepseek-v4-flash", thinkingRequest: "disabled" }
+    ],
+    [
+      "V4 flash enabled 但使用已废弃的 low effort",
+      { ...spec, provider: "aether", model: "deepseek-v4-flash", thinkingRequest: "enabled", reasoningEffort: "low" as unknown as "max" }
+    ],
+    [
+      "V4 pro 缺少 thinkingRequest",
+      { ...spec, provider: "aether", model: "deepseek-v4-pro", reasoningEffort: "max" }
+    ],
+    [
+      "V4 pro 缺少 reasoningEffort",
+      { ...spec, provider: "aether", model: "deepseek-v4-pro", thinkingRequest: "enabled" }
+    ],
+    [
+      "V4 pro 使用 disabled",
+      { ...spec, provider: "aether", model: "deepseek-v4-pro", thinkingRequest: "disabled" }
+    ],
+    [
+      "V4 pro enabled 但使用已废弃的 low effort",
+      { ...spec, provider: "aether", model: "deepseek-v4-pro", thinkingRequest: "enabled", reasoningEffort: "low" as unknown as "max" }
     ],
     [
       "其它 provider",
@@ -416,7 +422,7 @@ describe("chatComplete：正常路径", () => {
         provider: "dashscope",
         model: "deepseek-v4-flash",
         thinkingRequest: "enabled",
-        reasoningEffort: "low"
+        reasoningEffort: "max"
       }
     ],
     [
@@ -426,43 +432,18 @@ describe("chatComplete：正常路径", () => {
         provider: "aether",
         model: "other-model",
         thinkingRequest: "enabled",
-        reasoningEffort: "low"
+        reasoningEffort: "max"
       }
     ],
     [
-      "关闭时携带 effort",
-      {
-        ...spec,
-        provider: "aether",
-        model: "deepseek-v4-flash",
-        thinkingRequest: "disabled",
-        reasoningEffort: "low"
-      }
+      "非 V4 携带 thinkingRequest",
+      { ...spec, provider: "dashscope", model: "qwen-max", thinkingRequest: "disabled" }
     ],
     [
-      "关闭时缺 provider",
-      { ...spec, model: "deepseek-v4-flash", thinkingRequest: "disabled" }
+      "非 V4 携带 reasoningEffort",
+      { ...spec, provider: "dashscope", model: "qwen-max", reasoningEffort: "max" }
     ],
-    [
-      "关闭时使用其它 provider",
-      { ...spec, provider: "dashscope", model: "deepseek-v4-flash", thinkingRequest: "disabled" }
-    ],
-    [
-      "关闭时使用其它 model",
-      { ...spec, provider: "aether", model: "other-model", thinkingRequest: "disabled" }
-    ],
-    ["缺省请求却携带 effort", { ...spec, reasoningEffort: "low" }],
-    ["未支持的请求模式", { ...spec, thinkingRequest: "automatic" }],
-    [
-      "未支持的 effort",
-      {
-        ...spec,
-        provider: "aether",
-        model: "deepseek-v4-flash",
-        thinkingRequest: "enabled",
-        reasoningEffort: "medium"
-      }
-    ]
+    ["未支持的请求模式", { ...spec, thinkingRequest: "automatic" }]
   ])("无效推理组合在请求前被拒绝：%s", async (_name, invalidSpec) => {
     const fetchMock = vi.fn(async () => completionResponse("不应请求"));
     await expect(
@@ -2168,7 +2149,7 @@ describe("chatComplete：按输出活动判断是否停住", () => {
           model: "deepseek-v4-flash",
           thinking: false,
           thinkingRequest: "enabled",
-          reasoningEffort: "low"
+          reasoningEffort: "max"
         },
         [],
         {
@@ -3387,7 +3368,7 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
       const body = JSON.parse(String(init?.body));
       expect(body.max_tokens).toBe(2_048);
       expect(body.thinking).toEqual({ type: "enabled" });
-      expect(body.reasoning_effort).toBe("low");
+      expect(body.reasoning_effort).toBe("max");
       expect(body.response_format).toBeUndefined();
       calls += 1;
       if (calls === 1) {
@@ -3405,7 +3386,7 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
         provider: "aether",
         model: "deepseek-v4-flash",
         thinkingRequest: "enabled",
-        reasoningEffort: "low"
+        reasoningEffort: "max"
       },
       [],
       resultSchema,
