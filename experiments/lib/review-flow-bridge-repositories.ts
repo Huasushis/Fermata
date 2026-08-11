@@ -47,6 +47,7 @@ const sealedHistoricalInputPreparationBaseCodePaths = [
   "experiments/lib/evaluation-integrity.ts",
   "experiments/lib/physical-blind-common.ts",
   "experiments/lib/private-artifact-io.ts",
+  "experiments/lib/review-flow-bridge-repositories.ts",
   "experiments/lib/review-flow-evaluation-adapter.ts",
   "experiments/lib/review-flow-evaluation-bridge.ts",
   "experiments/lib/review-flow-evaluation-config.ts",
