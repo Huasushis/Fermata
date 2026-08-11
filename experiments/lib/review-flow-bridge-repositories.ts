@@ -1,5 +1,4 @@
 import { z } from "zod";
-import runtimeManifestDocument from "../../config/review-flow-runtime.json" with { type: "json" };
 
 /**
  * 生成器/验证器/捕获器三个仓库的身份形状与路径清单。
@@ -7,34 +6,12 @@ import runtimeManifestDocument from "../../config/review-flow-runtime.json" with
  * 避免两套 schema 定义漂移。
  */
 
-/** 与正式 11 角色判断、提示词、传输和证据策略直接相关的代码路径清单。 */
-export const reviewFlowEvaluationCodePaths: readonly string[] =
-  Object.freeze([...runtimeManifestDocument.codePaths]);
-
-export const upstreamVerifierRunnerPath =
-  "scripts/migrate-hist/prepare-review-gold.py" as const;
-
-export const upstreamVerifierDependencyPaths = [
-  upstreamVerifierRunnerPath,
-  "scripts/migrate-hist/parse-metadata.py"
-] as const;
-
-export const anklangCaptureRunnerPath =
-  "scripts/capture-review-flow-calibration.py" as const;
-
-export const anklangCaptureDependencyPaths = [
-  anklangCaptureRunnerPath,
-  "anklang/__init__.py",
-  "anklang/review_flow_capture.py",
-  "anklang/contracts.py"
-] as const;
-
-export const bridgeGeneratorRunnerPath =
-  "experiments/prepare-review-flow-dataset.ts" as const;
-
 /**
- * 冻结的 v1 历史输入准备基础代码路径清单（46 条），独立于可变的 runtime manifest
- * codePaths —— 新增/删除/重命名都不会静默改变 supposedly frozen v1 provenance。
+ * 冻结的 v1 代码路径基础清单（46 条），等于冻结数据集时代（0940fdb5）runtime
+ * manifest 的 codePaths，独立于当前可变的 runtime manifest codePaths（47 条，
+ * 含 bridge-repositories.ts）。新增/删除/重命名都不会静默改变已冻结的 v1 身份；
+ * 生成器与历史输入准备完成标记都从这份冻结基础推导，保证与已发布数据集
+ * completion 的 dependencyFileCount（generator 46 / fermata 48）逐字一致。
  */
 const sealedHistoricalInputPreparationBaseCodePaths = [
   "config/anchors/difficulty.json",
@@ -47,7 +24,6 @@ const sealedHistoricalInputPreparationBaseCodePaths = [
   "experiments/lib/evaluation-integrity.ts",
   "experiments/lib/physical-blind-common.ts",
   "experiments/lib/private-artifact-io.ts",
-  "experiments/lib/review-flow-bridge-repositories.ts",
   "experiments/lib/review-flow-evaluation-adapter.ts",
   "experiments/lib/review-flow-evaluation-bridge.ts",
   "experiments/lib/review-flow-evaluation-config.ts",
@@ -85,6 +61,31 @@ const sealedHistoricalInputPreparationBaseCodePaths = [
   "src/yaml-lite.ts",
   "tsconfig.json"
 ] as const;
+
+/** 与正式 11 角色判断、提示词、传输和证据策略直接相关的代码路径清单。 */
+export const reviewFlowEvaluationCodePaths: readonly string[] =
+  Object.freeze([...sealedHistoricalInputPreparationBaseCodePaths]);
+
+export const upstreamVerifierRunnerPath =
+  "scripts/migrate-hist/prepare-review-gold.py" as const;
+
+export const upstreamVerifierDependencyPaths = [
+  upstreamVerifierRunnerPath,
+  "scripts/migrate-hist/parse-metadata.py"
+] as const;
+
+export const anklangCaptureRunnerPath =
+  "scripts/capture-review-flow-calibration.py" as const;
+
+export const anklangCaptureDependencyPaths = [
+  anklangCaptureRunnerPath,
+  "anklang/__init__.py",
+  "anklang/review_flow_capture.py",
+  "anklang/contracts.py"
+] as const;
+
+export const bridgeGeneratorRunnerPath =
+  "experiments/prepare-review-flow-dataset.ts" as const;
 
 export const historicalInputPreparationCodePaths: readonly string[] =
   Object.freeze([

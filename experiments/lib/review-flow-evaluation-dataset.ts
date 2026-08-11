@@ -36,7 +36,7 @@ import {
 export const reviewFlowEvaluationDigestSchema = z
   .string()
   .regex(/^[0-9a-f]{64}$/u);
-export const reviewFlowEvaluationGeneratorDependencyFileCount = 47 as const;
+export const reviewFlowEvaluationGeneratorDependencyFileCount = 46 as const;
 export const reviewFlowEvaluationSafeIdSchema = z
   .string()
   .regex(/^case-[0-9]{4}$/u);

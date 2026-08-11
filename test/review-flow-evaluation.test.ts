@@ -3084,7 +3084,7 @@ function writeDatasetManifestAndBridge(
         codeVersion: "1".repeat(40),
         runnerSha256: sha256("synthetic-bridge-runner"),
         dependencyCodeSha256: sha256("synthetic-bridge-dependencies"),
-        dependencyFileCount: 47
+        dependencyFileCount: reviewFlowEvaluationCodePaths.length
       },
       repositories: {
         fermata: {
