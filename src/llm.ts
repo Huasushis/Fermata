@@ -202,7 +202,7 @@ export const llmTransportProtocolVersion =
   "llm-stream-eof-v8-receipt-v2-failure-audit-v1" as const;
 const maximumLlmResponseChunks = 65_536;
 /** 显式输出 token 上限本身也必须有界，避免错误配置变成近似无限输出。 */
-export const maximumExplicitLlmOutputTokens = 512_000;
+export const maximumExplicitLlmOutputTokens = 1_000_000;
 export const defaultLlmFirstOutputTimeoutMs = 30 * 60 * 1_000;
 export const defaultLlmMaximumDurationMs = 4 * 60 * 60 * 1_000;
 
