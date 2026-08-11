@@ -781,6 +781,49 @@ describe("chatComplete：正常路径", () => {
     }
   );
 
+  it("网关在 stop 之后发送空 delta 事件（重复 stop 或带 usage 的空 choice）应被接受", async () => {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        // 1) 正常 stop 事件（含内容）
+        controller.enqueue(encoder.encode([
+          'data: {"choices":[{"delta":{"content":"合成完整答案"},"finish_reason":"stop"}]}',
+          "",
+          ""
+        ].join("\n")));
+        // 2) post-stop：重复 stop 信号，空 delta
+        controller.enqueue(encoder.encode([
+          'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+          "",
+          ""
+        ].join("\n")));
+        // 3) post-stop：带 usage 的空 choice（无 finish_reason）
+        controller.enqueue(encoder.encode([
+          'data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}',
+          "",
+          ""
+        ].join("\n")));
+        // 4) DONE
+        controller.enqueue(encoder.encode([
+          "data: [DONE]",
+          "",
+          ""
+        ].join("\n")));
+        controller.close();
+      }
+    });
+    const fetchMock = vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    }));
+    const result = await chatComplete(provider, spec, [], {
+      ...runtime,
+      fetch: fetchMock
+    });
+    expect(result.content).toBe("合成完整答案");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     {
       name: "strict usage metadata",

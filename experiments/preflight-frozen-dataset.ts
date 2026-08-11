@@ -1,5 +1,5 @@
 // 读取专用冻结数据集的只读预检：不注册用途、不打开 Gold、不发起任何模型调用。
-import { loadReviewFlowEvaluationDataset } from "./lib/review-flow-evaluation-dataset.ts";
+import { loadReviewFlowEvaluationDataset } from "./lib/review-flow-evaluation-dataset.js";
 
 const manifestPath =
   "/home/ubuntu/codex-urmotiv/Urmotiv/private/review-flow-gate-20260808/review-flow-v5-prediction/manifest.private.json";

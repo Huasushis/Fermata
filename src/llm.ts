@@ -2446,9 +2446,32 @@ function consumeChatCompletionEvent(
     return false;
   }
   if (state.sawStop) {
-    // finish_reason=stop 之后只允许用量事件或 [DONE]。继续出现答案片段说明
-    // 服务端的流不完整或次序异常，不能把前半段误当成完整结果。
-    throw new LlmResponseFormatError("trailing_data", "choice_after_stop");
+    // finish_reason=stop 之后，部分网关会继续发送只含空 delta 的事件
+    // （重复 stop 信号或带 usage 的空 choice）。只有不含实际内容
+    // （content / reasoning_content / reasoning 全部为空或不存在）的
+    // 空 delta 事件可以安全忽略；任何带实际答案片段的 post-stop 事件
+    // 仍然说明流不完整，必须拒绝。
+    const postStopChoice = choices[0];
+    if (typeof postStopChoice !== "object" || postStopChoice === null) {
+      throw new LlmResponseFormatError("trailing_data", "choice_after_stop");
+    }
+    const postStopDeltaOrMessage =
+      typeof (postStopChoice as Record<string, unknown>).delta === "object" &&
+      (postStopChoice as Record<string, unknown>).delta !== null
+        ? (postStopChoice as Record<string, unknown>).delta
+        : (postStopChoice as Record<string, unknown>).message;
+    if (typeof postStopDeltaOrMessage !== "object" || postStopDeltaOrMessage === null) {
+      throw new LlmResponseFormatError("trailing_data", "choice_after_stop");
+    }
+    const postStopPart = postStopDeltaOrMessage as Record<string, unknown>;
+    const hasPostStopContent =
+      (typeof postStopPart.content === "string" && postStopPart.content.length > 0) ||
+      (typeof postStopPart.reasoning_content === "string" && postStopPart.reasoning_content.length > 0) ||
+      (typeof postStopPart.reasoning === "string" && postStopPart.reasoning.length > 0);
+    if (hasPostStopContent) {
+      throw new LlmResponseFormatError("trailing_data", "choice_after_stop");
+    }
+    return false;
   }
   const choice = choices[0];
   if (typeof choice !== "object" || choice === null) {
