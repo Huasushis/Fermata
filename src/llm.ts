@@ -59,9 +59,10 @@ export interface LlmJsonCompletionReceipt {
   readonly schemaVersion: 2;
   /**
    * 请求次数：1 = 首轮直接成功；2 = 触发修复轮或两轮设计（语义+格式）的第二轮；
-   * 3 = 两轮设计中格式轮再触发修复。
+   * 3 = 两轮设计中格式轮再触发修复，或三段式（探索+综合+格式）无修复；
+   * 4 = 三段式中格式轮再触发修复。
    */
-  readonly requestCount: 1 | 2 | 3;
+  readonly requestCount: 1 | 2 | 3 | 4;
   readonly transportAttemptCount: number;
   readonly eofVerified: true;
   readonly jsonSchemaValidated: true;
@@ -69,7 +70,13 @@ export interface LlmJsonCompletionReceipt {
   readonly responses:
     | readonly [LlmTransportReceipt]
     | readonly [LlmTransportReceipt, LlmTransportReceipt]
-    | readonly [LlmTransportReceipt, LlmTransportReceipt, LlmTransportReceipt];
+    | readonly [LlmTransportReceipt, LlmTransportReceipt, LlmTransportReceipt]
+    | readonly [
+        LlmTransportReceipt,
+        LlmTransportReceipt,
+        LlmTransportReceipt,
+        LlmTransportReceipt
+      ];
 }
 
 /**
@@ -79,7 +86,7 @@ export interface LlmJsonCompletionReceipt {
  */
 export interface LlmFailureAudit {
   readonly schemaVersion: 1;
-  readonly requestCount: 1 | 2 | 3;
+  readonly requestCount: 1 | 2 | 3 | 4;
   readonly transportAttemptCount: number;
   readonly completedResponses: readonly LlmTransportReceipt[];
   readonly terminal: {
@@ -864,6 +871,175 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
   throw error;
 }
 
+/**
+ * 三段式 solver：探索轮（只识别问题结构并锁定一条方向，不求解）、综合轮（沿给定方向
+ * 推导完整解法，不重新探索）、格式化轮（只做 schema 转换，不重新判断）。每轮都是独立
+ * 调用，因此 thinking=max 的推理 token 预算按轮分配，避免单个调用同时容纳超长推理链
+ * 与结构化输出而触顶 max_tokens。失败路径与两轮设计一致：任一前轮失败即按已发生轮次
+ * 升级审计；格式化轮可触发一轮修复。
+ */
+export async function chatCompleteStagedSolverJsonWithReceipt<T>(
+  provider: ProviderCredentialsLike,
+  spec: ModelCallSpec,
+  explorationMessages: ChatMessage[],
+  synthesisMessages: (
+    explorationOutput: string,
+    explorationReasoning: string | null
+  ) => ChatMessage[],
+  formatterMessages: (
+    synthesisOutput: string,
+    synthesisReasoning: string | null
+  ) => ChatMessage[],
+  schema: z.ZodType<T>,
+  runtime: LlmRuntimeOptions,
+  options: ChatCompletionJsonOptions = {}
+): Promise<{ data: T; reasoning: string | null; receipt: LlmJsonCompletionReceipt }> {
+  const semanticRunOptions = {
+    requestJson: false,
+    maxOutputTokens: options.maxOutputTokens
+  };
+
+  let exploration: ChatCompletionWithReceipt;
+  try {
+    exploration = await chatCompleteWithReceipt(
+      provider, spec, explorationMessages, runtime, semanticRunOptions
+    );
+    assertStructuredCompletionTransport(exploration.receipt);
+  } catch (error) {
+    promoteJsonFailureAudit(error, 1, [], 0);
+    throw error;
+  }
+
+  let synthesis: ChatCompletionWithReceipt;
+  try {
+    synthesis = await chatCompleteWithReceipt(
+      provider,
+      spec,
+      synthesisMessages(exploration.content, exploration.reasoning),
+      runtime,
+      semanticRunOptions
+    );
+    assertStructuredCompletionTransport(synthesis.receipt);
+  } catch (error) {
+    promoteJsonFailureAudit(
+      error, 2,
+      [exploration.receipt],
+      exploration.receipt.transportAttemptCount
+    );
+    throw error;
+  }
+
+  const formatMessages = formatterMessages(synthesis.content, synthesis.reasoning);
+  const jsonInstruction: ChatMessage = {
+    role: "system",
+    content: "只输出一个满足要求的 JSON 对象本身，不要输出任何解释、前后缀文字，也不要用 Markdown 代码块包裹。"
+  };
+  const firstFormatMessages: ChatMessage[] = [jsonInstruction, ...formatMessages];
+  let firstFormat: ChatCompletionWithReceipt;
+  try {
+    firstFormat = await chatCompleteWithReceipt(
+      provider, spec, firstFormatMessages, runtime, semanticRunOptions
+    );
+    assertStructuredCompletionTransport(firstFormat.receipt);
+  } catch (error) {
+    promoteJsonFailureAudit(
+      error, 3,
+      [exploration.receipt, synthesis.receipt],
+      exploration.receipt.transportAttemptCount + synthesis.receipt.transportAttemptCount
+    );
+    throw error;
+  }
+  const firstAttempt = tryParseAndValidate(firstFormat.content, schema);
+  if (firstAttempt.success) {
+    return {
+      data: firstAttempt.data,
+      reasoning: exploration.reasoning ?? synthesis.reasoning ?? firstFormat.reasoning,
+      receipt: {
+        schemaVersion: 2,
+        requestCount: 3,
+        transportAttemptCount:
+          exploration.receipt.transportAttemptCount +
+          synthesis.receipt.transportAttemptCount +
+          firstFormat.receipt.transportAttemptCount,
+        eofVerified: true,
+        jsonSchemaValidated: true,
+        responses: [exploration.receipt, synthesis.receipt, firstFormat.receipt]
+      }
+    };
+  }
+
+  const repairMessages: ChatMessage[] = [
+    ...firstFormatMessages,
+    { role: "assistant", content: firstFormat.content },
+    {
+      role: "user",
+      content: `上一条回复不满足要求：${firstAttempt.error}。请只重新输出一个满足要求的 JSON 对象，不要包含任何其它文字或代码块标记。`
+    }
+  ];
+  let secondFormat: ChatCompletionWithReceipt;
+  try {
+    secondFormat = await chatCompleteWithReceipt(
+      provider, spec, repairMessages, runtime, semanticRunOptions
+    );
+    assertStructuredCompletionTransport(secondFormat.receipt);
+  } catch (error) {
+    promoteJsonFailureAudit(
+      error, 4,
+      [exploration.receipt, synthesis.receipt, firstFormat.receipt],
+      exploration.receipt.transportAttemptCount +
+        synthesis.receipt.transportAttemptCount +
+        firstFormat.receipt.transportAttemptCount
+    );
+    throw error;
+  }
+  const secondAttempt = tryParseAndValidate(secondFormat.content, schema);
+  if (secondAttempt.success) {
+    return {
+      data: secondAttempt.data,
+      reasoning:
+        exploration.reasoning ??
+        synthesis.reasoning ??
+        firstFormat.reasoning ??
+        secondFormat.reasoning,
+      receipt: {
+        schemaVersion: 2,
+        requestCount: 4,
+        transportAttemptCount:
+          exploration.receipt.transportAttemptCount +
+          synthesis.receipt.transportAttemptCount +
+          firstFormat.receipt.transportAttemptCount +
+          secondFormat.receipt.transportAttemptCount,
+        eofVerified: true,
+        jsonSchemaValidated: true,
+        responses: [
+          exploration.receipt,
+          synthesis.receipt,
+          firstFormat.receipt,
+          secondFormat.receipt
+        ]
+      }
+    };
+  }
+
+  const error = new LlmJsonOutputError();
+  rememberLlmFailureAudit(error, {
+    requestCount: 4,
+    requestAudit: mutableAuditFromReceipt(secondFormat.receipt),
+    completedResponses: [
+      exploration.receipt,
+      synthesis.receipt,
+      firstFormat.receipt,
+      secondFormat.receipt
+    ],
+    priorTransportAttemptCount:
+      exploration.receipt.transportAttemptCount +
+      synthesis.receipt.transportAttemptCount +
+      firstFormat.receipt.transportAttemptCount,
+    jsonSchemaValidated: false
+  });
+  throw error;
+}
+
 // ---------------------------------------------------------------------------
 // 内部实现
 // ---------------------------------------------------------------------------
@@ -940,7 +1116,7 @@ function resetMutableLlmRequestAuditForAttempt(
 function rememberLlmFailureAudit(
   error: unknown,
   input: {
-    readonly requestCount: 1 | 2 | 3;
+    readonly requestCount: 1 | 2 | 3 | 4;
     readonly requestAudit: MutableLlmRequestAudit;
     readonly completedResponses?: readonly LlmTransportReceipt[];
     readonly priorTransportAttemptCount?: number;
@@ -999,7 +1175,7 @@ function assertStructuredCompletionTransport(
 
 function promoteJsonFailureAudit(
   error: unknown,
-  requestCount: 1 | 2 | 3,
+  requestCount: 1 | 2 | 3 | 4,
   completedResponses: readonly LlmTransportReceipt[],
   priorTransportAttemptCount: number
 ): void {

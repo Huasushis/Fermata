@@ -74,7 +74,12 @@ const roleTransportReceiptSchema = z
 export const roleCompletionReceiptSchema = z
   .object({
     schemaVersion: z.literal(2),
-    requestCount: z.union([z.literal(1), z.literal(2), z.literal(3)]),
+    requestCount: z.union([
+      z.literal(1),
+      z.literal(2),
+      z.literal(3),
+      z.literal(4)
+    ]),
     transportAttemptCount: z.number().int().positive().max(2_000),
     eofVerified: z.literal(true),
     jsonSchemaValidated: z.literal(true),
@@ -82,6 +87,12 @@ export const roleCompletionReceiptSchema = z
       z.tuple([roleTransportReceiptSchema]),
       z.tuple([roleTransportReceiptSchema, roleTransportReceiptSchema]),
       z.tuple([
+        roleTransportReceiptSchema,
+        roleTransportReceiptSchema,
+        roleTransportReceiptSchema
+      ]),
+      z.tuple([
+        roleTransportReceiptSchema,
         roleTransportReceiptSchema,
         roleTransportReceiptSchema,
         roleTransportReceiptSchema

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   chatCompleteJsonWithReceipt,
+  chatCompleteStagedSolverJsonWithReceipt,
   chatCompleteTwoRoundJsonWithReceipt,
   llmTransportProtocolVersion,
   type ChatMessage,
@@ -160,10 +161,11 @@ export function createReviewFlowLlmBundle(input: {
 
   const roles: ReviewFlowRoles = {
     solver: async (view) => {
-      const { data, reasoning, receipt } = await chatCompleteTwoRoundJsonWithReceipt(
+      const { data, reasoning, receipt } = await chatCompleteStagedSolverJsonWithReceipt(
         models.solver.credentials,
         models.solver.spec,
-        buildSolverSemanticMessages(view),
+        buildSolverExplorationMessages(view),
+        buildSolverSynthesisMessages,
         buildSolverFormatterMessages,
         solverPayloadSchema,
         models.solver.runtime,
@@ -241,12 +243,18 @@ export function createReviewFlowLlmBundle(input: {
       originalityPayloadSchema,
       1_000_000
     ),
-    tags: async (view) => runJsonRole(
-      models.tags,
-      buildTagsMessages(view),
-      tagsPayloadSchema,
-      1_000_000
-    ),
+    tags: async (view) => {
+      const { data, receipt } = await chatCompleteTwoRoundJsonWithReceipt(
+        models.tags.credentials,
+        models.tags.spec,
+        buildTagsSemanticMessages(view),
+        buildTagsFormatterMessages,
+        tagsPayloadSchema,
+        models.tags.runtime,
+        { maxOutputTokens: 1_000_000 }
+      );
+      return trustedRoleExecution(data, receipt);
+    },
     critic: async (view) => runJsonRole(
       models.critic,
       buildCriticMessages(view),
@@ -417,10 +425,11 @@ export function buildSolverMessages(
 }
 
 /**
- * 两轮设计的语义轮：让模型用自然语言解题，不强制 JSON 输出。
- * 这样 thinking=max 的推理 token 不会与 JSON 结构化输出争用 max_tokens 预算。
+ * 三段式 solver 的探索轮：只识别问题结构并锁定一条方向，不求解。
+ * 这是独立的一次调用，因此 thinking=max 的超长推理链不会与完整解法、
+ * 结构化输出争用同一次调用的 max_tokens 预算。
  */
-export function buildSolverSemanticMessages(
+export function buildSolverExplorationMessages(
   view: Parameters<ReviewFlowRoles["solver"]>[0]
 ): ChatMessage[] {
   return [
@@ -429,17 +438,14 @@ export function buildSolverSemanticMessages(
       content: guardedSystemPrompt("solver", [
         "你是正在参加算法竞赛的独立选手。你只能依据题面、约束和样例解题；你看不到官方题解、投稿者自报难度、",
         "历史审核结论、知识点标签或查重结果。不得假装见过标准答案，也不得用题号、作者或来源猜测难度。\n\n",
-        "先澄清目标与边界，再聚焦一条最有希望的正确思路完整验证它：先给出关键观察，再给出算法与正确性理由、",
-        "复杂度，并覆盖边界情况。不要穷举大量候选思路或在已确认无效的路线上反复绕行；推理链保持必要且收敛，",
-        "指向最终答案而不是无限探索。若无法完整解决，要明确停在哪一步和不确定性，不能为了显得成功而补写结论。\n\n",
-        "用自然语言输出你的解题过程，包含以下内容（不需要 JSON 格式）：\n",
-        "1. solved：你是否解出了这道题（是/否）\n",
-        "2. narrative：完整独立的解题记录，包括观察、失败路线、修正和最终思路\n",
-        "3. approach：精炼的算法概述\n",
-        "4. claimedComplexity：算法复杂度\n",
-        "5. uncertainties：你不确定的地方（如果有）\n\n",
-        "不要评价题目质量、比赛适配或官方题解。输出长度保持收敛：narrative 覆盖关键推理与修正即可，",
-        "不要为了篇幅重复推导或列出与最终答案无关的所有尝试。"
+        "本轮只做问题探索，不要求解出这道题：明确目标与边界、记录最关键的观察与样例规律、指出最有希望的一条",
+        "正确方向即可。不要展开完整推导、正确性证明或复杂度分析；选定一条方向后立即停止探索并输出探索笔记",
+        "（自然语言，不需要 JSON 格式）。\n\n",
+        "探索笔记包含：\n",
+        "1. 目标与边界：问题在问什么，输入输出约束里最关键的限制\n",
+        "2. 关键观察：直接指向解法的 2–5 条观察\n",
+        "3. 最有希望的方向：你选定的那条思路，以及为什么\n",
+        "4. uncertainties：探索阶段你不确定的地方（如果有）",
       ].join(""))
     },
     { role: "user", content: privateContext(view) }
@@ -447,7 +453,37 @@ export function buildSolverSemanticMessages(
 }
 
 /**
- * 两轮设计的格式化轮：把语义轮的自然语言输出转换为满足 schema 的 JSON。
+ * 三段式 solver 的综合轮：沿探索轮锁定的方向推导完整解法，不重新探索。
+ * 同样独立成一次调用，推理链聚焦于验证与推导，避免无限探索。
+ */
+export function buildSolverSynthesisMessages(
+  explorationOutput: string,
+  _explorationReasoning: string | null
+): ChatMessage[] {
+  return [
+    {
+      role: "system",
+      content: guardedSystemPrompt("solver", [
+        "你是正在参加算法竞赛的独立选手，正在沿上一位选手的探索笔记继续求解。不要重新探索其他方向，",
+        "也不要重写探索笔记；直接沿给定方向给出完整解法。若该方向确实不可行，明确说明不可行原因和",
+        "停在哪一步，不要转而穷举新方向。\n\n",
+        "用自然语言输出你的解题过程（不需要 JSON 格式）：\n",
+        "1. narrative：完整独立的解题记录，从关键观察到算法、正确性理由、复杂度与边界情况，覆盖修正过程\n",
+        "2. approach：精炼的算法概述（一句话）\n",
+        "3. claimedComplexity：算法复杂度\n",
+        "4. uncertainties：你不确定的地方（如果有）\n\n",
+        "输出长度保持收敛：记录覆盖关键推理与修正即可，不要为了篇幅重复推导或列出无关尝试。"
+      ].join("")),
+    },
+    {
+      role: "user",
+      content: `上一位选手的探索笔记：\n\n${explorationOutput}`
+    }
+  ];
+}
+
+/**
+ * 三段式 solver 的格式化轮：把综合轮的自然语言输出转换为满足 schema 的 JSON。
  * 只做格式转换，不重新判断或修改语义内容。
  */
 export function buildSolverFormatterMessages(
@@ -461,7 +497,49 @@ export function buildSolverFormatterMessages(
     },
     {
       role: "user",
-      content: `以下是选手的解题记录，请转换为严格 JSON 对象，包含字段：solved（布尔值）、narrative（字符串，完整解题记录）、approach（字符串，精炼算法概述）、claimedComplexity（字符串，复杂度）、uncertainties（字符串数组，不确定的地方，没有则空数组）。不要改变任何语义判断，只做格式转换。\n\n${semanticOutput}`
+      content: `以下是选手的解题记录，请转换为严格 JSON 对象，包含字段：solved（布尔值，记录给出完整算法与正确性理由时为 true，否则为 false）、narrative（字符串，完整解题记录）、approach（字符串，精炼算法概述）、claimedComplexity（字符串，复杂度）、uncertainties（字符串数组，不确定的地方，没有则空数组）。不要改变任何语义判断，只做格式转换。\n\n${semanticOutput}`
+    }
+  ];
+}
+
+/**
+ * 两轮设计用于 tags 角色的语义轮：让模型先用自然语言完成标签选择，不强制 JSON 输出，
+ * 避免 thinking=max 的推理与严格 JSON 在同一调用里互相争用 token 预算，也避免推理
+ * 中途反复修改选择而产出不满足 schema 的结构。
+ */
+export function buildTagsSemanticMessages(
+  view: Parameters<ReviewFlowRoles["tags"]>[0]
+): ChatMessage[] {
+  return [
+    {
+      role: "system",
+      content: guardedSystemPrompt("tags", [
+        "你是知识点标签整理员。一道题可以选择多个标签，但只能从输入给出的当前启用固定目录中选择真实 id；",
+        "不能自造标签、不能输出分类 id、不能沿用投稿者自由填写的旧知识点。优先选解题真正需要的知识点，",
+        "不要把所有可能相关的术语都勾上。\n\n",
+        "用自然语言输出你选定的标签 id 列表与理由（不需要 JSON 格式）。"
+      ].join(""))
+    },
+    { role: "user", content: privateContext(view) }
+  ];
+}
+
+/**
+ * 两轮设计用于 tags 角色的格式化轮：把语义轮选定的标签 id 转换为满足 schema 的 JSON。
+ * 只做格式转换，不重新判断或修改语义内容。
+ */
+export function buildTagsFormatterMessages(
+  semanticOutput: string,
+  _semanticReasoning: string | null
+): ChatMessage[] {
+  return [
+    {
+      role: "system",
+      content: "你是格式化助手。下面是标签整理结果。请将其转换为严格的 JSON 对象，不要改变任何语义内容。"
+    },
+    {
+      role: "user",
+      content: `以下是标签整理结果，请转换为严格 JSON 对象：tagIds（字符串数组，至少一项、去重，只能是整理结果里明确选定的目录 id）、rationale（字符串，选择理由）。不要改变任何语义判断，只做格式转换。\n\n${semanticOutput}`
     }
   ];
 }
@@ -605,23 +683,6 @@ export function buildOriginalityMessages(
   ];
 }
 
-export function buildTagsMessages(
-  view: Parameters<ReviewFlowRoles["tags"]>[0]
-): ChatMessage[] {
-  return [
-    {
-      role: "system",
-      content: guardedSystemPrompt("tags", [
-        "你是知识点标签整理员。一道题可以选择多个标签，但只能从输入给出的当前启用固定目录中选择真实 id；",
-        "不能自造标签、不能输出分类 id、不能沿用投稿者自由填写的旧知识点。优先选解题真正需要的知识点，",
-        "不要把所有可能相关的术语都勾上。\n\n",
-        "结合题面与题解选择最小充分集合。输出严格 JSON：tagIds（至少一项且不重复）和 rationale。"
-      ].join(""))
-    },
-    { role: "user", content: privateContext(view) }
-  ];
-}
-
 export function buildCriticMessages(
   view: Parameters<ReviewFlowRoles["critic"]>[0]
 ): ChatMessage[] {
@@ -751,20 +812,26 @@ function guardedSystemPrompt(role: ReviewFlowRole, roleInstructions: string): st
  */
 function promptImplementationDigest(role: ReviewFlowRole): string {
   const builders: Readonly<Record<ReviewFlowRole, (...args: never[]) => ChatMessage[]>> = {
-    solver: buildSolverSemanticMessages as (...args: never[]) => ChatMessage[],
+    solver: buildSolverExplorationMessages as (...args: never[]) => ChatMessage[],
     solution_analyst: buildSolutionAnalystMessages as (...args: never[]) => ChatMessage[],
     technical_auditor: buildTechnicalAuditorMessages as (...args: never[]) => ChatMessage[],
     difficulty: buildDifficultyMessages as (...args: never[]) => ChatMessage[],
     editorial_judge: buildEditorialJudgeMessages as (...args: never[]) => ChatMessage[],
     contest_fit: buildContestFitMessages as (...args: never[]) => ChatMessage[],
     originality: buildOriginalityMessages as (...args: never[]) => ChatMessage[],
-    tags: buildTagsMessages as (...args: never[]) => ChatMessage[],
+    tags: buildTagsSemanticMessages as (...args: never[]) => ChatMessage[],
     critic: buildCriticMessages as (...args: never[]) => ChatMessage[],
     adversary: buildAdversaryMessages as (...args: never[]) => ChatMessage[],
     adjudicator: buildAdjudicatorMessages as (...args: never[]) => ChatMessage[]
   };
   const solverFormatterSource = role === "solver"
     ? buildSolverFormatterMessages.toString()
+    : null;
+  const solverSynthesisSource = role === "solver"
+    ? buildSolverSynthesisMessages.toString()
+    : null;
+  const tagsFormatterSource = role === "tags"
+    ? buildTagsFormatterMessages.toString()
     : null;
   return hashCanonicalValue({
     builderSource: builders[role].toString(),
@@ -774,7 +841,9 @@ function promptImplementationDigest(role: ReviewFlowRole): string {
     rubricPromptDigest: tasteRubricRoles.has(role)
       ? historicalReviewRubricPromptDigest
       : null,
-    solverFormatterSource
+    solverFormatterSource,
+    solverSynthesisSource,
+    tagsFormatterSource
   });
 }
 

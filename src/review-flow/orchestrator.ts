@@ -232,7 +232,7 @@ export interface ReviewFlowRoleCompletionSummary {
   readonly role: ReviewFlowRole;
   readonly evidenceId: string;
   readonly receiptHash: string | null;
-  readonly requestCount: 0 | 1 | 2 | 3;
+  readonly requestCount: 0 | 1 | 2 | 3 | 4;
   readonly transportAttemptCount: number;
   readonly responseModes: readonly ("sse" | "json")[];
   readonly responses: readonly {
@@ -248,7 +248,7 @@ export interface ReviewFlowRoleFailureSummary {
   readonly role: ReviewFlowRole;
   readonly failureKind: ReviewFlowFailureKind;
   readonly httpStatus: number | null;
-  readonly requestCount: 0 | 1 | 2 | 3;
+  readonly requestCount: 0 | 1 | 2 | 3 | 4;
   readonly transportAttemptCount: number;
   readonly completedResponseCount: number;
   readonly terminalResponseMode: "sse" | "json" | null;
@@ -314,11 +314,11 @@ export const reviewFlowCalibrationRoleReceiptSchema = z
   .object({
     role: reviewFlowRoleSchema,
     receiptHash: digestSchema,
-    requestCount: z.union([z.literal(1), z.literal(2), z.literal(3)]),
+    requestCount: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
     transportAttemptCount: z.number().int().positive().max(2_000),
     responses: z
       .array(reviewFlowCalibrationReceiptResponseSchema)
-      .max(3)
+      .max(4)
   })
   .strict()
   .superRefine((receipt, context) => {

@@ -220,6 +220,36 @@ const trustedReceipt = {
 
 const trustedSolverReceipt = {
   schemaVersion: 2,
+  requestCount: 3,
+  transportAttemptCount: 3,
+  eofVerified: true,
+  jsonSchemaValidated: true,
+  responses: [{
+    schemaVersion: 2,
+    transportAttemptCount: 1,
+    eofVerified: true,
+    responseMode: "json",
+    finishReasonStopVerified: true,
+    sseDoneObserved: null
+  }, {
+    schemaVersion: 2,
+    transportAttemptCount: 1,
+    eofVerified: true,
+    responseMode: "json",
+    finishReasonStopVerified: true,
+    sseDoneObserved: null
+  }, {
+    schemaVersion: 2,
+    transportAttemptCount: 1,
+    eofVerified: true,
+    responseMode: "json",
+    finishReasonStopVerified: true,
+    sseDoneObserved: null
+  }]
+} as const;
+
+const trustedTwoRoundReceipt = {
+  schemaVersion: 2,
   requestCount: 2,
   transportAttemptCount: 2,
   eofVerified: true,
@@ -340,7 +370,7 @@ function syntheticRoleFetch(): PipelineModelConfig["runtime"]["fetch"] {
       catch { user = {}; }
     }
     let payload: unknown;
-    if (system.includes("独立选手") || system.includes("格式化助手")) {
+    if (system.includes("独立选手")) {
       payload = {
         solved: true,
         narrative: "合成独立解题记录。",
@@ -348,6 +378,33 @@ function syntheticRoleFetch(): PipelineModelConfig["runtime"]["fetch"] {
         claimedComplexity: "O(1)",
         uncertainties: []
       };
+    } else if (system.includes("格式化助手")) {
+      const userContent = String(userMessage?.content ?? "");
+      const firstBrace = userContent.indexOf("{");
+      const lastBrace = userContent.lastIndexOf("}");
+      let tagIds: readonly unknown[] | null = null;
+      if (firstBrace !== -1 && lastBrace > firstBrace) {
+        try {
+          const candidate: unknown = JSON.parse(userContent.slice(firstBrace, lastBrace + 1));
+          if (
+            typeof candidate === "object" && candidate !== null &&
+            "tagIds" in candidate && Array.isArray(candidate.tagIds)
+          ) {
+            tagIds = candidate.tagIds;
+          }
+        } catch {
+          tagIds = null;
+        }
+      }
+      payload = tagIds !== null
+        ? { tagIds, rationale: "合成标签。" }
+        : {
+            solved: true,
+            narrative: "合成独立解题记录。",
+            approach: "直接处理。",
+            claimedComplexity: "O(1)",
+            uncertainties: []
+          };
     } else if (system.includes("题解分析者")) {
       payload = {
         solverCorrect: true,
@@ -506,7 +563,7 @@ describe("冻结证据多角色审题编排", () => {
 
     expect(outcome.status).toBe("complete");
     if (outcome.status !== "complete") throw new Error("expected complete");
-    expect(fetchImpl).toHaveBeenCalledTimes(12);
+    expect(fetchImpl).toHaveBeenCalledTimes(14);
     expect(outcome.projection).toMatchObject({
       schemaVersion: 2,
       verdict: "approve",
@@ -682,9 +739,9 @@ describe("冻结证据多角色审题编排", () => {
       init?: RequestInit
     ): Promise<Response> => {
       callCount += 1;
-      if (callCount <= 4) return baseFetch(url, init);
-      if (callCount === 5) return new Response(null, { status: 500 });
-      if (callCount <= 9) {
+      if (callCount <= 5) return baseFetch(url, init);
+      if (callCount === 6) return new Response(null, { status: 500 });
+      if (callCount <= 10) {
         return new Promise<Response>((resolve) => {
           pendingResponses.push({ url, init, resolve });
         });
@@ -704,7 +761,7 @@ describe("冻结证据多角色审题编排", () => {
     });
 
     await vi.waitFor(() => {
-      expect(fetchImpl).toHaveBeenCalledTimes(9);
+      expect(fetchImpl).toHaveBeenCalledTimes(10);
       expect(pendingResponses).toHaveLength(4);
       expect(gate.canStartRequest()).toBe(false);
     });
@@ -716,9 +773,12 @@ describe("冻结证据多角色审题编排", () => {
     expect(outcome.status).toBe("incomplete");
     if (outcome.status !== "incomplete") throw new Error("expected incomplete");
     expect(outcome.failure.failedRoles.map((entry) => entry.role)).toEqual([
-      "difficulty"
+      "difficulty",
+      "tags"
     ]);
-    expect(fetchImpl).toHaveBeenCalledTimes(9);
+    // difficulty 首错后闸门关闭：已发出的兄弟请求仍收束，但 tags 的格式化轮是
+    // 闸门关闭后的新逻辑请求，被 LLM_REQUEST_START_BLOCKED 拒绝并归类为 cancelled。
+    expect(fetchImpl).toHaveBeenCalledTimes(10);
   });
 
   it("solver 运行时只收到题面视图，题解、标签、查重和自报答案均不可见", async () => {
@@ -848,7 +908,9 @@ describe("冻结证据多角色审题编排", () => {
       expect(artifact.sourceSnapshotHash).toBe(first.sourceSnapshotHash);
       const expectedReceipt = artifact === artifacts(first).solver
         ? trustedSolverReceipt
-        : trustedReceipt;
+        : artifact === artifacts(first).tags
+          ? trustedTwoRoundReceipt
+          : trustedReceipt;
       expect(artifact.execution).toEqual({
         trust: "trusted_llm",
         runContextHash: first.runContextHash,
@@ -937,9 +999,9 @@ describe("冻结证据多角色审题编排", () => {
       role: "tags",
       failureKind: "validation",
       httpStatus: null,
-      requestCount: 1,
-      transportAttemptCount: 1,
-      completedResponseCount: 1,
+      requestCount: 2,
+      transportAttemptCount: 2,
+      completedResponseCount: 2,
       terminalResponseMode: "json",
       terminalEofObserved: true,
       terminalFinishReasonStopObserved: true,

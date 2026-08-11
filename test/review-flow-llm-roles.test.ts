@@ -17,7 +17,7 @@ import {
   buildRoleIdentities,
   buildSolutionAnalystMessages,
   buildSolverMessages,
-  buildTagsMessages,
+  buildTagsSemanticMessages,
   buildTechnicalAuditorMessages,
   createReviewFlowLlmBundle,
   isProductionEligibleReviewFlowLlmBundle,
@@ -382,7 +382,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
       buildEditorialJudgeMessages,
       buildContestFitMessages,
       buildOriginalityMessages,
-      buildTagsMessages,
+      buildTagsSemanticMessages,
       buildCriticMessages,
       buildAdversaryMessages,
       buildAdjudicatorMessages
@@ -524,13 +524,43 @@ describe("历史人工标准驱动的多角色提示词", () => {
     const completedRoles: ReviewFlowRole[] = [];
     for (const role of reviewFlowRoleSchema.options) {
       const requestIndex = observedRequests.length;
-      const expectedRequests = role === "solver" ? 2 : 1;
+      const expectedRequests = role === "solver" ? 3 : role === "tags" ? 2 : 1;
       const result = trustedRoleExecutionResultSchema.parse(await invocations[role]());
       expect(observedRequests).toHaveLength(requestIndex + expectedRequests);
       for (let i = 0; i < expectedRequests; i++) {
         expect(observedRequests[requestIndex + i]).toEqual({ role, model: uniqueModels[role] });
       }
       if (role === "solver") {
+        expect(result.receipt).toEqual({
+          schemaVersion: 2,
+          requestCount: 3,
+          transportAttemptCount: 3,
+          eofVerified: true,
+          jsonSchemaValidated: true,
+          responses: [{
+            schemaVersion: 2,
+            transportAttemptCount: 1,
+            eofVerified: true,
+            responseMode: "json",
+            finishReasonStopVerified: true,
+            sseDoneObserved: null
+          }, {
+            schemaVersion: 2,
+            transportAttemptCount: 1,
+            eofVerified: true,
+            responseMode: "json",
+            finishReasonStopVerified: true,
+            sseDoneObserved: null
+          }, {
+            schemaVersion: 2,
+            transportAttemptCount: 1,
+            eofVerified: true,
+            responseMode: "json",
+            finishReasonStopVerified: true,
+            sseDoneObserved: null
+          }]
+        });
+      } else if (role === "tags") {
         expect(result.receipt).toEqual({
           schemaVersion: 2,
           requestCount: 2,
@@ -573,7 +603,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
       completedRoles.push(role);
     }
 
-    expect(fetchImpl).toHaveBeenCalledTimes(reviewFlowRoleSchema.options.length + 1);
+    expect(fetchImpl).toHaveBeenCalledTimes(reviewFlowRoleSchema.options.length + 3);
     expect(completedRoles).toEqual(reviewFlowRoleSchema.options);
     expect(new Set(observedRequests.map((request) => request.role))).toEqual(
       new Set(reviewFlowRoleSchema.options)
@@ -633,7 +663,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
     expect(Object.isFrozen(bundle.roles)).toBe(true);
     expect(bundle.transportMode).toBe("injected_fetch");
     await bundle.roles.solver(flowViews().statement);
-    expect(originalFetch).toHaveBeenCalledTimes(2);
+    expect(originalFetch).toHaveBeenCalledTimes(3);
     expect(replacementFetch).not.toHaveBeenCalled();
 
     const productionTransportBundle = createReviewFlowLlmBundle({
@@ -755,7 +785,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
     for (const role of reviewFlowRoleSchema.options) {
       await invocations[role]();
     }
-    expect(fetchImpl).toHaveBeenCalledTimes(reviewFlowRoleSchema.options.length + 1);
+    expect(fetchImpl).toHaveBeenCalledTimes(reviewFlowRoleSchema.options.length + 3);
     for (const role of reviewFlowRoleSchema.options) {
       expect(observedMaxTokens[`cap-test-${role}`]).toBe(1_000_000);
     }
