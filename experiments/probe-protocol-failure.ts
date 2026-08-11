@@ -81,6 +81,14 @@ const jsonMessages = [
   }
 ];
 
+// 复杂公开提示词——模拟审稿流程的复杂度，但不包含任何私有题面。
+const complexMessages = [
+  {
+    role: "user" as const,
+    content: "你是一个算法题目审稿人。请分析以下公开题目并给出判断。\n\n题目：给定一个正整数 n，判断它是否为偶数。\n输入：一个正整数 n (1 ≤ n ≤ 10^9)。\n输出：如果是偶数输出 YES，否则输出 NO。\n\n请分析：1) 题目难度（easy/medium/hard）2) 是否适合作为竞赛题目 3) 数据范围是否合理\n\n请用中文详细回答。"
+  }
+];
+
 interface SafeProbeResult {
   readonly probe: string;
   readonly httpStatus: number | null;
@@ -254,6 +262,47 @@ async function runJsonProbe(
   }
 }
 
+async function runComplexProbe(
+  credentials: ProviderCredentials
+): Promise<SafeProbeResult> {
+  const base: SafeProbeResult = {
+    probe: "complex-text",
+    httpStatus: null,
+    formatFailureStage: null,
+    formatFailureSubstage: null,
+    errorCode: null,
+    errorName: null,
+    contentLength: null,
+    reasoningLength: null,
+    finishReason: null,
+    eofVerified: null,
+    transportAttemptCount: null,
+    requestCount: null,
+    jsonSchemaValidated: null,
+    failureAuditStage: null,
+    failureAuditHttpStatus: null
+  };
+
+  try {
+    const result = await chatCompleteWithReceipt(
+      credentials,
+      probeSpec,
+      complexMessages,
+      { ...probeRuntime, fetch: undefined as never } as LlmRuntimeOptions,
+      { requestJson: false, maxOutputTokens: 8192 }
+    );
+    return {
+      ...base,
+      contentLength: result.content.length,
+      reasoningLength: result.reasoning?.length ?? null,
+      eofVerified: result.receipt.eofVerified,
+      transportAttemptCount: result.receipt.transportAttemptCount
+    };
+  } catch (error) {
+    return { ...describeError(error), probe: "complex-text" };
+  }
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
   const profile =
@@ -284,6 +333,10 @@ async function main(): Promise<void> {
   console.log("--- starting json-schema probe ---");
   const json = await runJsonProbe(credentials);
   console.log("json-result:", JSON.stringify(json));
+
+  console.log("--- starting complex-text probe ---");
+  const complex = await runComplexProbe(credentials);
+  console.log("complex-result:", JSON.stringify(complex));
 }
 
 main().catch((error) => {
