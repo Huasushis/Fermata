@@ -120,6 +120,7 @@ export const reviewFlowEvaluationIdentitySchema = z
         maxAttempts: z.number().int().min(1).max(10),
         baseDelayMs: z.number().int().positive(),
         concurrency: z.number().int().min(1).max(4),
+        caseAttempts: z.number().int().min(1).max(8),
         proxyEnvironmentFingerprint: digestSchema,
         proxyEnvironmentKeys: z
           .array(z.enum([
@@ -245,7 +246,8 @@ const failureSchema = z
     httpStatus: z.number().int().min(100).max(599).nullable(),
     completedRoleCount: z.number().int().min(0).max(11),
     failedRoleCount: z.number().int().min(0).max(11),
-    failedRoles: z.array(roleFailureSchema)
+    failedRoles: z.array(roleFailureSchema),
+    caseAttempts: z.number().int().min(1).max(8).default(1)
   })
   .strict();
 export type ReviewFlowEvaluationFailure = z.infer<typeof failureSchema>;

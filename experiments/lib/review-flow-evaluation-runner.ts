@@ -1,5 +1,8 @@
 /** 并发执行器：单题失败不阻止其它题目启动；最终封存仍要求 32 题全部完成。 */
-import type { ReviewFlowCalibrationProjection } from "../../src/review-flow/orchestrator";
+import type {
+  ReviewFlowCalibrationProjection,
+  ReviewFlowFailureKind
+} from "../../src/review-flow/orchestrator";
 import { LlmRequestStartGate } from "../../src/llm";
 import type {
   ReviewFlowEvaluationExecutionOutcome
@@ -22,6 +25,46 @@ export interface ReviewFlowEvaluationExecutor<TPrepared> {
     runId: string,
     requestStartGate: LlmRequestStartGate
   ): Promise<ReviewFlowEvaluationExecutionOutcome>;
+}
+
+/**
+ * 单案例允许的执行次数。超出次数的失败按终态记录，绝不为任何策略无限重试。
+ */
+export const maxReviewFlowEvaluationCaseAttempts = 8;
+
+/**
+ * 可重试失败类别：模型输出长度超限、JSON 结构噪声、瞬态传输/HTTP/超时与
+ * 取消。它们不表明题目语义上无法完成——本轮样本在 v8 与 v8b 中出现过同题
+ * 一次通过、一次超限的随机摆动（max 推理在 1M 上限附近），完整重试能吸收。
+ * 业务校验失败（validation）与方法内部错误（role_internal）不可重试。
+ */
+export function isRetryableReviewFlowEvaluationFailureKind(
+  kind: ReviewFlowFailureKind | null
+): boolean {
+  switch (kind) {
+    case "output_limit":
+    case "schema_output":
+    case "service_http":
+    case "transport":
+    case "timeout":
+    case "content_filtered":
+    case "protocol":
+    case "cancelled":
+      return true;
+    case "validation":
+    case "role_internal":
+    case null:
+      return false;
+    default:
+      // 新失败类别默认不可重试，避免未知语义被盲目重跑烧钱。
+      return false;
+  }
+}
+
+function isRetryableReviewFlowEvaluationFailure(
+  failure: ReviewFlowEvaluationFailure
+): boolean {
+  return isRetryableReviewFlowEvaluationFailureKind(failure.failureKind);
 }
 
 export type ReviewFlowEvaluationTerminationSignal =
@@ -110,6 +153,7 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
   readonly executor: ReviewFlowEvaluationExecutor<TPrepared>;
   readonly concurrency: number;
   readonly startGate?: ReviewFlowEvaluationStartGate;
+  readonly maxCaseAttempts?: number;
 }): Promise<ReviewFlowEvaluationCheckpointState> {
   if (
     !Number.isSafeInteger(input.concurrency) ||
@@ -117,6 +161,14 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
     input.concurrency > 4
   ) {
     throw new Error("REVIEW_FLOW_EVALUATION_CONCURRENCY_INVALID");
+  }
+  const maxCaseAttempts = input.maxCaseAttempts ?? 1;
+  if (
+    !Number.isSafeInteger(maxCaseAttempts) ||
+    maxCaseAttempts < 1 ||
+    maxCaseAttempts > maxReviewFlowEvaluationCaseAttempts
+  ) {
+    throw new Error("REVIEW_FLOW_EVALUATION_CASE_ATTEMPTS_INVALID");
   }
   const initial = input.checkpoint.snapshot();
   const startGate = input.startGate ??
@@ -165,35 +217,70 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
           }
           throw error;
         }
-        let outcome: ReviewFlowEvaluationExecutionOutcome;
-        try {
-          outcome = await input.executor.execute(
-            evaluationCase.prepared,
-            initial.runId,
-            startGate.createCaseRequestStartGate()
-          );
-        } catch {
-          const failure = unexpectedFailure();
-          try {
-            input.checkpoint.markFailed(safeId, failure);
-          } catch {
-            localFatal = true;
+        // 同一案例允许在可重试失败类别下完整重跑（每次独立闸门与独立 token
+        // 预算）。失败尝试不会记入最终封存；只有最后一次尝试的投影落地。
+        // 闸门关闭（终止/全局停止）或预算耗尽时，已发生的最新一次失败必须
+        // 立即落地，否则该案例会悬停在 active 且不再有 worker 处理。
+        let caseAttempts = 0;
+        let latestIncomplete: ReviewFlowEvaluationFailure | null = null;
+        let latestThrown = false;
+        let finalized = false;
+        while (!finalized && !localFatal) {
+          if (!startGate.canStart() || caseAttempts >= maxCaseAttempts) {
+            if (latestIncomplete !== null || latestThrown) {
+              const failure = latestThrown
+                ? { ...unexpectedFailure(), caseAttempts }
+                : { ...latestIncomplete!, caseAttempts };
+              try {
+                input.checkpoint.markFailed(safeId, failure);
+              } catch {
+                localFatal = true;
+              }
+            }
+            finalized = true;
+            continue;
           }
-          continue;
-        }
+          caseAttempts += 1;
+          let outcome: ReviewFlowEvaluationExecutionOutcome;
+          try {
+            latestThrown = false;
+            latestIncomplete = null;
+            outcome = await input.executor.execute(
+              evaluationCase.prepared,
+              initial.runId,
+              startGate.createCaseRequestStartGate()
+            );
+          } catch {
+            latestThrown = true;
+            continue;
+          }
 
-        if (outcome.status === "incomplete") {
-          try {
-            input.checkpoint.markFailed(safeId, outcome.failure);
-          } catch {
-            localFatal = true;
+          if (outcome.status === "incomplete") {
+            latestIncomplete = outcome.failure;
+            if (
+              isRetryableReviewFlowEvaluationFailure(outcome.failure) &&
+              caseAttempts < maxCaseAttempts &&
+              startGate.canStart()
+            ) {
+              continue;
+            }
+            try {
+              input.checkpoint.markFailed(safeId, {
+                ...latestIncomplete,
+                caseAttempts
+              });
+            } catch {
+              localFatal = true;
+            }
+            finalized = true;
+            continue;
           }
-          continue;
-        }
-        try {
-          markCompleted(input.checkpoint, safeId, outcome.projection);
-        } catch {
-          throw new Error("REVIEW_FLOW_EVALUATION_LOCAL_STATE_FAILURE");
+          try {
+            markCompleted(input.checkpoint, safeId, outcome.projection);
+          } catch {
+            throw new Error("REVIEW_FLOW_EVALUATION_LOCAL_STATE_FAILURE");
+          }
+          finalized = true;
         }
       }
     } catch {
@@ -235,6 +322,7 @@ function unexpectedFailure(): ReviewFlowEvaluationFailure {
     httpStatus: null,
     completedRoleCount: 0,
     failedRoleCount: 0,
-    failedRoles: []
+    failedRoles: [],
+    caseAttempts: 1
   };
 }

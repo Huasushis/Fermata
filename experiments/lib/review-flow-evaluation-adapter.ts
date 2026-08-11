@@ -101,6 +101,7 @@ export function createReviewFlowEvaluationAdapter(input: {
   readonly placeholderTagIds: ReviewFlowEvaluationPlaceholderTagIds;
   readonly purpose: "development" | "holdout";
   readonly concurrency: number;
+  readonly maxCaseAttempts: number;
   readonly proxyEnvironment: NodeJS.ProcessEnv;
 }): ReviewFlowEvaluationAdapter {
   if (!Number.isSafeInteger(input.concurrency) || input.concurrency < 1 || input.concurrency > 4) {
@@ -148,6 +149,7 @@ export function createReviewFlowEvaluationAdapter(input: {
     timeouts: input.config.models.timeouts,
     retry: input.config.models.retry,
     concurrency: input.concurrency,
+    caseAttempts: input.maxCaseAttempts,
     anklangInputPolicy: input.anklangInputPolicy,
     placeholderTagIds,
     proxyEnvironmentFingerprint: proxyEnvironmentSummary.fingerprint,
@@ -162,6 +164,7 @@ export function createReviewFlowEvaluationAdapter(input: {
     maxAttempts: input.config.models.retry.maxAttempts,
     baseDelayMs: input.config.models.retry.baseDelayMs,
     concurrency: input.concurrency,
+    caseAttempts: input.maxCaseAttempts,
     proxyEnvironmentFingerprint: proxyEnvironmentSummary.fingerprint,
     proxyEnvironmentKeys: [...proxyEnvironmentSummary.keys],
     duplicateSimilarityReject:
@@ -334,6 +337,7 @@ function normalizeIncompleteFailure(
       requestCount: role.requestCount,
       transportAttemptCount: role.transportAttemptCount,
       completedResponseCount: role.completedResponseCount
-    }))
+    })),
+    caseAttempts: 1
   };
 }

@@ -46,6 +46,7 @@ import {
 } from "./lib/review-flow-evaluation-report";
 import {
   installReviewFlowEvaluationSignalHandlers,
+  maxReviewFlowEvaluationCaseAttempts,
   ReviewFlowEvaluationStartGate,
   runReviewFlowEvaluationCases
 } from "./lib/review-flow-evaluation-runner";
@@ -85,6 +86,7 @@ export interface ReviewFlowEvaluationRunCliOptions {
   readonly developmentBaselineLabel: string | null;
   readonly developmentCandidateLabel: string | null;
   readonly resume: boolean;
+  readonly maxCaseAttempts: number;
 }
 
 export interface ReviewFlowEvaluationRevealCliOptions {
@@ -171,7 +173,8 @@ export function resolveReviewFlowEvaluationCliOptions(
     "variant",
     "baseline-label",
     "development-baseline-label",
-    "development-candidate-label"
+    "development-candidate-label",
+    "max-case-attempts"
   ]);
   if ([...values.keys()].some((key) => !allowed.has(key))) {
     throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
@@ -202,6 +205,17 @@ export function resolveReviewFlowEvaluationCliOptions(
       (revealDescriptorPath === null || !isAbsolute(revealDescriptorPath))) ||
     (purpose.data === "holdout" && revealDescriptorPath !== null) ||
     revealDescriptorPath === manifestPath
+  ) {
+    throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+  }
+  const maxCaseAttemptsRaw = values.get("max-case-attempts");
+  const maxCaseAttempts = maxCaseAttemptsRaw === undefined
+    ? 3
+    : Number(maxCaseAttemptsRaw);
+  if (
+    !Number.isSafeInteger(maxCaseAttempts) ||
+    maxCaseAttempts < 1 ||
+    maxCaseAttempts > maxReviewFlowEvaluationCaseAttempts
   ) {
     throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
   }
@@ -240,7 +254,8 @@ export function resolveReviewFlowEvaluationCliOptions(
     baselineLabel,
     developmentBaselineLabel,
     developmentCandidateLabel,
-    resume
+    resume,
+    maxCaseAttempts
   };
 }
 
@@ -386,6 +401,7 @@ async function runPredictionOrDevelopment(input: {
       placeholderTagIds: dataset.placeholderTagIds,
       purpose: dataset.purpose,
       concurrency,
+      maxCaseAttempts: options.maxCaseAttempts,
       proxyEnvironment: input.env
     });
     // 全量 taskSource 预检发生在 checkpoint/claim 与任何模型调用之前。
@@ -467,7 +483,8 @@ async function runPredictionOrDevelopment(input: {
       cases: preparedCases,
       executor: adapter,
       concurrency,
-      startGate: gate
+      startGate: gate,
+      maxCaseAttempts: options.maxCaseAttempts
     });
     removeSignalHandlers();
     removeSignalHandlers = undefined;

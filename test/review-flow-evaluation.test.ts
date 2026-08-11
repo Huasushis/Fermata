@@ -536,6 +536,150 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
     resumed.close();
   });
 
+  it("可重试失败在同一案例内重生闸门整体重跑，最后一次尝试才封存", async () => {
+    const fixture = createStateFixture(2);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const calls: string[] = [];
+    const execute = vi.fn(async (safeId: string) => {
+      calls.push(safeId);
+      if (safeId === "case-0001" && calls.filter((id) => id === safeId).length < 3) {
+        return {
+          status: "incomplete" as const,
+          failure: {
+            ...fixedFailure("REVIEW_FLOW_OUTPUT_LIMIT", 200),
+            failureKind: "output_limit" as const
+          }
+        };
+      }
+      return { status: "complete" as const, projection: projection("approve") };
+    });
+    const state = await runReviewFlowEvaluationCases({
+      checkpoint,
+      cases: preparedStateCases(fixture),
+      executor: { execute },
+      concurrency: 2,
+      maxCaseAttempts: 3
+    });
+    expect(state.entries.map((entry) => entry.status)).toEqual([
+      "completed",
+      "completed"
+    ]);
+    // case-0001 重试两次失败后第三次成功；case-0002 首次即成功。
+    expect(calls.filter((id) => id === "case-0001")).toHaveLength(3);
+    expect(calls.filter((id) => id === "case-0002")).toHaveLength(1);
+    expect(state.entries.every((entry) => entry.status === "completed")).toBe(true);
+    expect(state.executionSeal).not.toBeNull();
+    checkpoint.close();
+  });
+
+  it("可重试失败耗尽预算后封存 failed 并记录尝试次数，不无限重试", async () => {
+    const fixture = createStateFixture(1);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const execute = vi.fn(async () => ({
+      status: "incomplete" as const,
+      failure: {
+        ...fixedFailure("REVIEW_FLOW_OUTPUT_LIMIT", 200),
+        failureKind: "output_limit" as const
+      }
+    }));
+    const state = await runReviewFlowEvaluationCases({
+      checkpoint,
+      cases: preparedStateCases(fixture),
+      executor: { execute },
+      concurrency: 1,
+      maxCaseAttempts: 3
+    });
+    expect(execute).toHaveBeenCalledTimes(3);
+    expect(state.entries.map((entry) => entry.status)).toEqual(["failed"]);
+    const attemptByCase = new Map(
+      state.entries.map((entry) => [
+        entry.safeId,
+        entry.status === "failed" ? entry.failure.caseAttempts : null
+      ])
+    );
+    expect(attemptByCase.get("case-0001")).toBe(3);
+    expect(state.executionSeal?.complete).toBe(false);
+    checkpoint.close();
+  });
+
+  it("不可重试失败只尝试一次且不消耗重试预算", async () => {
+    const fixture = createStateFixture(1);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const execute = vi.fn(async (safeId: string) => ({
+      status: "incomplete" as const,
+      failure: {
+        ...fixedFailure("REVIEW_FLOW_VALIDATION", 200),
+        failureKind: "validation" as const
+      }
+    }));
+    const state = await runReviewFlowEvaluationCases({
+      checkpoint,
+      cases: preparedStateCases(fixture),
+      executor: { execute },
+      concurrency: 1,
+      maxCaseAttempts: 3
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+    const attemptByCase = new Map(
+      state.entries.map((entry) => [
+        entry.safeId,
+        entry.status === "failed" ? entry.failure.caseAttempts : null
+      ])
+    );
+    expect(attemptByCase.get("case-0001")).toBe(1);
+    checkpoint.close();
+  });
+
+  it("maxCaseAttempts 超界或非整数被拒绝", async () => {
+    const fixture = createStateFixture(1);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    await expect(runReviewFlowEvaluationCases({
+      checkpoint,
+      cases: preparedStateCases(fixture),
+      executor: { execute: async () => ({ status: "complete" as const, projection: projection("approve") }) },
+      concurrency: 1,
+      maxCaseAttempts: 9
+    })).rejects.toThrow("REVIEW_FLOW_EVALUATION_CASE_ATTEMPTS_INVALID");
+    checkpoint.close();
+  });
+
+  it("终止后闸门关闭，剩余重试不再启动", async () => {
+    const fixture = createStateFixture(1);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const source = new EventEmitter();
+    const gate = new ReviewFlowEvaluationStartGate(checkpoint);
+    const remove = installReviewFlowEvaluationSignalHandlers({ gate, source });
+    const called: number[] = [];
+    const run = runReviewFlowEvaluationCases({
+      checkpoint,
+      cases: preparedStateCases(fixture),
+      executor: {
+        async execute() {
+          called.push(called.length);
+          source.emit("SIGTERM");
+          return {
+            status: "incomplete" as const,
+            failure: fixedFailure("REVIEW_FLOW_HTTP_499", 499)
+          };
+        }
+      },
+      concurrency: 1,
+      startGate: gate,
+      maxCaseAttempts: 3
+    });
+    const state = await run;
+    remove();
+    expect(called).toHaveLength(1);
+    const attemptByCase = new Map(
+      state.entries.map((entry) => [
+        entry.safeId,
+        entry.status === "failed" ? entry.failure.caseAttempts : null
+      ])
+    );
+    expect(attemptByCase.get("case-0001")).toBe(1);
+    checkpoint.close();
+  });
+
   it("单题失败不阻止其它题目启动；每题拥有独立请求闸门", async () => {
     const fixture = createStateFixture(2);
     const checkpoint = openCheckpoint(fixture, { bindClaim: true });
@@ -1644,6 +1788,7 @@ describe("adapter、CLI 与窄环境", () => {
       placeholderTagIds: dataset.placeholderTagIds,
       purpose: dataset.purpose,
       concurrency: 2,
+      maxCaseAttempts: 2,
       proxyEnvironment: { HTTP_PROXY: "http://127.0.0.1:10808" }
     });
     const prepared = adapter.prepare({
@@ -1667,6 +1812,7 @@ describe("adapter、CLI 与窄环境", () => {
     });
     expect(adapter.identity.configurationSummary).toMatchObject({
       concurrency: 2,
+      caseAttempts: 2,
       proxyEnvironmentKeys: ["HTTP_PROXY"],
       proxyEnvironmentFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/u)
     });
@@ -1685,6 +1831,7 @@ describe("adapter、CLI 与窄环境", () => {
       placeholderTagIds: dataset.placeholderTagIds,
       purpose: dataset.purpose,
       concurrency: 3,
+      maxCaseAttempts: 2,
       proxyEnvironment: { HTTP_PROXY: "http://127.0.0.1:10808" }
     });
     const changedProxy = createReviewFlowEvaluationAdapter({
@@ -1702,6 +1849,7 @@ describe("adapter、CLI 与窄环境", () => {
       placeholderTagIds: dataset.placeholderTagIds,
       purpose: dataset.purpose,
       concurrency: 2,
+      maxCaseAttempts: 2,
       proxyEnvironment: { HTTPS_PROXY: "http://127.0.0.1:10809" }
     });
     expect(changedConcurrency.identity.configurationFingerprint).not.toBe(
@@ -1725,9 +1873,31 @@ describe("adapter、CLI 与窄环境", () => {
       placeholderTagIds: ["tag-other"],
       purpose: dataset.purpose,
       concurrency: 2,
+      maxCaseAttempts: 2,
       proxyEnvironment: { HTTP_PROXY: "http://127.0.0.1:10808" }
     });
     expect(changedPlaceholder.identity.configurationFingerprint).not.toBe(
+      adapter.identity.configurationFingerprint
+    );
+    const changedCaseAttempts = createReviewFlowEvaluationAdapter({
+      config,
+      codeIdentity: codeIdentityFixture(),
+      runtimeIdentity: runtimeIdentityFixture(),
+      difficultyAnchors: {
+        anchors: [],
+        provisional: true,
+        fingerprint: "4".repeat(64)
+      },
+      datasetFingerprint: dataset.datasetFingerprint,
+      manifestSha256: dataset.manifestSha256,
+      anklangInputPolicy: dataset.anklangInputPolicy,
+      placeholderTagIds: dataset.placeholderTagIds,
+      purpose: dataset.purpose,
+      concurrency: 2,
+      maxCaseAttempts: 5,
+      proxyEnvironment: { HTTP_PROXY: "http://127.0.0.1:10808" }
+    });
+    expect(changedCaseAttempts.identity.configurationFingerprint).not.toBe(
       adapter.identity.configurationFingerprint
     );
     expect(() => changedPlaceholder.prepare({
@@ -2485,6 +2655,7 @@ function identityFixture(
       maxAttempts: 3,
       baseDelayMs: 500,
       concurrency: 2,
+      caseAttempts: 1,
       proxyEnvironmentFingerprint: "b".repeat(64),
       proxyEnvironmentKeys: ["HTTP_PROXY"],
       duplicateSimilarityReject: 0.9,
@@ -2668,7 +2839,8 @@ function fixedFailure(code: string, httpStatus: number | null) {
     httpStatus,
     completedRoleCount: 1,
     failedRoleCount: 1,
-    failedRoles: []
+    failedRoles: [],
+    caseAttempts: 1
   };
 }
 
