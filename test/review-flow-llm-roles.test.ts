@@ -658,7 +658,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
     )).toThrow("REVIEW_FLOW_PRODUCTION_GRANT_INVALID");
   });
 
-  it("所有 11 个角色的 maxOutputTokens 均为 256000", async () => {
+  it("所有 11 个角色的 maxOutputTokens 均为 384000", async () => {
     const roleByModel = new Map<string, ReviewFlowRole>(
       reviewFlowRoleSchema.options.map((role) => [`cap-test-${role}`, role] as const)
     );
@@ -729,7 +729,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
     }
     expect(fetchImpl).toHaveBeenCalledTimes(reviewFlowRoleSchema.options.length);
     for (const role of reviewFlowRoleSchema.options) {
-      expect(observedMaxTokens[`cap-test-${role}`]).toBe(256_000);
+      expect(observedMaxTokens[`cap-test-${role}`]).toBe(384_000);
     }
   });
 });
