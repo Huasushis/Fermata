@@ -2667,7 +2667,8 @@ function fixedFailure(code: string, httpStatus: number | null) {
     failureKind: httpStatus === 499 ? "cancelled" as const : null,
     httpStatus,
     completedRoleCount: 1,
-    failedRoleCount: 1
+    failedRoleCount: 1,
+    failedRoles: []
   };
 }
 

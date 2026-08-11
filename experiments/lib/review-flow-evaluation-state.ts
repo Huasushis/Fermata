@@ -228,13 +228,24 @@ export type ReviewFlowEvaluationExpectedCase = z.infer<
   typeof expectedCaseSchema
 >;
 
+const roleFailureSchema = z
+  .object({
+    role: z.string().min(1).max(64),
+    failureKind: z.enum(reviewFlowFailureKindAllowlist).nullable(),
+    requestCount: z.number().int().min(0).max(4),
+    transportAttemptCount: z.number().int().min(0).max(64),
+    completedResponseCount: z.number().int().min(0).max(4)
+  })
+  .strict();
+
 const failureSchema = z
   .object({
     code: z.string().regex(/^[A-Z0-9_]{1,120}$/u),
     failureKind: z.enum(reviewFlowFailureKindAllowlist).nullable(),
     httpStatus: z.number().int().min(100).max(599).nullable(),
     completedRoleCount: z.number().int().min(0).max(11),
-    failedRoleCount: z.number().int().min(0).max(11)
+    failedRoleCount: z.number().int().min(0).max(11),
+    failedRoles: z.array(roleFailureSchema)
   })
   .strict();
 export type ReviewFlowEvaluationFailure = z.infer<typeof failureSchema>;

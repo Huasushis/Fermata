@@ -327,6 +327,13 @@ function normalizeIncompleteFailure(
     failureKind: failure.failureKind,
     httpStatus,
     completedRoleCount: failure.completedRoles.length,
-    failedRoleCount: failure.failedRoles.length
+    failedRoleCount: failure.failedRoles.length,
+    failedRoles: failure.failedRoles.map((role) => ({
+      role: role.role,
+      failureKind: role.failureKind,
+      requestCount: role.requestCount,
+      transportAttemptCount: role.transportAttemptCount,
+      completedResponseCount: role.completedResponseCount
+    }))
   };
 }

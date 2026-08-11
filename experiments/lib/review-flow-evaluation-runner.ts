@@ -234,6 +234,7 @@ function unexpectedFailure(): ReviewFlowEvaluationFailure {
     failureKind: null,
     httpStatus: null,
     completedRoleCount: 0,
-    failedRoleCount: 0
+    failedRoleCount: 0,
+    failedRoles: []
   };
 }
