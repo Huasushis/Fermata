@@ -127,6 +127,7 @@ const safeReceiptSchema = z.object({
   provider: z.literal("aether"),
   model: z.enum(["deepseek-v4-pro", "deepseek-v4-flash"]),
   modelFingerprint: digestSchema,
+  schemaFingerprint: digestSchema,
   maxOutputTokens: z.union([z.literal(32_000), z.literal(8_000), z.literal(24_000), z.literal(12_000)]),
   thinkingRequest: z.literal("enabled"),
   reasoningEffort: z.literal("max"),
@@ -178,6 +179,23 @@ const requestLedgerSchema = z.object({
     context.addIssue({ code: "custom", message: "stage binding mismatch" });
   }
 });
+const safeFailureCodeSchema = z.enum([
+  "rate_limited",
+  "server_error",
+  "connect",
+  "first_byte_timeout",
+  "no_progress_timeout",
+  "stream_interrupted",
+  "output_limit",
+  "schema_invalid",
+  "permanent",
+  "request_receipt_schema_invalid",
+  "checkpoint_state_schema_invalid",
+  "final_failure"
+]);
+const safeFailureLocationSchema = z.string().regex(
+  /^[A-Za-z0-9._/-]+:\d+:[A-Za-z0-9_.#<>-]+$/u
+);
 const privateCheckpointSchema = z.object({
   schemaVersion: z.literal(1),
   profileName: z.literal("development-smoke-6x4-v1"),
@@ -196,6 +214,8 @@ const privateCheckpointSchema = z.object({
   requests: z.array(requestLedgerSchema).max(10),
   phase0Forecast: z.unknown().nullable(),
   stopReason: z.string().nullable(),
+  failureCode: safeFailureCodeSchema.nullable().optional(),
+  failureLocation: safeFailureLocationSchema.nullable().optional(),
   accuracyClaim: z.null(),
   includedInFinalCalibration: z.literal(false),
   phase1Released: z.literal(false)
@@ -204,6 +224,17 @@ const privateCheckpointSchema = z.object({
 type PrivateManifest = z.infer<typeof privateManifestSchema>;
 type PrivateBinding = z.infer<typeof privateBindingSchema>;
 type PrivateCheckpoint = z.infer<typeof privateCheckpointSchema>;
+type SafeFailureCode = z.infer<typeof safeFailureCodeSchema>;
+
+class DevelopmentSmokeSafeError extends Error {
+  public constructor(
+    public readonly safeCode: SafeFailureCode,
+    options: { readonly cause: unknown }
+  ) {
+    super(safeCode, { cause: options.cause });
+    this.name = "DevelopmentSmokeSafeError";
+  }
+}
 
 export interface DevelopmentSmokePreparedCase {
   readonly slot: DevelopmentSmokeAnonymousSlot;
@@ -335,10 +366,15 @@ export async function executeDevelopmentSmokePhase0(input: {
       scheduler,
       startedAtMs: new Date(ledger.state.createdAt).getTime(),
       safeReceiptSink: (receipt) => {
-        const phase0Receipt = safeReceiptSchema.parse(receipt);
+        const parsedReceipt = safeReceiptSchema.safeParse(receipt);
+        if (!parsedReceipt.success) {
+          throw new DevelopmentSmokeSafeError("request_receipt_schema_invalid", {
+            cause: parsedReceipt.error
+          });
+        }
         ledger.mutate((state) => ({
           ...state,
-          requests: [...state.requests, { receipt: phase0Receipt }]
+          requests: [...state.requests, { receipt: parsedReceipt.data }]
         }));
       },
       safeCompletionSink: (slot, stage, timing) => {
@@ -401,19 +437,27 @@ export async function executeDevelopmentSmokePhase0(input: {
           }));
         }
       });
-      const rejected = outcomes.some((outcome) => outcome.status === "rejected");
+      const rejectedOutcome = outcomes.find((outcome) => outcome.status === "rejected");
+      const rejected = rejectedOutcome !== undefined;
       const forecast = rejected ? null : controller.phase0Forecast(controller.elapsedMs());
       ledger.mutate((state) => ({
         ...state,
         state: rejected ? "incomplete" : "phase0_complete",
         phase0Forecast: forecast,
-        stopReason: rejected ? controller.checkpoint().stopReason ?? "final_failure" : null
+        stopReason: rejected ? controller.checkpoint().stopReason ?? "final_failure" : null,
+        failureCode: rejectedOutcome === undefined ? null : safeFailureCode(rejectedOutcome.reason),
+        failureLocation: rejectedOutcome === undefined
+          ? null
+          : safeFailureLocation(rejectedOutcome.reason)
       }));
     } catch (error) {
+      const failureCode = safeFailureCode(error);
       ledger.mutate((state) => ({
         ...state,
         state: "incomplete",
-        stopReason: safeFailureCode(error)
+        stopReason: failureCode,
+        failureCode,
+        failureLocation: safeFailureLocation(error)
       }));
     } finally {
       clearTimeout(checkpoint15);
@@ -714,6 +758,8 @@ function createRunLedger(
     requests: [],
     phase0Forecast: null,
     stopReason: null,
+    failureCode: null,
+    failureLocation: null,
     accuracyClaim: null,
     includedInFinalCalibration: false,
     phase1Released: false
@@ -761,14 +807,19 @@ class RunLedger {
 
   public mutate(update: (state: PrivateCheckpoint) => Omit<PrivateCheckpoint, "revision" | "previousCheckpointSha256" | "updatedAt"> & Partial<Pick<PrivateCheckpoint, "revision" | "previousCheckpointSha256" | "updatedAt">>): void {
     const previousBytes = checkpointBytes(this.state);
-    const next = privateCheckpointSchema.parse({
+    const parsedNext = privateCheckpointSchema.safeParse({
       ...update(this.state),
       revision: this.state.revision + 1,
       previousCheckpointSha256: sha256(previousBytes),
       updatedAt: this.#now().toISOString()
     });
-    this.#persist(next);
-    this.state = next;
+    if (!parsedNext.success) {
+      throw new DevelopmentSmokeSafeError("checkpoint_state_schema_invalid", {
+        cause: parsedNext.error
+      });
+    }
+    this.#persist(parsedNext.data);
+    this.state = parsedNext.data;
   }
 
   #persist(state: PrivateCheckpoint): void {
@@ -1004,9 +1055,38 @@ function isPathWithin(path: string, root: string): boolean {
   return pathRelative === "" || (!pathRelative.startsWith(`..${sep}`) && pathRelative !== "..");
 }
 
-function safeFailureCode(error: unknown): string {
-  if (typeof error === "object" && error !== null && "kind" in error && typeof error.kind === "string") {
-    return error.kind;
+function safeFailureCode(error: unknown): SafeFailureCode {
+  let current = error;
+  let stageFailure: SafeFailureCode | null = null;
+  const visited = new Set<unknown>();
+  while (typeof current === "object" && current !== null && !visited.has(current)) {
+    visited.add(current);
+    if (current instanceof DevelopmentSmokeSafeError) return current.safeCode;
+    if ("kind" in current) {
+      const parsedKind = safeFailureCodeSchema.safeParse(current.kind);
+      if (parsedKind.success) stageFailure ??= parsedKind.data;
+    }
+    current = "cause" in current ? current.cause : null;
   }
-  return "final_failure";
+  return stageFailure ?? "final_failure";
+}
+
+function safeFailureLocation(error: unknown): string | null {
+  let current = error;
+  let location: string | null = null;
+  const visited = new Set<unknown>();
+  while (typeof current === "object" && current !== null && !visited.has(current)) {
+    visited.add(current);
+    if (current instanceof Error && typeof current.stack === "string") {
+      const frame = current.stack.split("\n").find((line) => line.includes("Fermata/"));
+      const match = frame?.match(
+        /at\s+(?:(?<symbol>[^\s(]+)\s+\()?[^()]*Fermata\/(?<path>[^():]+):(?<line>\d+):\d+\)?/u
+      );
+      if (match?.groups !== undefined) {
+        location = `${match.groups.path}:${match.groups.line}:${match.groups.symbol ?? "anonymous"}`;
+      }
+    }
+    current = "cause" in current ? current.cause : null;
+  }
+  return location;
 }

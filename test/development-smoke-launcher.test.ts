@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   executeDevelopmentSmokePhase0,
   type DevelopmentSmokePreflight
@@ -70,13 +70,13 @@ function fixturePreflight(root: string): DevelopmentSmokePreflight {
         slot: "slot-01",
         sourceBinding: digest("1"),
         source,
-        truthBindingHash: digest("a")
+        truthBindingHash: digest("1")
       },
       {
         slot: "slot-02",
         sourceBinding: digest("2"),
         source,
-        truthBindingHash: digest("b")
+        truthBindingHash: digest("2")
       }
     ],
     models: {} as never,
@@ -93,6 +93,42 @@ function fixturePreflight(root: string): DevelopmentSmokePreflight {
       externalAttemptCeiling: 30,
       manifestFingerprint
     }
+  };
+}
+
+function offlineModels(
+  fetch: NonNullable<DevelopmentSmokePreflight["models"]["A"]["runtime"]["fetch"]>
+): DevelopmentSmokePreflight["models"] {
+  const credentials = {
+    baseUrl: "https://offline-transport.invalid/v1",
+    apiKey: "offline-test-only"
+  };
+  const runtime = {
+    outputIdleTimeoutMs: developmentSmokeProfile.outputIdleTimeoutMs,
+    firstOutputTimeoutMs: developmentSmokeProfile.firstValidOutputTimeoutMs,
+    maximumDurationMs: developmentSmokeProfile.preFirstOutputFallbackMs,
+    maxAttempts: 1,
+    baseDelayMs: 500,
+    fetch
+  };
+  const model = (name: "deepseek-v4-pro" | "deepseek-v4-flash") => ({
+    spec: {
+      provider: "aether" as const,
+      model: name,
+      temperature: 0,
+      thinking: false,
+      thinkingRequest: "enabled" as const,
+      reasoningEffort: "max" as const
+    },
+    credentials,
+    runtime
+  });
+  return {
+    A: model("deepseek-v4-pro"),
+    B: model("deepseek-v4-flash"),
+    C: model("deepseek-v4-pro"),
+    D: model("deepseek-v4-pro"),
+    formatter: model("deepseek-v4-flash")
   };
 }
 
@@ -124,6 +160,46 @@ afterEach(() => {
 });
 
 describe("development smoke private checkpoint", () => {
+  it("persists authorization receipts before entering an injected offline transport", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fermata-smoke-authorization-"));
+    temporaryRoots.push(root);
+    chmodSync(root, 0o700);
+    const transport = vi.fn(async () => {
+      throw new Error("OFFLINE_TRANSPORT_BOUNDARY");
+    });
+    const preflight = {
+      ...fixturePreflight(root),
+      models: offlineModels(transport)
+    };
+
+    const result = await executeDevelopmentSmokePhase0({ preflight });
+
+    const runDirectory = resolve(
+      preflight.privateRuntimeRoot,
+      `run-${result.runId}`
+    );
+    const checkpointNames = readdirSync(runDirectory)
+      .filter((name) => name.startsWith("checkpoint-"))
+      .sort();
+    const checkpoint = JSON.parse(readFileSync(
+      resolve(runDirectory, checkpointNames.at(-1)!),
+      "utf8"
+    ));
+    expect(checkpoint.failureCode).toBe("connect");
+    expect(result).toMatchObject({
+      state: "incomplete",
+      requestCount: 4
+    });
+    expect(transport).toHaveBeenCalledTimes(4);
+    expect(checkpoint.phase1Released).toBe(false);
+    expect(checkpoint.requests).toHaveLength(4);
+    expect(checkpoint.requests.every(
+      (request: { receipt: { schemaFingerprint?: string }; failureKind?: string }) =>
+        request.receipt.schemaFingerprint?.length === 64 &&
+        request.failureKind === "connect"
+    )).toBe(true);
+  });
+
   it("writes an owner-only immutable hash chain and never persists source text", async () => {
     const root = mkdtempSync(join(tmpdir(), "fermata-smoke-checkpoint-"));
     temporaryRoots.push(root);
