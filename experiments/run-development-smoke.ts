@@ -5,30 +5,76 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   executeDevelopmentSmokePhase0,
-  preflightDevelopmentSmoke
+  executeDevelopmentSmokePhase1,
+  preflightDevelopmentSmoke,
+  preflightDevelopmentSmokePhase1
 } from "./lib/development-smoke-launcher";
 
 const repositoryRoot = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), ".."));
 const projectRoot = realpathSync(resolve(repositoryRoot, ".."));
 const manifestPath = resolve(repositoryRoot, "private/development-smoke-6x4-v1/manifest.private.json");
 
-export interface DevelopmentSmokeCliOptions {
-  readonly networkPhase0: boolean;
-  readonly resumeRunId?: string;
-}
+export type DevelopmentSmokeCliOptions =
+  | Readonly<{ mode: "preflight" }>
+  | Readonly<{ mode: "phase1-preflight"; resumeRunId: string }>
+  | Readonly<{ mode: "network-phase0"; resumeRunId?: string }>
+  | Readonly<{
+      mode: "network-phase1";
+      resumeRunId: string;
+      releaseAuthorized: true;
+    }>;
 
-export function parseDevelopmentSmokeCli(argv: readonly string[]): DevelopmentSmokeCliOptions {
+export function parseDevelopmentSmokeCli(
+  argv: readonly string[]
+): DevelopmentSmokeCliOptions {
   if (argv.length === 0 || (argv.length === 1 && argv[0] === "--preflight")) {
-    return Object.freeze({ networkPhase0: false });
+    return Object.freeze({ mode: "preflight" });
   }
-  if (argv[0] !== "--network-phase0" || argv.length > 2) {
+  const resumeValues = argv.flatMap((value) => {
+    const match = /^--resume=([a-f0-9]{64})$/u.exec(value);
+    return match === null ? [] : [match[1]!];
+  });
+  const modes = [
+    argv.includes("--preflight-phase1") ? "phase1-preflight" : null,
+    argv.includes("--network-phase0") ? "network-phase0" : null,
+    argv.includes("--network-phase1") ? "network-phase1" : null
+  ].filter((mode): mode is Exclude<DevelopmentSmokeCliOptions["mode"], "preflight"> =>
+    mode !== null
+  );
+  const releaseAuthorized = argv.includes("--release-phase1");
+  const known = new Set([
+    "--preflight-phase1",
+    "--network-phase0",
+    "--network-phase1",
+    "--release-phase1"
+  ]);
+  if (
+    modes.length !== 1 ||
+    resumeValues.length > 1 ||
+    argv.some((value) =>
+      !known.has(value) && !/^--resume=[a-f0-9]{64}$/u.test(value)
+    )
+  ) {
     throw new Error("DEVELOPMENT_SMOKE_ARGUMENTS_INVALID");
   }
-  const resume = argv[1];
-  if (resume === undefined) return Object.freeze({ networkPhase0: true });
-  const match = /^--resume=([a-f0-9]{64})$/u.exec(resume);
-  if (match === null) throw new Error("DEVELOPMENT_SMOKE_ARGUMENTS_INVALID");
-  return Object.freeze({ networkPhase0: true, resumeRunId: match[1] });
+  const mode = modes[0]!;
+  const resumeRunId = resumeValues[0];
+  if (mode === "network-phase0") {
+    if (releaseAuthorized || argv.length !== 1 + (resumeRunId === undefined ? 0 : 1)) {
+      throw new Error("DEVELOPMENT_SMOKE_ARGUMENTS_INVALID");
+    }
+    return Object.freeze({ mode, resumeRunId });
+  }
+  if (
+    resumeRunId === undefined ||
+    (mode === "phase1-preflight" && (releaseAuthorized || argv.length !== 2)) ||
+    (mode === "network-phase1" && (!releaseAuthorized || argv.length !== 3))
+  ) {
+    throw new Error("DEVELOPMENT_SMOKE_ARGUMENTS_INVALID");
+  }
+  return mode === "phase1-preflight"
+    ? Object.freeze({ mode, resumeRunId })
+    : Object.freeze({ mode, resumeRunId, releaseAuthorized: true as const });
 }
 
 export async function runDevelopmentSmokeCli(
@@ -42,7 +88,7 @@ export async function runDevelopmentSmokeCli(
   const codeVersion = gitOutput(["rev-parse", "HEAD"]);
   const trackedWorktreeClean =
     gitOutput(["status", "--porcelain", "--untracked-files=no"]) === "";
-  if (options.networkPhase0 && !trackedWorktreeClean) {
+  if (options.mode !== "preflight" && !trackedWorktreeClean) {
     throw new Error("DEVELOPMENT_SMOKE_TRACKED_WORKTREE_NOT_CLEAN");
   }
   const preflight = preflightDevelopmentSmoke({
@@ -52,7 +98,7 @@ export async function runDevelopmentSmokeCli(
     codeVersion,
     env
   });
-  if (!options.networkPhase0) {
+  if (options.mode === "preflight") {
     process.stdout.write(`${JSON.stringify({
       status: trackedWorktreeClean ? "GO-PHASE0" : "NO-GO-TRACKED-WORKTREE-DIRTY",
       networkCalls: 0,
@@ -61,19 +107,46 @@ export async function runDevelopmentSmokeCli(
     })}\n`);
     return trackedWorktreeClean ? 0 : 1;
   }
-  const result = await executeDevelopmentSmokePhase0({
+  if (options.mode === "phase1-preflight") {
+    const result = preflightDevelopmentSmokePhase1({
+      preflight,
+      resumeRunId: options.resumeRunId
+    });
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return 0;
+  }
+  if (options.mode === "network-phase0") {
+    const result = await executeDevelopmentSmokePhase0({
+      preflight,
+      resumeRunId: options.resumeRunId
+    });
+    process.stdout.write(`${JSON.stringify({
+      status: result.state === "phase0_complete" ? "PHASE0-COMPLETE" : "INCOMPLETE",
+      requestCount: result.requestCount,
+      runBindingPrefix: result.runId.slice(0, 12),
+      accuracyClaim: null,
+      includedInFinalCalibration: false,
+      phase1Released: false
+    })}\n`);
+    return result.state === "phase0_complete" ? 0 : 1;
+  }
+  const result = await executeDevelopmentSmokePhase1({
     preflight,
-    resumeRunId: options.resumeRunId
+    resumeRunId: options.resumeRunId,
+    releaseAuthorized: options.releaseAuthorized
   });
   process.stdout.write(`${JSON.stringify({
-    status: result.state === "phase0_complete" ? "PHASE0-COMPLETE" : "INCOMPLETE",
+    status: result.state === "complete" ? "PHASE1-COMPLETE" : "INCOMPLETE",
+    phase0RequestCount: result.phase0RequestCount,
+    phase1RequestCount: result.phase1RequestCount,
     requestCount: result.requestCount,
     runBindingPrefix: result.runId.slice(0, 12),
+    metrics: result.metrics,
     accuracyClaim: null,
     includedInFinalCalibration: false,
-    phase1Released: false
+    phase1Released: true
   })}\n`);
-  return result.state === "phase0_complete" ? 0 : 1;
+  return result.state === "complete" ? 0 : 1;
 }
 
 function gitOutput(args: readonly string[]): string {

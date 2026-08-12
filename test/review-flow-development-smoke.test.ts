@@ -484,6 +484,26 @@ describe("development smoke profile", () => {
     );
     expect(finalRun.checkpoint().stopReason).toBe("final_failure");
   });
+  it("anchors the three-hour soft gate to a Phase 1 T1 clock", () => {
+    const phase1 = new DevelopmentSmokeRunController({
+      profile: developmentSmokeProfile,
+      manifest: manifest(),
+      runBindingHash,
+      scheduler: createDevelopmentSmokeScheduler(),
+      initialPhase: "phase1",
+      startedAtMs: 1_000,
+      clock: () => 1_000 + developmentSmokeProfile.closeNewStagesAfterMs
+    });
+    expect(() => phase1.authorizeRequest(request("slot-03", "A"))).toThrow(
+      "DEVELOPMENT_SMOKE_NEW_REQUESTS_CLOSED"
+    );
+    expect(phase1.checkpoint()).toMatchObject({
+      phase: "phase1",
+      stopped: true,
+      stopReason: "three_hour_gate"
+    });
+  });
+
 });
 
 describe("development smoke transport timing", () => {

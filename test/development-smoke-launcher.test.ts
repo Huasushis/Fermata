@@ -5,13 +5,16 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
-  statSync
+  statSync,
+  writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   executeDevelopmentSmokePhase0,
+  executeDevelopmentSmokePhase1,
+  preflightDevelopmentSmokePhase1,
   type DevelopmentSmokePreflight
 } from "../experiments/lib/development-smoke-launcher";
 import {
@@ -23,7 +26,10 @@ import {
 const temporaryRoots: string[] = [];
 const digest = (character: string): string => character.repeat(64);
 
-function fixturePreflight(root: string): DevelopmentSmokePreflight {
+function fixturePreflight(
+  root: string,
+  allCases = false
+): DevelopmentSmokePreflight {
   const manifest = parseDevelopmentSmokeManifest({
     schemaVersion: 1,
     profileName: developmentSmokeProfile.name,
@@ -65,20 +71,14 @@ function fixturePreflight(root: string): DevelopmentSmokePreflight {
     manifestFileSha256: digest("a"),
     manifest,
     privateManifest: {} as never,
-    cases: [
-      {
-        slot: "slot-01",
-        sourceBinding: digest("1"),
+    cases: manifest.slots
+      .slice(0, allCases ? 6 : 2)
+      .map((binding) => ({
+        slot: binding.slot,
+        sourceBinding: binding.slotBindingHash,
         source,
-        truthBindingHash: digest("1")
-      },
-      {
-        slot: "slot-02",
-        sourceBinding: digest("2"),
-        source,
-        truthBindingHash: digest("2")
-      }
-    ],
+        truthBindingHash: binding.truthBindingHash
+      })),
     models: {} as never,
     codeVersion: "b".repeat(40),
     repositoryRoot: root,
@@ -151,6 +151,98 @@ function slot(
 
 function sha256(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+function validStageOutput(stage: "A" | "B" | "C" | "D"): string {
+  const output = {
+    A: {
+      solvable: true,
+      blindSolution: "synthetic",
+      positiveSignals: ["synthetic"],
+      negativeSignals: []
+    },
+    B: {
+      codeforcesDifficulty: 1800,
+      thinkingLevel: 4,
+      codingLevel: 3,
+      rationale: "synthetic"
+    },
+    C: {
+      solutionAnalysis: "synthetic",
+      technicalQuality: "synthetic",
+      editorialQuality: "synthetic",
+      contestFit: "acceptable",
+      originalityLevel: 4,
+      tagIds: ["synthetic"],
+      positiveSignals: ["synthetic"],
+      negativeSignals: [],
+      hardBlockers: []
+    },
+    D: {
+      verdict: "approve",
+      qualityLevel: 4,
+      acceptedSignals: ["synthetic"],
+      rejectedSignals: [],
+      hardBlockers: [],
+      improvements: "synthetic",
+      publicComment: "synthetic",
+      privateNote: "synthetic"
+    }
+  } as const;
+  return JSON.stringify(output[stage]);
+}
+
+function validOfflineTransport(
+  entered?: (stage: "A" | "B" | "C" | "D") => void
+) {
+  return vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as {
+      readonly response_format?: {
+        readonly json_schema?: { readonly name?: string };
+      };
+    };
+    const stage = body.response_format?.json_schema?.name
+      ?.match(/_([abcd])_v1$/u)?.[1]?.toUpperCase();
+    if (stage !== "A" && stage !== "B" && stage !== "C" && stage !== "D") {
+      throw new Error("SYNTHETIC_STAGE_INVALID");
+    }
+    entered?.(stage);
+    return new Response(JSON.stringify({
+      choices: [{
+        message: { role: "assistant", content: validStageOutput(stage) },
+        finish_reason: "stop"
+      }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  });
+}
+
+async function completeSyntheticPhase0(root: string) {
+  const transport = validOfflineTransport();
+  const preflight = {
+    ...fixturePreflight(root, true),
+    models: offlineModels(transport)
+  };
+  const t0 = new Date("2026-08-12T00:00:00.000Z");
+  const result = await executeDevelopmentSmokePhase0({
+    preflight,
+    now: () => t0
+  });
+  expect(result).toMatchObject({ state: "phase0_complete", requestCount: 8 });
+  expect(transport).toHaveBeenCalledTimes(8);
+  return { preflight, result, transport, t0 };
+}
+
+function checkpointPaths(
+  preflight: DevelopmentSmokePreflight,
+  runId: string
+): string[] {
+  const directory = resolve(preflight.privateRuntimeRoot, `run-${runId}`);
+  return readdirSync(directory)
+    .filter((name) => name.startsWith("checkpoint-"))
+    .sort()
+    .map((name) => resolve(directory, name));
 }
 
 afterEach(() => {
@@ -342,5 +434,248 @@ describe("development smoke private checkpoint", () => {
       `run-${left.runId}`,
       `run-${right.runId}`
     ].sort());
+  });
+  it("preflights Phase 1 without network calls or checkpoint writes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fermata-smoke-phase1-preflight-"));
+    temporaryRoots.push(root);
+    chmodSync(root, 0o700);
+    const completed = await completeSyntheticPhase0(root);
+    const pathsBefore = checkpointPaths(completed.preflight, completed.result.runId);
+    const hashesBefore = pathsBefore.map((path) => sha256(readFileSync(path)));
+
+    const result = preflightDevelopmentSmokePhase1({
+      preflight: completed.preflight,
+      resumeRunId: completed.result.runId,
+      now: () => new Date(completed.t0.getTime() + 16 * 60_000)
+    });
+
+    expect(result).toMatchObject({
+      status: "GO-PHASE1",
+      mode: "release",
+      phase0RequestCount: 8,
+      phase1RequestCount: 0,
+      logicalRequestsUsed: 8,
+      logicalRequestCeiling: 30,
+      remainingSlotCount: 4,
+      phase1Released: false,
+      networkCalls: 0,
+      checkpointAppended: false
+    });
+    expect(completed.transport).toHaveBeenCalledTimes(8);
+    expect(checkpointPaths(completed.preflight, completed.result.runId))
+      .toEqual(pathsBefore);
+    expect(pathsBefore.map((path) => sha256(readFileSync(path))))
+      .toEqual(hashesBefore);
+  });
+
+  it("atomically releases once, resumes a post-release crash, and never resends Phase 0", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fermata-smoke-phase1-resume-"));
+    temporaryRoots.push(root);
+    chmodSync(root, 0o700);
+    const completed = await completeSyntheticPhase0(root);
+    const t1 = new Date(completed.t0.getTime() + 16 * 60_000);
+    let concurrentFailure: unknown;
+
+    await expect(executeDevelopmentSmokePhase1({
+      preflight: completed.preflight,
+      resumeRunId: completed.result.runId,
+      releaseAuthorized: true,
+      now: () => t1,
+      afterReleaseCheckpoint: () => {
+        try {
+          preflightDevelopmentSmokePhase1({
+            preflight: completed.preflight,
+            resumeRunId: completed.result.runId,
+            now: () => t1
+          });
+        } catch (error) {
+          concurrentFailure = error;
+        }
+        throw new Error("SYNTHETIC_POST_RELEASE_CRASH");
+      }
+    })).rejects.toThrow("SYNTHETIC_POST_RELEASE_CRASH");
+    expect(concurrentFailure).toMatchObject({
+      message: "DEVELOPMENT_SMOKE_RUN_LOCKED"
+    });
+    expect(completed.transport).toHaveBeenCalledTimes(8);
+
+    const releasedPaths = checkpointPaths(
+      completed.preflight,
+      completed.result.runId
+    );
+    const releaseCheckpoint = JSON.parse(readFileSync(
+      releasedPaths.at(-1)!,
+      "utf8"
+    ));
+    expect(statSync(releasedPaths.at(-1)!).mode & 0o777).toBe(0o600);
+    expect(releaseCheckpoint).toMatchObject({
+      phase: "phase1",
+      state: "running",
+      phase1Released: true,
+      phase1Release: {
+        t1: t1.toISOString(),
+        phase0LogicalRequestsUsed: 8,
+        phase0ExternalAttemptsUsed: 8,
+        logicalRequestCeiling: 30,
+        externalAttemptCeiling: 30,
+        checkpointAfterMs: 15 * 60_000,
+        reestimateAfterMs: 60 * 60_000,
+        closeNewStagesAfterMs: 180 * 60_000
+      }
+    });
+    expect(releaseCheckpoint.phase1Release.remainingSlots.map(
+      (entry: { slot: string }) => entry.slot
+    )).toEqual(["slot-03", "slot-04", "slot-05", "slot-06"]);
+
+    const resumePreflight = preflightDevelopmentSmokePhase1({
+      preflight: completed.preflight,
+      resumeRunId: completed.result.runId,
+      now: () => new Date(t1.getTime() + 60_000)
+    });
+    expect(resumePreflight).toMatchObject({
+      status: "GO-PHASE1",
+      mode: "resume",
+      logicalRequestsUsed: 8,
+      remainingSlotCount: 4,
+      networkCalls: 0,
+      checkpointAppended: false
+    });
+    expect(checkpointPaths(completed.preflight, completed.result.runId))
+      .toHaveLength(releasedPaths.length);
+
+    const result = await executeDevelopmentSmokePhase1({
+      preflight: completed.preflight,
+      resumeRunId: completed.result.runId,
+      releaseAuthorized: true,
+      now: () => new Date(t1.getTime() + 60_000)
+    });
+    expect(result).toMatchObject({
+      state: "complete",
+      phase0RequestCount: 8,
+      phase1RequestCount: 16,
+      requestCount: 24
+    });
+    expect(completed.transport).toHaveBeenCalledTimes(24);
+    const finalCheckpoint = JSON.parse(readFileSync(
+      checkpointPaths(completed.preflight, completed.result.runId).at(-1)!,
+      "utf8"
+    ));
+    expect(finalCheckpoint.phase1Release).toEqual(releaseCheckpoint.phase1Release);
+    expect(finalCheckpoint.requests.slice(0, 8).every(
+      (request: { receipt: { phase: string } }) => request.receipt.phase === "phase0"
+    )).toBe(true);
+    expect(finalCheckpoint.requests.slice(8).every(
+      (request: { receipt: { phase: string } }) => request.receipt.phase === "phase1"
+    )).toBe(true);
+    expect(finalCheckpoint.requests.map(
+      (request: { receipt: { logicalRequestsUsed: number } }) =>
+        request.receipt.logicalRequestsUsed
+    )).toEqual(Array.from({ length: 24 }, (_, index) => index + 1));
+    expect(finalCheckpoint.metrics).toMatchObject({
+      phase0: { requestCount: 8, completedRequestCount: 8 },
+      phase1: { requestCount: 16, completedRequestCount: 16 },
+      run: { requestCount: 24, completedRequestCount: 24 },
+      remainingLogicalRequestBudget: 6
+    });
+    expect(finalCheckpoint.accuracyClaim).toBeNull();
+    expect(finalCheckpoint.includedInFinalCalibration).toBe(false);
+  });
+
+  it.each([
+    ["wrong code", (preflight: DevelopmentSmokePreflight) => ({
+      ...preflight,
+      codeVersion: "c".repeat(40)
+    })],
+    ["wrong manifest file", (preflight: DevelopmentSmokePreflight) => ({
+      ...preflight,
+      manifestFileSha256: digest("d")
+    })],
+    ["wrong manifest fingerprint", (preflight: DevelopmentSmokePreflight) => ({
+      ...preflight,
+      safeSummary: {
+        ...preflight.safeSummary,
+        manifestFingerprint: digest("e")
+      }
+    })],
+    ["missing remaining slot", (preflight: DevelopmentSmokePreflight) => ({
+      ...preflight,
+      cases: preflight.cases.slice(0, 5)
+    })],
+    ["extra remaining slot", (preflight: DevelopmentSmokePreflight) => ({
+      ...preflight,
+      cases: [...preflight.cases, preflight.cases[5]!]
+    })]
+  ])("rejects Phase 1 preflight with %s", async (_name, alter) => {
+    const root = mkdtempSync(join(tmpdir(), "fermata-smoke-phase1-binding-"));
+    temporaryRoots.push(root);
+    chmodSync(root, 0o700);
+    const completed = await completeSyntheticPhase0(root);
+    expect(() => preflightDevelopmentSmokePhase1({
+      preflight: alter(completed.preflight),
+      resumeRunId: completed.result.runId,
+      now: () => new Date(completed.t0.getTime() + 16 * 60_000)
+    })).toThrow();
+    expect(completed.transport).toHaveBeenCalledTimes(8);
+  });
+
+  it.each([
+    ["invalid state", (checkpoint: Record<string, unknown>) => {
+      checkpoint.state = "running";
+    }],
+    ["failure", (checkpoint: Record<string, unknown>) => {
+      checkpoint.failureCode = "final_failure";
+      checkpoint.stopReason = "final_failure";
+    }],
+    ["inflight request", (checkpoint: Record<string, unknown>) => {
+      const request = (checkpoint.requests as Array<Record<string, unknown>>)[0]!;
+      delete request.completedStage;
+      delete request.timing;
+    }],
+    ["attempt mismatch", (checkpoint: Record<string, unknown>) => {
+      const request = (checkpoint.requests as Array<{
+        receipt: Record<string, unknown>;
+      }>)[7]!;
+      request.receipt.logicalRequestsUsed = 7;
+    }],
+    ["attempt overflow", (checkpoint: Record<string, unknown>) => {
+      const request = (checkpoint.requests as Array<{
+        receipt: Record<string, unknown>;
+      }>)[7]!;
+      request.receipt.logicalRequestsUsed = 30;
+      request.receipt.externalAttemptsUsed = 30;
+    }],
+    ["extra Phase 0 request", (checkpoint: Record<string, unknown>) => {
+      const requests = checkpoint.requests as Array<Record<string, unknown>>;
+      const duplicate = structuredClone(requests[0]!);
+      const receipt = duplicate.receipt as Record<string, unknown>;
+      receipt.logicalRequestsUsed = 9;
+      receipt.externalAttemptsUsed = 9;
+      requests.push(duplicate);
+    }],
+    ["wrong profile", (checkpoint: Record<string, unknown>) => {
+      checkpoint.profileFingerprint = digest("f");
+    }]
+  ])("rejects Phase 1 preflight for %s", async (_name, mutate) => {
+    const root = mkdtempSync(join(tmpdir(), "fermata-smoke-phase1-state-"));
+    temporaryRoots.push(root);
+    chmodSync(root, 0o700);
+    const completed = await completeSyntheticPhase0(root);
+    const path = checkpointPaths(
+      completed.preflight,
+      completed.result.runId
+    ).at(-1)!;
+    const checkpoint = JSON.parse(readFileSync(path, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    mutate(checkpoint);
+    writeFileSync(path, `${JSON.stringify(checkpoint)}\n`, { mode: 0o600 });
+
+    expect(() => preflightDevelopmentSmokePhase1({
+      preflight: completed.preflight,
+      resumeRunId: completed.result.runId,
+      now: () => new Date(completed.t0.getTime() + 16 * 60_000)
+    })).toThrow();
+    expect(completed.transport).toHaveBeenCalledTimes(8);
   });
 });

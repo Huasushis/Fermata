@@ -367,7 +367,7 @@ export class DevelopmentSmokeRunController {
   #consecutiveSystemFailures = 0;
   readonly #startedAtMs: number;
   readonly #clock: () => number;
-  #phase: "phase0" | "phase1" = "phase0";
+  #phase: "phase0" | "phase1";
   #stopped = false;
   #stopReason: DevelopmentSmokeStopReason | null = null;
 
@@ -388,6 +388,7 @@ export class DevelopmentSmokeRunController {
       failure: FourCallSafeRequestFailure
     ) => void;
     readonly startedAtMs: number;
+    readonly initialPhase?: "phase0" | "phase1";
     readonly clock?: () => number;
   }) {
     parseDevelopmentSmokeProfile(input.profile);
@@ -400,6 +401,7 @@ export class DevelopmentSmokeRunController {
       throw new Error("DEVELOPMENT_SMOKE_STARTED_AT_INVALID");
     }
     this.#startedAtMs = input.startedAtMs;
+    this.#phase = input.initialPhase ?? "phase0";
     this.#safeFailureSink = input.safeFailureSink ?? (() => undefined);
     this.#clock = input.clock ?? Date.now;
     this.#safeCompletionSink = input.safeCompletionSink ?? (() => undefined);
@@ -507,11 +509,10 @@ export class DevelopmentSmokeRunController {
       this.#completed.has(key) ||
       receipt.schemaVersion !== 1 ||
       receipt.profileName !== this.profile.name ||
-      receipt.profileFingerprint !== developmentSmokeProfileFingerprint ||
-      receipt.manifestFingerprint !== this.manifestSummary.manifestFingerprint ||
-      receipt.runBindingHash !== this.#runBindingHash ||
-      receipt.phase !== "phase0" ||
-      !phase0Slots.has(slot) ||
+      !(
+        (receipt.phase === "phase0" && phase0Slots.has(slot)) ||
+        (receipt.phase === "phase1" && phase1Slots.has(slot))
+      ) ||
       receipt.provider !== "aether" ||
       receipt.model !== expectedModels[receipt.stage] ||
       receipt.schemaFingerprint !== expectedSchemaFingerprint ||

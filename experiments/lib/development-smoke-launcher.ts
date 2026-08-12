@@ -33,6 +33,7 @@ import {
   DevelopmentSmokeRunController,
   parseDevelopmentSmokeManifest,
   runDevelopmentSmokePhase,
+  developmentSmokePhaseSlots,
   summarizeDevelopmentSmokeManifest,
   type DevelopmentSmokeAnonymousSlot,
   type DevelopmentSmokeSafeRequestReceipt
@@ -122,7 +123,7 @@ const safeReceiptSchema = z.object({
   manifestFingerprint: digestSchema,
   runBindingHash: digestSchema,
   anonymousSlot: slotSchema,
-  phase: z.literal("phase0"),
+  phase: z.enum(["phase0", "phase1"]),
   stage: z.enum(["A", "B", "C", "D", "formatter"]),
   provider: z.literal("aether"),
   model: z.enum(["deepseek-v4-pro", "deepseek-v4-flash"]),
@@ -285,7 +286,70 @@ const safeFailureCodeSchema = z.enum([
 const safeFailureLocationSchema = z.string().regex(
   /^[A-Za-z0-9._/-]+:\d+:[A-Za-z0-9_.#<>-]+$/u
 );
-const privateCheckpointSchema = z.object({
+const phaseReleaseSlotBinding = (
+  slot: "slot-03" | "slot-04" | "slot-05" | "slot-06"
+) => z.object({
+  slot: z.literal(slot),
+  slotBindingHash: digestSchema,
+  truthBindingHash: digestSchema
+}).strict();
+const phase0ForecastSchema = z.object({
+  basis: z.literal("phase0_measured_per_logical_request"),
+  legacy31MinuteObservationUnit: z.literal("UNKNOWN"),
+  durationEstimator: z.literal("nearest_rank_empirical_p90"),
+  measuredLogicalRequestCount: z.literal(8),
+  measurementFingerprint: digestSchema,
+  estimatorFingerprint: digestSchema,
+  observedLogicalRequestP90Ms: z.number().int().nonnegative(),
+  observedFirstValidOutputP90Ms: z.number().int().nonnegative(),
+  observedValidOutputEventsPerMinuteFloor: z.number().int().nonnegative(),
+  remainingCriticalWaveCount: z.union([z.literal(3), z.literal(4)]),
+  projectedAllSixP90Ms: z.number().int().nonnegative()
+}).strict();
+const phase1ReleaseSchema = z.object({
+  schemaVersion: z.literal(1),
+  t1: z.string().datetime(),
+  releaseRevision: z.number().int().positive(),
+  remainingSlots: z.tuple([
+    phaseReleaseSlotBinding("slot-03"),
+    phaseReleaseSlotBinding("slot-04"),
+    phaseReleaseSlotBinding("slot-05"),
+    phaseReleaseSlotBinding("slot-06")
+  ]),
+  phase0LogicalRequestsUsed: z.literal(8),
+  phase0ExternalAttemptsUsed: z.literal(8),
+  logicalRequestCeiling: z.literal(30),
+  externalAttemptCeiling: z.literal(30),
+  checkpointAfterMs: z.literal(15 * 60_000),
+  reestimateAfterMs: z.literal(60 * 60_000),
+  closeNewStagesAfterMs: z.literal(180 * 60_000),
+  releaseBindingHash: digestSchema
+}).strict();
+const phaseMetricsSchema = z.object({
+  requestCount: z.number().int().min(0).max(30),
+  completedRequestCount: z.number().int().min(0).max(30),
+  failedRequestCount: z.number().int().min(0).max(30),
+  inflightRequestCount: z.number().int().min(0).max(30),
+  measuredTimingCount: z.number().int().min(0).max(30),
+  firstValidOutputP90Ms: z.number().int().nonnegative().nullable(),
+  endToEndP90Ms: z.number().int().nonnegative().nullable()
+}).strict();
+const phase1EtaSchema = z.object({
+  basis: z.enum(["phase0_fallback", "phase1_measured"]),
+  measuredLogicalRequestCount: z.number().int().positive().max(30),
+  observedLogicalRequestP90Ms: z.number().int().nonnegative(),
+  remainingCriticalWaveCount: z.number().int().min(0).max(4),
+  projectedRemainingMs: z.number().int().nonnegative(),
+  projectedCompletionAt: z.string().datetime()
+}).strict();
+const runMetricsSchema = z.object({
+  phase0: phaseMetricsSchema,
+  phase1: phaseMetricsSchema,
+  run: phaseMetricsSchema,
+  remainingLogicalRequestBudget: z.number().int().min(0).max(30),
+  phase1Eta: phase1EtaSchema.nullable()
+}).strict();
+const privateCheckpointBaseSchema = z.object({
   schemaVersion: z.literal(1),
   profileName: z.literal("development-smoke-6x4-v1"),
   profileFingerprint: digestSchema,
@@ -294,21 +358,58 @@ const privateCheckpointSchema = z.object({
   runId: digestSchema,
   runBindingHash: digestSchema,
   codeVersion: z.string().regex(/^[a-f0-9]{40}$/u),
-  phase: z.literal("phase0"),
-  state: z.enum(["prepared", "running", "phase0_complete", "incomplete"]),
+  phase: z.enum(["phase0", "phase1"]),
+  state: z.enum(["prepared", "running", "phase0_complete", "complete", "incomplete"]),
   revision: z.number().int().positive(),
   previousCheckpointSha256: digestSchema.nullable(),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
-  requests: z.array(requestLedgerSchema).max(10),
-  phase0Forecast: z.unknown().nullable(),
+  requests: z.array(requestLedgerSchema).max(30),
+  phase0Forecast: phase0ForecastSchema.nullable(),
+  phase1Forecast: phase1EtaSchema.nullable().optional(),
+  phase1Release: phase1ReleaseSchema.nullable().optional(),
+  metrics: runMetricsSchema.optional(),
   stopReason: z.string().nullable(),
   failureCode: safeFailureCodeSchema.nullable().optional(),
   failureLocation: safeFailureLocationSchema.nullable().optional(),
   accuracyClaim: z.null(),
   includedInFinalCalibration: z.literal(false),
-  phase1Released: z.literal(false)
+  phase1Released: z.boolean()
 }).strict();
+const privateCheckpointSchema = privateCheckpointBaseSchema.superRefine((value, context) => {
+  const phase1State = value.phase === "phase1";
+  if (value.phase1Released !== phase1State) {
+    context.addIssue({ code: "custom", message: "phase release state invalid" });
+  }
+  if (phase1State) {
+    if (
+      value.phase1Release === undefined ||
+      value.phase1Release === null ||
+      !["running", "complete", "incomplete"].includes(value.state)
+    ) {
+      context.addIssue({ code: "custom", message: "phase1 checkpoint invalid" });
+    }
+  } else if (
+    (value.phase1Release !== undefined && value.phase1Release !== null) ||
+    value.phase1Forecast !== undefined ||
+    value.state === "complete"
+  ) {
+    context.addIssue({ code: "custom", message: "phase0 checkpoint invalid" });
+  }
+});
+const privateCheckpointSchemaForWrite = privateCheckpointBaseSchema.superRefine(
+  (value, context) => {
+    const parsed = privateCheckpointSchema.safeParse(value);
+    if (!parsed.success) {
+      context.addIssue({ code: "custom", message: "checkpoint state invalid" });
+    }
+    if (value.metrics === undefined) {
+      context.addIssue({ code: "custom", message: "checkpoint metrics missing" });
+    }
+  }
+);
+// Existing Phase 0 checkpoints omit the optional Phase 1 and metrics fields.
+// They remain readable byte-for-byte; every new revision is append-only.
 
 type PrivateManifest = z.infer<typeof privateManifestSchema>;
 type PrivateBinding = z.infer<typeof privateBindingSchema>;
@@ -392,7 +493,7 @@ export function preflightDevelopmentSmoke(
   if (difficultyAnchors.length === 0) {
     throw new Error("DEVELOPMENT_SMOKE_DIFFICULTY_ANCHORS_MISSING");
   }
-  const cases = privateManifest.bindings.slice(0, 2).map((binding) => ({
+  const cases = privateManifest.bindings.map((binding) => ({
     slot: binding.slot,
     sourceBinding: binding.slotBindingHash,
     source: buildFourCallSource(
@@ -447,51 +548,12 @@ export async function executeDevelopmentSmokePhase0(input: {
       ? createRunLedger(input.preflight, runId, runDirectory, now)
       : resumeRunLedger(input.preflight, runId, runDirectory, now);
     ledger.mutate((state) => ({ ...state, state: "running" }));
-    const scheduler = createDevelopmentSmokeScheduler();
-    const controller = new DevelopmentSmokeRunController({
-      profile: developmentSmokeProfile,
-      manifest: input.preflight.manifest,
-      runBindingHash: ledger.state.runBindingHash,
-      scheduler,
+    const controller = createLedgerController({
+      preflight: input.preflight,
+      ledger,
+      initialPhase: "phase0",
       startedAtMs: new Date(ledger.state.createdAt).getTime(),
-      safeReceiptSink: (receipt) => {
-        const parsedReceipt = safeReceiptSchema.safeParse(receipt);
-        if (!parsedReceipt.success) {
-          throw new DevelopmentSmokeSafeError("request_receipt_schema_invalid", {
-            cause: parsedReceipt.error
-          });
-        }
-        ledger.mutate((state) => ({
-          ...state,
-          requests: [...state.requests, { receipt: parsedReceipt.data }]
-        }));
-      },
-      safeCompletionSink: (slot, stage, timing) => {
-        ledger.mutate((state) => ({
-          ...state,
-          requests: state.requests.map((request) =>
-            request.receipt.anonymousSlot === slot && request.receipt.stage === stage
-              ? { ...request, timing }
-              : request
-          )
-        }));
-      },
-      safeFailureSink: (slot, stage, failure) => {
-        const failureDetail = safeRequestFailureSchema.parse(failure);
-        ledger.mutate((state) => ({
-          ...state,
-          requests: state.requests.map((request) =>
-            request.receipt.anonymousSlot === slot &&
-            request.receipt.stage === stage
-              ? {
-                  ...request,
-                  failureKind: failureDetail.kind,
-                  failureDetail
-                }
-              : request
-          )
-        }));
-      }
+      clock: () => now().getTime()
     });
     const reusableBySlot = restoreReusableRequests(controller, ledger.state);
     const checkpoint15 = setTimeout(() => {
@@ -499,9 +561,9 @@ export async function executeDevelopmentSmokePhase0(input: {
     }, developmentSmokeProfile.phase0CheckpointMs);
     checkpoint15.unref();
     const checkpoint60 = setTimeout(() => {
-      let forecast: unknown = null;
+      let forecast: z.infer<typeof phase0ForecastSchema> | null = null;
       try {
-        forecast = controller.reestimate();
+        forecast = phase0ForecastSchema.parse(controller.reestimate());
       } catch {
         // 未收齐八个语义请求时，没有可诚实计算的 Phase 0 样本 P90。
       }
@@ -514,7 +576,7 @@ export async function executeDevelopmentSmokePhase0(input: {
         controller,
         models: input.preflight.models,
         nativeSchemaCompatible: true,
-        cases: input.preflight.cases.map((entry) => ({
+        cases: preparedCasesForPhase(input.preflight, "phase0").map((entry) => ({
           ...entry,
           reusableStages: reusableBySlot.get(entry.slot)
         })),
@@ -538,7 +600,11 @@ export async function executeDevelopmentSmokePhase0(input: {
         (outcome) => safeFailureCode(outcome.reason) !== "final_failure"
       ) ?? rejectedOutcomes[0];
       const rejected = rejectedOutcome !== undefined;
-      const forecast = rejected ? null : controller.phase0Forecast(controller.elapsedMs());
+      const forecast = rejected
+        ? null
+        : phase0ForecastSchema.parse(
+            controller.phase0Forecast(controller.elapsedMs())
+          );
       ledger.mutate((state) => ({
         ...state,
         state: rejected ? "incomplete" : "phase0_complete",
@@ -566,6 +632,187 @@ export async function executeDevelopmentSmokePhase0(input: {
       runId,
       state: ledger.state.state === "phase0_complete" ? "phase0_complete" : "incomplete",
       requestCount: ledger.state.requests.length
+    });
+  } finally {
+    releaseLock();
+  }
+}
+
+export interface DevelopmentSmokePhase1PreflightResult {
+  readonly status: "GO-PHASE1";
+  readonly mode: "release" | "resume";
+  readonly runId: string;
+  readonly phase0RequestCount: 8;
+  readonly phase1RequestCount: number;
+  readonly logicalRequestsUsed: number;
+  readonly logicalRequestCeiling: 30;
+  readonly remainingSlotCount: number;
+  readonly phase1Released: boolean;
+  readonly networkCalls: 0;
+  readonly checkpointAppended: false;
+  readonly metrics: z.infer<typeof runMetricsSchema>;
+}
+
+export function preflightDevelopmentSmokePhase1(input: {
+  readonly preflight: DevelopmentSmokePreflight;
+  readonly resumeRunId: string;
+  readonly now?: () => Date;
+}): DevelopmentSmokePhase1PreflightResult {
+  const now = input.now ?? (() => new Date());
+  const runId = digestSchema.parse(input.resumeRunId);
+  const runDirectory = resolve(input.preflight.privateRuntimeRoot, `run-${runId}`);
+  assertUserOnlyPath(runDirectory, true);
+  assertRunUnlocked(runDirectory, runId);
+  const state = readLatestCheckpoint(runDirectory);
+  const validated = validatePhase1Entry(input.preflight, state, now);
+  assertRunUnlocked(runDirectory, runId);
+  return phase1PreflightResult(state, validated.mode, now());
+}
+
+export async function executeDevelopmentSmokePhase1(input: {
+  readonly preflight: DevelopmentSmokePreflight;
+  readonly resumeRunId: string;
+  readonly releaseAuthorized: true;
+  readonly now?: () => Date;
+  readonly afterReleaseCheckpoint?: () => void;
+}): Promise<Readonly<{
+  runId: string;
+  state: "complete" | "incomplete";
+  phase0RequestCount: number;
+  phase1RequestCount: number;
+  requestCount: number;
+  metrics: z.infer<typeof runMetricsSchema>;
+}>> {
+  if (input.releaseAuthorized !== true) {
+    throw new Error("DEVELOPMENT_SMOKE_PHASE1_RELEASE_REQUIRED");
+  }
+  const now = input.now ?? (() => new Date());
+  const runId = digestSchema.parse(input.resumeRunId);
+  const runDirectory = resolve(input.preflight.privateRuntimeRoot, `run-${runId}`);
+  assertUserOnlyPath(runDirectory, true);
+  const releaseLock = acquireRunLock(runDirectory, runId);
+  try {
+    const initial = readLatestCheckpoint(runDirectory);
+    const validated = validatePhase1Entry(input.preflight, initial, now);
+    const ledger = new RunLedger(runDirectory, initial, now, false);
+    if (validated.mode === "release") {
+      const release = buildPhase1Release(input.preflight, initial, now());
+      ledger.mutate((state) => {
+        const releasedState = {
+          ...state,
+          phase: "phase1" as const,
+          state: "running" as const,
+          phase1Released: true,
+          phase1Release: release,
+          stopReason: null,
+          failureCode: null,
+          failureLocation: null
+        };
+        return {
+          ...releasedState,
+          phase1Forecast: buildPhase1Eta(
+            releasedState as PrivateCheckpoint,
+            new Date(release.t1)
+          )
+        };
+      });
+      input.afterReleaseCheckpoint?.();
+    }
+    const release = phase1ReleaseSchema.parse(ledger.state.phase1Release);
+    const controller = createLedgerController({
+      preflight: input.preflight,
+      ledger,
+      initialPhase: "phase1",
+      startedAtMs: new Date(release.t1).getTime(),
+      clock: () => now().getTime()
+    });
+    const reusableBySlot = restoreReusableRequests(controller, ledger.state);
+    const checkpoint15 = setTimeout(() => {
+      ledger.mutate((state) => ({
+        ...state,
+        phase1Forecast: buildPhase1Eta(state, now())
+      }));
+    }, release.checkpointAfterMs);
+    checkpoint15.unref();
+    const checkpoint60 = setTimeout(() => {
+      const at = now();
+      const forecast = buildPhase1Eta(ledger.state, at);
+      if (
+        forecast !== null &&
+        at.getTime() - new Date(release.t1).getTime() +
+          forecast.projectedRemainingMs > release.closeNewStagesAfterMs
+      ) {
+        controller.softStop("p90_over_three_hours");
+      }
+      ledger.mutate((state) => ({ ...state, phase1Forecast: forecast }));
+    }, release.reestimateAfterMs);
+    checkpoint60.unref();
+    try {
+      const outcomes = await runDevelopmentSmokePhase({
+        phase: "phase1",
+        controller,
+        models: input.preflight.models,
+        nativeSchemaCompatible: true,
+        cases: preparedCasesForPhase(input.preflight, "phase1").map((entry) => ({
+          ...entry,
+          reusableStages: reusableBySlot.get(entry.slot)
+        })),
+        onStageCompleted: (slot, completed) => {
+          const sealedStage = completedStageSchema.parse(completed);
+          ledger.mutate((state) => ({
+            ...state,
+            requests: state.requests.map((request) =>
+              request.receipt.anonymousSlot === slot &&
+              request.receipt.stage === sealedStage.receipt.stage
+                ? { ...request, completedStage: sealedStage }
+                : request
+            )
+          }));
+        }
+      });
+      const rejectedOutcomes = outcomes.filter(
+        (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected"
+      );
+      const rejectedOutcome = rejectedOutcomes.find(
+        (outcome) => safeFailureCode(outcome.reason) !== "final_failure"
+      ) ?? rejectedOutcomes[0];
+      const rejected = rejectedOutcome !== undefined;
+      ledger.mutate((state) => ({
+        ...state,
+        state: rejected ? "incomplete" : "complete",
+        phase1Forecast: buildPhase1Eta(state, now()),
+        stopReason: rejected
+          ? controller.checkpoint().stopReason ?? "final_failure"
+          : null,
+        failureCode: rejectedOutcome === undefined
+          ? null
+          : safeFailureCode(rejectedOutcome.reason),
+        failureLocation: rejectedOutcome === undefined
+          ? null
+          : safeFailureLocation(rejectedOutcome.reason)
+      }));
+    } catch (error) {
+      const failureCode = safeFailureCode(error);
+      ledger.mutate((state) => ({
+        ...state,
+        state: "incomplete",
+        phase1Forecast: buildPhase1Eta(state, now()),
+        stopReason: controller.checkpoint().stopReason ?? failureCode,
+        failureCode,
+        failureLocation: safeFailureLocation(error)
+      }));
+    } finally {
+      clearTimeout(checkpoint15);
+      clearTimeout(checkpoint60);
+    }
+    const metrics = buildRunMetrics(ledger.state, now());
+    return Object.freeze({
+      runId,
+      state: ledger.state.state === "complete" ? "complete" : "incomplete",
+      phase0RequestCount: metrics.phase0.requestCount,
+      phase1RequestCount: metrics.phase1.requestCount,
+      requestCount: metrics.run.requestCount,
+      metrics
     });
   } finally {
     releaseLock();
@@ -824,6 +1071,448 @@ function loadDevelopmentModels(input: {
   };
 }
 
+type Phase1EntryMode = "release" | "resume";
+
+function preparedCasesForPhase(
+  preflight: DevelopmentSmokePreflight,
+  phase: "phase0" | "phase1"
+): readonly DevelopmentSmokePreparedCase[] {
+  const slots = developmentSmokePhaseSlots(phase);
+  const cases = slots.map((slot) =>
+    preflight.cases.find((candidate) => candidate.slot === slot)
+  );
+  const uniqueCaseCount = new Set(
+    preflight.cases.map((entry) => entry.slot)
+  ).size;
+  const allowedCaseCount =
+    phase === "phase0"
+      ? preflight.cases.length === developmentSmokeProfile.phase0SlotCount ||
+        preflight.cases.length === developmentSmokeProfile.anonymousSlotCount
+      : preflight.cases.length === developmentSmokeProfile.anonymousSlotCount;
+  if (
+    !allowedCaseCount ||
+    uniqueCaseCount !== preflight.cases.length ||
+    cases.some((entry) => entry === undefined)
+  ) {
+    throw new Error("DEVELOPMENT_SMOKE_PREPARED_CASES_INVALID");
+  }
+  return Object.freeze(cases as DevelopmentSmokePreparedCase[]);
+}
+
+function createLedgerController(input: {
+  readonly preflight: DevelopmentSmokePreflight;
+  readonly ledger: RunLedger;
+  readonly initialPhase: "phase0" | "phase1";
+  readonly startedAtMs: number;
+  readonly clock: () => number;
+}): DevelopmentSmokeRunController {
+  return new DevelopmentSmokeRunController({
+    profile: developmentSmokeProfile,
+    manifest: input.preflight.manifest,
+    runBindingHash: input.ledger.state.runBindingHash,
+    scheduler: createDevelopmentSmokeScheduler(),
+    initialPhase: input.initialPhase,
+    startedAtMs: input.startedAtMs,
+    clock: input.clock,
+    safeReceiptSink: (receipt) => {
+      const parsedReceipt = safeReceiptSchema.safeParse(receipt);
+      if (!parsedReceipt.success) {
+        throw new DevelopmentSmokeSafeError("request_receipt_schema_invalid", {
+          cause: parsedReceipt.error
+        });
+      }
+      input.ledger.mutate((state) => ({
+        ...state,
+        requests: [...state.requests, { receipt: parsedReceipt.data }]
+      }));
+    },
+    safeCompletionSink: (slot, stage, timing) => {
+      input.ledger.mutate((state) => ({
+        ...state,
+        requests: state.requests.map((request) =>
+          request.receipt.anonymousSlot === slot &&
+          request.receipt.stage === stage
+            ? { ...request, timing }
+            : request
+        )
+      }));
+    },
+    safeFailureSink: (slot, stage, failure) => {
+      const failureDetail = safeRequestFailureSchema.parse(failure);
+      input.ledger.mutate((state) => ({
+        ...state,
+        requests: state.requests.map((request) =>
+          request.receipt.anonymousSlot === slot &&
+          request.receipt.stage === stage
+            ? { ...request, failureKind: failureDetail.kind, failureDetail }
+            : request
+        )
+      }));
+    }
+  });
+}
+
+function validatePhase1Entry(
+  preflight: DevelopmentSmokePreflight,
+  state: PrivateCheckpoint,
+  now: () => Date
+): { readonly mode: Phase1EntryMode } {
+  assertCheckpointBinding(preflight, state);
+  preparedCasesForPhase(preflight, "phase1");
+  assertExactPhase0Success(state);
+  const at = now();
+  if (!Number.isFinite(at.getTime())) {
+    throw new Error("DEVELOPMENT_SMOKE_PHASE1_TIME_INVALID");
+  }
+  if (!state.phase1Released) {
+    if (
+      state.phase !== "phase0" ||
+      state.state !== "phase0_complete" ||
+      state.requests.length !== 8 ||
+      state.phase1Release !== undefined ||
+      state.failureCode !== null ||
+      state.stopReason !== null
+    ) {
+      throw new Error("DEVELOPMENT_SMOKE_PHASE1_PRECONDITION_INVALID");
+    }
+    const controller = new DevelopmentSmokeRunController({
+      profile: developmentSmokeProfile,
+      manifest: preflight.manifest,
+      runBindingHash: state.runBindingHash,
+      scheduler: createDevelopmentSmokeScheduler(),
+      initialPhase: "phase0",
+      startedAtMs: new Date(state.createdAt).getTime(),
+      clock: () => at.getTime()
+    });
+    restoreReusableRequests(controller, state);
+    const persistedForecast = phase0ForecastSchema.parse(state.phase0Forecast);
+    const recomputedForecast = controller.releasePhase1();
+    if (
+      persistedForecast.measurementFingerprint !==
+        recomputedForecast.measurementFingerprint ||
+      persistedForecast.estimatorFingerprint !==
+        recomputedForecast.estimatorFingerprint ||
+      persistedForecast.observedLogicalRequestP90Ms !==
+        recomputedForecast.observedLogicalRequestP90Ms ||
+      persistedForecast.observedFirstValidOutputP90Ms !==
+        recomputedForecast.observedFirstValidOutputP90Ms ||
+      persistedForecast.observedValidOutputEventsPerMinuteFloor !==
+        recomputedForecast.observedValidOutputEventsPerMinuteFloor ||
+      persistedForecast.remainingCriticalWaveCount !==
+        recomputedForecast.remainingCriticalWaveCount ||
+      persistedForecast.projectedAllSixP90Ms >
+        developmentSmokeProfile.closeNewStagesAfterMs
+    ) {
+      throw new Error("DEVELOPMENT_SMOKE_PHASE0_FORECAST_INVALID");
+    }
+    return Object.freeze({ mode: "release" as const });
+  }
+  if (
+    state.phase !== "phase1" ||
+    state.state !== "running" ||
+    state.failureCode !== null ||
+    state.stopReason !== null ||
+    state.requests.some((request) =>
+      request.completedStage === undefined ||
+      request.timing === undefined ||
+      request.failureKind !== undefined ||
+      request.failureDetail !== undefined
+    )
+  ) {
+    throw new Error("DEVELOPMENT_SMOKE_PHASE1_RESUME_INVALID");
+  }
+  const release = phase1ReleaseSchema.parse(state.phase1Release);
+  assertPhase1Release(preflight, state, release);
+  const t1 = new Date(release.t1).getTime();
+  const elapsed = at.getTime() - t1;
+  if (
+    !Number.isSafeInteger(elapsed) ||
+    elapsed < 0 ||
+    elapsed >= release.closeNewStagesAfterMs
+  ) {
+    throw new Error("DEVELOPMENT_SMOKE_PHASE1_TIME_INVALID");
+  }
+  assertCompletedRequestSequence(state);
+  return Object.freeze({ mode: "resume" as const });
+}
+
+function assertCheckpointBinding(
+  preflight: DevelopmentSmokePreflight,
+  state: PrivateCheckpoint
+): void {
+  const expectedRunBindingHash = hashCanonicalValue({
+    schemaVersion: 1,
+    runId: state.runId,
+    codeVersion: preflight.codeVersion,
+    profileFingerprint: developmentSmokeProfileFingerprint,
+    manifestFingerprint: preflight.safeSummary.manifestFingerprint,
+    privateManifestFileSha256: preflight.manifestFileSha256
+  });
+  if (
+    state.codeVersion !== preflight.codeVersion ||
+    state.profileFingerprint !== developmentSmokeProfileFingerprint ||
+    state.manifestFingerprint !== preflight.safeSummary.manifestFingerprint ||
+    state.privateManifestFileSha256 !== preflight.manifestFileSha256 ||
+    state.runBindingHash !== expectedRunBindingHash
+  ) {
+    throw new Error("DEVELOPMENT_SMOKE_PHASE1_BINDING_INVALID");
+  }
+}
+
+function assertExactPhase0Success(state: PrivateCheckpoint): void {
+  const phase0Requests = state.requests.filter(
+    (request) => request.receipt.phase === "phase0"
+  );
+  const expectedKeys = new Set(
+    developmentSmokePhaseSlots("phase0").flatMap((slot) =>
+      (["A", "B", "C", "D"] as const).map((stage) => `${slot}:${stage}`)
+    )
+  );
+  const actualKeys = phase0Requests.map(
+    (request) => `${request.receipt.anonymousSlot}:${request.receipt.stage}`
+  );
+  if (
+    phase0Requests.length !== 8 ||
+    new Set(actualKeys).size !== expectedKeys.size ||
+    actualKeys.some((key) => !expectedKeys.has(key)) ||
+    phase0Requests.some((request) =>
+      request.completedStage === undefined ||
+      request.timing === undefined ||
+      request.failureKind !== undefined ||
+      request.failureDetail !== undefined
+    )
+  ) {
+    throw new Error("DEVELOPMENT_SMOKE_PHASE0_SUCCESS_INVALID");
+  }
+  assertCompletedRequestSequence({ ...state, requests: phase0Requests });
+}
+
+function assertCompletedRequestSequence(
+  state: Pick<PrivateCheckpoint, "requests">
+): void {
+  const ordered = [...state.requests].sort((left, right) =>
+    left.receipt.logicalRequestsUsed - right.receipt.logicalRequestsUsed
+  );
+  if (
+    ordered.length > developmentSmokeProfile.maximumTotalLogicalRequests ||
+    ordered.some((request, index) =>
+      request.receipt.logicalRequestsUsed !== index + 1 ||
+      request.receipt.externalAttemptsUsed !== index + 1 ||
+      request.receipt.logicalRequestCeiling !== 30 ||
+      request.receipt.externalAttemptCeiling !== 30 ||
+      request.completedStage === undefined ||
+      request.timing === undefined ||
+      request.failureKind !== undefined ||
+      request.failureDetail !== undefined
+    )
+  ) {
+    throw new Error("DEVELOPMENT_SMOKE_ATTEMPT_LEDGER_INVALID");
+  }
+  const keys = ordered.map((request) =>
+    `${request.receipt.anonymousSlot}:${request.receipt.stage}`
+  );
+  if (new Set(keys).size !== keys.length) {
+    throw new Error("DEVELOPMENT_SMOKE_ATTEMPT_LEDGER_INVALID");
+  }
+  for (const slot of developmentSmokePhaseSlots("phase1")) {
+    if (keys.filter((key) => key.startsWith(`${slot}:`)).length > 5) {
+      throw new Error("DEVELOPMENT_SMOKE_ATTEMPT_LEDGER_INVALID");
+    }
+  }
+}
+
+function buildPhase1Release(
+  preflight: DevelopmentSmokePreflight,
+  state: PrivateCheckpoint,
+  at: Date
+): z.infer<typeof phase1ReleaseSchema> {
+  const remainingSlots = preparedCasesForPhase(preflight, "phase1").map((entry) => {
+    const binding = preflight.manifest.slots.find((slot) => slot.slot === entry.slot);
+    if (
+      binding === undefined ||
+      binding.slotBindingHash !== entry.sourceBinding ||
+      binding.truthBindingHash !== entry.truthBindingHash
+    ) {
+      throw new Error("DEVELOPMENT_SMOKE_PHASE1_SLOT_BINDING_INVALID");
+    }
+    return {
+      slot: entry.slot,
+      slotBindingHash: binding.slotBindingHash,
+      truthBindingHash: binding.truthBindingHash
+    };
+  });
+  const base = {
+    schemaVersion: 1 as const,
+    t1: at.toISOString(),
+    releaseRevision: state.revision + 1,
+    remainingSlots,
+    phase0LogicalRequestsUsed: 8 as const,
+    phase0ExternalAttemptsUsed: 8 as const,
+    logicalRequestCeiling: 30 as const,
+    externalAttemptCeiling: 30 as const,
+    checkpointAfterMs: developmentSmokeProfile.phase0CheckpointMs,
+    reestimateAfterMs: developmentSmokeProfile.reestimateCheckpointMs,
+    closeNewStagesAfterMs: developmentSmokeProfile.closeNewStagesAfterMs
+  };
+  return phase1ReleaseSchema.parse({
+    ...base,
+    releaseBindingHash: hashCanonicalValue(base)
+  });
+}
+
+function assertPhase1Release(
+  preflight: DevelopmentSmokePreflight,
+  state: PrivateCheckpoint,
+  release: z.infer<typeof phase1ReleaseSchema>
+): void {
+  const { releaseBindingHash, ...base } = release;
+  const expected = buildPhase1Release(
+    preflight,
+    { ...state, revision: release.releaseRevision - 1 },
+    new Date(release.t1)
+  );
+  if (
+    release.releaseRevision > state.revision ||
+    releaseBindingHash !== hashCanonicalValue(base) ||
+    hashCanonicalValue(release) !== hashCanonicalValue(expected)
+  ) {
+    throw new Error("DEVELOPMENT_SMOKE_PHASE1_RELEASE_INVALID");
+  }
+}
+
+function phase1PreflightResult(
+  state: PrivateCheckpoint,
+  mode: Phase1EntryMode,
+  at: Date
+): DevelopmentSmokePhase1PreflightResult {
+  const metrics = buildRunMetrics(state, at);
+  const remainingSlotCount = developmentSmokePhaseSlots("phase1").filter((slot) =>
+    !["A", "B", "C", "D"].every((stage) =>
+      state.requests.some((request) =>
+        request.receipt.anonymousSlot === slot &&
+        request.receipt.stage === stage &&
+        request.completedStage !== undefined
+      )
+    )
+  ).length;
+  return Object.freeze({
+    status: "GO-PHASE1" as const,
+    mode,
+    runId: state.runId,
+    phase0RequestCount: 8 as const,
+    phase1RequestCount: metrics.phase1.requestCount,
+    logicalRequestsUsed: metrics.run.requestCount,
+    logicalRequestCeiling: 30 as const,
+    remainingSlotCount,
+    phase1Released: state.phase1Released,
+    networkCalls: 0 as const,
+    checkpointAppended: false as const,
+    metrics
+  });
+}
+
+function buildRunMetrics(
+  state: Pick<PrivateCheckpoint, "requests" | "phase1Released" | "phase1Release">,
+  at: Date
+): z.infer<typeof runMetricsSchema> {
+  const phase0Requests = state.requests.filter(
+    (request) => request.receipt.phase === "phase0"
+  );
+  const phase1Requests = state.requests.filter(
+    (request) => request.receipt.phase === "phase1"
+  );
+  const result = {
+    phase0: buildPhaseMetrics(phase0Requests),
+    phase1: buildPhaseMetrics(phase1Requests),
+    run: buildPhaseMetrics(state.requests),
+    remainingLogicalRequestBudget:
+      developmentSmokeProfile.maximumTotalLogicalRequests - state.requests.length,
+    phase1Eta: state.phase1Released
+      ? buildPhase1Eta(state as PrivateCheckpoint, at)
+      : null
+  };
+  return runMetricsSchema.parse(result);
+}
+
+function buildPhaseMetrics(
+  requests: PrivateCheckpoint["requests"]
+): z.infer<typeof phaseMetricsSchema> {
+  const completed = requests.filter((request) => request.completedStage !== undefined);
+  const failures = requests.filter((request) => request.failureKind !== undefined);
+  const timings = completed.flatMap((request) =>
+    request.timing === undefined ? [] : [request.timing]
+  );
+  return phaseMetricsSchema.parse({
+    requestCount: requests.length,
+    completedRequestCount: completed.length,
+    failedRequestCount: failures.length,
+    inflightRequestCount: requests.length - completed.length - failures.length,
+    measuredTimingCount: timings.length,
+    firstValidOutputP90Ms: timings.length === 0
+      ? null
+      : nearestRankSafe(timings.map((timing) => timing.firstValidOutputMs)),
+    endToEndP90Ms: timings.length === 0
+      ? null
+      : nearestRankSafe(timings.map((timing) => timing.endToEndMs))
+  });
+}
+
+function buildPhase1Eta(
+  state: PrivateCheckpoint,
+  at: Date
+): z.infer<typeof phase1EtaSchema> | null {
+  const phase1Timings = state.requests.flatMap((request) =>
+    request.receipt.phase === "phase1" &&
+    request.completedStage !== undefined &&
+    request.timing !== undefined
+      ? [request.timing]
+      : []
+  );
+  const phase0Timings = state.requests.flatMap((request) =>
+    request.receipt.phase === "phase0" &&
+    request.completedStage !== undefined &&
+    request.timing !== undefined
+      ? [request.timing]
+      : []
+  );
+  const timings = phase1Timings.length === 0 ? phase0Timings : phase1Timings;
+  if (timings.length === 0) return null;
+  const observedLogicalRequestP90Ms = nearestRankSafe(
+    timings.map((timing) => timing.endToEndMs)
+  );
+  const stageComplete = (stage: "A" | "B" | "C" | "D"): boolean =>
+    developmentSmokePhaseSlots("phase1").every((slot) =>
+      state.requests.some((request) =>
+        request.receipt.anonymousSlot === slot &&
+        request.receipt.stage === stage &&
+        request.completedStage !== undefined
+      )
+    );
+  const remainingCriticalWaveCount =
+    !stageComplete("A") || !stageComplete("B")
+      ? 4
+      : !stageComplete("C")
+        ? 3
+        : !stageComplete("D")
+          ? 2
+          : 0;
+  const projectedRemainingMs =
+    observedLogicalRequestP90Ms * remainingCriticalWaveCount;
+  return phase1EtaSchema.parse({
+    basis: phase1Timings.length === 0 ? "phase0_fallback" : "phase1_measured",
+    measuredLogicalRequestCount: timings.length,
+    observedLogicalRequestP90Ms,
+    remainingCriticalWaveCount,
+    projectedRemainingMs,
+    projectedCompletionAt: new Date(at.getTime() + projectedRemainingMs).toISOString()
+  });
+}
+
+function nearestRankSafe(values: readonly number[]): number {
+  const ordered = [...values].sort((left, right) => left - right);
+  return ordered[Math.ceil(ordered.length * 0.9) - 1]!;
+}
+
 function createRunLedger(
   preflight: DevelopmentSmokePreflight,
   runId: string,
@@ -839,7 +1528,7 @@ function createRunLedger(
     manifestFingerprint: preflight.safeSummary.manifestFingerprint,
     privateManifestFileSha256: preflight.manifestFileSha256
   });
-  const state: PrivateCheckpoint = {
+  const base = privateCheckpointSchema.parse({
     schemaVersion: 1,
     profileName: developmentSmokeProfile.name,
     profileFingerprint: developmentSmokeProfileFingerprint,
@@ -862,8 +1551,12 @@ function createRunLedger(
     accuracyClaim: null,
     includedInFinalCalibration: false,
     phase1Released: false
-  };
-  return new RunLedger(runDirectory, privateCheckpointSchema.parse(state), now, true);
+  });
+  const state = privateCheckpointSchemaForWrite.parse({
+    ...base,
+    metrics: buildRunMetrics(base, new Date(timestamp))
+  });
+  return new RunLedger(runDirectory, state, now, true);
 }
 
 function resumeRunLedger(
@@ -873,14 +1566,16 @@ function resumeRunLedger(
   now: () => Date
 ): RunLedger {
   const state = readLatestCheckpoint(runDirectory);
+  assertCheckpointBinding(preflight, state);
   if (
     state.runId !== runId ||
-    state.codeVersion !== preflight.codeVersion ||
-    state.profileFingerprint !== developmentSmokeProfileFingerprint ||
-    state.manifestFingerprint !== preflight.safeSummary.manifestFingerprint ||
-    state.privateManifestFileSha256 !== preflight.manifestFileSha256 ||
+    state.phase !== "phase0" ||
+    state.phase1Released ||
     state.state === "phase0_complete" ||
-    state.requests.some((request) => request.completedStage === undefined || request.timing === undefined)
+    state.requests.some((request) =>
+      request.completedStage === undefined ||
+      request.timing === undefined
+    )
   ) {
     throw new Error("DEVELOPMENT_SMOKE_RESUME_BINDING_INVALID");
   }
@@ -906,11 +1601,17 @@ class RunLedger {
 
   public mutate(update: (state: PrivateCheckpoint) => Omit<PrivateCheckpoint, "revision" | "previousCheckpointSha256" | "updatedAt"> & Partial<Pick<PrivateCheckpoint, "revision" | "previousCheckpointSha256" | "updatedAt">>): void {
     const previousBytes = checkpointBytes(this.state);
-    const parsedNext = privateCheckpointSchema.safeParse({
-      ...update(this.state),
+    const updated = update(this.state);
+    const at = this.#now();
+    const candidate = {
+      ...updated,
       revision: this.state.revision + 1,
       previousCheckpointSha256: sha256(previousBytes),
-      updatedAt: this.#now().toISOString()
+      updatedAt: at.toISOString()
+    };
+    const parsedNext = privateCheckpointSchemaForWrite.safeParse({
+      ...candidate,
+      metrics: buildRunMetrics(candidate, at)
     });
     if (!parsedNext.success) {
       throw new DevelopmentSmokeSafeError("checkpoint_state_schema_invalid", {
@@ -949,6 +1650,11 @@ function restoreReusableRequests(
       [request.receipt.stage]: request.completedStage as ReviewFlowCompletedStage
     }));
   }
+  for (const [slot, completed] of result) {
+    if ((["A", "B", "C", "D"] as const).every((stage) => completed[stage] !== undefined)) {
+      controller.markSlotComplete(slot);
+    }
+  }
   return result;
 }
 
@@ -975,6 +1681,22 @@ function readLatestCheckpoint(runDirectory: string): PrivateCheckpoint {
     latest = parsed;
   }
   return latest!;
+}
+
+function assertRunUnlocked(runDirectory: string, runId: string): void {
+  const lockPath = resolve(runDirectory, "active.lock.private.json");
+  if (!existsSync(lockPath)) return;
+  const lock = asRecord(parseJson(readPrivateFile(lockPath, [runDirectory]).bytes));
+  if (
+    lock.schemaVersion !== 1 ||
+    lock.runId !== runId ||
+    typeof lock.pid !== "number" ||
+    !Number.isSafeInteger(lock.pid) ||
+    lock.pid < 1
+  ) {
+    throw new Error("DEVELOPMENT_SMOKE_RUN_LOCK_INVALID");
+  }
+  throw new Error("DEVELOPMENT_SMOKE_RUN_LOCKED");
 }
 
 function acquireRunLock(runDirectory: string, runId: string): () => void {

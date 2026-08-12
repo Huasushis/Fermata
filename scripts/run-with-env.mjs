@@ -21,7 +21,7 @@ import { readProtectedEnvFile } from "./private-runtime.mjs";
 const usage =
   "用法：node scripts/run-with-env.mjs <env文件> <命令> [参数...]\n" +
   "      node scripts/run-with-env.mjs --review-flow-evaluation <env文件> [评测参数...]\n" +
-  "      node scripts/run-with-env.mjs --development-smoke <env文件> [--preflight|--network-phase0 [--resume=<runId>]]\n";
+  "      node scripts/run-with-env.mjs --development-smoke <env文件> [--preflight|--preflight-phase1 --resume=<runId>|--network-phase0 [--resume=<runId>]|--network-phase1 --resume=<runId> --release-phase1]\n";
 
 export const reviewFlowEvaluationModeFlag = "--review-flow-evaluation";
 export const developmentSmokeModeFlag = "--development-smoke";
@@ -339,6 +339,45 @@ export function installRunWithEnvSignalHandlers(
   };
 }
 
+export function assertDevelopmentSmokeArguments(args) {
+  const resumeCount = args.filter((value) =>
+    /^--resume=[a-f0-9]{64}$/u.test(value)
+  ).length;
+  const knownFlags = new Set([
+    "--preflight",
+    "--preflight-phase1",
+    "--network-phase0",
+    "--network-phase1",
+    "--release-phase1"
+  ]);
+  const modeCount = [
+    args.includes("--preflight"),
+    args.includes("--preflight-phase1"),
+    args.includes("--network-phase0"),
+    args.includes("--network-phase1")
+  ].filter(Boolean).length;
+  if (
+    args.length === 0 ||
+    modeCount !== 1 ||
+    resumeCount > 1 ||
+    args.some((value) =>
+      !knownFlags.has(value) && !/^--resume=[a-f0-9]{64}$/u.test(value)
+    ) ||
+    (args.includes("--preflight") && args.length !== 1) ||
+    (args.includes("--preflight-phase1") &&
+      (args.length !== 2 || resumeCount !== 1)) ||
+    (args.includes("--network-phase0") &&
+      (args.includes("--release-phase1") ||
+        args.length !== 1 + resumeCount)) ||
+    (args.includes("--network-phase1") &&
+      (args.length !== 3 ||
+        resumeCount !== 1 ||
+        !args.includes("--release-phase1")))
+  ) {
+    throw new Error("RUN_WITH_ENV_INVALID_ARGUMENTS");
+  }
+}
+
 export function spawnRunCommand(command, environment, spawnProcess = spawn) {
   try {
     return spawnProcess(command[0], command.slice(1), {
@@ -378,6 +417,9 @@ export function runWithEnv(
     !isAbsolute(envPath)
   ) {
     throw new Error("RUN_WITH_ENV_INVALID_ARGUMENTS");
+  }
+  if (dedicatedDevelopmentSmoke) {
+    assertDevelopmentSmokeArguments(remainingArguments);
   }
   // 在接触可能含密钥的文件之前先拒绝会让 Node 回显或注入环境的父设置。
   assertSafeNodeEnvironment(parentEnvironment);

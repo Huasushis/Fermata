@@ -954,25 +954,33 @@ DeepSeek 服务。
 凭据。`--preflight` 是默认离线动作，只核对私有文件 owner-only 权限、无符号链接、哈希/证据绑定、
 固定模型映射、当前提交和 tracked worktree，不调用网络。显式 `--network-phase0` 才创建新的随机
 run 并发起两个槽位；`--network-phase0 --resume=<64位runId>` 只恢复同提交、同 profile、同 manifest
-的未完成 run。示例：
+的未完成 Phase 0 run。
+
+Phase 1 不创建 run。`--preflight-phase1 --resume=<64位runId>` 只读验证不可变 checkpoint 链、
+代码/profile/manifest/run 绑定、`phase0_complete` 状态、固定 A/B/C/D 共 8 个成功 EOF receipt、
+零失败/在途 attempt、30 次共享上限和恰好四个剩余槽位；输出 `GO-PHASE1` 时仍为 0 次网络调用且
+不追加 checkpoint。真实放行必须同时给出
+`--network-phase1 --resume=<64位runId> --release-phase1`。Phase 0 与 Phase 1 参数互斥；缺少显式
+release flag 时不能调用网络。示例：
 
 ```bash
 node scripts/run-with-env.mjs --development-smoke private/development-smoke-6x4-v1/review-flow.env --preflight
 node scripts/run-with-env.mjs --development-smoke private/development-smoke-6x4-v1/review-flow.env --network-phase0
+node scripts/run-with-env.mjs --development-smoke private/development-smoke-6x4-v1/review-flow.env --preflight-phase1 --resume=<64位runId>
+node scripts/run-with-env.mjs --development-smoke private/development-smoke-6x4-v1/review-flow.env --network-phase1 --resume=<64位runId> --release-phase1
 ```
 
-该 launcher 只实现 phase0，没有 phase1 参数或自动放行路径。phase0 先同时放行两个槽位，初始 A/B
-最多 4 请求；15 分钟写入不可变 checkpoint 链，60 分钟只依据已完成请求重估。健康流不设总墙钟
-硬杀；180 分钟只阻止后续阶段，绝不取消已在途付费流。后续四槽必须由用户在读取 phase0 报告后另行
-明确授权，并由后续受控变更新增唯一入口。
+Phase 1 放行在独占 owner-only 锁内先原子追加唯一 release revision，登记 T1、四个剩余槽位的安全绑定、
+已使用 8/总上限 30，以及相对 T1 的 15/60/180 分钟闸门，然后才允许 fetch。崩溃恢复沿用该 release
+和已计费 receipt，不重复放行、不重置预算、不重发成功 stage；授权后没有成功 checkpoint 的不确定
+attempt 固定拒绝。四槽先形成最多 8 个 A/B 请求，再按 DAG 推进 C、D 和必要 formatter；全局并发
+仍为 12。失败只关闭新阶段，已在途健康流自然排空，且不设置总墙钟硬杀。
 
-每个 run 使用独占 owner-only 锁和只增不改的原子 checkpoint 链。请求授权 receipt 在 fetch 前
-落盘；成功 stage 的原始输出和 sealed receipt 只保存在 Git 忽略私有 checkpoint 中。恢复会重放已
-计费 receipt、跳过已成功 stage，且遇到授权后未形成成功 checkpoint 的不确定 attempt 会固定拒绝，
-不会把预算重置或静默重发。phase0/未来 phase1 共用一次预算：每逻辑请求最多 1 attempt、每题最多
-5、整题重跑为 0、总逻辑请求和外部 attempt 都最多 30、全局并发 12；任何字段缺失或放大都在 fetch
-前拒绝。所有错误类别均零重试。请求数量有严格上界，但在途自然排空的墙钟上界未知；报告只能给基于
-实测值的 ETA 区间。
+每个 run 使用只增不改的原子 checkpoint 链。请求授权 receipt 在 fetch 前落盘；成功 stage 的原始
+输出和 sealed receipt 只保存在 Git 忽略私有 checkpoint 中。Phase 0、Phase 1 和全 run 分开记录安全
+聚合计数、P90 时序、失败码及 ETA；`accuracyClaim` 始终为空且不进入最终校准。两阶段共用一次预算：
+每逻辑请求最多 1 attempt、每题最多 5、整题重跑为 0、总逻辑请求和外部 attempt 都最多 30、全局
+并发 12；任何字段缺失或放大都在 fetch 前拒绝。所有错误类别均零重试。
 
 Candidate B 的协议验证使用
 `npm run experiment:probe-difficulty-thinking`。这个入口只依次检查一个人工合成的短题和三个与

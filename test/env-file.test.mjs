@@ -8,6 +8,7 @@ import {
 import {
   buildReviewFlowEvaluationRunEnvironment,
   buildDevelopmentSmokeRunEnvironment,
+  assertDevelopmentSmokeArguments,
   buildRunEnvironment,
   createRunWithEnvSignalController,
   formatRunWithEnvFailure,
@@ -477,6 +478,31 @@ describe("run-with-env 的受控环境与同步启动异常", () => {
       developmentSmokeEntrypointPath,
       "--preflight"
     ]);
+  });
+
+  it("development-smoke 包装器固定 Phase 1 恢复与显式 release 组合", () => {
+    const runId = "a".repeat(64);
+    expect(() => assertDevelopmentSmokeArguments([
+      "--preflight-phase1",
+      `--resume=${runId}`
+    ])).not.toThrow();
+    expect(() => assertDevelopmentSmokeArguments([
+      "--network-phase1",
+      `--resume=${runId}`,
+      "--release-phase1"
+    ])).not.toThrow();
+    for (const args of [
+      ["--network-phase1"],
+      ["--network-phase1", `--resume=${runId}`],
+      ["--network-phase1", "--release-phase1"],
+      ["--preflight-phase1"],
+      ["--preflight-phase1", `--resume=${runId}`, "--release-phase1"],
+      ["--network-phase0", "--release-phase1"]
+    ]) {
+      expect(() => assertDevelopmentSmokeArguments(args)).toThrow(
+        "RUN_WITH_ENV_INVALID_ARGUMENTS"
+      );
+    }
   });
 
   it("专用模式即使父 PATH 可疑，也不会经 PATH 解析 npm、tsx 或调用者命令", () => {
