@@ -484,7 +484,8 @@ export function buildSolverSynthesisMessages(
         "2. approach：精炼的算法概述（一句话）\n",
         "3. claimedComplexity：算法复杂度\n",
         "4. uncertainties：你不确定的地方（如果有）\n\n",
-        "输出长度保持收敛：记录覆盖关键推理与修正即可，不要为了篇幅重复推导或列出无关尝试。"
+        "输出长度保持收敛：完整解题记录控制在 1500 字以内，记录覆盖关键推理与修正即可，",
+        "不要为了篇幅重复推导或列出无关尝试。"
       ].join("")),
     },
     {
@@ -529,7 +530,7 @@ export function buildTagsSemanticMessages(
         "你是知识点标签整理员。一道题可以选择多个标签，但只能从输入给出的当前启用固定目录中选择真实 id；",
         "不能自造标签、不能输出分类 id、不能沿用投稿者自由填写的旧知识点。优先选解题真正需要的知识点，",
         "不要把所有可能相关的术语都勾上。\n\n",
-        "用自然语言输出你选定的标签 id 列表与理由（不需要 JSON 格式）。"
+        "用自然语言输出你选定的标签 id 列表与理由（不需要 JSON 格式），控制在 200 字以内。"
       ].join(""))
     },
     { role: "user", content: privateContext(view) }
@@ -670,7 +671,8 @@ export function buildContestFitSemanticMessages(
         "implementationBurden 使用 1–5，1 表示实现负担低、5 表示高。请用自然语言完整陈述你的判断结论，",
         "覆盖 icpcFit、implementationBurden、thinkingImplementationBalance、knowledgeFairness、",
         "problemsetRole、roleConfidence 以及 evidenceCoverage（必须明确两种方向的证据是否存在；未找到时写",
-        "none_found，不能静默遗漏或凭空补证据）与证据引用。不要输出 JSON。"
+        "none_found，不能静默遗漏或凭空补证据）与证据引用。结论控制在 300 字以内，只陈述判断与关键依据，",
+        "不要展开泛泛分析。不要输出 JSON。"
       ].join(""))
     },
     { role: "user", content: privateContext(compactEditorialView(view)) }
@@ -688,15 +690,14 @@ export function buildContestFitFormatterMessages(
         "上一条消息是审稿人对题目的自然语言结论。你只把该结论转换为严格 JSON，不添加、不修改、不删除任何",
         "判断，不引入语义输出中没有的事实。JSON 字段：icpcFit、implementationBurden、",
         "thinkingImplementationBalance、knowledgeFairness、problemsetRole、roleConfidence、",
-        "evidenceCoverage、evidence、rationale。evidence 只包含语义结论中真正引用过的证据；不确定就省略。" 
+        "evidenceCoverage、evidence、rationale。evidence 只包含语义结论中真正引用过的证据；不确定就省略。",
+        "先输出序列化后的 JSON 对象本身，不要先写分析、复述或解释；序列化结果控制在 3000 字符以内。"
       ].join(""))
     },
     {
       role: "user",
       content: [
-        "语义判断（若有推理过程也一并参考，但以结论文字为准）：",
-        semanticOutput,
-        semanticReasoning === null ? "" : `\n推理过程（仅供理解，不写入 JSON）：\n${semanticReasoning}`
+        `语义判断（直接转换，不要复述）：\n${semanticOutput}`
       ].join("\n")
     }
   ];
@@ -714,7 +715,7 @@ export function buildOriginalitySemanticMessages(
         "必须引用输入中真实存在的 evidenceId，不能编造来源。highestSimilarity 必须等于输入证据的实际最大值，",
         "没有证据时为 0；确认同题时至少引用一条明确建议同题的证据。若证据不足，保持保守并在 rationale 说明。",
         "请用自然语言完整陈述：原创性等级判断、是否有实质相同既有题、最高相似度数值及其依据、引用的",
-        "evidenceId 与理由。不要输出 JSON。"
+        "evidenceId 与理由。结论控制在 600 字以内，只陈述判断与关键依据。不要输出 JSON。"
       ].join(""))
     },
     { role: "user", content: privateContext(view) }
@@ -731,15 +732,14 @@ export function buildOriginalityFormatterMessages(
       content: guardedSystemPrompt("originality", [
         "上一条消息是原创性分析者用自然语言给出的结论。你只把该结论转换为严格 JSON，不添加、不修改任何",
         "判断，不引入语义输出中没有的事实。JSON 字段：originalityLevel、sameProblemAsExisting、",
-        "highestSimilarity、evidenceIds、rationale。evidenceIds 只包含语义结论中真正引用过的证据。"
+        "highestSimilarity、evidenceIds、rationale。evidenceIds 只包含语义结论中真正引用过的证据。",
+        "先输出序列化后的 JSON 对象本身，不要先写分析、复述或解释；序列化结果控制在 3000 字符以内。"
       ].join(""))
     },
     {
       role: "user",
       content: [
-        "语义结论（若有推理过程也一并参考，但以结论文字为准）：",
-        semanticOutput,
-        semanticReasoning === null ? "" : `\n推理过程（仅供理解，不写入 JSON）：\n${semanticReasoning}`
+        `语义结论（直接转换，不要复述）：\n${semanticOutput}`
       ].join("\n")
     }
   ];
