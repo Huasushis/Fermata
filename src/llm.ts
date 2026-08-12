@@ -199,6 +199,11 @@ export interface ChatCompletionOptions {
    * `max_tokens`，保持既有调用行为。
    */
   readonly maxOutputTokens?: number;
+  /** 完整 JSON Schema 强制输出；与旧 requestJson 互斥。 */
+  readonly responseJsonSchema?: {
+    readonly name: string;
+    readonly schema: Readonly<Record<string, unknown>>;
+  };
 }
 
 export interface ChatCompletionJsonOptions {
@@ -213,9 +218,9 @@ export const llmTransportProtocolVersion =
   "llm-stream-eof-v8-receipt-v2-failure-audit-v1" as const;
 const maximumLlmResponseChunks = 65_536;
 /** 显式输出 token 上限本身也必须有界，避免错误配置变成近似无限输出。 */
-export const maximumExplicitLlmOutputTokens = 1_000_000;
+export const maximumExplicitLlmOutputTokens = 32_000;
 export const defaultLlmFirstOutputTimeoutMs = 30 * 60 * 1_000;
-export const defaultLlmMaximumDurationMs = 4 * 60 * 60 * 1_000;
+export const defaultLlmMaximumDurationMs = 30 * 60 * 1_000;
 
 let productionDispatcher: EnvHttpProxyAgent | undefined;
 
@@ -339,12 +344,15 @@ export class LlmRequestError extends Error {
   public readonly formatFailureSubstage:
     | LlmResponseFormatFailureSubstage
     | undefined;
+  /** 只保留已限幅的 Retry-After 毫秒数，不保留原始响应头。 */
+  public readonly retryAfterMs: number | null;
 
   public constructor(
     code: LlmRequestError["code"],
     status?: number,
     formatFailureStage?: LlmResponseFormatFailureStage,
-    formatFailureSubstage?: LlmResponseFormatFailureSubstage
+    formatFailureSubstage?: LlmResponseFormatFailureSubstage,
+    retryAfterMs?: number | null
   ) {
     assertSafeFormatFailureSubstage(
       formatFailureStage,
@@ -368,6 +376,9 @@ export class LlmRequestError extends Error {
     this.status = status;
     this.formatFailureStage = formatFailureStage;
     this.formatFailureSubstage = formatFailureSubstage;
+    this.retryAfterMs = retryAfterMs === undefined || retryAfterMs === null
+      ? null
+      : Math.max(0, Math.min(Math.floor(retryAfterMs), 60 * 60 * 1_000));
   }
 }
 
@@ -532,7 +543,22 @@ export async function chatCompleteWithReceipt(
     stream: true,
     messages
   };
-  if (options.requestJson === true) {
+  if (options.requestJson === true && options.responseJsonSchema !== undefined) {
+    throw new Error("LLM_RESPONSE_FORMAT_CONFLICT");
+  }
+  if (options.responseJsonSchema !== undefined) {
+    if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/u.test(options.responseJsonSchema.name)) {
+      throw new Error("LLM_RESPONSE_SCHEMA_NAME_INVALID");
+    }
+    body.response_format = {
+      type: "json_schema",
+      json_schema: {
+        name: options.responseJsonSchema.name,
+        strict: true,
+        schema: options.responseJsonSchema.schema
+      }
+    };
+  } else if (options.requestJson === true) {
     body.response_format = { type: "json_object" };
   }
   if (spec.thinkingRequest !== undefined) {
@@ -574,7 +600,13 @@ export async function chatCompleteWithReceipt(
 
   if (!response.ok) {
     // 服务商的 error.message 可能回显请求内容，不能放进异常或日志。
-    const error = new LlmRequestError("LLM_HTTP_ERROR", response.status);
+    const error = new LlmRequestError(
+      "LLM_HTTP_ERROR",
+      response.status,
+      undefined,
+      undefined,
+      response.retryAfterMs
+    );
     rememberLlmFailureAudit(error, {
       requestCount: 1,
       requestAudit,
@@ -1216,10 +1248,12 @@ async function requestWithRetry(
   readonly responseMode: LlmResponseMode | null;
   readonly finishReasonStopVerified: boolean;
   readonly sseDoneObserved: boolean | null;
+  readonly retryAfterMs: number | null;
 }> {
   const durations = resolveLlmRequestDurations(runtime);
   const deadline = Date.now() + durations.maximumDurationMs;
   let attempt = 1;
+  let retryAfterMs: number | null = null;
   for (;;) {
     resetMutableLlmRequestAuditForAttempt(audit);
     assertLlmRequestMayStart();
@@ -1253,6 +1287,10 @@ async function requestWithRetry(
       );
       responseReceived = true;
       audit.status = response.status;
+      retryAfterMs = parseRetryAfterMilliseconds(
+        response.headers.get("retry-after"),
+        Date.now()
+      );
       if (!response.ok) {
         cancelResponseBodyWithoutReading(response, controller);
         const timeoutError = watchdog.error();
@@ -1270,7 +1308,8 @@ async function requestWithRetry(
             attemptCount: audit.attemptCount,
             responseMode: null,
             finishReasonStopVerified: false,
-            sseDoneObserved: null
+            sseDoneObserved: null,
+            retryAfterMs
           };
         }
       } else {
@@ -1304,7 +1343,8 @@ async function requestWithRetry(
           attemptCount: audit.attemptCount,
           responseMode: parsed.responseMode,
           finishReasonStopVerified: true,
-          sseDoneObserved: parsed.sseDoneObserved
+          sseDoneObserved: parsed.sseDoneObserved,
+          retryAfterMs: null
         };
       }
     } catch (error) {
@@ -1341,7 +1381,7 @@ async function requestWithRetry(
     }
     assertLlmRequestMayStart();
     await delayBeforeRetry(
-      backoffMs(runtime.baseDelayMs, attempt),
+      Math.max(backoffMs(runtime.baseDelayMs, attempt), retryAfterMs ?? 0),
       deadline,
       runtime.signal
     );
@@ -1567,6 +1607,20 @@ function validateMaxOutputTokens(value: number): number {
 
 function backoffMs(baseDelayMs: number, attempt: number): number {
   return baseDelayMs * 2 ** (attempt - 1);
+}
+
+function parseRetryAfterMilliseconds(value: string | null, nowMs: number): number | null {
+  if (value === null) return null;
+  const trimmed = value.trim();
+  if (/^\d+(?:\.\d+)?$/u.test(trimmed)) {
+    const seconds = Number(trimmed);
+    return Number.isFinite(seconds)
+      ? Math.min(Math.ceil(seconds * 1_000), 60 * 60 * 1_000)
+      : null;
+  }
+  const timestamp = Date.parse(trimmed);
+  if (!Number.isFinite(timestamp)) return null;
+  return Math.min(Math.max(0, timestamp - nowMs), 60 * 60 * 1_000);
 }
 
 function delay(ms: number): Promise<void> {

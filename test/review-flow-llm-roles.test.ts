@@ -719,7 +719,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
     )).toThrow("REVIEW_FLOW_PRODUCTION_GRANT_INVALID");
   });
 
-  it("所有 11 个角色的 maxOutputTokens 均为 1000000", async () => {
+  it("legacy 11-role adapter also uses bounded stage-class output budgets", async () => {
     const roleByModel = new Map<string, ReviewFlowRole>(
       reviewFlowRoleSchema.options.map((role) => [`cap-test-${role}`, role] as const)
     );
@@ -789,8 +789,21 @@ describe("历史人工标准驱动的多角色提示词", () => {
       await invocations[role]();
     }
     expect(fetchImpl).toHaveBeenCalledTimes(reviewFlowRoleSchema.options.length + 5);
+    const expectedBudgets: Readonly<Record<ReviewFlowRole, number>> = {
+      solver: 32_000,
+      solution_analyst: 24_000,
+      technical_auditor: 24_000,
+      difficulty: 8_000,
+      editorial_judge: 24_000,
+      contest_fit: 24_000,
+      originality: 24_000,
+      tags: 8_000,
+      critic: 12_000,
+      adversary: 12_000,
+      adjudicator: 12_000
+    };
     for (const role of reviewFlowRoleSchema.options) {
-      expect(observedMaxTokens[`cap-test-${role}`]).toBe(1_000_000);
+      expect(observedMaxTokens[`cap-test-${role}`]).toBe(expectedBudgets[role]);
     }
   });
 });

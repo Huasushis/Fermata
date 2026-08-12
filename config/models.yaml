@@ -22,14 +22,11 @@ defaults:
   maximumConcurrentTasks: 2
 
 # profiles 下每个 key 是一个"模型档位"的名字，供 modelProfileName 引用。
-# 每个档位为四条旧流水线（difficulty / thinking / coding / verdict）以及新的
-# 多角色审题流分别指定 provider、model、temperature，以及是否保留模型返回的思考过程。`thinking: true`
-# Aether 的 deepseek-v4-flash 和 deepseek-v4-pro 都支持配置 `thinkingRequest: enabled`，
-# 必须同时配置 `reasoningEffort: max`，按 DeepSeek 当前 OpenAI-compatible 格式发送
-# `thinking: {type: "enabled"}` 和 `reasoning_effort: "max"`；disabled 只发送
-# `thinking: {type: "disabled"}`。留空时两个请求字段都不发送。thinking 流水线本身
-# 分两步，所以下面有 solver 和 analyst 两个子配置。reviewFlow 必须逐项配置全部
-# 11 个角色，不接受一个“综合审题模型”字段代替这些角色。
+# 每个档位同时保留旧流水线与旧 11 角色槽，供历史 checkpoint 验证；新的 A/B/C/D runtime
+# 从对应槽位组装四个语义请求和一个可选 formatter。`thinking` 只决定是否保留返回的推理过程。
+# Aether deepseek-v4-flash / deepseek-v4-pro 必须配置 `thinkingRequest: enabled` 与
+# `reasoningEffort: max`，传输固定发送 `thinking: {type: "enabled"}` 和
+# `reasoning_effort: "max"`；缺失、disabled 或非 max 都在网络前失败关闭。
 #
 # 下面这些具体模型名只是示例默认值，请按实际网关上可用的模型调整，不代表
 # 硬性要求。
@@ -155,12 +152,11 @@ retry:
   baseDelayMs: 500
 
 timeouts:
-  # 等待第一段模型输出。深度思考可能较久，因此不能设成短时限。
-  llmFirstOutputMs: 1800000
-  # 收到首个有效模型事件后，允许连续没有新有效内容的时间。
+  # 首个事件、输出停顿和最终保护均为分阶段失效保护；持续输出按有效进度重置停顿计时。
+  llmFirstOutputMs: 600000
   llmOutputIdleMs: 600000
-  # 只保护首个有效事件前的阶段（包括 429 等待）；有效输出开始后不是总时限。
-  llmMaximumDurationMs: 14400000
+  # 正常调用不允许回到 120 秒短总时限，也不使用 4 小时常态保护。
+  llmMaximumDurationMs: 1800000
   codeforcesRequestMs: 15000
 
 codeforces:

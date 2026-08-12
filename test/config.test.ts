@@ -89,7 +89,7 @@ retry:
 timeouts:
   llmFirstOutputMs: 1800000
   llmOutputIdleMs: 600000
-  llmMaximumDurationMs: 14400000
+  llmMaximumDurationMs: 1800000
   codeforcesRequestMs: 15000
 codeforces:
   minimumRequestIntervalMs: 2100
@@ -198,9 +198,9 @@ describe("loadConfig：正常路径", () => {
     ).toEqual([...reviewFlowModelRoleNames].sort());
     expect(config.models.retry).toEqual({ maxAttempts: 3, baseDelayMs: 500 });
     expect(config.models.timeouts).toMatchObject({
-      llmFirstOutputMs: 1_800_000,
+      llmFirstOutputMs: 600_000,
       llmOutputIdleMs: 600_000,
-      llmMaximumDurationMs: 14_400_000
+      llmMaximumDurationMs: 1_800_000
     });
   });
 });
@@ -533,7 +533,7 @@ retry:
 timeouts:
   llmFirstOutputMs: 1800000
   llmOutputIdleMs: 600000
-  llmMaximumDurationMs: 14400000
+  llmMaximumDurationMs: 1800000
   codeforcesRequestMs: 15000
 codeforces:
   minimumRequestIntervalMs: 2100

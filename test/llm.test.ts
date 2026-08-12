@@ -3477,3 +3477,78 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("chatComplete：统一机器 JSON Schema transport", () => {
+  it("sends strict json_schema and native max in the same request", async () => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      expect(body).toMatchObject({
+        thinking: { type: "enabled" },
+        reasoning_effort: "max",
+        max_tokens: 12_000,
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            name: "fermata_review_flow_unified_v1",
+            strict: true,
+            schema: {
+              type: "object",
+              required: ["verdict"],
+              additionalProperties: false
+            }
+          }
+        }
+      });
+      return completionResponse('{"verdict":"approve"}');
+    });
+    await expect(chatCompleteWithReceipt(
+      provider,
+      {
+        provider: "aether",
+        model: "deepseek-v4-pro",
+        temperature: 0,
+        thinking: false,
+        thinkingRequest: "enabled",
+        reasoningEffort: "max"
+      },
+      [],
+      { ...runtime, maxAttempts: 1, fetch: fetchMock },
+      {
+        maxOutputTokens: 12_000,
+        responseJsonSchema: {
+          name: "fermata_review_flow_unified_v1",
+          schema: {
+            type: "object",
+            required: ["verdict"],
+            additionalProperties: false
+          }
+        }
+      }
+    )).resolves.toMatchObject({ receipt: { eofVerified: true, transportAttemptCount: 1 } });
+  });
+
+  it("carries bounded Retry-After on a terminal 429 without reading its body", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("private-body-must-not-be-read"));
+      },
+      cancel: vi.fn()
+    });
+    const fetchMock = vi.fn(async () => new Response(body, {
+      status: 429,
+      headers: { "Retry-After": "7" }
+    }));
+    const error = await chatCompleteWithReceipt(
+      provider,
+      spec,
+      [],
+      { ...runtime, maxAttempts: 1, fetch: fetchMock }
+    ).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(LlmRequestError);
+    expect(error).toMatchObject({
+      code: "LLM_HTTP_ERROR",
+      status: 429,
+      retryAfterMs: 7_000
+    });
+  });
+});

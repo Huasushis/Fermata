@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "experiment:report-review-flow-stages": "tsx experiments/review-flow-stage-report.ts",
     "experiment:fetch-cf-dataset": "tsx experiments/fetch-cf-dataset.ts",
     "experiment:eval-difficulty": "tsx experiments/eval-difficulty.ts",
     "experiment:probe-difficulty-connectivity": "tsx experiments/probe-difficulty-connectivity.ts",

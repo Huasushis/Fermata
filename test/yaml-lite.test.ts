@@ -147,9 +147,9 @@ describe("parseYamlLite：解析真实的 config/models.yaml", () => {
     expect(defaultProfile.coding).toBeTruthy();
     expect(defaultProfile.verdict).toBeTruthy();
     expect(parsed.timeouts).toMatchObject({
-      llmFirstOutputMs: 1_800_000,
+      llmFirstOutputMs: 600_000,
       llmOutputIdleMs: 600_000,
-      llmMaximumDurationMs: 14_400_000
+      llmMaximumDurationMs: 1_800_000
     });
     expect(parsed.experimentVersion).toBe(
       "experiment-2026-08-review-flow-historical-rubric-v1-eof-receipt-v3"

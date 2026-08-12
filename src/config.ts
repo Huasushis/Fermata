@@ -212,9 +212,9 @@ export const modelsYamlSchema = z
       .strict(),
     timeouts: z
       .object({
-        llmFirstOutputMs: z.number().int().min(1_800_000).max(86_400_000),
-        llmOutputIdleMs: z.number().int().min(600_000).max(86_400_000),
-        llmMaximumDurationMs: z.number().int().min(14_400_000).max(86_400_000),
+        llmFirstOutputMs: z.number().int().min(600_000).max(1_800_000),
+        llmOutputIdleMs: z.number().int().min(600_000).max(1_800_000),
+        llmMaximumDurationMs: z.number().int().min(600_000).max(1_800_000),
         codeforcesRequestMs: z.number().int().min(1_000).max(600_000)
       })
       .strict()

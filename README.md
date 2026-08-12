@@ -75,16 +75,12 @@ npm test            # vitest run
 缺字段的设置一律关闭失败：旧版本原样保留等待人工核对，缺字段或损坏文件则拒绝启动。
 `enabled` 和版本一致只是必要条件，不是生产资格证书。
 
-模型配置中的 `thinking` 只决定是否把响应里的推理过程保留给下游；可选的
-`thinkingRequest` 才会为当前 Aether `deepseek-v4-flash` 显式开启或关闭
-深度思考。`enabled` 必须同时配置 `reasoningEffort: low`；`disabled` 不允许带
-推理强度，未配置 `thinkingRequest` 时两个请求字段都不发送。当
-`thinkingRequest: enabled` 时仍保留 `temperature` 配置以维持档位形状，但当前
-服务端会忽略这个字段。当前 difficulty 已恢复 Candidate C 的
-`deepseek-v4-flash`、`thinkingRequest: disabled` 请求；它会发送
-`thinking: {type: "disabled"}`，不会发送 `reasoning_effort`。同一档位还保留旧流水线配置用于
-历史实验和隔离测试，但正式 worker 只读取完整的 `reviewFlow` 11 角色配置；任何角色缺槽都会在
-启动前失败。
+模型配置中的 `thinking` 只决定是否保留响应里的推理过程；正式 Aether DeepSeek V4
+请求必须同时使用 `thinkingRequest: enabled` 和 `reasoningEffort: max`。配置层会在网络请求前拒绝
+缺字段、关闭思考或非 `max` 的 V4 槽位。新的四语义请求审题流按 A/B/C/D 执行：A 盲解与 B 独立
+难度并行，A 完成后运行 C 综合核验，B 与 C 都完成后才运行 D 独立反证和硬规则裁决；典型语义请求
+数为 4，关键路径为 3。B 只对冻结 Codeforces 参考难度，D 的通过/否决只对独立人工真值，两个轴
+不能互相推出。旧 11 角色实现仅保留作历史兼容和离线对照，不是新实验的请求拓扑。
 
 Fermata 本身不解析 `.env` 文件，只读取进程已经收到的环境变量。上面的
 `run-with-env.mjs` 只接受 `Fermata/private/` 内的绝对路径，并沿已经打开的目录描述符
@@ -177,16 +173,17 @@ node scripts/run-with-env.mjs "$FERMATA_ENV_FILE" npm run experiment:eval-verdic
 完整用法是 `node scripts/run-with-env.mjs <env文件> <命令> [参数...]`。不要改回
 shell 的 `source` 或 `.`。
 
-### 正式 11 角色审题流的准确性实验
+### 正式四语义请求审题流的准确性实验
 
-`experiment:eval-review-flow` 是这个入口在 package.json 中的识别名；真实付费运行不得先执行
-`npm run`，必须使用下文专用包装命令。它评估当前生产路径实际使用的 11 个角色，而不是旧的
-thinking/coding/verdict 流水线。这个入口只消费已经人工整理好的严格数据集，不生成题目、
-不生成 gold，也不会直接读取 Urmotiv、历史 XML 或题库目录。导入人员必须先在隔离步骤中把允许使用的
-材料整理成完整 `robotReviewTaskSchema` 快照。当前 32 题历史品味基线固定使用
-`exclude_current_corpus_for_historical_outcome`：bridge 仍逐字验证并绑定原始 Anklang request、response、
-capture 与 verifier 重放，但输出任务的 `reviewItems` 必须为空，避免已经参赛的题在当前语料中自匹配后把
-历史通过/否决结果泄漏给模型。入口会在任何付费请求前一次性校验所有样本及这项全局策略。
+当前代码已冻结 A/B/C/D 四语义 DAG、统一机器 JSON Schema、内容绑定阶段 receipt 和请求级全局
+公平调度，但**尚未产生新的真实准确性报告**，生产资格仍恒关闭。任何新的付费实验都必须先取得用户
+明确同意；本轮代码验收未读取私有题面、未发送模型请求、未启动新 eval。现有
+`experiment:eval-review-flow` 的 11 角色 bridge、registry 和旧 checkpoint 仍作为只读历史证据
+保留，不能把它的请求数量或结果冒充四调用基线，也不能取消、覆写或复用旧 checkpoint 身份。
+
+准确性入口只消费已经人工整理好的严格数据集，不生成题目、不生成 gold，也不会直接读取 Urmotiv、
+历史 XML 或题库目录。导入人员必须先在隔离步骤中把允许使用的材料整理成完整
+`robotReviewTaskSchema` 快照。历史品味样本继续使用避免当前语料自匹配的排除策略。
 
 manifest、固定标签目录、逐题 content 和逐题 gold 都必须放在 `--dataset-private-root` 明确指定的
 Git 忽略私有根内；当前桥接输出可以留在 `Urmotiv/private/`，只有 registry、检查点和报告固定写入
@@ -840,12 +837,12 @@ not_used、unknown、历史通过和历史否决覆盖，并明确使用 `icpcFi
 
 每个 label 和 run UUID 都是全项目永久实验身份；固定私有全局 registry 用 O_EXCL claim 绑定 label、
 run、代码/配置身份和检查点目录的 device/inode，因此换 `--private-dir` 或并发启动也不能重用 label。
-只有同一 label、同一主体/case 集合、同一代码、Node/platform/arch、实际依赖版本、配置、profile、
-11 个 provider/model 槽位和基线绑定全部精确一致时才能加 `--resume`。每道题在付费前先同步落成
-`active`；`active` 或 `failed` 都是永久污染证据，续跑绝不重发。首个 499、取消、断流、缺角色、
-跳过、receipt 不完整或本地持久化失败都会使整链不完整。SIGINT、SIGTERM、SIGHUP 只关闭新请求闸门，
-不会 Abort 已付费流；入口等待全部在途请求自然读到服务端真正结束后再封存不完整状态。不会恢复
-120 秒总时限，也不得用手工 JSON 或只有 `complete=true` 的报告开启生产。
+只有同一 label、同一主体/case 集合、同一代码、Node/platform/arch、实际依赖版本、配置、模型绑定
+和基线绑定全部精确一致时才能恢复。新四调用 checkpoint 逐阶段绑定 input、prompt、schema、model、
+attempt、真实 EOF 与 output 哈希；只有全部绑定一致的成功阶段可复用。失去 worker 的 `active`
+必须派生为 `orphaned_unknown`，且只能写新 checkpoint，不能改旧文件原字节。软停止只拒绝尚未开始
+的请求，在途请求自然读到真实 EOF。完整性要求 pending/active/orphaned/failed/missing 全为 0，
+并要求每个必需阶段恰有一份唯一有效 receipt；否则准确性报告固定 `INCOMPLETE`。
 
 ### 让长时间标定留在服务器运行
 
@@ -909,12 +906,12 @@ npm run experiment:calibrate-levels:detached -- \
 思维和代码难度标定中的深度推理可能明显超过 90 秒。模型开始输出后，每收到一个通过
 格式检查的非空白 content/reasoning 事件都会重新计算等待时间；心跳、用量和只含角色的事件
 不会续时。默认连续 10 分钟没有新有效内容才停止。等待第一个有效事件默认最多 30 分钟，在它之前
-（包括 429 重试等待）另有 4 小时的最终保护；首个有效输出到达后会清除这道保护，它不是持续输出
-请求的绝对总时限。实验可分别用 `LEVELS_LLM_OUTPUT_IDLE_MS`、
-`LEVELS_LLM_FIRST_OUTPUT_MS` 和 `LEVELS_LLM_MAX_DURATION_MS` 覆盖这三项。它们只接受整数，
-安全下限依次是 600000、1800000 和 14400000 毫秒，上限都是 86400000 毫秒；最终保护配置值不能
-小于另外两项等待配置值。旧的 `LEVELS_LLM_TIMEOUT_MS` 已不再支持，设置后会明确报错。
-`LEVELS_LLM_MAX_ATTEMPTS` 调整最多尝试次数，但只有模型服务明确返回请求过多时才会再次尝试。
+（包括 429 重试等待）另有 30 分钟的最终保护；持续输出会按有效进度刷新停顿计时，任何 transport
+调用都不再以 4 小时作为常态。实验可分别用 `LEVELS_LLM_OUTPUT_IDLE_MS`、
+`LEVELS_LLM_FIRST_OUTPUT_MS` 和 `LEVELS_LLM_MAX_DURATION_MS` 覆盖三项，但正式 review-flow
+配置只接受 10 至 30 分钟的有界值；不得恢复 120 秒总时限。
+旧实验的 `LEVELS_LLM_*` 约束按冻结 checkpoint 解释；新四调用 scheduler 的 attempts 和 duration
+由本节前述固定契约控制。旧的 `LEVELS_LLM_TIMEOUT_MS` 已不再支持，设置后会明确报错。
 `EVAL_CONCURRENCY` 决定同时处理几道题，只接受 1 到 32 的整数。模型响应正文按 UTF-8 原始字节
 计算，固定最多读取 4 MiB（约 4 MB）；超过后立即停止读取，并且错误和日志都不会包含响应正文。
 流式响应还固定最多读取 65536 个非空网络分块；分块是底层每次交给客户端的一小段字节。超过上限
@@ -922,31 +919,26 @@ npm run experiment:calibrate-levels:detached -- \
 
 正式服务已有的 `settings.json` 会保留上次保存的 `experimentVersion`，不会因为替换
 `models.yaml` 自动改变。当前配置版本是
-`experiment-2026-08-review-flow-historical-rubric-v1-eof-receipt-v2`。部署后必须先保持
-`enabled=false`；只有在没有在途任务、逐项核对整个所选档位的协议和准确性证据后，才能通过
-Urmotiv 的 Fermata 设置页或管理接口显式写入当前版本并开启。worker 还会在每轮 claim 前重新
-比较版本和生产资格证据，旧值即使同时保存了 `enabled=true` 也不会领取任务。由于当前
-`review-balanced` 内的 pro 请求尚未在 provider-v1 配置下完成独立协议预检，这个实验版本还被
-代码级固定封锁：即使操作员把
-settings 改成当前版本并开启，或手工放入一份声称合格的当前版本证据，也不会调用 claim。当前提交
-实际上对所有版本恒关闭；未来版本也必须等可信源证据聚合器另行实现、审阅并替换这道门。
+`experiment-2026-08-review-flow-historical-rubric-v1-eof-receipt-v3`。部署后必须先保持
+`enabled=false`；生产资格 verifier 仍恒拒绝，因此本次离线代码通过也不会领取任务。
 
-当前正式 worker 已接到 11 个相互隔离的审题角色，不再走旧的“难度、思维、代码、综合裁决”生产
-路径；续租与提交隔离测试会在 Vitest 模块边界替换整个新证据引擎，worker 源码没有切回旧流程的
-开关。新路径先严格构造完整任务快照，
-盲解完成并冻结后才允许其它角色读取题解；命题品味与 ICPC 比赛适配使用由历史人工通过/否决意见
-对照得到的版本化标准：比较时排除了已经确认原题/重复题的案例，也不把投题者自填难度当作人工
-真值。冻结摘要只发给命题品味相关角色，不进入盲解和独立难度角色。每轮模型调用必须保留真实 HTTP EOF、明确
-`finish_reason=stop`、SSE `[DONE]`、JSON 修复轮数及 429 尝试数的安全摘要；499、取消、断流、
-缺失角色或 schema 失败统一得到 `incomplete`，不会提交审核。任务里的 Anklang 条目必须同时通过
-正式内置插件编号、来源枚举、有效期、v2 完整状态和题目内容哈希校验；只有这条认证链上的
-`sameProblemSuggestion` 才能参与确定性重复题规则。准确性报告通过不可伪造的进程内 grant 独立
-绑定 runner 与 decision；报告指纹不参与 runner 身份，避免标定身份自指。当前生产资格 verifier
-仍恒拒绝。未来即使存在合格 grant，worker 也会在 claim 之前用当前 11 个槽位、provider
-凭据摘要、难度锚点、传输模式和构建摘要重算 runner 身份；任一不匹配都不领取任务。
-Anklang 证据的有效期还会在一次性提交载荷取出前再检查；运行期间过期、租约已过期或重复的
-assignment 都不会发起第二条模型流程。所以这些安全边界并不
-表示已经达到可开启自动审题的准确度。
+四调用 transport 的单题语义拓扑是 `A || B`、`A → C`、`B + C → D`。若服务商无法同时保证
+原生 `thinking=max` 与强制 schema，A-D 保持自然语义请求，全题末尾最多增加 1 次统一 formatter；
+formatter 只接收 A-D 已有输出并逐字段转写，不得重判。统一 schema 是唯一来源，严格声明
+required/type/enum/nullability/items，并在每层 object 使用 `additionalProperties=false`；
+运行时复验并把 schema 指纹写入 receipt。输出预算固定 A 32k、B 8k、C 24k、D 12k、
+formatter 8k；通用 transport 显式上限为 32k，默认最终保护 30 分钟，不恢复 120 秒短总时限，
+也不使用 1M token/4 小时作为常态。
+
+所有模型档位共用一个请求级调度器：全局并发默认 12，可显式配置 16；20 必须同时登记已接受的
+并发探针。按样本轮转且 work-conserving，不存在三个档位上限相加。每个逻辑请求最多 3 attempts，
+每题合计最多 8；只对 429、5xx、connect、首输出超时、无进度超时和流中断重试，并使用
+`Retry-After`、指数退避和抖动。output-limit、schema 或永久错误不做相同请求盲重试，单题失败不会
+触发全局 fail-fast。首输出、持续进度、无进度和真实 EOF 由 transport 分别记录。
+
+这些代码与合成测试只证明离线协议行为，不证明模型判断准确。双轴报告分别输出 verdict 的预测/人工
+class counts、confusion、false accept/reject，以及只对冻结 CF 参考计算的难度 MAE 和分层覆盖；
+完整性未通过时 metrics 必须为空。
 
 Candidate B 的协议验证使用
 `npm run experiment:probe-difficulty-thinking`。这个入口只依次检查一个人工合成的短题和三个与
@@ -1014,8 +1006,8 @@ failed=1、complete=false，request/fetch 都精确为 1，HTTP 200，正文到�
 完整收口，但终止标记后的协议数据仍未通过严格校验；没有进入结构化输出和 stop+EOF 成功判定。标签锁
 已释放，两个私有产物均为 `0600`，completion 的 SHA-256 为
 `4c80428cbc136f4c8c682d41a083d4b59b7decdf5b5b92c365f667ccea191afd`。c 已占用，不能重跑，也不得
-据此启动 83 题付费实验。格式错误后的排空沿用配置中的 10 分钟连续停顿与 4 小时总保护，不会恢复
-120 秒总时限；传输中断、停顿超时或任务取消都不会伪装成 EOF。私有 completion 只保存固定枚举的
+据此启动 83 题付费实验。旧 checkpoint 仍按当时的 10 分钟连续停顿与 4 小时保护解释；新调用不继承
+这一常态。传输中断、停顿超时或任务取消都不会伪装成 EOF。私有 completion 只保存固定枚举的
 失败阶段，不保存原始事件、响应字段、正文、长度明细或服务商错误。
 
 v5 在不放宽任何接受条件的前提下，把 `trailing_data` 细分为三个固定子阶段：
@@ -1203,11 +1195,10 @@ AGENTS.md 第 4 节。
 
 | 流水线 | 状态 | 说明 |
 | --- | --- | --- |
-| CF 难度（旧 difficulty.ts） | **Candidate C 完整但未达标；旧 provider-v1 探针已冻结** | 当前旧锚点控制组 83/83 完整报告为 MAE 285.5、±200 命中率 54.2%；Candidate C 使用 7 条独立公开锚点后 83/83 完整，MAE 265.1、命中率 60.2%，有所改善但仍未达到 MAE ≤ 200、命中率 ≥ 75% 的门槛，锚点继续标记为 `provisional: true`。Candidate D 与恢复后的 Candidate C 请求都在旧根路径配置下返回 404；一次只读 `/v1/models` 已确认目录声明包含 flash/pro。修正 `/v1` 后的 b 单请求得到 HTTP 200，但客户端取消正文、未观察 EOF；v4 的 c 单请求安全排空到真实 EOF，固定失败阶段为 `trailing_data`。v5 的 d 单请求也是 HTTP 200、request/fetch=1、真实 EOF、未取消，但只得到粗分类 `data_after_done`。v6 的 e 单请求同样 request/fetch=1、HTTP 200、真实 EOF、未取消，并进一步固定为 `data_after_done_other_or_unclassifiable`；它仍是 `complete=false`。v7/f 只完成了预登记且未运行；当前配置哈希已经变化，所以 f 永久冻结，不能更新绑定或补跑。a/b/c/d/e 证据均保留，当前实验版本由服务端代码级生产门固定封锁，settings 无法开启 claim。 |
-| 思维难度（thinking.ts） | **旧实验均不可作基线** | 两份早期报告无法证明完整；后两份明确只完成 6/24、9/24，而且都缺高分段。 |
-| 代码难度（coding.ts） | **旧实验均不可作基线** | 与思维难度共用的旧实验不完整；小样本曾出现难度分段升高但代码难度均值下降，需要在完整基线上复核。 |
-| 查重判断（verdict.ts） | **旧设计不可作准确性基线；新盲评/续跑基础尚未实跑** | 旧实验只有 3 个正常样本和 3 个人工重复样本；新代码已把 content-only 选择、独立 case gold、prediction-only 检查点和完整链防重放接入，但尚未用新唯一标签运行，不能声明准确率。 |
-| 11 角色 reviewFlow | **盲测/恢复工具已接线，准确性未实跑，生产恒关闭** | 历史二元结论和稀疏 XML 意见与可选独立人工标注已分开；holdout 两条链只保存预测与 11-role EOF receipt，独立 one-shot reveal 才同时计分。全局 label/主体/phase 账本、dirfd 检查点、信号收口和私有报告崩溃恢复已覆盖合成测试，但尚无合格的修改前/后真实准确性报告和可信聚合指纹。 |
+| CF 难度（旧 difficulty.ts） | **Candidate C 完整但未达标；旧 provider-v1 探针已冻结** | 旧 83/83 结果只作历史证据；不得据此声明当前四调用准确。 |
+| 思维/代码难度（旧流水线） | **旧实验均不可作基线** | 旧结果不完整或缺分层，保持原字节只读。 |
+| 查重判断（旧 verdict.ts） | **旧设计不可作准确性基线** | 不能替代独立 human truth 的 verdict 轴。 |
+| 四语义请求 reviewFlow | **代码离线验收进行中；准确性未实跑；生产恒关闭** | A/B/C/D、统一 formatter、全局公平调度、阶段 receipt、完整性 gate 与双轴汇总已有合成覆盖；旧实验终态仍为 0 completed / 20 failed / 72 pending / 4 orphaned，accuracy=`INCOMPLETE`。 |
 
 这张表应该随每一次真正跑过评测脚本之后更新。只有当前代码生成、对应脱敏汇总与完成证据存在，
 并且报告明确 `eligible=true` 时，才能把结果写成合格候选；仅有完整性为真不代表准确性达标。
@@ -1224,7 +1215,7 @@ AGENTS.md 第 4 节。
 
 ```
 config/
-  models.yaml              旧离线流水线及 11 个正式角色的模型/温度/思考配置
+  models.yaml              当前模型/native max 与 30 分钟有界 transport 配置
   anchors/difficulty.json  CF 难度评估的参照题（当前为 7 条 Candidate C 临时数据，见"当前校准状态"）
 scripts/
   env-file.mjs             run-with-env 和后台启动器共用的简单 env 解析规则
@@ -1247,10 +1238,11 @@ src/
                            正式领取总门与不透明 grant；可信聚合器完成前零签发、恒关闭
   review-flow/
     task-source.ts         严格绑定 Urmotiv 任务、Anklang 来源和标签目录
-    llm-roles.ts           11 个独立模型角色、提示边界与 runner 身份
-    orchestrator.ts        冻结证据、失败收束、确定性规则和一次性提交载荷
-    schemas.ts / views.ts  完整输入、角色输出与最小可见视图
-    historical-rubric.ts  从历史通过/否决意见冻结的匿名命题品味摘要
+    four-call.ts           A/B/C/D DAG、统一 schema、预算与内容绑定 receipt
+    four-call-runtime.ts   共享全局 scheduler 的生产 transport 适配
+    llm-roles.ts           旧 11 角色历史兼容适配
+    orchestrator.ts        旧证据流冻结、失败收束与一次性提交载荷
+    schemas.ts / views.ts  旧 11 角色输入、输出与最小可见视图
   reviewer.ts              主循环：轮询、并发、续租、优雅停机
   server.ts                管理端口
   index.ts                 入口
