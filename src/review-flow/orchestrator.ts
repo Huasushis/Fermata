@@ -36,6 +36,7 @@ import {
   reviewFlowRoleSchema,
   reviewFlowAssignmentContextSchema,
   reviewFlowExecutionContextSchema,
+  roleAcceptedEventShapeSchema,
   roleIdentitySchema,
   solutionAnalystPayloadSchema,
   solverPayloadSchema,
@@ -294,6 +295,7 @@ const reviewFlowCalibrationReceiptResponseSchema = z
     transportAttemptCount: z.number().int().positive().max(1_000),
     eofVerified: z.literal(true),
     finishReasonStopVerified: z.literal(true),
+    acceptedEventShapes: z.array(roleAcceptedEventShapeSchema).max(64).readonly(),
     sseDoneObserved: z.union([z.literal(true), z.null()])
   })
   .strict()
@@ -432,6 +434,7 @@ export const reviewFlowCalibrationProjectionSchema = z
               eofVerified: response.eofVerified,
               responseMode: response.responseMode,
               finishReasonStopVerified: response.finishReasonStopVerified,
+              acceptedEventShapes: response.acceptedEventShapes,
               sseDoneObserved: response.sseDoneObserved
             }))
           })
@@ -1204,6 +1207,7 @@ async function runAndSeal<TPayload>(input: {
         transportAttemptCount: response.transportAttemptCount,
         eofVerified: response.eofVerified,
         finishReasonStopVerified: response.finishReasonStopVerified,
+        acceptedEventShapes: response.acceptedEventShapes,
         // roleCompletionReceiptSchema 已在进入此分支前验证 SSE=true/JSON=null；
         // 这里收窄为标定投影允许的安全字面量。
         sseDoneObserved: response.responseMode === "sse" ? true : null

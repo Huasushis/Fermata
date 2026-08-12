@@ -55,6 +55,7 @@ const receipt = {
     eofVerified: true,
     responseMode: "json",
     finishReasonStopVerified: true,
+    acceptedEventShapes: [],
     sseDoneObserved: null
   }]
 } as const;

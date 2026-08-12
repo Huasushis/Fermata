@@ -192,6 +192,7 @@ describe("chatComplete：正常路径", () => {
         eofVerified: true,
         responseMode: "json",
         finishReasonStopVerified: true,
+        acceptedEventShapes: [],
         sseDoneObserved: null
       }
     });
@@ -271,6 +272,7 @@ describe("chatComplete：正常路径", () => {
         chunkCount: 0,
         usageEventCount: 0,
         usageTotalTokens: null,
+        acceptedEventShapes: [],
         firstRejectedEvent: null
       },
       jsonSchemaValidated: null
@@ -2027,6 +2029,288 @@ describe("chatComplete：正常路径", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("SSE 成功流只按封闭形状聚合事件，不保存任何字段值", async () => {
+    const privateSentinel = "SYNTHETIC_PRIVATE_ACCEPTED_VALUE";
+    const contentEvent = (content: string): string =>
+      `data: ${JSON.stringify({
+        choices: [{ delta: { content } }]
+      })}`;
+    const body = [
+      ": heartbeat",
+      "",
+      `data: ${JSON.stringify(strictUsageMetadataEvent())}`,
+      "",
+      `data: ${JSON.stringify({
+        choices: [
+          { delta: { role: "assistant" } },
+          { delta: { content: "ignored second choice" } }
+        ]
+      })}`,
+      "",
+      contentEvent(privateSentinel),
+      "",
+      contentEvent("synthetic second fragment"),
+      "",
+      `data: ${JSON.stringify({
+        choices: [{ message: { reasoning_content: "synthetic reasoning" } }]
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        choices: [{
+          delta: {
+            content: "synthetic combined content",
+            reasoning_content: "synthetic combined reasoning"
+          }
+        }]
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        choices: [{ delta: {}, finish_reason: "stop" }]
+      })}`,
+      "",
+      "data: [DONE]",
+      "",
+      ""
+    ].join("\n");
+
+    const result = await chatCompleteWithReceipt(provider, spec, [], {
+      ...runtime,
+      fetch: vi.fn(async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      }))
+    });
+
+    expect(result.receipt.acceptedEventShapes.map(({ category, count }) => ({
+      category,
+      count
+    }))).toEqual([
+      { category: "content", count: 2 },
+      { category: "content_reasoning", count: 1 },
+      { category: "done", count: 1 },
+      { category: "finish", count: 1 },
+      { category: "metadata", count: 1 },
+      { category: "reasoning", count: 1 },
+      { category: "role", count: 1 },
+      { category: "usage", count: 1 }
+    ]);
+    for (const shape of result.receipt.acceptedEventShapes) {
+      expect(shape.shapeFingerprint).toMatch(/^[a-f0-9]{64}$/u);
+    }
+    expect(JSON.stringify(result.receipt)).not.toContain(privateSentinel);
+  });
+
+  it.each([
+    {
+      name: "多 data 字段、完整已知字段类型和 stop",
+      body: [
+        "data: {\"created\":1,\"id\":\"SYNTHETIC_PRIVATE_SHAPE_VALUE\",\"model\":\"synthetic\",\"object\":\"chunk\",\"service_tier\":\"default\",\"system_fingerprint\":null,\"usage\":{},\"control\":{},\"future_top\":{\"value\":\"SYNTHETIC_PRIVATE_SHAPE_VALUE\"},\"choices\":[",
+        "data: {\"delta\":{\"content\":7,\"reasoning_content\":false,\"reasoning\":null,\"role\":\"assistant\",\"function_call\":{},\"refusal\":null,\"tool_calls\":[],\"future_delta\":\"SYNTHETIC_PRIVATE_SHAPE_VALUE\"},\"message\":{\"content\":\"synthetic\",\"reasoning_content\":null,\"reasoning\":\"synthetic\",\"role\":\"assistant\",\"function_call\":null,\"refusal\":\"synthetic\",\"tool_calls\":{},\"future_message\":true},\"finish_reason\":\"stop\",\"index\":0,\"logprobs\":null,\"future_choice\":true}]}",
+        "",
+        ""
+      ].join("\n"),
+      expectedCode: "LLM_RESPONSE_FORMAT_INVALID",
+      expectedDataFieldCount: 2,
+      expectedShape: "delta_field_type",
+      expectedStructure: {
+        fieldTypes: {
+          choices: "array",
+          created: "number",
+          id: "string",
+          model: "string",
+          object: "string",
+          serviceTier: "string",
+          systemFingerprint: "null",
+          usage: "object",
+          error: "missing",
+          control: "object",
+          choice: "object",
+          delta: "object",
+          message: "object",
+          finishReason: "string",
+          index: "number",
+          logprobs: "null",
+          deltaFields: {
+            content: "number",
+            reasoningContent: "boolean",
+            reasoning: "null",
+            role: "string",
+            functionCall: "object",
+            refusal: "null",
+            toolCalls: "array"
+          },
+          messageFields: {
+            content: "string",
+            reasoningContent: "null",
+            reasoning: "string",
+            role: "string",
+            functionCall: "null",
+            refusal: "string",
+            toolCalls: "object"
+          }
+        },
+        choicesLength: "1",
+        payloadSource: "both",
+        finishReasonClass: "stop",
+        finishReasonIsNull: false,
+        finishReasonUnknownStringHash: null,
+        hasUsageField: true,
+        hasErrorField: false,
+        hasControlField: true,
+        unknownTopLevelKeys: ["future_top"],
+        unknownChoiceKeys: ["future_choice"],
+        unknownPayloadKeys: ["future_delta", "future_message"]
+      }
+    },
+    {
+      name: "length",
+      body: 'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n',
+      expectedCode: "LLM_OUTPUT_LENGTH_LIMIT",
+      expectedDataFieldCount: 1,
+      expectedShape: "finish_reason_type_or_unknown",
+      expectedStructure: {
+        choicesLength: "1",
+        payloadSource: "delta",
+        finishReasonClass: "length",
+        finishReasonIsNull: false,
+        finishReasonUnknownStringHash: null
+      }
+    },
+    {
+      name: "content_filter",
+      body: 'data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}\n\n',
+      expectedCode: "LLM_OUTPUT_CONTENT_FILTERED",
+      expectedDataFieldCount: 1,
+      expectedShape: "finish_reason_type_or_unknown",
+      expectedStructure: {
+        choicesLength: "1",
+        payloadSource: "delta",
+        finishReasonClass: "content_filter",
+        finishReasonIsNull: false,
+        finishReasonUnknownStringHash: null
+      }
+    },
+    {
+      name: "未知字符串和多个 choice",
+      body: 'data: {"choices":[{"message":{},"finish_reason":"SYNTHETIC_PRIVATE_SHAPE_VALUE"},{"delta":{}}]}\n\n',
+      expectedCode: "LLM_RESPONSE_FORMAT_INVALID",
+      expectedDataFieldCount: 1,
+      expectedShape: "finish_reason_type_or_unknown",
+      expectedStructure: {
+        choicesLength: "many",
+        payloadSource: "message",
+        finishReasonClass: "unknown_string",
+        finishReasonIsNull: false
+      }
+    },
+    {
+      name: "非字符串 finish",
+      body: 'data: {"choices":[{"delta":{},"finish_reason":17}]}\n\n',
+      expectedCode: "LLM_RESPONSE_FORMAT_INVALID",
+      expectedDataFieldCount: 1,
+      expectedShape: "finish_reason_type_or_unknown",
+      expectedStructure: {
+        choicesLength: "1",
+        payloadSource: "delta",
+        finishReasonClass: "non_string",
+        finishReasonIsNull: false,
+        finishReasonUnknownStringHash: null
+      }
+    },
+    {
+      name: "choices=0 且 usage/error/control",
+      body: 'data: {"choices":[],"usage":{"private":"SYNTHETIC_PRIVATE_SHAPE_VALUE"},"error":{"private":"SYNTHETIC_PRIVATE_SHAPE_VALUE"},"control":{"private":"SYNTHETIC_PRIVATE_SHAPE_VALUE"}}\n\n',
+      expectedCode: "LLM_RESPONSE_FORMAT_INVALID",
+      expectedDataFieldCount: 1,
+      expectedShape: "error_object",
+      expectedStructure: {
+        choicesLength: "0",
+        payloadSource: "neither",
+        finishReasonClass: "missing",
+        finishReasonIsNull: false,
+        finishReasonUnknownStringHash: null,
+        hasUsageField: true,
+        hasErrorField: true,
+        hasControlField: true
+      }
+    },
+    {
+      name: "message reasoning 类型错误",
+      body: 'data: {"choices":[{"message":{"reasoning":false}}]}\n\n',
+      expectedCode: "LLM_RESPONSE_FORMAT_INVALID",
+      expectedDataFieldCount: 1,
+      expectedShape: "delta_field_type",
+      expectedStructure: {
+        choicesLength: "1",
+        payloadSource: "message",
+        finishReasonClass: "missing",
+        fieldTypes: {
+          message: "object",
+          messageFields: {
+            reasoning: "boolean"
+          }
+        }
+      }
+    },
+    {
+      name: "损坏 JSON",
+      body: "data: {SYNTHETIC_PRIVATE_SHAPE_VALUE\n\n",
+      expectedCode: "LLM_RESPONSE_FORMAT_INVALID",
+      expectedDataFieldCount: 1,
+      expectedShape: "json_invalid",
+      expectedStructure: {
+        choicesLength: null,
+        payloadSource: "neither",
+        finishReasonClass: "missing",
+        finishReasonIsNull: false,
+        finishReasonUnknownStringHash: null
+      }
+    }
+  ] as const)(
+    "SSE 封闭形状审计覆盖$name，永久失败且零重试",
+    async ({
+      body,
+      expectedCode,
+      expectedDataFieldCount,
+      expectedShape,
+      expectedStructure
+    }) => {
+      const privateSentinel = "SYNTHETIC_PRIVATE_SHAPE_VALUE";
+      const fetchMock = vi.fn(async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      }));
+      const error = await chatComplete(provider, spec, [], {
+        ...runtime,
+        fetch: fetchMock
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({ code: expectedCode });
+      const audit = getLlmFailureAudit(error);
+      expect(audit?.stream.firstRejectedEvent).toMatchObject({
+        dataFieldCount: expectedDataFieldCount,
+        shape: expectedShape,
+        structure: expectedStructure
+      });
+      expect(
+        audit?.stream.firstRejectedEvent?.structure.unknownKeysFingerprint
+      ).toMatch(/^[a-f0-9]{64}$/u);
+      expect(audit?.stream.firstRejectedEvent?.shapeFingerprint).toMatch(
+        /^[a-f0-9]{64}$/u
+      );
+      if (
+        audit?.stream.firstRejectedEvent?.structure.finishReasonClass ===
+        "unknown_string"
+      ) {
+        expect(
+          audit.stream.firstRejectedEvent.structure.finishReasonUnknownStringHash
+        ).toMatch(/^[a-f0-9]{64}$/u);
+      }
+      expect(JSON.stringify(audit)).not.toContain(privateSentinel);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+  );
+
   it("SSE 未知 finish 首错不会被尾部事件替换，排空 EOF 后保留安全阶段", async () => {
     const encoder = new TextEncoder();
     let cancelled = false;
@@ -3343,7 +3627,8 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
           eofVerified: true,
           responseMode: "json",
           finishReasonStopVerified: true,
-          sseDoneObserved: null
+          sseDoneObserved: null,
+          acceptedEventShapes: []
         },
         {
           schemaVersion: 2,
@@ -3351,7 +3636,8 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
           eofVerified: true,
           responseMode: "json",
           finishReasonStopVerified: true,
-          sseDoneObserved: null
+          sseDoneObserved: null,
+          acceptedEventShapes: []
         }
       ]
     });

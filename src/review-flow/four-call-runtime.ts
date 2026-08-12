@@ -8,6 +8,7 @@ import {
   LlmResponseFormatError,
   type ChatMessage,
   type ChatCompletionWithReceipt,
+  type LlmSseAcceptedShapeAudit,
   type LlmResponseFormatFailureStage,
   type LlmResponseFormatFailureSubstage,
   type LlmSseRejectedEventAudit
@@ -41,6 +42,7 @@ export interface FourCallSafeRequestTiming {
   readonly endToEndMs: number;
   readonly validOutputEventCount: number;
   readonly outputUtf8Bytes: number;
+  readonly acceptedEventShapes: readonly LlmSseAcceptedShapeAudit[];
 }
 export interface FourCallSafeRequestFailure {
   readonly kind: LlmStageFailureKind;
@@ -66,6 +68,7 @@ export interface FourCallSafeRequestFailure {
   readonly streamChunkCount: number;
   readonly usageEventCount: number;
   readonly usageTotalTokens: number | null;
+  readonly acceptedEventShapes: readonly LlmSseAcceptedShapeAudit[];
   readonly firstRejectedEvent: LlmSseRejectedEventAudit | null;
 }
 
@@ -205,7 +208,8 @@ async function executeProductionCall(
     firstValidOutputMs,
     endToEndMs: Date.now() - startedAt,
     validOutputEventCount,
-    outputUtf8Bytes: Buffer.byteLength(completion.content, "utf8")
+    outputUtf8Bytes: Buffer.byteLength(completion.content, "utf8"),
+    acceptedEventShapes: completion.receipt.acceptedEventShapes
   }));
   return {
     output: completion.content,
@@ -302,6 +306,7 @@ function safeRequestFailure(
     streamChunkCount: audit?.stream.chunkCount ?? 0,
     usageEventCount: audit?.stream.usageEventCount ?? 0,
     usageTotalTokens: audit?.stream.usageTotalTokens ?? null,
+    acceptedEventShapes: audit?.stream.acceptedEventShapes ?? [],
     firstRejectedEvent: audit?.stream.firstRejectedEvent ?? null,
     formatFailureStage: hasFormatFailure
       ? error.formatFailureStage ?? null

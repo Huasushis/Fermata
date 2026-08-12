@@ -47,6 +47,83 @@ export type LlmSseRejectedShape =
   | "delta_missing_or_non_object"
   | "delta_field_type"
   | "finish_reason_type_or_unknown";
+export type LlmSafeJsonType =
+  | "missing"
+  | "null"
+  | "string"
+  | "number"
+  | "boolean"
+  | "array"
+  | "object"
+  | "other";
+export type LlmSseChoicesLengthBucket = "0" | "1" | "many";
+export type LlmSsePayloadSource = "delta" | "message" | "both" | "neither";
+export type LlmSseFinishReasonClass =
+  | "missing"
+  | "null"
+  | "stop"
+  | "length"
+  | "content_filter"
+  | "unknown_string"
+  | "non_string";
+export interface LlmSsePayloadFieldTypeAudit {
+  readonly content: LlmSafeJsonType;
+  readonly reasoningContent: LlmSafeJsonType;
+  readonly reasoning: LlmSafeJsonType;
+  readonly role: LlmSafeJsonType;
+  readonly functionCall: LlmSafeJsonType;
+  readonly refusal: LlmSafeJsonType;
+  readonly toolCalls: LlmSafeJsonType;
+}
+export interface LlmSseFieldTypeAudit {
+  readonly choices: LlmSafeJsonType;
+  readonly created: LlmSafeJsonType;
+  readonly id: LlmSafeJsonType;
+  readonly model: LlmSafeJsonType;
+  readonly object: LlmSafeJsonType;
+  readonly serviceTier: LlmSafeJsonType;
+  readonly systemFingerprint: LlmSafeJsonType;
+  readonly usage: LlmSafeJsonType;
+  readonly error: LlmSafeJsonType;
+  readonly control: LlmSafeJsonType;
+  readonly choice: LlmSafeJsonType;
+  readonly delta: LlmSafeJsonType;
+  readonly message: LlmSafeJsonType;
+  readonly finishReason: LlmSafeJsonType;
+  readonly index: LlmSafeJsonType;
+  readonly logprobs: LlmSafeJsonType;
+  readonly deltaFields: LlmSsePayloadFieldTypeAudit;
+  readonly messageFields: LlmSsePayloadFieldTypeAudit;
+}
+export interface LlmSseStructuralAudit {
+  readonly fieldTypes: LlmSseFieldTypeAudit;
+  readonly choicesLength: LlmSseChoicesLengthBucket | null;
+  readonly payloadSource: LlmSsePayloadSource;
+  readonly finishReasonClass: LlmSseFinishReasonClass;
+  readonly finishReasonIsNull: boolean;
+  readonly finishReasonUnknownStringHash: string | null;
+  readonly hasUsageField: boolean;
+  readonly hasErrorField: boolean;
+  readonly hasControlField: boolean;
+  readonly unknownTopLevelKeys: readonly string[];
+  readonly unknownChoiceKeys: readonly string[];
+  readonly unknownPayloadKeys: readonly string[];
+  readonly unknownKeysFingerprint: string;
+}
+export type LlmSseAcceptedShapeCategory =
+  | "done"
+  | "usage"
+  | "content"
+  | "reasoning"
+  | "content_reasoning"
+  | "role"
+  | "finish"
+  | "metadata";
+export interface LlmSseAcceptedShapeAudit {
+  readonly category: LlmSseAcceptedShapeCategory;
+  readonly shapeFingerprint: string;
+  readonly count: number;
+}
 
 export interface LlmSseRejectedEventAudit {
   readonly eventOrdinal: number;
@@ -57,6 +134,7 @@ export interface LlmSseRejectedEventAudit {
   readonly choiceKeys: readonly string[];
   readonly deltaKeys: readonly string[];
   readonly shape: LlmSseRejectedShape;
+  readonly structure: LlmSseStructuralAudit;
   readonly shapeFingerprint: string;
 }
 
@@ -71,6 +149,7 @@ export interface LlmTransportReceipt {
   /** SSE 必须明确观察到 finish_reason=stop；JSON 回退也做同样校验。 */
   readonly finishReasonStopVerified: true;
   /** JSON 没有 `[DONE]`；SSE 则如实记录服务端是否发送了协议终止标记。 */
+  readonly acceptedEventShapes: readonly LlmSseAcceptedShapeAudit[];
   readonly sseDoneObserved: boolean | null;
 }
 
@@ -125,6 +204,7 @@ export interface LlmFailureAudit {
     readonly chunkCount: number;
     readonly usageEventCount: number;
     readonly usageTotalTokens: number | null;
+    readonly acceptedEventShapes: readonly LlmSseAcceptedShapeAudit[];
     readonly firstRejectedEvent: LlmSseRejectedEventAudit | null;
   };
   /** null 表示尚未走到结构化 JSON 校验；false 表示校验未成功。 */
@@ -672,6 +752,7 @@ export async function chatCompleteWithReceipt(
       eofVerified: true,
       responseMode: response.responseMode,
       finishReasonStopVerified: true,
+      acceptedEventShapes: acceptedShapeAudit(requestAudit),
       sseDoneObserved: response.sseDoneObserved
     }
   };
@@ -1159,6 +1240,11 @@ interface MutableLlmRequestAudit {
   finishReasonStopObserved: boolean;
   sseDoneObserved: boolean | null;
   streamEventCount: number;
+  acceptedEventShapeCounts: Map<string, {
+    readonly category: LlmSseAcceptedShapeCategory;
+    readonly shapeFingerprint: string;
+    count: number;
+  }>;
   streamUtf8Bytes: number;
   streamChunkCount: number;
   usageEventCount: number;
@@ -1175,6 +1261,7 @@ function createMutableLlmRequestAudit(): MutableLlmRequestAudit {
     finishReasonStopObserved: false,
     sseDoneObserved: null,
     streamEventCount: 0,
+    acceptedEventShapeCounts: new Map(),
     streamUtf8Bytes: 0,
     streamChunkCount: 0,
     usageEventCount: 0,
@@ -1193,6 +1280,7 @@ function resetMutableLlmRequestAuditForAttempt(
   audit.sseDoneObserved = null;
   audit.streamEventCount = 0;
   audit.streamUtf8Bytes = 0;
+  audit.acceptedEventShapeCounts.clear();
   audit.streamChunkCount = 0;
   audit.usageEventCount = 0;
   audit.usageTotalTokens = null;
@@ -1228,6 +1316,7 @@ function rememberLlmFailureAudit(
     chunkCount: input.requestAudit.streamChunkCount,
     usageEventCount: input.requestAudit.usageEventCount,
     usageTotalTokens: input.requestAudit.usageTotalTokens,
+    acceptedEventShapes: acceptedShapeAudit(input.requestAudit),
     firstRejectedEvent: input.requestAudit.firstRejectedEvent
   });
   llmFailureAudits.set(error, Object.freeze({
@@ -1253,6 +1342,12 @@ function mutableAuditFromReceipt(
     finishReasonStopObserved: true,
     sseDoneObserved: receipt.sseDoneObserved,
     streamEventCount: 0,
+    acceptedEventShapeCounts: new Map(
+      receipt.acceptedEventShapes.map((entry) => [
+        `${entry.category}:${entry.shapeFingerprint}`,
+        { ...entry }
+      ])
+    ),
     streamUtf8Bytes: 0,
     streamChunkCount: 0,
     usageEventCount: 0,
@@ -1297,6 +1392,12 @@ function promoteJsonFailureAudit(
       finishReasonStopObserved: existing.terminal.finishReasonStopObserved,
       sseDoneObserved: existing.terminal.sseDoneObserved,
       streamEventCount: existing.stream.eventCount,
+      acceptedEventShapeCounts: new Map(
+        existing.stream.acceptedEventShapes.map((entry) => [
+          `${entry.category}:${entry.shapeFingerprint}`,
+          { ...entry }
+        ])
+      ),
       streamUtf8Bytes: existing.stream.utf8Bytes,
       streamChunkCount: existing.stream.chunkCount,
       usageEventCount: existing.stream.usageEventCount,
@@ -2362,6 +2463,7 @@ async function readChatCompletionEventStream(
         state,
         observer
       );
+      recordAcceptedSseEvent(event, audit);
       audit.sseDoneObserved = state.sawDone;
       audit.finishReasonStopObserved = state.sawStop;
       resetPostDonePendingDataScan(postDonePendingDataScan, state);
@@ -2610,7 +2712,7 @@ function describeRejectedSseEvent(
     } else {
       const record = raw as Record<string, unknown>;
       topLevelKeys = safeShapeKeys(record);
-      if (Object.prototype.hasOwnProperty.call(record, "error")) {
+      if (Object.hasOwn(record, "error")) {
         shape = "error_object";
       } else if (!Array.isArray(record.choices)) {
         shape = "choices_missing_or_non_array";
@@ -2621,14 +2723,14 @@ function describeRejectedSseEvent(
         } else {
           const choiceRecord = choice as Record<string, unknown>;
           choiceKeys = safeShapeKeys(choiceRecord);
-          const delta = choiceRecord.delta ?? choiceRecord.message;
-          if (typeof delta !== "object" || delta === null) {
+          const payload = choiceRecord.delta ?? choiceRecord.message;
+          if (typeof payload !== "object" || payload === null) {
             shape = "delta_missing_or_non_object";
           } else {
-            const deltaRecord = delta as Record<string, unknown>;
-            deltaKeys = safeShapeKeys(deltaRecord);
+            const payloadRecord = payload as Record<string, unknown>;
+            deltaKeys = safeShapeKeys(payloadRecord);
             shape = ["reasoning_content", "reasoning", "content"].some((key) => {
-              const value = deltaRecord[key];
+              const value = payloadRecord[key];
               return value !== undefined && value !== null &&
                 typeof value !== "string";
             })
@@ -2639,12 +2741,14 @@ function describeRejectedSseEvent(
       }
     }
   }
-  const shapeFingerprint = createHash("sha256").update(JSON.stringify({
+  const structure = describeSseStructure(raw);
+  const shapeFingerprint = safeAuditFingerprint({
     topLevelKeys,
     choiceKeys,
     deltaKeys,
-    shape
-  })).digest("hex");
+    shape,
+    structure
+  });
   return Object.freeze({
     eventOrdinal: ordinal,
     completedEventCount: ordinal - 1,
@@ -2654,8 +2758,277 @@ function describeRejectedSseEvent(
     choiceKeys,
     deltaKeys,
     shape,
+    structure,
     shapeFingerprint
   });
+}
+
+const knownTopLevelSseKeys = new Set([
+  "choices",
+  "created",
+  "error",
+  "id",
+  "model",
+  "object",
+  "service_tier",
+  "system_fingerprint",
+  "usage",
+  "control"
+]);
+const knownChoiceSseKeys = new Set([
+  "delta",
+  "finish_reason",
+  "index",
+  "logprobs",
+  "message"
+]);
+const knownPayloadSseKeys = new Set([
+  "content",
+  "function_call",
+  "reasoning",
+  "reasoning_content",
+  "refusal",
+  "role",
+  "tool_calls"
+]);
+
+function describeSseStructure(raw: unknown): LlmSseStructuralAudit {
+  const top = isRecordForAudit(raw) ? raw : undefined;
+  const choices = top?.choices;
+  const choice = Array.isArray(choices) && choices.length > 0
+    ? choices[0]
+    : undefined;
+  const choiceRecord = isRecordForAudit(choice) ? choice : undefined;
+  const hasDelta = choiceRecord !== undefined && Object.hasOwn(choiceRecord, "delta");
+  const hasMessage =
+    choiceRecord !== undefined && Object.hasOwn(choiceRecord, "message");
+  const payloadSource: LlmSsePayloadSource =
+    hasDelta && hasMessage ? "both"
+      : hasDelta ? "delta"
+        : hasMessage ? "message"
+          : "neither";
+  const deltaRecord = isRecordForAudit(choiceRecord?.delta)
+    ? choiceRecord.delta
+    : undefined;
+  const messageRecord = isRecordForAudit(choiceRecord?.message)
+    ? choiceRecord.message
+    : undefined;
+  const payloadRecord = deltaRecord ?? messageRecord;
+  const finishReason = fieldValue(choiceRecord, "finish_reason");
+  const finishReasonClass = classifyFinishReason(finishReason);
+  const unknownTopLevelKeys = unknownShapeKeys(top, knownTopLevelSseKeys);
+  const unknownChoiceKeys = unknownShapeKeys(choiceRecord, knownChoiceSseKeys);
+  const unknownPayloadKeys = Object.freeze(
+    [...new Set([
+      ...unknownShapeKeys(deltaRecord, knownPayloadSseKeys),
+      ...unknownShapeKeys(messageRecord, knownPayloadSseKeys)
+    ])].sort()
+  );
+  const unknownKeysFingerprint = safeAuditFingerprint({
+    topLevel: unknownTopLevelKeys,
+    choice: unknownChoiceKeys,
+    payload: unknownPayloadKeys
+  });
+  return Object.freeze({
+    fieldTypes: Object.freeze({
+      choices: fieldType(top, "choices"),
+      created: fieldType(top, "created"),
+      id: fieldType(top, "id"),
+      model: fieldType(top, "model"),
+      object: fieldType(top, "object"),
+      serviceTier: fieldType(top, "service_tier"),
+      systemFingerprint: fieldType(top, "system_fingerprint"),
+      usage: fieldType(top, "usage"),
+      error: fieldType(top, "error"),
+      control: fieldType(top, "control"),
+      choice: safeJsonType(choice, Array.isArray(choices) && choices.length > 0),
+      delta: fieldType(choiceRecord, "delta"),
+      message: fieldType(choiceRecord, "message"),
+      finishReason: fieldType(choiceRecord, "finish_reason"),
+      index: fieldType(choiceRecord, "index"),
+      logprobs: fieldType(choiceRecord, "logprobs"),
+      deltaFields: payloadFieldTypes(deltaRecord),
+      messageFields: payloadFieldTypes(messageRecord)
+    }),
+    choicesLength: Array.isArray(choices)
+      ? choices.length === 0 ? "0" : choices.length === 1 ? "1" : "many"
+      : null,
+    payloadSource,
+    finishReasonClass,
+    finishReasonIsNull: finishReason.present && finishReason.value === null,
+    finishReasonUnknownStringHash:
+      finishReasonClass === "unknown_string"
+        ? safeValueHash(finishReason.value as string)
+        : null,
+    hasUsageField: top !== undefined && Object.hasOwn(top, "usage"),
+    hasErrorField: top !== undefined && Object.hasOwn(top, "error"),
+    hasControlField: top !== undefined && Object.hasOwn(top, "control"),
+    unknownTopLevelKeys,
+    unknownChoiceKeys,
+    unknownPayloadKeys,
+    unknownKeysFingerprint
+  });
+}
+
+function recordAcceptedSseEvent(
+  event: string,
+  audit: MutableLlmRequestAudit
+): void {
+  const raw = parseSseEventData(event);
+  const structure = describeSseStructure(raw);
+  const category = acceptedShapeCategory(event, raw, structure);
+  const fingerprint = safeAuditFingerprint({
+    dataFieldCount: sseDataFields(event).length,
+    topLevelKeys: isRecordForAudit(raw) ? safeShapeKeys(raw) : [],
+    choiceKeys: acceptedChoiceKeys(raw),
+    payloadKeys: acceptedPayloadKeys(raw),
+    structure
+  });
+  const key = `${category}:${fingerprint}`;
+  const existing = audit.acceptedEventShapeCounts.get(key);
+  if (existing === undefined) {
+    audit.acceptedEventShapeCounts.set(key, {
+      category,
+      shapeFingerprint: fingerprint,
+      count: 1
+    });
+  } else {
+    existing.count += 1;
+  }
+}
+
+function acceptedShapeAudit(
+  audit: MutableLlmRequestAudit
+): readonly LlmSseAcceptedShapeAudit[] {
+  return Object.freeze(
+    [...audit.acceptedEventShapeCounts.values()]
+      .sort((left, right) =>
+        left.category.localeCompare(right.category) ||
+        left.shapeFingerprint.localeCompare(right.shapeFingerprint)
+      )
+      .map((entry) => Object.freeze({ ...entry }))
+  );
+}
+
+function acceptedShapeCategory(
+  event: string,
+  raw: unknown,
+  structure: LlmSseStructuralAudit
+): LlmSseAcceptedShapeCategory {
+  if (sseDataFields(event).join("\n") === "[DONE]") return "done";
+  if (structure.hasUsageField && structure.choicesLength === "0") return "usage";
+  const payload = acceptedPayloadRecord(raw);
+  const content = fieldType(payload, "content") === "string";
+  const reasoning =
+    fieldType(payload, "reasoning_content") === "string" ||
+    fieldType(payload, "reasoning") === "string";
+  if (content && reasoning) return "content_reasoning";
+  if (content) return "content";
+  if (reasoning) return "reasoning";
+  if (fieldType(payload, "role") !== "missing") return "role";
+  if (structure.finishReasonClass !== "missing") return "finish";
+  return "metadata";
+}
+
+function acceptedChoiceRecord(raw: unknown): Record<string, unknown> | undefined {
+  if (!isRecordForAudit(raw) || !Array.isArray(raw.choices)) return undefined;
+  return isRecordForAudit(raw.choices[0]) ? raw.choices[0] : undefined;
+}
+
+function acceptedPayloadRecord(raw: unknown): Record<string, unknown> | undefined {
+  const choice = acceptedChoiceRecord(raw);
+  if (choice === undefined) return undefined;
+  const payload = choice.delta ?? choice.message;
+  return isRecordForAudit(payload) ? payload : undefined;
+}
+
+function acceptedChoiceKeys(raw: unknown): readonly string[] {
+  const choice = acceptedChoiceRecord(raw);
+  return choice === undefined ? [] : safeShapeKeys(choice);
+}
+
+function acceptedPayloadKeys(raw: unknown): readonly string[] {
+  const payload = acceptedPayloadRecord(raw);
+  return payload === undefined ? [] : safeShapeKeys(payload);
+}
+
+function payloadFieldTypes(
+  record: Record<string, unknown> | undefined
+): LlmSsePayloadFieldTypeAudit {
+  return Object.freeze({
+    content: fieldType(record, "content"),
+    reasoningContent: fieldType(record, "reasoning_content"),
+    reasoning: fieldType(record, "reasoning"),
+    role: fieldType(record, "role"),
+    functionCall: fieldType(record, "function_call"),
+    refusal: fieldType(record, "refusal"),
+    toolCalls: fieldType(record, "tool_calls")
+  });
+}
+
+function classifyFinishReason(
+  field: { readonly present: boolean; readonly value: unknown }
+): LlmSseFinishReasonClass {
+  if (!field.present) return "missing";
+  if (field.value === null) return "null";
+  if (field.value === "stop") return "stop";
+  if (field.value === "length") return "length";
+  if (field.value === "content_filter") return "content_filter";
+  return typeof field.value === "string" ? "unknown_string" : "non_string";
+}
+
+function fieldValue(
+  record: Record<string, unknown> | undefined,
+  key: string
+): { readonly present: boolean; readonly value: unknown } {
+  return record !== undefined && Object.hasOwn(record, key)
+    ? { present: true, value: record[key] }
+    : { present: false, value: undefined };
+}
+
+function fieldType(
+  record: Record<string, unknown> | undefined,
+  key: string
+): LlmSafeJsonType {
+  const field = fieldValue(record, key);
+  return safeJsonType(field.value, field.present);
+}
+
+function safeJsonType(value: unknown, present = true): LlmSafeJsonType {
+  if (!present) return "missing";
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  if (typeof value === "string") return "string";
+  if (typeof value === "number") return "number";
+  if (typeof value === "boolean") return "boolean";
+  if (typeof value === "object") return "object";
+  return "other";
+}
+
+function isRecordForAudit(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function unknownShapeKeys(
+  record: Record<string, unknown> | undefined,
+  known: ReadonlySet<string>
+): readonly string[] {
+  return Object.freeze(
+    record === undefined
+      ? []
+      : safeShapeKeys(record).filter((key) => !known.has(key))
+  );
+}
+
+function safeAuditFingerprint(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function safeValueHash(value: string): string {
+  return createHash("sha256")
+    .update("fermata-sse-unknown-finish-v1\0")
+    .update(value)
+    .digest("hex");
 }
 
 function parseSseEventData(event: string): unknown {

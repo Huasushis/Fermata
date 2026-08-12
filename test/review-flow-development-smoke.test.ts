@@ -55,6 +55,7 @@ function safeFailure(
     streamChunkCount: 0,
     usageEventCount: 0,
     usageTotalTokens: null,
+    acceptedEventShapes: [],
     firstRejectedEvent: null,
     formatFailureStage: null,
     formatFailureSubstage: null
@@ -159,7 +160,8 @@ function completeSlot(
       firstValidOutputMs: Math.min(1_000, endToEndMs),
       endToEndMs,
       validOutputEventCount: 2,
-      outputUtf8Bytes: 100
+      outputUtf8Bytes: 100,
+      acceptedEventShapes: []
     });
   }
   run.markSlotComplete(anonymousSlot);
@@ -313,7 +315,8 @@ describe("development smoke profile", () => {
       firstValidOutputMs: 1_000,
       endToEndMs: 2_000,
       validOutputEventCount: 2,
-      outputUtf8Bytes: 100
+      outputUtf8Bytes: 100,
+      acceptedEventShapes: []
     };
     first.recordRequestCompleted(stageA, timing);
     const restored = controller();
@@ -459,7 +462,8 @@ describe("development smoke profile", () => {
       firstValidOutputMs: 1,
       endToEndMs: 2,
       validOutputEventCount: 1,
-      outputUtf8Bytes: 1
+      outputUtf8Bytes: 1,
+      acceptedEventShapes: []
     });
     resetRun.recordFailure("connect");
     expect(resetRun.checkpoint().stopped).toBe(false);

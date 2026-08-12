@@ -106,11 +106,89 @@ const privateManifestSchema = z.object({
   bindings: z.array(privateBindingSchema).length(6)
 }).strict();
 
+const safeJsonTypeSchema = z.enum([
+  "missing",
+  "null",
+  "string",
+  "number",
+  "boolean",
+  "array",
+  "object",
+  "other"
+]);
+const safeShapeKeySchema = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/u);
+const safePayloadFieldTypesSchema = z.object({
+  content: safeJsonTypeSchema,
+  reasoningContent: safeJsonTypeSchema,
+  reasoning: safeJsonTypeSchema,
+  role: safeJsonTypeSchema,
+  functionCall: safeJsonTypeSchema,
+  refusal: safeJsonTypeSchema,
+  toolCalls: safeJsonTypeSchema
+}).strict();
+const safeSseStructureSchema = z.object({
+  fieldTypes: z.object({
+    choices: safeJsonTypeSchema,
+    created: safeJsonTypeSchema,
+    id: safeJsonTypeSchema,
+    model: safeJsonTypeSchema,
+    object: safeJsonTypeSchema,
+    serviceTier: safeJsonTypeSchema,
+    systemFingerprint: safeJsonTypeSchema,
+    usage: safeJsonTypeSchema,
+    error: safeJsonTypeSchema,
+    control: safeJsonTypeSchema,
+    choice: safeJsonTypeSchema,
+    delta: safeJsonTypeSchema,
+    message: safeJsonTypeSchema,
+    finishReason: safeJsonTypeSchema,
+    index: safeJsonTypeSchema,
+    logprobs: safeJsonTypeSchema,
+    deltaFields: safePayloadFieldTypesSchema,
+    messageFields: safePayloadFieldTypesSchema
+  }).strict(),
+  choicesLength: z.enum(["0", "1", "many"]).nullable(),
+  payloadSource: z.enum(["delta", "message", "both", "neither"]),
+  finishReasonClass: z.enum([
+    "missing",
+    "null",
+    "stop",
+    "length",
+    "content_filter",
+    "unknown_string",
+    "non_string"
+  ]),
+  finishReasonIsNull: z.boolean(),
+  finishReasonUnknownStringHash: digestSchema.nullable(),
+  hasUsageField: z.boolean(),
+  hasErrorField: z.boolean(),
+  hasControlField: z.boolean(),
+  unknownTopLevelKeys: z.array(safeShapeKeySchema).max(32),
+  unknownChoiceKeys: z.array(safeShapeKeySchema).max(32),
+  unknownPayloadKeys: z.array(safeShapeKeySchema).max(32),
+  unknownKeysFingerprint: digestSchema
+}).strict();
+const acceptedEventShapeSchema = z.object({
+  category: z.enum([
+    "done",
+    "usage",
+    "content",
+    "reasoning",
+    "content_reasoning",
+    "role",
+    "finish",
+    "metadata"
+  ]),
+  shapeFingerprint: digestSchema,
+  count: z.number().int().positive()
+}).strict();
+
 const safeTimingSchema = z.object({
   firstValidOutputMs: z.number().int().nonnegative(),
   endToEndMs: z.number().int().nonnegative(),
   validOutputEventCount: z.number().int().positive(),
-  outputUtf8Bytes: z.number().int().positive()
+  outputUtf8Bytes: z.number().int().positive(),
+  acceptedEventShapes: z.array(acceptedEventShapeSchema).max(64).readonly()
 }).strict().superRefine((value, context) => {
   if (value.endToEndMs < value.firstValidOutputMs) {
     context.addIssue({ code: "custom", message: "invalid timing order" });
@@ -192,14 +270,15 @@ const safeRequestFailureSchema = z.object({
   streamChunkCount: z.number().int().nonnegative(),
   usageEventCount: z.number().int().nonnegative(),
   usageTotalTokens: z.number().int().nonnegative().nullable(),
+  acceptedEventShapes: z.array(acceptedEventShapeSchema).max(64).readonly(),
   firstRejectedEvent: z.object({
     eventOrdinal: z.number().int().positive(),
     completedEventCount: z.number().int().nonnegative(),
     dataFieldCount: z.number().int().nonnegative(),
     eventUtf8Bytes: z.number().int().nonnegative(),
-    topLevelKeys: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/u)).max(32),
-    choiceKeys: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/u)).max(32),
-    deltaKeys: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/u)).max(32),
+    topLevelKeys: z.array(safeShapeKeySchema).max(32),
+    choiceKeys: z.array(safeShapeKeySchema).max(32),
+    deltaKeys: z.array(safeShapeKeySchema).max(32),
     shape: z.enum([
       "json_invalid",
       "non_object",
@@ -210,6 +289,7 @@ const safeRequestFailureSchema = z.object({
       "delta_field_type",
       "finish_reason_type_or_unknown"
     ]),
+    structure: safeSseStructureSchema,
     shapeFingerprint: digestSchema
   }).strict().nullable(),
   formatFailureStage: z.enum([

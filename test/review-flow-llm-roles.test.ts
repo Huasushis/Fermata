@@ -546,6 +546,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
             eofVerified: true,
             responseMode: "json",
             finishReasonStopVerified: true,
+            acceptedEventShapes: [],
             sseDoneObserved: null
           }, {
             schemaVersion: 2,
@@ -553,6 +554,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
             eofVerified: true,
             responseMode: "json",
             finishReasonStopVerified: true,
+            acceptedEventShapes: [],
             sseDoneObserved: null
           }, {
             schemaVersion: 2,
@@ -560,6 +562,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
             eofVerified: true,
             responseMode: "json",
             finishReasonStopVerified: true,
+            acceptedEventShapes: [],
             sseDoneObserved: null
           }]
         });
@@ -576,6 +579,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
             eofVerified: true,
             responseMode: "json",
             finishReasonStopVerified: true,
+            acceptedEventShapes: [],
             sseDoneObserved: null
           }, {
             schemaVersion: 2,
@@ -583,6 +587,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
             eofVerified: true,
             responseMode: "json",
             finishReasonStopVerified: true,
+            acceptedEventShapes: [],
             sseDoneObserved: null
           }]
         });
@@ -599,6 +604,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
             eofVerified: true,
             responseMode: "json",
             finishReasonStopVerified: true,
+            acceptedEventShapes: [],
             sseDoneObserved: null
           }]
         });

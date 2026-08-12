@@ -786,6 +786,7 @@ describe("32 案例 × 11 角色 = 352 收据封存契约", () => {
         transportAttemptCount: attemptCount,
         eofVerified: true as const,
         finishReasonStopVerified: true as const,
+        acceptedEventShapes: [],
         sseDoneObserved: index % 2 === 0 ? true as const : null
       };
       return {
@@ -802,6 +803,7 @@ describe("32 案例 × 11 角色 = 352 收据封存契约", () => {
             eofVerified: true,
             responseMode: response.responseMode,
             finishReasonStopVerified: response.finishReasonStopVerified,
+            acceptedEventShapes: response.acceptedEventShapes,
             sseDoneObserved: response.sseDoneObserved
           }]
         }),
@@ -2734,6 +2736,7 @@ function projection(
       transportAttemptCount: 1,
       eofVerified: true as const,
       finishReasonStopVerified: true as const,
+      acceptedEventShapes: [],
       sseDoneObserved: index % 2 === 0 ? true as const : null
     };
     return {

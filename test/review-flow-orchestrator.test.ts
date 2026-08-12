@@ -214,6 +214,7 @@ const trustedReceipt = {
     eofVerified: true,
     responseMode: "json",
     finishReasonStopVerified: true,
+    acceptedEventShapes: [],
     sseDoneObserved: null
   }]
 } as const;
@@ -230,6 +231,7 @@ const trustedSolverReceipt = {
     eofVerified: true,
     responseMode: "json",
     finishReasonStopVerified: true,
+    acceptedEventShapes: [],
     sseDoneObserved: null
   }, {
     schemaVersion: 2,
@@ -237,6 +239,7 @@ const trustedSolverReceipt = {
     eofVerified: true,
     responseMode: "json",
     finishReasonStopVerified: true,
+    acceptedEventShapes: [],
     sseDoneObserved: null
   }, {
     schemaVersion: 2,
@@ -244,6 +247,7 @@ const trustedSolverReceipt = {
     eofVerified: true,
     responseMode: "json",
     finishReasonStopVerified: true,
+    acceptedEventShapes: [],
     sseDoneObserved: null
   }]
 } as const;
@@ -260,6 +264,7 @@ const trustedTwoRoundReceipt = {
     eofVerified: true,
     responseMode: "json",
     finishReasonStopVerified: true,
+    acceptedEventShapes: [],
     sseDoneObserved: null
   }, {
     schemaVersion: 2,
@@ -267,6 +272,7 @@ const trustedTwoRoundReceipt = {
     eofVerified: true,
     responseMode: "json",
     finishReasonStopVerified: true,
+    acceptedEventShapes: [],
     sseDoneObserved: null
   }]
 } as const;

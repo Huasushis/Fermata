@@ -47,6 +47,21 @@ export const reviewFlowExecutionContextSchema = reviewFlowAssignmentContextSchem
   .strict();
 export type ReviewFlowExecutionContext = z.infer<typeof reviewFlowExecutionContextSchema>;
 
+export const roleAcceptedEventShapeSchema = z.object({
+  category: z.enum([
+    "done",
+    "usage",
+    "content",
+    "reasoning",
+    "content_reasoning",
+    "role",
+    "finish",
+    "metadata"
+  ]),
+  shapeFingerprint: digestSchema,
+  count: z.number().int().positive()
+}).strict();
+
 const roleTransportReceiptSchema = z
   .object({
     schemaVersion: z.literal(2),
@@ -54,6 +69,7 @@ const roleTransportReceiptSchema = z
     eofVerified: z.literal(true),
     responseMode: z.enum(["sse", "json"]),
     finishReasonStopVerified: z.literal(true),
+    acceptedEventShapes: z.array(roleAcceptedEventShapeSchema).max(64).readonly(),
     sseDoneObserved: z.boolean().nullable()
   })
   .strict()

@@ -218,6 +218,42 @@ function validOfflineTransport(
   });
 }
 
+function validOfflineSseTransport() {
+  return vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as {
+      readonly response_format?: {
+        readonly json_schema?: { readonly name?: string };
+      };
+    };
+    const stage = body.response_format?.json_schema?.name
+      ?.match(/_([abcd])_v1$/u)?.[1]?.toUpperCase();
+    if (stage !== "A" && stage !== "B" && stage !== "C" && stage !== "D") {
+      throw new Error("SYNTHETIC_STAGE_INVALID");
+    }
+    return new Response([
+      ": heartbeat",
+      "",
+      `data: ${JSON.stringify({
+        choices: [],
+        usage: { total_tokens: 7 }
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        choices: [{ delta: { content: validStageOutput(stage) } }]
+      })}`,
+      "",
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      "",
+      "data: [DONE]",
+      "",
+      ""
+    ].join("\n"), {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    });
+  });
+}
+
 async function completeSyntheticPhase0(root: string) {
   const transport = validOfflineTransport();
   const preflight = {
@@ -295,6 +331,131 @@ describe("development smoke private checkpoint", () => {
         request.failureDetail?.code === "LLM_NETWORK_FAILED" &&
         request.failureDetail.transportAttemptCount === 1
     )).toBe(true);
+  });
+
+  it("persists accepted SSE shape aggregates through strict private checkpoints", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fermata-smoke-sse-shapes-"));
+    temporaryRoots.push(root);
+    chmodSync(root, 0o700);
+    const transport = validOfflineSseTransport();
+    const preflight = {
+      ...fixturePreflight(root),
+      models: offlineModels(transport)
+    };
+
+    const result = await executeDevelopmentSmokePhase0({ preflight });
+    const checkpoint = JSON.parse(readFileSync(
+      checkpointPaths(preflight, result.runId).at(-1)!,
+      "utf8"
+    )) as {
+      readonly requests: readonly {
+        readonly timing?: {
+          readonly acceptedEventShapes?: readonly {
+            readonly category: string;
+            readonly shapeFingerprint: string;
+            readonly count: number;
+          }[];
+        };
+      }[];
+    };
+
+    expect(result).toMatchObject({ state: "phase0_complete", requestCount: 8 });
+    expect(transport).toHaveBeenCalledTimes(8);
+    expect(checkpoint.requests).toHaveLength(8);
+    for (const request of checkpoint.requests) {
+      expect(request.timing?.acceptedEventShapes?.map(({ category, count }) => ({
+        category,
+        count
+      }))).toEqual([
+        { category: "content", count: 1 },
+        { category: "done", count: 1 },
+        { category: "finish", count: 1 },
+        { category: "metadata", count: 1 },
+        { category: "usage", count: 1 }
+      ]);
+      for (const shape of request.timing?.acceptedEventShapes ?? []) {
+        expect(shape.shapeFingerprint).toMatch(/^[a-f0-9]{64}$/u);
+      }
+    }
+  });
+
+  it("persists rejected SSE structure without field values and never retries it", async () => {
+    const privateSentinel = "SYNTHETIC_PRIVATE_CHECKPOINT_VALUE";
+    const root = mkdtempSync(join(tmpdir(), "fermata-smoke-sse-rejected-"));
+    temporaryRoots.push(root);
+    chmodSync(root, 0o700);
+    const transport = vi.fn(async () => new Response([
+      ": heartbeat",
+      "",
+      'data: {"choices":[],"usage":{"total_tokens":7}}',
+      "",
+      `data: ${JSON.stringify({
+        id: privateSentinel,
+        control: { private: privateSentinel },
+        future_top: { private: privateSentinel },
+        choices: [{
+          delta: {
+            content: 17,
+            future_payload: privateSentinel
+          },
+          finish_reason: "stop",
+          future_choice: privateSentinel
+        }]
+      })}`,
+      "",
+      ""
+    ].join("\n"), {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    }));
+    const preflight = {
+      ...fixturePreflight(root),
+      models: offlineModels(transport)
+    };
+
+    const result = await executeDevelopmentSmokePhase0({ preflight });
+    const checkpointBytes = readFileSync(
+      checkpointPaths(preflight, result.runId).at(-1)!,
+      "utf8"
+    );
+    const checkpoint = JSON.parse(checkpointBytes) as {
+      readonly requests: readonly {
+        readonly failureDetail?: {
+          readonly acceptedEventShapes?: readonly unknown[];
+          readonly firstRejectedEvent?: {
+            readonly structure?: Record<string, unknown>;
+          };
+        };
+      }[];
+    };
+    const failed = checkpoint.requests.filter(
+      (request) => request.failureDetail !== undefined
+    );
+
+    expect(result.state).toBe("incomplete");
+    expect(transport).toHaveBeenCalledTimes(checkpoint.requests.length);
+    expect(failed.length).toBeGreaterThan(0);
+    for (const request of failed) {
+      expect(request.failureDetail).toMatchObject({
+        acceptedEventShapes: [
+          { category: "metadata", count: 1 },
+          { category: "usage", count: 1 }
+        ],
+        firstRejectedEvent: {
+          shape: "delta_field_type",
+          structure: {
+            choicesLength: "1",
+            payloadSource: "delta",
+            finishReasonClass: "stop",
+            hasControlField: true,
+            unknownTopLevelKeys: ["future_top"],
+            unknownChoiceKeys: ["future_choice"],
+            unknownPayloadKeys: ["future_payload"]
+          }
+        }
+      });
+    }
+    expect(checkpointBytes).not.toContain(privateSentinel);
   });
 
   it("keeps the primary HTTP failure when soft-stop masks another case", async () => {
