@@ -354,6 +354,17 @@ function trustedTaskSource() {
   }, { duplicateSimilarityRejectThreshold: 0.9 });
 }
 
+function extractEmbeddedJsonPayload(text: string): unknown {
+  const firstBrace = text.indexOf("{");
+  const lastBrace = text.lastIndexOf("}");
+  if (firstBrace === -1 || lastBrace <= firstBrace) return undefined;
+  try {
+    return JSON.parse(text.slice(firstBrace, lastBrace + 1)) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
 function syntheticRoleFetch(): PipelineModelConfig["runtime"]["fetch"] {
   return vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
     const request = JSON.parse(String(init?.body)) as {
@@ -466,6 +477,11 @@ function syntheticRoleFetch(): PipelineModelConfig["runtime"]["fetch"] {
         }],
         rationale: "合成比赛适配。"
       };
+    } else if (system.includes("只把该结论转换为严格 JSON")) {
+      // 格式化轮：把语义结论（用户消息里嵌套的 JSON 文本）原样转成 JSON，
+      // 使证据引用与数值保持语义轮一致，避免业务校验误判。
+      const embedded = extractEmbeddedJsonPayload(String(userMessage?.content ?? ""));
+      payload = embedded ?? {};
     } else if (system.includes("原创性证据分析者")) {
       const evidence = user.duplicateEvidence as readonly {
         readonly evidenceId: string;
@@ -561,9 +577,13 @@ describe("冻结证据多角色审题编排", () => {
       requestStartGate: new LlmRequestStartGate()
     });
 
+    if (outcome.status !== "complete") {
+      throw new Error(
+        `expected complete: ${JSON.stringify(outcome.failure?.failedRoles ?? null)}`
+      );
+    }
     expect(outcome.status).toBe("complete");
-    if (outcome.status !== "complete") throw new Error("expected complete");
-    expect(fetchImpl).toHaveBeenCalledTimes(14);
+    expect(fetchImpl).toHaveBeenCalledTimes(16);
     expect(outcome.projection).toMatchObject({
       schemaVersion: 2,
       verdict: "approve",
@@ -774,10 +794,13 @@ describe("冻结证据多角色审题编排", () => {
     if (outcome.status !== "incomplete") throw new Error("expected incomplete");
     expect(outcome.failure.failedRoles.map((entry) => entry.role)).toEqual([
       "difficulty",
+      "contest_fit",
+      "originality",
       "tags"
     ]);
-    // difficulty 首错后闸门关闭：已发出的兄弟请求仍收束，但 tags 的格式化轮是
-    // 闸门关闭后的新逻辑请求，被 LLM_REQUEST_START_BLOCKED 拒绝并归类为 cancelled。
+    // difficulty 首错后闸门关闭：已发出的兄弟请求仍收束，但两轮角色
+    // （contest_fit/originality/tags）的格式化轮是闸门关闭后的新逻辑请求，
+    // 被 LLM_REQUEST_START_BLOCKED 拒绝并归类为 cancelled；单轮兄弟角色则完整收束。
     expect(fetchImpl).toHaveBeenCalledTimes(10);
   });
 
@@ -908,7 +931,9 @@ describe("冻结证据多角色审题编排", () => {
       expect(artifact.sourceSnapshotHash).toBe(first.sourceSnapshotHash);
       const expectedReceipt = artifact === artifacts(first).solver
         ? trustedSolverReceipt
-        : artifact === artifacts(first).tags
+        : artifact === artifacts(first).tags ||
+            artifact === artifacts(first).contestFit ||
+            artifact === artifacts(first).originality
           ? trustedTwoRoundReceipt
           : trustedReceipt;
       expect(artifact.execution).toEqual({

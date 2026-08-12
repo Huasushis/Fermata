@@ -231,18 +231,30 @@ export function createReviewFlowLlmBundle(input: {
       editorialPayloadSchema,
       1_000_000
     ),
-    contestFit: async (view) => runJsonRole(
-      models.contest_fit,
-      buildContestFitMessages(view),
-      contestFitPayloadSchema,
-      1_000_000
-    ),
-    originality: async (view) => runJsonRole(
-      models.originality,
-      buildOriginalityMessages(view),
-      originalityPayloadSchema,
-      1_000_000
-    ),
+    contestFit: async (view) => {
+      const { data, receipt } = await chatCompleteTwoRoundJsonWithReceipt(
+        models.contest_fit.credentials,
+        models.contest_fit.spec,
+        buildContestFitSemanticMessages(view),
+        buildContestFitFormatterMessages,
+        contestFitPayloadSchema,
+        models.contest_fit.runtime,
+        { maxOutputTokens: 1_000_000 }
+      );
+      return trustedRoleExecution(data, receipt);
+    },
+    originality: async (view) => {
+      const { data, receipt } = await chatCompleteTwoRoundJsonWithReceipt(
+        models.originality.credentials,
+        models.originality.spec,
+        buildOriginalitySemanticMessages(view),
+        buildOriginalityFormatterMessages,
+        originalityPayloadSchema,
+        models.originality.runtime,
+        { maxOutputTokens: 1_000_000 }
+      );
+      return trustedRoleExecution(data, receipt);
+    },
     tags: async (view) => {
       const { data, receipt } = await chatCompleteTwoRoundJsonWithReceipt(
         models.tags.credentials,
@@ -643,7 +655,7 @@ export function buildEditorialJudgeMessages(
   ];
 }
 
-export function buildContestFitMessages(
+export function buildContestFitSemanticMessages(
   view: Parameters<ReviewFlowRoles["contestFit"]>[0]
 ): ChatMessage[] {
   return [
@@ -655,17 +667,42 @@ export function buildContestFitMessages(
         "专门题位。没有完整题组上下文时必须降低 roleConfidence，不能编造其它题。\n\n",
         "难度在历史通过和否决意见中都很常见，所以‘太难/太易’本身不是结论。要说明难度与题组角色、实现量、",
         "公平性和比赛风格怎样共同作用。正确但风格不合可以否决；有小技术问题但核心优秀通常应考虑退修。\n\n",
-        "implementationBurden 使用 1–5，1 表示实现负担低、5 表示高。输出严格 JSON：icpcFit、",
-        "implementationBurden、thinkingImplementationBalance、knowledgeFairness、",
-        "problemsetRole、roleConfidence、evidenceCoverage、evidence、rationale。evidenceCoverage 必须明确两种",
-        "方向是否找到证据；未找到时写 none_found，不能静默遗漏或凭空补证据。"
+        "implementationBurden 使用 1–5，1 表示实现负担低、5 表示高。请用自然语言完整陈述你的判断结论，",
+        "覆盖 icpcFit、implementationBurden、thinkingImplementationBalance、knowledgeFairness、",
+        "problemsetRole、roleConfidence 以及 evidenceCoverage（必须明确两种方向的证据是否存在；未找到时写",
+        "none_found，不能静默遗漏或凭空补证据）与证据引用。不要输出 JSON。"
       ].join(""))
     },
     { role: "user", content: privateContext(compactEditorialView(view)) }
   ];
 }
 
-export function buildOriginalityMessages(
+export function buildContestFitFormatterMessages(
+  semanticOutput: string,
+  semanticReasoning: string | null
+): ChatMessage[] {
+  return [
+    {
+      role: "system",
+      content: guardedSystemPrompt("contest_fit", [
+        "上一条消息是审稿人对题目的自然语言结论。你只把该结论转换为严格 JSON，不添加、不修改、不删除任何",
+        "判断，不引入语义输出中没有的事实。JSON 字段：icpcFit、implementationBurden、",
+        "thinkingImplementationBalance、knowledgeFairness、problemsetRole、roleConfidence、",
+        "evidenceCoverage、evidence、rationale。evidence 只包含语义结论中真正引用过的证据；不确定就省略。" 
+      ].join(""))
+    },
+    {
+      role: "user",
+      content: [
+        "语义判断（若有推理过程也一并参考，但以结论文字为准）：",
+        semanticOutput,
+        semanticReasoning === null ? "" : `\n推理过程（仅供理解，不写入 JSON）：\n${semanticReasoning}`
+      ].join("\n")
+    }
+  ];
+}
+
+export function buildOriginalitySemanticMessages(
   view: Parameters<ReviewFlowRoles["originality"]>[0]
 ): ChatMessage[] {
   return [
@@ -673,13 +710,38 @@ export function buildOriginalityMessages(
       role: "system",
       content: guardedSystemPrompt("originality", [
         "你是原创性证据分析者。只依据题面和给定查重证据判断；相似度只是检索信号，不能把主题、常用算法或",
-        "相似叙事直接当成同一道题。只有核心任务、关键结构和解法实质一致时才可 sameProblemAsExisting=true。\n\n",
+        "相似叙事直接当成同一道题。只有核心任务、关键结构和解法实质一致时才可判定与既有题实质相同。\n\n",
         "必须引用输入中真实存在的 evidenceId，不能编造来源。highestSimilarity 必须等于输入证据的实际最大值，",
         "没有证据时为 0；确认同题时至少引用一条明确建议同题的证据。若证据不足，保持保守并在 rationale 说明。",
-        "输出严格 JSON：originalityLevel、sameProblemAsExisting、highestSimilarity、evidenceIds、rationale。"
+        "请用自然语言完整陈述：原创性等级判断、是否有实质相同既有题、最高相似度数值及其依据、引用的",
+        "evidenceId 与理由。不要输出 JSON。"
       ].join(""))
     },
     { role: "user", content: privateContext(view) }
+  ];
+}
+
+export function buildOriginalityFormatterMessages(
+  semanticOutput: string,
+  semanticReasoning: string | null
+): ChatMessage[] {
+  return [
+    {
+      role: "system",
+      content: guardedSystemPrompt("originality", [
+        "上一条消息是原创性分析者用自然语言给出的结论。你只把该结论转换为严格 JSON，不添加、不修改任何",
+        "判断，不引入语义输出中没有的事实。JSON 字段：originalityLevel、sameProblemAsExisting、",
+        "highestSimilarity、evidenceIds、rationale。evidenceIds 只包含语义结论中真正引用过的证据。"
+      ].join(""))
+    },
+    {
+      role: "user",
+      content: [
+        "语义结论（若有推理过程也一并参考，但以结论文字为准）：",
+        semanticOutput,
+        semanticReasoning === null ? "" : `\n推理过程（仅供理解，不写入 JSON）：\n${semanticReasoning}`
+      ].join("\n")
+    }
   ];
 }
 
@@ -817,8 +879,8 @@ function promptImplementationDigest(role: ReviewFlowRole): string {
     technical_auditor: buildTechnicalAuditorMessages as (...args: never[]) => ChatMessage[],
     difficulty: buildDifficultyMessages as (...args: never[]) => ChatMessage[],
     editorial_judge: buildEditorialJudgeMessages as (...args: never[]) => ChatMessage[],
-    contest_fit: buildContestFitMessages as (...args: never[]) => ChatMessage[],
-    originality: buildOriginalityMessages as (...args: never[]) => ChatMessage[],
+    contest_fit: buildContestFitSemanticMessages as (...args: never[]) => ChatMessage[],
+    originality: buildOriginalitySemanticMessages as (...args: never[]) => ChatMessage[],
     tags: buildTagsSemanticMessages as (...args: never[]) => ChatMessage[],
     critic: buildCriticMessages as (...args: never[]) => ChatMessage[],
     adversary: buildAdversaryMessages as (...args: never[]) => ChatMessage[],
@@ -833,6 +895,12 @@ function promptImplementationDigest(role: ReviewFlowRole): string {
   const tagsFormatterSource = role === "tags"
     ? buildTagsFormatterMessages.toString()
     : null;
+  const contestFitFormatterSource = role === "contest_fit"
+    ? buildContestFitFormatterMessages.toString()
+    : null;
+  const originalityFormatterSource = role === "originality"
+    ? buildOriginalityFormatterMessages.toString()
+    : null;
   return hashCanonicalValue({
     builderSource: builders[role].toString(),
     guardSource: guardedSystemPrompt.toString(),
@@ -843,7 +911,9 @@ function promptImplementationDigest(role: ReviewFlowRole): string {
       : null,
     solverFormatterSource,
     solverSynthesisSource,
-    tagsFormatterSource
+    tagsFormatterSource,
+    contestFitFormatterSource,
+    originalityFormatterSource
   });
 }
 

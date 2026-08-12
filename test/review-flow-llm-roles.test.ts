@@ -9,11 +9,13 @@ import {
 import {
   buildAdjudicatorMessages,
   buildAdversaryMessages,
-  buildContestFitMessages,
+  buildContestFitFormatterMessages,
+  buildContestFitSemanticMessages,
   buildCriticMessages,
   buildDifficultyMessages,
   buildEditorialJudgeMessages,
-  buildOriginalityMessages,
+  buildOriginalityFormatterMessages,
+  buildOriginalitySemanticMessages,
   buildRoleIdentities,
   buildSolutionAnalystMessages,
   buildSolverMessages,
@@ -359,7 +361,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
   it("命题品味与 ICPC 适配分别覆盖历史通过/否决的实际区分轴", () => {
     const { editorial, contestFit } = flowViews();
     const editorialSystem = buildEditorialJudgeMessages(editorial)[0]!.content;
-    const contestSystem = buildContestFitMessages(contestFit)[0]!.content;
+    const contestSystem = buildContestFitSemanticMessages(contestFit)[0]!.content;
     for (const dimension of ["新意", "洞察深度", "自然", "参赛体验"]) {
       expect(editorialSystem).toContain(dimension);
     }
@@ -380,8 +382,8 @@ describe("历史人工标准驱动的多角色提示词", () => {
       buildTechnicalAuditorMessages,
       buildDifficultyMessages,
       buildEditorialJudgeMessages,
-      buildContestFitMessages,
-      buildOriginalityMessages,
+      buildContestFitSemanticMessages,
+      buildOriginalitySemanticMessages,
       buildTagsSemanticMessages,
       buildCriticMessages,
       buildAdversaryMessages,
@@ -524,7 +526,8 @@ describe("历史人工标准驱动的多角色提示词", () => {
     const completedRoles: ReviewFlowRole[] = [];
     for (const role of reviewFlowRoleSchema.options) {
       const requestIndex = observedRequests.length;
-      const expectedRequests = role === "solver" ? 3 : role === "tags" ? 2 : 1;
+      const expectedRequests =
+        role === "solver" ? 3 : role === "tags" || role === "contest_fit" || role === "originality" ? 2 : 1;
       const result = trustedRoleExecutionResultSchema.parse(await invocations[role]());
       expect(observedRequests).toHaveLength(requestIndex + expectedRequests);
       for (let i = 0; i < expectedRequests; i++) {
@@ -560,7 +563,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
             sseDoneObserved: null
           }]
         });
-      } else if (role === "tags") {
+      } else if (role === "tags" || role === "contest_fit" || role === "originality") {
         expect(result.receipt).toEqual({
           schemaVersion: 2,
           requestCount: 2,
@@ -603,7 +606,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
       completedRoles.push(role);
     }
 
-    expect(fetchImpl).toHaveBeenCalledTimes(reviewFlowRoleSchema.options.length + 3);
+    expect(fetchImpl).toHaveBeenCalledTimes(reviewFlowRoleSchema.options.length + 5);
     expect(completedRoles).toEqual(reviewFlowRoleSchema.options);
     expect(new Set(observedRequests.map((request) => request.role))).toEqual(
       new Set(reviewFlowRoleSchema.options)
@@ -785,7 +788,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
     for (const role of reviewFlowRoleSchema.options) {
       await invocations[role]();
     }
-    expect(fetchImpl).toHaveBeenCalledTimes(reviewFlowRoleSchema.options.length + 3);
+    expect(fetchImpl).toHaveBeenCalledTimes(reviewFlowRoleSchema.options.length + 5);
     for (const role of reviewFlowRoleSchema.options) {
       expect(observedMaxTokens[`cap-test-${role}`]).toBe(1_000_000);
     }
