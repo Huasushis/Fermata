@@ -147,6 +147,11 @@ export interface LlmRuntimeOptions {
   readonly fetch?: FetchLike;
   /** 任务已经丢失或被明确拒绝时，由上层用它停止仍在运行的付费请求。 */
   readonly signal?: AbortSignal;
+  /**
+   * 有效 content/reasoning 事件的安全活动通知。回调不接收响应正文；仅供
+   * development smoke 在进程内测首个有效输出与事件速率。
+   */
+  readonly onSafeOutputActivity?: () => void;
 }
 
 /**
@@ -1316,6 +1321,7 @@ async function requestWithRetry(
         const parsed = await parseResponseBody(response, controller, {
           onValidOutput: () => {
             watchdog.receivedValidOutput();
+            runtime.onSafeOutputActivity?.();
           },
           onInvalidResponseDrainStarted: (
             formatFailureStage,

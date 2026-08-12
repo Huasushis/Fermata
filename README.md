@@ -926,9 +926,10 @@ npm run experiment:calibrate-levels:detached -- \
 原生 `thinking=max` 与强制 schema，A-D 保持自然语义请求，全题末尾最多增加 1 次统一 formatter；
 formatter 只接收 A-D 已有输出并逐字段转写，不得重判。统一 schema 是唯一来源，严格声明
 required/type/enum/nullability/items，并在每层 object 使用 `additionalProperties=false`；
-运行时复验并把 schema 指纹写入 receipt。输出预算固定 A 32k、B 8k、C 24k、D 12k、
-formatter 8k；通用 transport 显式上限为 32k，默认最终保护 30 分钟，不恢复 120 秒短总时限，
-也不使用 1M token/4 小时作为常态。
+运行时复验并把 schema 指纹写入 receipt。每次请求的输出上限分别为 A 32k、B 8k、C 24k、
+D 12k、formatter 8k；A-D 每题合计 76k，若需要 formatter 则每题合计最多 84k。通用 transport
+显式单请求上限为 32k。development smoke 不对健康流设置总墙钟硬杀：首个有效输出前使用
+30 分钟最终保护；首个有效输出后只执行 10 分钟无进度保护，并持续读取到服务端 EOF。
 
 所有模型档位共用一个请求级调度器：全局并发默认 12，可显式配置 16；20 必须同时登记已接受的
 并发探针。按样本轮转且 work-conserving，不存在三个档位上限相加。每个逻辑请求最多 3 attempts，
@@ -939,6 +940,22 @@ formatter 8k；通用 transport 显式上限为 32k，默认最终保护 30 分�
 这些代码与合成测试只证明离线协议行为，不证明模型判断准确。双轴报告分别输出 verdict 的预测/人工
 class counts、confusion、false accept/reject，以及只对冻结 CF 参考计算的难度 MAE 和分层覆盖；
 完整性未通过时 metrics 必须为空。
+
+development smoke 使用固定 `development-smoke-6x4-v1` profile，只验证管道，不进入最终
+`>=32` 题冻结校准集，也不报告准确率提升。输入只能是 `slot-01` 至 `slot-06` 六个匿名槽位：
+低/中/高各 2、人工 pass/reject 各 3、既往 output-limit/schema 各至少 1，且六槽都必须同时绑定
+难度和结论两条人工真值。安全 manifest 只含类别计数、双轴真值存在性和绑定 SHA-256，不含题目
+ID、题面或答案。该 profile 禁止原题集、Codeforces 和 Web 请求；唯一可联网目标是当前配置的
+Aether DeepSeek 服务。
+
+同一次 run/checkpoint 先同时放行两个槽位，初始 A/B 最多 4 请求；15 分钟 checkpoint 后，只有
+phase0 无 output-limit、schema、final failure，且以 phase0 的每逻辑请求首字节/输出速率/端到端
+实测值预测六槽 P90 不超过 3 小时，才一次放行其余四槽。60 分钟重估，180 分钟无条件关闭新阶段。
+旧“31 分钟 P50”的安全元数据不能证明它是每逻辑请求还是每题，因此登记为 `UNKNOWN`，不得用它
+先验放行六槽。phase0 与 phase1 共用一次预算：每逻辑请求最多 1 attempt、每题最多 5、整题重跑
+为 0、总逻辑请求和外部 attempt 都最多 30、全局并发 12；任何字段缺失或放大都在 fetch 前拒绝。
+所有错误类别均零重试。soft stop 只关闭尚未开始的请求，不中止已在流式进行的付费请求；因此请求
+数量有严格上界，但在途自然排空的墙钟上界未知，报告只能给基于实测值的 ETA 区间。
 
 Candidate B 的协议验证使用
 `npm run experiment:probe-difficulty-thinking`。这个入口只依次检查一个人工合成的短题和三个与

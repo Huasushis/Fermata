@@ -14,7 +14,11 @@ import {
   type FourCallRequest,
   type FourCallResponse
 } from "./four-call";
-import { FairLlmRequestScheduler, LlmStageRequestError } from "../llm-scheduler";
+import {
+  FairLlmRequestScheduler,
+  LlmStageRequestError,
+  type LlmStageFailureKind
+} from "../llm-scheduler";
 import { hashCanonicalValue } from "./evidence";
 import type { ReviewFlowModelConfigs } from "./llm-roles";
 
@@ -25,6 +29,26 @@ export interface FourCallRuntimeModels {
   readonly D: PipelineModelConfig;
   readonly formatter: PipelineModelConfig;
 }
+export interface FourCallSafeRequestTiming {
+  readonly firstValidOutputMs: number;
+  readonly endToEndMs: number;
+  readonly validOutputEventCount: number;
+  readonly outputUtf8Bytes: number;
+}
+
+export interface FourCallRequestLifecycle {
+  /** 在任何可能计费的 fetch 前同步执行；抛错即 fail closed。 */
+  readonly beforeRequest: (request: FourCallRequest) => void;
+  readonly requestCompleted: (
+    request: FourCallRequest,
+    timing: FourCallSafeRequestTiming
+  ) => void;
+  readonly requestFailed: (
+    request: FourCallRequest,
+    failureKind: LlmStageFailureKind
+  ) => void;
+}
+
 
 export function fourCallRuntimeModelsFromLegacySlots(
   models: ReviewFlowModelConfigs
@@ -50,6 +74,7 @@ export async function runProductionFourCallReviewDag(input: {
   readonly nativeSchemaCompatible: boolean;
   readonly scheduler: FairLlmRequestScheduler;
   readonly reusableStages?: Parameters<typeof runFourCallReviewDag>[0]["reusableStages"];
+  readonly lifecycle?: FourCallRequestLifecycle;
 }): Promise<FourCallDagResult> {
   const bindings: FourCallModelBindings = Object.freeze({
     A: modelBinding(input.models.A),
@@ -66,7 +91,14 @@ export async function runProductionFourCallReviewDag(input: {
     nativeSchemaCompatible: input.nativeSchemaCompatible,
     scheduler: input.scheduler,
     reusableStages: input.reusableStages,
-    call: async (request) => executeProductionCall(request, input.models[request.stage])
+    call: async (request) => {
+      input.lifecycle?.beforeRequest(request);
+      return executeProductionCall(
+        request,
+        input.models[request.stage],
+        input.lifecycle
+      );
+    }
   });
 }
 
@@ -82,9 +114,13 @@ export function createFourCallScheduler(input: {
 
 async function executeProductionCall(
   request: FourCallRequest,
-  config: PipelineModelConfig
+  config: PipelineModelConfig,
+  lifecycle?: FourCallRequestLifecycle
 ): Promise<FourCallResponse> {
   assertRequestMatchesConfig(request.model, config);
+  const startedAt = Date.now();
+  let firstValidOutputMs: number | null = null;
+  let validOutputEventCount = 0;
   let completion: ChatCompletionWithReceipt;
   try {
     completion = await chatCompleteWithReceipt(
@@ -94,7 +130,12 @@ async function executeProductionCall(
       {
         ...config.runtime,
         // 逐阶段逻辑重试由 FairLlmRequestScheduler 统一计数，传输层不得再暗中重试。
-        maxAttempts: 1
+        maxAttempts: 1,
+        onSafeOutputActivity: () => {
+          config.runtime.onSafeOutputActivity?.();
+          validOutputEventCount += 1;
+          firstValidOutputMs ??= Date.now() - startedAt;
+        }
       },
       {
         maxOutputTokens: request.maxOutputTokens,
@@ -107,8 +148,21 @@ async function executeProductionCall(
       }
     );
   } catch (error) {
-    throw classifyTransportFailure(error);
+    const classified = classifyTransportFailure(error);
+    lifecycle?.requestFailed(request, classified.kind);
+    throw classified;
   }
+  if (firstValidOutputMs === null || validOutputEventCount < 1) {
+    const classified = new LlmStageRequestError("stream_interrupted");
+    lifecycle?.requestFailed(request, classified.kind);
+    throw classified;
+  }
+  lifecycle?.requestCompleted(request, Object.freeze({
+    firstValidOutputMs,
+    endToEndMs: Date.now() - startedAt,
+    validOutputEventCount,
+    outputUtf8Bytes: Buffer.byteLength(completion.content, "utf8")
+  }));
   return {
     output: completion.content,
     eofVerified: completion.receipt.eofVerified

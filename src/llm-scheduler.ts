@@ -42,6 +42,8 @@ export interface LogicalLlmRequestResult<T> {
 
 export interface FairLlmRequestSchedulerSnapshot {
   readonly maximumConcurrency: number;
+  readonly maximumAttemptsPerLogicalRequest: number;
+  readonly maximumAttemptsPerCase: number;
   readonly active: number;
   readonly queued: number;
   readonly peakConcurrency: number;
@@ -178,6 +180,8 @@ export class FairLlmRequestScheduler {
   snapshot(): FairLlmRequestSchedulerSnapshot {
     return Object.freeze({
       maximumConcurrency: this.maximumConcurrency,
+      maximumAttemptsPerLogicalRequest: this.maximumAttemptsPerLogicalRequest,
+      maximumAttemptsPerCase: this.maximumAttemptsPerCase,
       active: this.active,
       queued: this.queued,
       peakConcurrency: this.peakConcurrency,
