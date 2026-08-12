@@ -30,9 +30,30 @@ import {
   type FourCallRequest,
   type ReviewFlowDagStage
 } from "../src/review-flow/four-call";
+import type { FourCallSafeRequestFailure } from "../src/review-flow/four-call-runtime";
 import { hashCanonicalValue } from "../src/review-flow/evidence";
 
 const digest = (character: string): string => character.repeat(64);
+
+function safeFailure(
+  kind: LlmStageFailureKind
+): FourCallSafeRequestFailure {
+  return {
+    kind,
+    code: "unknown",
+    httpStatus: null,
+    requestCount: 0,
+    transportAttemptCount: 0,
+    completedResponseCount: 0,
+    terminalResponseMode: null,
+    terminalEofObserved: false,
+    terminalFinishReasonStopObserved: false,
+    terminalSseDoneObserved: null,
+    jsonSchemaValidated: null,
+    formatFailureStage: null,
+    formatFailureSubstage: null
+  };
+}
 const runBindingHash = digest("f");
 const stages = ["A", "B", "C", "D", "formatter"] as const;
 const expectedModels: Readonly<Record<ReviewFlowDagStage, string>> = {
@@ -447,13 +468,13 @@ describe("development smoke profile", () => {
     const firstSystemRun = controller();
     firstSystemRun.lifecycle().requestFailed(
       request("slot-01", "A"),
-      "connect"
+      safeFailure("connect")
     );
     expect(firstSystemRun.checkpoint().stopped).toBe(false);
     const finalRun = controller();
     finalRun.lifecycle().requestFailed(
       request("slot-01", "A"),
-      "permanent"
+      safeFailure("permanent")
     );
     expect(finalRun.checkpoint().stopReason).toBe("final_failure");
   });

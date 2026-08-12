@@ -1,9 +1,15 @@
 import type { PipelineModelConfig } from "../pipelines/types";
 import {
   chatCompleteWithReceipt,
+  getLlmFailureAudit,
+  LlmJsonOutputError,
   LlmRequestError,
+  LlmResponseBodyTooLargeError,
+  LlmResponseFormatError,
   type ChatMessage,
-  type ChatCompletionWithReceipt
+  type ChatCompletionWithReceipt,
+  type LlmResponseFormatFailureStage,
+  type LlmResponseFormatFailureSubstage
 } from "../llm";
 import {
   runFourCallReviewDag,
@@ -35,6 +41,27 @@ export interface FourCallSafeRequestTiming {
   readonly validOutputEventCount: number;
   readonly outputUtf8Bytes: number;
 }
+export interface FourCallSafeRequestFailure {
+  readonly kind: LlmStageFailureKind;
+  readonly code:
+    | LlmRequestError["code"]
+    | "LLM_RESPONSE_BODY_TOO_LARGE"
+    | "LLM_RESPONSE_FORMAT_INVALID"
+    | "LLM_JSON_OUTPUT_INVALID"
+    | "unknown";
+  readonly httpStatus: number | null;
+  readonly requestCount: 0 | 1 | 2 | 3 | 4;
+  readonly transportAttemptCount: number;
+  readonly completedResponseCount: number;
+  readonly terminalResponseMode: "sse" | "json" | null;
+  readonly terminalEofObserved: boolean;
+  readonly terminalFinishReasonStopObserved: boolean;
+  readonly terminalSseDoneObserved: boolean | null;
+  readonly jsonSchemaValidated: false | null;
+  readonly formatFailureStage: LlmResponseFormatFailureStage | null;
+  readonly formatFailureSubstage: LlmResponseFormatFailureSubstage | null;
+}
+
 
 export interface FourCallRequestLifecycle {
   /** 在任何可能计费的 fetch 前同步执行；抛错即 fail closed。 */
@@ -45,7 +72,7 @@ export interface FourCallRequestLifecycle {
   ) => void;
   readonly requestFailed: (
     request: FourCallRequest,
-    failureKind: LlmStageFailureKind
+    failure: FourCallSafeRequestFailure
   ) => void;
 }
 
@@ -153,12 +180,18 @@ async function executeProductionCall(
     );
   } catch (error) {
     const classified = classifyTransportFailure(error);
-    lifecycle?.requestFailed(request, classified.kind);
+    lifecycle?.requestFailed(
+      request,
+      safeRequestFailure(error, classified.kind)
+    );
     throw classified;
   }
   if (firstValidOutputMs === null || validOutputEventCount < 1) {
     const classified = new LlmStageRequestError("stream_interrupted");
-    lifecycle?.requestFailed(request, classified.kind);
+    lifecycle?.requestFailed(
+      request,
+      safeRequestFailure(classified, classified.kind)
+    );
     throw classified;
   }
   lifecycle?.requestCompleted(request, Object.freeze({
@@ -213,6 +246,7 @@ export function classifyTransportFailure(error: unknown): LlmStageRequestError {
   if (error.code === "LLM_HTTP_ERROR") {
     if (error.status === 429) {
       return new LlmStageRequestError("rate_limited", {
+
         retryAfterMs: error.retryAfterMs,
         cause: error
       });
@@ -230,4 +264,37 @@ export function classifyTransportFailure(error: unknown): LlmStageRequestError {
     LLM_OUTPUT_LENGTH_LIMIT: "output_limit"
   };
   return new LlmStageRequestError(byCode[error.code] ?? "permanent", { cause: error });
+}
+function safeRequestFailure(
+  error: unknown,
+  kind: LlmStageFailureKind
+): FourCallSafeRequestFailure {
+  const audit = getLlmFailureAudit(error);
+  const recognized = error instanceof LlmRequestError ||
+    error instanceof LlmResponseBodyTooLargeError ||
+    error instanceof LlmResponseFormatError ||
+    error instanceof LlmJsonOutputError;
+  const hasFormatFailure = error instanceof LlmRequestError ||
+    error instanceof LlmResponseBodyTooLargeError ||
+    error instanceof LlmResponseFormatError;
+  return Object.freeze({
+    kind,
+    code: recognized ? error.code : "unknown",
+    httpStatus: audit?.terminal.status ?? null,
+    requestCount: audit?.requestCount ?? 0,
+    transportAttemptCount: audit?.transportAttemptCount ?? 0,
+    completedResponseCount: audit?.completedResponses.length ?? 0,
+    terminalResponseMode: audit?.terminal.responseMode ?? null,
+    terminalEofObserved: audit?.terminal.eofObserved ?? false,
+    terminalFinishReasonStopObserved:
+      audit?.terminal.finishReasonStopObserved ?? false,
+    terminalSseDoneObserved: audit?.terminal.sseDoneObserved ?? null,
+    jsonSchemaValidated: audit?.jsonSchemaValidated ?? null,
+    formatFailureStage: hasFormatFailure
+      ? error.formatFailureStage ?? null
+      : null,
+    formatFailureSubstage: hasFormatFailure
+      ? error.formatFailureSubstage ?? null
+      : null
+  });
 }

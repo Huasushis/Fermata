@@ -198,6 +198,80 @@ describe("development smoke private checkpoint", () => {
         request.receipt.schemaFingerprint?.length === 64 &&
         request.failureKind === "connect"
     )).toBe(true);
+    expect(checkpoint.requests.every(
+      (request: { failureDetail?: { code?: string; transportAttemptCount?: number } }) =>
+        request.failureDetail?.code === "LLM_NETWORK_FAILED" &&
+        request.failureDetail.transportAttemptCount === 1
+    )).toBe(true);
+  });
+
+  it("keeps the primary HTTP failure when soft-stop masks another case", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fermata-smoke-primary-failure-"));
+    temporaryRoots.push(root);
+    chmodSync(root, 0o700);
+    let stageACalls = 0;
+    const transport = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as {
+        readonly response_format?: {
+          readonly json_schema?: { readonly name?: string };
+        };
+      };
+      const stage = body.response_format?.json_schema?.name
+        ?.match(/_([abcd])_v1$/u)?.[1]?.toUpperCase();
+      if (stage === "A" && ++stageACalls === 2) {
+        return new Response(null, { status: 400 });
+      }
+      return new Response(JSON.stringify({
+        choices: [{
+          message: { role: "assistant", content: "{}" },
+          finish_reason: "stop"
+        }]
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    const preflight = {
+      ...fixturePreflight(root),
+      models: offlineModels(transport)
+    };
+
+    const result = await executeDevelopmentSmokePhase0({ preflight });
+    const runDirectory = resolve(
+      preflight.privateRuntimeRoot,
+      `run-${result.runId}`
+    );
+    const checkpointNames = readdirSync(runDirectory)
+      .filter((name) => name.startsWith("checkpoint-"))
+      .sort();
+    const checkpoint = JSON.parse(readFileSync(
+      resolve(runDirectory, checkpointNames.at(-1)!),
+      "utf8"
+    ));
+    const failedRequests = checkpoint.requests.filter(
+      (request: { failureKind?: string }) => request.failureKind !== undefined
+    );
+
+    expect(result).toMatchObject({ state: "incomplete", requestCount: 4 });
+    expect(transport).toHaveBeenCalledTimes(4);
+    expect(checkpoint.failureCode).toBe("permanent");
+    expect(checkpoint.phase1Released).toBe(false);
+    expect(failedRequests).toHaveLength(1);
+    expect(failedRequests[0].failureDetail).toMatchObject({
+      kind: "permanent",
+      code: "LLM_HTTP_ERROR",
+      httpStatus: 400,
+      requestCount: 1,
+      transportAttemptCount: 1,
+      completedResponseCount: 0,
+      terminalResponseMode: null,
+      terminalEofObserved: false,
+      terminalFinishReasonStopObserved: false,
+      terminalSseDoneObserved: null,
+      jsonSchemaValidated: null,
+      formatFailureStage: null,
+      formatFailureSubstage: null
+    });
   });
 
   it("writes an owner-only immutable hash chain and never persists source text", async () => {

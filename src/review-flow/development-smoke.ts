@@ -23,6 +23,7 @@ import {
   runProductionFourCallReviewDag,
   type FourCallRequestLifecycle,
   type FourCallRuntimeModels,
+  type FourCallSafeRequestFailure,
   type FourCallSafeRequestTiming
 } from "./four-call-runtime";
 
@@ -358,7 +359,7 @@ export class DevelopmentSmokeRunController {
   readonly #safeFailureSink: (
     slot: DevelopmentSmokeAnonymousSlot,
     stage: ReviewFlowDagStage,
-    failureKind: LlmStageFailureKind
+    failure: FourCallSafeRequestFailure
   ) => void;
   readonly #authorized = new Map<string, DevelopmentSmokeSafeRequestReceipt>();
   readonly #completed = new Map<string, FourCallSafeRequestTiming>();
@@ -384,7 +385,7 @@ export class DevelopmentSmokeRunController {
     readonly safeFailureSink?: (
       slot: DevelopmentSmokeAnonymousSlot,
       stage: ReviewFlowDagStage,
-      failureKind: LlmStageFailureKind
+      failure: FourCallSafeRequestFailure
     ) => void;
     readonly startedAtMs: number;
     readonly clock?: () => number;
@@ -425,14 +426,14 @@ export class DevelopmentSmokeRunController {
       },
       requestFailed: (
         request: FourCallRequest,
-        failureKind: LlmStageFailureKind
+        failure: FourCallSafeRequestFailure
       ) => {
         this.#safeFailureSink(
           anonymousSlotSchema.parse(request.caseId),
           request.stage,
-          failureKind
+          failure
         );
-        this.recordFailure(failureKind);
+        this.recordFailure(failure.kind);
       }
     });
   }

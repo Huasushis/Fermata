@@ -148,6 +148,73 @@ const stageReceiptSchema = z.object({
   outputHash: digestSchema,
   receiptHash: digestSchema
 }).strict();
+const stageFailureKindSchema = z.enum([
+  "rate_limited",
+  "server_error",
+  "connect",
+  "first_byte_timeout",
+  "no_progress_timeout",
+  "stream_interrupted",
+  "output_limit",
+  "schema_invalid",
+  "permanent"
+]);
+const safeRequestFailureSchema = z.object({
+  kind: stageFailureKindSchema,
+  code: z.enum([
+    "LLM_HTTP_ERROR",
+    "LLM_NETWORK_FAILED",
+    "LLM_FIRST_OUTPUT_TIMEOUT",
+    "LLM_OUTPUT_IDLE_TIMEOUT",
+    "LLM_TOTAL_TIMEOUT",
+    "LLM_STREAM_INTERRUPTED",
+    "LLM_CANCELLED",
+    "LLM_REQUEST_START_BLOCKED",
+    "LLM_OUTPUT_LENGTH_LIMIT",
+    "LLM_OUTPUT_CONTENT_FILTERED",
+    "LLM_RESPONSE_BODY_TOO_LARGE",
+    "LLM_RESPONSE_FORMAT_INVALID",
+    "LLM_JSON_OUTPUT_INVALID",
+    "unknown"
+  ]),
+  httpStatus: z.number().int().min(100).max(599).nullable(),
+  requestCount: z.number().int().min(0).max(4),
+  transportAttemptCount: z.number().int().nonnegative(),
+  completedResponseCount: z.number().int().nonnegative(),
+  terminalResponseMode: z.enum(["sse", "json"]).nullable(),
+  terminalEofObserved: z.boolean(),
+  terminalFinishReasonStopObserved: z.boolean(),
+  terminalSseDoneObserved: z.boolean().nullable(),
+  jsonSchemaValidated: z.literal(false).nullable(),
+  formatFailureStage: z.enum([
+    "missing_body",
+    "content_type",
+    "json_utf8",
+    "json_parse",
+    "response_shape",
+    "sse_utf8",
+    "event_json",
+    "event_shape",
+    "delta_shape",
+    "finish_shape",
+    "trailing_data"
+  ]).nullable(),
+  formatFailureSubstage: z.enum([
+    "duplicate_done",
+    "data_after_done",
+    "data_after_done_usage_metadata_only",
+    "data_after_done_benign_controls_only",
+    "data_after_done_json_syntax_invalid",
+    "data_after_done_json_non_object",
+    "data_after_done_error_object",
+    "data_after_done_unknown_object_or_scan_limit",
+    "data_after_done_choices_present",
+    "data_after_done_content_or_tool_present",
+    "data_after_done_other_or_unclassifiable",
+    "data_after_done_tail_incomplete",
+    "choice_after_stop"
+  ]).nullable()
+}).strict();
 const completedStageSchema = z.object({
   output: z.string().min(1),
   receipt: stageReceiptSchema
@@ -156,23 +223,20 @@ const requestLedgerSchema = z.object({
   receipt: safeReceiptSchema,
   timing: safeTimingSchema.optional(),
   completedStage: completedStageSchema.optional(),
-  failureKind: z.enum([
-    "rate_limited",
-    "server_error",
-    "connect",
-    "first_byte_timeout",
-    "no_progress_timeout",
-    "stream_interrupted",
-    "output_limit",
-    "schema_invalid",
-    "permanent"
-  ]).optional()
+  failureKind: stageFailureKindSchema.optional(),
+  failureDetail: safeRequestFailureSchema.optional()
 }).strict().superRefine((value, context) => {
   if (
     value.completedStage !== undefined &&
     (value.timing === undefined || value.failureKind !== undefined)
   ) {
     context.addIssue({ code: "custom", message: "completed stage state invalid" });
+  }
+  if (
+    value.failureDetail !== undefined &&
+    value.failureDetail.kind !== value.failureKind
+  ) {
+    context.addIssue({ code: "custom", message: "failure detail mismatch" });
   }
   if (value.completedStage?.receipt.stage !== undefined &&
       value.completedStage.receipt.stage !== value.receipt.stage) {
@@ -387,13 +451,18 @@ export async function executeDevelopmentSmokePhase0(input: {
           )
         }));
       },
-      safeFailureSink: (slot, stage, failureKind) => {
+      safeFailureSink: (slot, stage, failure) => {
+        const failureDetail = safeRequestFailureSchema.parse(failure);
         ledger.mutate((state) => ({
           ...state,
           requests: state.requests.map((request) =>
             request.receipt.anonymousSlot === slot &&
             request.receipt.stage === stage
-              ? { ...request, failureKind }
+              ? {
+                  ...request,
+                  failureKind: failureDetail.kind,
+                  failureDetail
+                }
               : request
           )
         }));
@@ -437,7 +506,12 @@ export async function executeDevelopmentSmokePhase0(input: {
           }));
         }
       });
-      const rejectedOutcome = outcomes.find((outcome) => outcome.status === "rejected");
+      const rejectedOutcomes = outcomes.filter(
+        (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected"
+      );
+      const rejectedOutcome = rejectedOutcomes.find(
+        (outcome) => safeFailureCode(outcome.reason) !== "final_failure"
+      ) ?? rejectedOutcomes[0];
       const rejected = rejectedOutcome !== undefined;
       const forecast = rejected ? null : controller.phase0Forecast(controller.elapsedMs());
       ledger.mutate((state) => ({
