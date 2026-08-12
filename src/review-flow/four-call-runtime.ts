@@ -74,6 +74,9 @@ export async function runProductionFourCallReviewDag(input: {
   readonly nativeSchemaCompatible: boolean;
   readonly scheduler: FairLlmRequestScheduler;
   readonly reusableStages?: Parameters<typeof runFourCallReviewDag>[0]["reusableStages"];
+  readonly onStageCompleted?: Parameters<
+    typeof runFourCallReviewDag
+  >[0]["onStageCompleted"];
   readonly lifecycle?: FourCallRequestLifecycle;
 }): Promise<FourCallDagResult> {
   const bindings: FourCallModelBindings = Object.freeze({
@@ -91,6 +94,7 @@ export async function runProductionFourCallReviewDag(input: {
     nativeSchemaCompatible: input.nativeSchemaCompatible,
     scheduler: input.scheduler,
     reusableStages: input.reusableStages,
+    onStageCompleted: input.onStageCompleted,
     call: async (request) => {
       input.lifecycle?.beforeRequest(request);
       return executeProductionCall(

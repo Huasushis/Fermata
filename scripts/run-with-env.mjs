@@ -20,11 +20,19 @@ import { readProtectedEnvFile } from "./private-runtime.mjs";
 
 const usage =
   "用法：node scripts/run-with-env.mjs <env文件> <命令> [参数...]\n" +
-  "      node scripts/run-with-env.mjs --review-flow-evaluation <env文件> [评测参数...]\n";
+  "      node scripts/run-with-env.mjs --review-flow-evaluation <env文件> [评测参数...]\n" +
+  "      node scripts/run-with-env.mjs --development-smoke <env文件> [--preflight|--network-phase0 [--resume=<runId>]]\n";
 
 export const reviewFlowEvaluationModeFlag = "--review-flow-evaluation";
+export const developmentSmokeModeFlag = "--development-smoke";
 export const reviewFlowEvaluationBootstrapPath = fileURLToPath(
   new URL("./review-flow-evaluation-bootstrap.mjs", import.meta.url)
+);
+export const developmentSmokeEntrypointPath = fileURLToPath(
+  new URL("../experiments/run-development-smoke.ts", import.meta.url)
+);
+export const developmentSmokeTsxPath = fileURLToPath(
+  new URL("../node_modules/tsx/dist/cli.mjs", import.meta.url)
 );
 const forwardedSignals = Object.freeze(["SIGINT", "SIGTERM", "SIGHUP"]);
 
@@ -108,6 +116,11 @@ const allowedReviewFlowEvaluationFileEnvironmentKeys = [
   "EVAL_CODE_VERSION",
   "EVAL_CONCURRENCY"
 ];
+const allowedDevelopmentSmokeFileEnvironmentKeys = [
+  "AETHER_API_KEY",
+  "AETHER_BASE_URL"
+];
+
 
 /**
  * review-flow CLI 可用它对自己的最终进程环境做同一套白名单检查。标记和空值
@@ -229,6 +242,52 @@ export function buildReviewFlowEvaluationRunEnvironment(
     NODE_V8_COVERAGE: ""
   };
 }
+export function buildDevelopmentSmokeRunEnvironment(
+  envFileContent,
+  parentEnvironment
+) {
+  assertSafeNodeEnvironment(parentEnvironment);
+  const fileEnvironment = parseEnvFile(envFileContent);
+  assertSafeNodeEnvironment(fileEnvironment);
+  assertNoUnknownPrefixedEnvironmentKeys(
+    parentEnvironment,
+    [
+      ...allowedDevelopmentSmokeFileEnvironmentKeys,
+      ...allowedProxyEnvironmentKeys,
+      ...allowedBasicEnvironmentKeys
+    ],
+    protectedRunEnvironmentPrefixes
+  );
+  assertNoUnknownPrefixedEnvironmentKeys(
+    fileEnvironment,
+    allowedDevelopmentSmokeFileEnvironmentKeys,
+    [""]
+  );
+  for (const requiredKey of allowedDevelopmentSmokeFileEnvironmentKeys) {
+    if (!Object.hasOwn(fileEnvironment, requiredKey)) {
+      throw new Error("DEVELOPMENT_SMOKE_ENV_FILE_INCOMPLETE");
+    }
+  }
+  return {
+    ...selectEnvironment(parentEnvironment, [
+      ...allowedProxyEnvironmentKeys,
+      ...allowedBasicEnvironmentKeys
+    ]),
+    ...selectEnvironment(
+      fileEnvironment,
+      allowedDevelopmentSmokeFileEnvironmentKeys
+    ),
+    FERMATA_RUN_WITH_ENV: "1",
+    NODE_DEBUG: "",
+    NODE_DEBUG_NATIVE: "",
+    NODE_DISABLE_COMPILE_CACHE: "1",
+    NODE_OPTIONS: "",
+    NODE_PATH: "",
+    NODE_REDIRECT_WARNINGS: "",
+    NODE_V8_COVERAGE: ""
+  };
+}
+
 
 export function createRunWithEnvSignalController() {
   let child;
@@ -304,13 +363,18 @@ export function runWithEnv(
   if (signalController?.closed === true) return undefined;
   const dedicatedReviewFlowEvaluation =
     argv[0] === reviewFlowEvaluationModeFlag;
-  const effectiveArguments = dedicatedReviewFlowEvaluation
-    ? argv.slice(1)
-    : argv;
+  const dedicatedDevelopmentSmoke =
+    argv[0] === developmentSmokeModeFlag;
+  const effectiveArguments =
+    dedicatedReviewFlowEvaluation || dedicatedDevelopmentSmoke
+      ? argv.slice(1)
+      : argv;
   const [envPath, ...remainingArguments] = effectiveArguments;
   if (
     envPath === undefined ||
-    (!dedicatedReviewFlowEvaluation && remainingArguments.length === 0) ||
+    (!dedicatedReviewFlowEvaluation &&
+      !dedicatedDevelopmentSmoke &&
+      remainingArguments.length === 0) ||
     !isAbsolute(envPath)
   ) {
     throw new Error("RUN_WITH_ENV_INVALID_ARGUMENTS");
@@ -323,12 +387,24 @@ export function runWithEnv(
         envFileContent,
         parentEnvironment
       )
-    : buildRunEnvironment(envFileContent, parentEnvironment);
-  // 付费 review-flow 模式不能经 PATH 解析 npm/tsx 或接受任意命令。包装器固定
-  // 使用当前已启动的 Node 加载纯内置模块 bootstrap；其余参数都只是评测参数。
+    : dedicatedDevelopmentSmoke
+      ? buildDevelopmentSmokeRunEnvironment(
+          envFileContent,
+          parentEnvironment
+        )
+      : buildRunEnvironment(envFileContent, parentEnvironment);
+  // 付费 review-flow/development-smoke 模式不能经 PATH 解析 npm/tsx 或接受任意命令。
+  // 包装器固定使用当前 Node 和仓库内绝对入口；其余参数只能是对应入口的参数。
   const command = dedicatedReviewFlowEvaluation
     ? [process.execPath, reviewFlowEvaluationBootstrapPath, ...remainingArguments]
-    : remainingArguments;
+    : dedicatedDevelopmentSmoke
+      ? [
+          process.execPath,
+          developmentSmokeTsxPath,
+          developmentSmokeEntrypointPath,
+          ...remainingArguments
+        ]
+      : remainingArguments;
   if (signalController?.closed === true) return undefined;
   const child = spawnRunCommand(command, childEnvironment, spawnProcess);
   signalController?.attach(child);

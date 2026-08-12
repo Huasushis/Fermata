@@ -7,9 +7,12 @@ import {
 } from "../scripts/env-file.mjs";
 import {
   buildReviewFlowEvaluationRunEnvironment,
+  buildDevelopmentSmokeRunEnvironment,
   buildRunEnvironment,
   createRunWithEnvSignalController,
   formatRunWithEnvFailure,
+  developmentSmokeEntrypointPath,
+  developmentSmokeTsxPath,
   reviewFlowEvaluationBootstrapPath,
   runWithEnv,
   spawnRunCommand
@@ -393,6 +396,86 @@ describe("run-with-env 的受控环境与同步启动异常", () => {
       reviewFlowEvaluationBootstrapPath,
       "command",
       "argument"
+    ]);
+  });
+
+  it("development-smoke 模式只透传 Aether、代理和基本环境", () => {
+    const environment = buildDevelopmentSmokeRunEnvironment(
+      "AETHER_BASE_URL=https://model.example/v1\n" +
+        "AETHER_API_KEY=private-value\n",
+      {
+        PATH: "/safe/bin",
+        HTTP_PROXY: "http://127.0.0.1:10808",
+        RANDOM_PARENT_VALUE: "must-not-pass"
+      }
+    );
+    expect(environment).toMatchObject({
+      PATH: "/safe/bin",
+      HTTP_PROXY: "http://127.0.0.1:10808",
+      AETHER_BASE_URL: "https://model.example/v1",
+      AETHER_API_KEY: "private-value",
+      FERMATA_RUN_WITH_ENV: "1"
+    });
+    expect(environment.RANDOM_PARENT_VALUE).toBeUndefined();
+    expect(environment.URMOTIV_ROBOT_TOKEN).toBeUndefined();
+    expect(environment.CODEFORCES_SECRET).toBeUndefined();
+    expect(environment.EVAL_CODE_VERSION).toBeUndefined();
+  });
+
+  it("development-smoke 文件缺项或多出项目变量时固定拒绝", () => {
+    expect(() => buildDevelopmentSmokeRunEnvironment(
+      "AETHER_BASE_URL=https://model.example/v1\n",
+      { PATH: "/safe/bin", AETHER_API_KEY: "parent-must-not-fill" }
+    )).toThrow("DEVELOPMENT_SMOKE_ENV_FILE_INCOMPLETE");
+    for (const content of [
+      "AETHER_BASE_URL=https://model.example/v1\n" +
+        "AETHER_API_KEY=value\nURMOTIV_ROBOT_TOKEN=never\n",
+      "AETHER_BASE_URL=https://model.example/v1\n" +
+        "AETHER_API_KEY=value\nEVAL_CONCURRENCY=2\n",
+      "AETHER_BASE_URL=https://model.example/v1\n" +
+        "AETHER_API_KEY=value\nFERMATA_RUN_WITH_ENV=1\n"
+    ]) {
+      expect(() => buildDevelopmentSmokeRunEnvironment(
+        content,
+        { PATH: "/safe/bin" }
+      )).toThrow("UNKNOWN_PROTECTED_ENVIRONMENT_KEY");
+    }
+  });
+
+  it("development-smoke 显式模式只启动仓库内固定 CLI", () => {
+    let receivedEnvironment;
+    let receivedCommand;
+    let receivedArguments;
+    const child = { once() {} };
+    expect(runWithEnv(
+      [
+        "--development-smoke",
+        "/project/private/smoke.env",
+        "--preflight"
+      ],
+      {
+        parentEnvironment: { PATH: "/safe/bin" },
+        readEnvFile: () =>
+          "AETHER_BASE_URL=https://model.example/v1\n" +
+          "AETHER_API_KEY=private-value\n",
+        spawnProcess: (command, arguments_, options) => {
+          receivedCommand = command;
+          receivedArguments = arguments_;
+          receivedEnvironment = options.env;
+          return child;
+        }
+      }
+    )).toBe(child);
+    expect(receivedEnvironment).toMatchObject({
+      AETHER_BASE_URL: "https://model.example/v1",
+      AETHER_API_KEY: "private-value",
+      FERMATA_RUN_WITH_ENV: "1"
+    });
+    expect(receivedCommand).toBe(process.execPath);
+    expect(receivedArguments).toEqual([
+      developmentSmokeTsxPath,
+      developmentSmokeEntrypointPath,
+      "--preflight"
     ]);
   });
 

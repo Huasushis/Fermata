@@ -942,20 +942,37 @@ class counts、confusion、false accept/reject，以及只对冻结 CF 参考计
 完整性未通过时 metrics 必须为空。
 
 development smoke 使用固定 `development-smoke-6x4-v1` profile，只验证管道，不进入最终
-`>=32` 题冻结校准集，也不报告准确率提升。输入只能是 `slot-01` 至 `slot-06` 六个匿名槽位：
-低/中/高各 2、人工 pass/reject 各 3、既往 output-limit/schema 各至少 1，且六槽都必须同时绑定
-难度和结论两条人工真值。安全 manifest 只含类别计数、双轴真值存在性和绑定 SHA-256，不含题目
-ID、题面或答案。该 profile 禁止原题集、Codeforces 和 Web 请求；唯一可联网目标是当前配置的
-Aether DeepSeek 服务。
+`>=32` 题冻结校准集，也不报告准确率提升。输入只能是 `slot-01` 至 `slot-06` 六个不可逆匿名槽位：
+低/中/高均有覆盖、人工 pass/reject 各 3、既往 output-limit/schema 各至少 1，且六槽都必须同时绑定
+难度和结论两条冻结人工证据。私有 manifest 只保存绝对本地引用、逐文件 SHA-256、不可逆槽位摘要和
+双轴真值；不复制题面、题解或测试。启动前逐一重算冻结来源、人工结论、人工 CF 难度证据及既往失败
+检查点的绑定。该 profile 禁止原题集、Codeforces 和 Web 请求；唯一可联网目标是当前配置的 Aether
+DeepSeek 服务。
 
-同一次 run/checkpoint 先同时放行两个槽位，初始 A/B 最多 4 请求；15 分钟 checkpoint 后，只有
-phase0 无 output-limit、schema、final failure，且以 phase0 的每逻辑请求首字节/输出速率/端到端
-实测值预测六槽 P90 不超过 3 小时，才一次放行其余四槽。60 分钟重估，180 分钟无条件关闭新阶段。
-旧“31 分钟 P50”的安全元数据不能证明它是每逻辑请求还是每题，因此登记为 `UNKNOWN`，不得用它
-先验放行六槽。phase0 与 phase1 共用一次预算：每逻辑请求最多 1 attempt、每题最多 5、整题重跑
-为 0、总逻辑请求和外部 attempt 都最多 30、全局并发 12；任何字段缺失或放大都在 fetch 前拒绝。
-所有错误类别均零重试。soft stop 只关闭尚未开始的请求，不中止已在流式进行的付费请求；因此请求
-数量有严格上界，但在途自然排空的墙钟上界未知，报告只能给基于实测值的 ETA 区间。
+唯一启动入口是 `scripts/run-with-env.mjs --development-smoke`。env 文件必须且只能含完整
+`AETHER_BASE_URL`/`AETHER_API_KEY`；wrapper 会丢弃其它 provider、评估、原题集、Codeforces 和项目
+凭据。`--preflight` 是默认离线动作，只核对私有文件 owner-only 权限、无符号链接、哈希/证据绑定、
+固定模型映射、当前提交和 tracked worktree，不调用网络。显式 `--network-phase0` 才创建新的随机
+run 并发起两个槽位；`--network-phase0 --resume=<64位runId>` 只恢复同提交、同 profile、同 manifest
+的未完成 run。示例：
+
+```bash
+node scripts/run-with-env.mjs --development-smoke private/development-smoke-6x4-v1/review-flow.env --preflight
+node scripts/run-with-env.mjs --development-smoke private/development-smoke-6x4-v1/review-flow.env --network-phase0
+```
+
+该 launcher 只实现 phase0，没有 phase1 参数或自动放行路径。phase0 先同时放行两个槽位，初始 A/B
+最多 4 请求；15 分钟写入不可变 checkpoint 链，60 分钟只依据已完成请求重估。健康流不设总墙钟
+硬杀；180 分钟只阻止后续阶段，绝不取消已在途付费流。后续四槽必须由用户在读取 phase0 报告后另行
+明确授权，并由后续受控变更新增唯一入口。
+
+每个 run 使用独占 owner-only 锁和只增不改的原子 checkpoint 链。请求授权 receipt 在 fetch 前
+落盘；成功 stage 的原始输出和 sealed receipt 只保存在 Git 忽略私有 checkpoint 中。恢复会重放已
+计费 receipt、跳过已成功 stage，且遇到授权后未形成成功 checkpoint 的不确定 attempt 会固定拒绝，
+不会把预算重置或静默重发。phase0/未来 phase1 共用一次预算：每逻辑请求最多 1 attempt、每题最多
+5、整题重跑为 0、总逻辑请求和外部 attempt 都最多 30、全局并发 12；任何字段缺失或放大都在 fetch
+前拒绝。所有错误类别均零重试。请求数量有严格上界，但在途自然排空的墙钟上界未知；报告只能给基于
+实测值的 ETA 区间。
 
 Candidate B 的协议验证使用
 `npm run experiment:probe-difficulty-thinking`。这个入口只依次检查一个人工合成的短题和三个与

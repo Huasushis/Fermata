@@ -254,6 +254,9 @@ export async function runFourCallReviewDag(input: {
   readonly nativeSchemaCompatible: boolean;
   readonly scheduler: FairLlmRequestScheduler;
   readonly reusableStages?: ReviewFlowCompletedStages;
+  readonly onStageCompleted?: (
+    completed: ReviewFlowCompletedStage
+  ) => void;
   readonly call: (request: FourCallRequest) => Promise<FourCallResponse>;
 }): Promise<FourCallDagResult> {
   assertDigest(input.sourceBinding, "REVIEW_FLOW_SOURCE_BINDING_INVALID");
@@ -334,11 +337,13 @@ export async function runFourCallReviewDag(input: {
         return response.output;
       }
     });
-    return sealCompletedStage({
+    const completed = sealCompletedStage({
       ...expected,
       attemptCount: scheduled.attemptCount,
       output: scheduled.value
     });
+    input.onStageCompleted?.(completed);
+    return completed;
   };
 
   const semanticSchema = (stage: ReviewFlowSemanticStage): MachineJsonSchema | null =>

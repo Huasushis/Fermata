@@ -15,6 +15,7 @@ import {
   developmentSmokeAggregateBudgetReceipt,
   developmentSmokePhaseSlots,
   developmentSmokeProfile,
+  developmentSmokeProfileFingerprint,
   parseDevelopmentSmokeManifest,
   parseDevelopmentSmokeProfile,
   runDevelopmentSmokePhase,
@@ -48,8 +49,8 @@ function manifest(): DevelopmentSmokeManifest {
     profileName: developmentSmokeProfile.name,
     slots: [
       slot("slot-01", "low", "pass", ["schema_invalid"], "1"),
-      slot("slot-02", "low", "reject", [], "2"),
-      slot("slot-03", "middle", "pass", [], "3"),
+      slot("slot-02", "middle", "reject", [], "2"),
+      slot("slot-03", "high", "pass", [], "3"),
       slot("slot-04", "middle", "reject", ["output_limit"], "4"),
       slot("slot-05", "high", "pass", [], "5"),
       slot("slot-06", "high", "reject", [], "6")
@@ -207,7 +208,7 @@ describe("development smoke profile", () => {
     const summary = summarizeDevelopmentSmokeManifest(manifest());
     expect(summary).toMatchObject({
       slotCount: 6,
-      difficultyCounts: { low: 2, middle: 2, high: 2 },
+      difficultyCounts: { low: 1, middle: 2, high: 3 },
       verdictCounts: { pass: 3, reject: 3 },
       priorFailureCounts: { output_limit: 1, schema_invalid: 1 },
       slotsWithBothTruthAxes: 6
@@ -274,6 +275,34 @@ describe("development smoke profile", () => {
       formatterOutputTokenCeiling: 48_000,
       totalOutputTokenCeiling: 504_000
     });
+  });
+
+  it("restores sealed requests without resetting budget or authorizing them twice", () => {
+    const receipts: DevelopmentSmokeSafeRequestReceipt[] = [];
+    const first = controller((receipt) => receipts.push(receipt));
+    const stageA = request("slot-01", "A");
+    first.authorizeRequest(stageA);
+    const timing = {
+      firstValidOutputMs: 1_000,
+      endToEndMs: 2_000,
+      validOutputEventCount: 2,
+      outputUtf8Bytes: 100
+    };
+    first.recordRequestCompleted(stageA, timing);
+    const restored = controller();
+    restored.restoreCompletedRequest(receipts[0]!, timing);
+    expect(restored.checkpoint()).toMatchObject({
+      logicalRequestsUsed: 1,
+      externalAttemptsUsed: 1
+    });
+    expect(() => restored.authorizeRequest(stageA)).toThrow(
+      "DEVELOPMENT_SMOKE_WHOLE_CASE_RETRY_FORBIDDEN"
+    );
+    expect(() => restored.restoreCompletedRequest({
+      ...receipts[0]!,
+      profileFingerprint: developmentSmokeProfileFingerprint,
+      logicalRequestsUsed: 2
+    }, timing)).toThrow("DEVELOPMENT_SMOKE_RESTORED_REQUEST_INVALID");
   });
 
   it("shares one 30-attempt ceiling across phase0 and one-shot phase1", () => {
@@ -393,8 +422,20 @@ describe("development smoke profile", () => {
     const repeatedRun = controller();
     repeatedRun.recordFailure("server_error");
     expect(repeatedRun.checkpoint().stopped).toBe(false);
-    repeatedRun.recordFailure("server_error");
+    repeatedRun.recordFailure("connect");
     expect(repeatedRun.checkpoint().stopReason).toBe("repeated_system_error");
+    const resetRun = controller();
+    resetRun.recordFailure("server_error");
+    const successfulRequest = request("slot-01", "A");
+    resetRun.authorizeRequest(successfulRequest);
+    resetRun.recordRequestCompleted(successfulRequest, {
+      firstValidOutputMs: 1,
+      endToEndMs: 2,
+      validOutputEventCount: 1,
+      outputUtf8Bytes: 1
+    });
+    resetRun.recordFailure("connect");
+    expect(resetRun.checkpoint().stopped).toBe(false);
     const elapsedRun = controller(
       () => undefined,
       developmentSmokeProfile.closeNewStagesAfterMs
@@ -403,8 +444,17 @@ describe("development smoke profile", () => {
       "DEVELOPMENT_SMOKE_NEW_REQUESTS_CLOSED"
     );
     expect(elapsedRun.checkpoint().stopReason).toBe("three_hour_gate");
+    const firstSystemRun = controller();
+    firstSystemRun.lifecycle().requestFailed(
+      request("slot-01", "A"),
+      "connect"
+    );
+    expect(firstSystemRun.checkpoint().stopped).toBe(false);
     const finalRun = controller();
-    finalRun.lifecycle().requestFailed(request("slot-01", "A"), "connect");
+    finalRun.lifecycle().requestFailed(
+      request("slot-01", "A"),
+      "permanent"
+    );
     expect(finalRun.checkpoint().stopReason).toBe("final_failure");
   });
 });

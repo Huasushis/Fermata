@@ -15,6 +15,8 @@ import {
   type FourCallDagResult,
   type FourCallRequest,
   type FourCallReviewSource,
+  type ReviewFlowCompletedStage,
+  type ReviewFlowCompletedStages,
   type ReviewFlowDagStage
 } from "./four-call";
 import {
@@ -272,9 +274,9 @@ export function parseDevelopmentSmokeManifest(
   }
   const summary = summarizeDevelopmentSmokeManifest(parsed.data);
   if (
-    summary.difficultyCounts.low !== 2 ||
-    summary.difficultyCounts.middle !== 2 ||
-    summary.difficultyCounts.high !== 2 ||
+    summary.difficultyCounts.low < 1 ||
+    summary.difficultyCounts.middle < 1 ||
+    summary.difficultyCounts.high < 1 ||
     summary.verdictCounts.pass !== 3 ||
     summary.verdictCounts.reject !== 3 ||
     summary.priorFailureCounts.output_limit < 1 ||
@@ -348,10 +350,20 @@ export class DevelopmentSmokeRunController {
   readonly #runBindingHash: string;
   readonly #scheduler: FairLlmRequestScheduler;
   readonly #safeReceiptSink: (receipt: DevelopmentSmokeSafeRequestReceipt) => void;
+  readonly #safeCompletionSink: (
+    slot: DevelopmentSmokeAnonymousSlot,
+    stage: ReviewFlowDagStage,
+    timing: FourCallSafeRequestTiming
+  ) => void;
+  readonly #safeFailureSink: (
+    slot: DevelopmentSmokeAnonymousSlot,
+    stage: ReviewFlowDagStage,
+    failureKind: LlmStageFailureKind
+  ) => void;
   readonly #authorized = new Map<string, DevelopmentSmokeSafeRequestReceipt>();
   readonly #completed = new Map<string, FourCallSafeRequestTiming>();
   readonly #completedSlots = new Set<DevelopmentSmokeAnonymousSlot>();
-  readonly #failureCounts = new Map<LlmStageFailureKind, number>();
+  #consecutiveSystemFailures = 0;
   readonly #startedAtMs: number;
   readonly #clock: () => number;
   #phase: "phase0" | "phase1" = "phase0";
@@ -364,6 +376,16 @@ export class DevelopmentSmokeRunController {
     readonly runBindingHash: string;
     readonly scheduler: FairLlmRequestScheduler;
     readonly safeReceiptSink?: (receipt: DevelopmentSmokeSafeRequestReceipt) => void;
+    readonly safeCompletionSink?: (
+      slot: DevelopmentSmokeAnonymousSlot,
+      stage: ReviewFlowDagStage,
+      timing: FourCallSafeRequestTiming
+    ) => void;
+    readonly safeFailureSink?: (
+      slot: DevelopmentSmokeAnonymousSlot,
+      stage: ReviewFlowDagStage,
+      failureKind: LlmStageFailureKind
+    ) => void;
     readonly startedAtMs: number;
     readonly clock?: () => number;
   }) {
@@ -377,7 +399,9 @@ export class DevelopmentSmokeRunController {
       throw new Error("DEVELOPMENT_SMOKE_STARTED_AT_INVALID");
     }
     this.#startedAtMs = input.startedAtMs;
+    this.#safeFailureSink = input.safeFailureSink ?? (() => undefined);
     this.#clock = input.clock ?? Date.now;
+    this.#safeCompletionSink = input.safeCompletionSink ?? (() => undefined);
     if (this.#clock() < this.#startedAtMs) {
       throw new Error("DEVELOPMENT_SMOKE_CLOCK_INVALID");
     }
@@ -400,11 +424,15 @@ export class DevelopmentSmokeRunController {
         this.recordRequestCompleted(request, timing);
       },
       requestFailed: (
-        _request: FourCallRequest,
+        request: FourCallRequest,
         failureKind: LlmStageFailureKind
       ) => {
+        this.#safeFailureSink(
+          anonymousSlotSchema.parse(request.caseId),
+          request.stage,
+          failureKind
+        );
         this.recordFailure(failureKind);
-        this.recordFinalFailure();
       }
     });
   }
@@ -464,6 +492,44 @@ export class DevelopmentSmokeRunController {
     return receipt;
   }
 
+  public restoreCompletedRequest(
+    receipt: DevelopmentSmokeSafeRequestReceipt,
+    timing: FourCallSafeRequestTiming
+  ): void {
+    const slot = anonymousSlotSchema.parse(receipt.anonymousSlot);
+    const key = `${slot}:${receipt.stage}`;
+    const expectedSchemaFingerprint = hashCanonicalValue(
+      reviewFlowStageJsonSchemas[receipt.stage]
+    );
+    if (
+      this.#authorized.has(key) ||
+      this.#completed.has(key) ||
+      receipt.schemaVersion !== 1 ||
+      receipt.profileName !== this.profile.name ||
+      receipt.profileFingerprint !== developmentSmokeProfileFingerprint ||
+      receipt.manifestFingerprint !== this.manifestSummary.manifestFingerprint ||
+      receipt.runBindingHash !== this.#runBindingHash ||
+      receipt.phase !== "phase0" ||
+      !phase0Slots.has(slot) ||
+      receipt.provider !== "aether" ||
+      receipt.model !== expectedModels[receipt.stage] ||
+      receipt.schemaFingerprint !== expectedSchemaFingerprint ||
+      receipt.maxOutputTokens !== reviewFlowStageOutputBudgets[receipt.stage] ||
+      receipt.thinkingRequest !== "enabled" ||
+      receipt.reasoningEffort !== "max" ||
+      receipt.logicalAttempt !== 1 ||
+      receipt.logicalRequestsUsed !== this.#authorized.size + 1 ||
+      receipt.externalAttemptsUsed !== this.#authorized.size + 1 ||
+      receipt.logicalRequestCeiling !== 30 ||
+      receipt.externalAttemptCeiling !== 30
+    ) {
+      throw new Error("DEVELOPMENT_SMOKE_RESTORED_REQUEST_INVALID");
+    }
+    assertSafeTiming(timing);
+    this.#authorized.set(key, deepFreeze({ ...receipt }));
+    this.#completed.set(key, deepFreeze({ ...timing }));
+  }
+
   public recordRequestCompleted(
     request: FourCallRequest,
     timing: FourCallSafeRequestTiming
@@ -475,7 +541,13 @@ export class DevelopmentSmokeRunController {
     if (this.#completed.has(key)) {
       throw new Error("DEVELOPMENT_SMOKE_REQUEST_COMPLETION_DUPLICATE");
     }
+    this.#safeCompletionSink(
+      anonymousSlotSchema.parse(request.caseId),
+      request.stage,
+      timing
+    );
     this.#completed.set(key, deepFreeze({ ...timing }));
+    this.#consecutiveSystemFailures = 0;
   }
 
   public markSlotComplete(slotCandidate: string): void {
@@ -580,13 +652,14 @@ export class DevelopmentSmokeRunController {
   }
 
   public recordFailure(kind: LlmStageFailureKind): void {
-    const count = (this.#failureCounts.get(kind) ?? 0) + 1;
-    this.#failureCounts.set(kind, count);
     if (kind === "output_limit") this.softStop("output_limit");
     if (kind === "schema_invalid") this.softStop("schema_invalid");
     if (kind === "permanent") this.softStop("final_failure");
-    if (systemFailureKinds.has(kind as SystemFailureKind) && count >= 2) {
-      this.softStop("repeated_system_error");
+    if (systemFailureKinds.has(kind as SystemFailureKind)) {
+      this.#consecutiveSystemFailures += 1;
+      if (this.#consecutiveSystemFailures >= 2) {
+        this.softStop("repeated_system_error");
+      }
     }
   }
 
@@ -710,7 +783,12 @@ export async function runDevelopmentSmokePhase(input: {
     readonly sourceBinding: string;
     readonly source: FourCallReviewSource;
     readonly truthBindingHash: string;
+    readonly reusableStages?: ReviewFlowCompletedStages;
   }[];
+  readonly onStageCompleted?: (
+    slot: DevelopmentSmokeAnonymousSlot,
+    completed: ReviewFlowCompletedStage
+  ) => void;
 }): Promise<readonly PromiseSettledResult<FourCallDagResult>[]> {
   const requiredSlots = developmentSmokePhaseSlots(input.phase);
   if (
@@ -736,6 +814,10 @@ export async function runDevelopmentSmokePhase(input: {
         models,
         nativeSchemaCompatible: input.nativeSchemaCompatible,
         scheduler: input.controller.scheduler(),
+        reusableStages: entry.reusableStages,
+        onStageCompleted: (completed) => {
+          input.onStageCompleted?.(entry.slot, completed);
+        },
         lifecycle: input.controller.lifecycle()
       });
       input.controller.markSlotComplete(entry.slot);
@@ -804,6 +886,21 @@ function nearestRankP90(values: readonly number[]): number {
   }
   const ordered = [...values].sort((left, right) => left - right);
   return ordered[Math.ceil(ordered.length * 0.9) - 1]!;
+}
+
+function assertSafeTiming(timing: FourCallSafeRequestTiming): void {
+  if (
+    !Number.isSafeInteger(timing.firstValidOutputMs) ||
+    timing.firstValidOutputMs < 0 ||
+    !Number.isSafeInteger(timing.endToEndMs) ||
+    timing.endToEndMs < timing.firstValidOutputMs ||
+    !Number.isSafeInteger(timing.validOutputEventCount) ||
+    timing.validOutputEventCount < 1 ||
+    !Number.isSafeInteger(timing.outputUtf8Bytes) ||
+    timing.outputUtf8Bytes < 1
+  ) {
+    throw new Error("DEVELOPMENT_SMOKE_TIMING_INVALID");
+  }
 }
 
 function deepFreeze<T>(value: T): T {

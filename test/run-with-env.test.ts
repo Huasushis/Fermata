@@ -17,7 +17,8 @@ describe("run-with-env：命令行边界", () => {
     expect(result.stdout).toBe("");
     expect(result.stderr).toBe(
       "用法：node scripts/run-with-env.mjs <env文件> <命令> [参数...]\n" +
-      "      node scripts/run-with-env.mjs --review-flow-evaluation <env文件> [评测参数...]\n"
+      "      node scripts/run-with-env.mjs --review-flow-evaluation <env文件> [评测参数...]\n" +
+      "      node scripts/run-with-env.mjs --development-smoke <env文件> [--preflight|--network-phase0 [--resume=<runId>]]\n"
     );
   });
 
