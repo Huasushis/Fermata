@@ -105,9 +105,12 @@ export interface LlmSseStructuralAudit {
   readonly hasUsageField: boolean;
   readonly hasErrorField: boolean;
   readonly hasControlField: boolean;
-  readonly unknownTopLevelKeys: readonly string[];
-  readonly unknownChoiceKeys: readonly string[];
-  readonly unknownPayloadKeys: readonly string[];
+  readonly unknownTopLevelKeyCount: number;
+  readonly unknownTopLevelKeysFingerprint: string;
+  readonly unknownChoiceKeyCount: number;
+  readonly unknownChoiceKeysFingerprint: string;
+  readonly unknownPayloadKeyCount: number;
+  readonly unknownPayloadKeysFingerprint: string;
   readonly unknownKeysFingerprint: string;
 }
 export type LlmSseAcceptedShapeCategory =
@@ -125,16 +128,77 @@ export interface LlmSseAcceptedShapeAudit {
   readonly count: number;
 }
 
+/**
+ * 错误信封的安全分类闭集。不依赖任何负载值、message 或 code 内容；
+ * 只从键名是否存在和字段类型推导。所有 error 事件永久拒绝，不进入任何接受路径。
+ */
+export type LlmSseErrorEnvelopeClassification =
+  | "known_fields_only"
+  | "unknown_fields_present"
+  | "non_object";
+
+/** 已知错误信封字段名的闭集。只有这些字段名会被原样持久化。 */
+const errorEnvelopeAllowlist = new Set([
+  "code",
+  "message",
+  "type",
+  "param",
+  "detail",
+  "status",
+  "instance",
+  "title",
+  "error",
+  "errors",
+  "reason",
+  "request_id"
+]);
+
+/** 允许持久化嵌套对象键名的闭集。只有这些嵌套键名会被原样记录。 */
+const errorEnvelopeNestedAllowlist = new Set([
+  "error",
+  "errors",
+  "detail"
+]);
+
+/** 安全的错误信封字段审计：只记录 allowlist 字段名和类型，绝不记录字段值。 */
+export interface LlmSseErrorEnvelopeFieldAudit {
+  readonly key: string;
+  readonly type: LlmSafeJsonType;
+}
+
+/**
+ * provider/gateway `error` 信封的安全形状指纹。闭集只记录 allowlist 字段名、
+ * 字段类型和安全分类；未知字段名只记录计数和域分离不可逆指纹，绝不原样持久化。
+ * 不记录 message、code 值或任何原始负载文本。所有 error 事件永久拒绝。
+ */
+export interface LlmSseErrorEnvelopeAudit {
+  readonly present: true;
+  readonly classification: LlmSseErrorEnvelopeClassification;
+  readonly fieldCount: number;
+  readonly allowedFields: readonly LlmSseErrorEnvelopeFieldAudit[];
+  readonly allowedNestedObjectKeys: readonly string[];
+  readonly unknownFieldCount: number;
+  readonly unknownKeysFingerprint: string;
+  readonly envelopeFingerprint: string;
+}
+
 export interface LlmSseRejectedEventAudit {
   readonly eventOrdinal: number;
   readonly completedEventCount: number;
   readonly dataFieldCount: number;
   readonly eventUtf8Bytes: number;
   readonly topLevelKeys: readonly string[];
+  readonly unknownTopLevelKeyCount: number;
+  readonly unknownTopLevelKeysFingerprint: string;
   readonly choiceKeys: readonly string[];
+  readonly unknownChoiceKeyCount: number;
+  readonly unknownChoiceKeysFingerprint: string;
   readonly deltaKeys: readonly string[];
+  readonly unknownPayloadKeyCount: number;
+  readonly unknownPayloadKeysFingerprint: string;
   readonly shape: LlmSseRejectedShape;
   readonly structure: LlmSseStructuralAudit;
+  readonly errorEnvelope: LlmSseErrorEnvelopeAudit | null;
   readonly shapeFingerprint: string;
 }
 
@@ -2696,7 +2760,7 @@ function observeSseUsage(event: string, audit: MutableLlmRequestAudit): void {
   }
 }
 
-function describeRejectedSseEvent(
+export function describeRejectedSseEvent(
   event: string,
   ordinal: number
 ): LlmSseRejectedEventAudit {
@@ -2704,14 +2768,17 @@ function describeRejectedSseEvent(
   const raw = parseSseEventData(event);
   let shape: LlmSseRejectedShape = "json_invalid";
   let topLevelKeys: readonly string[] = [];
+  let unknownTopLevelKeys: readonly string[] = [];
   let choiceKeys: readonly string[] = [];
+  let unknownChoiceKeys: readonly string[] = [];
   let deltaKeys: readonly string[] = [];
+  let unknownPayloadKeys: readonly string[] = [];
   if (raw !== undefined) {
     if (typeof raw !== "object" || raw === null) {
       shape = "non_object";
     } else {
       const record = raw as Record<string, unknown>;
-      topLevelKeys = safeShapeKeys(record);
+      ({ known: topLevelKeys, unknown: unknownTopLevelKeys } = splitKnownKeys(record, knownTopLevelSseKeys));
       if (Object.hasOwn(record, "error")) {
         shape = "error_object";
       } else if (!Array.isArray(record.choices)) {
@@ -2722,13 +2789,13 @@ function describeRejectedSseEvent(
           shape = "choice_non_object";
         } else {
           const choiceRecord = choice as Record<string, unknown>;
-          choiceKeys = safeShapeKeys(choiceRecord);
+          ({ known: choiceKeys, unknown: unknownChoiceKeys } = splitKnownKeys(choiceRecord, knownChoiceSseKeys));
           const payload = choiceRecord.delta ?? choiceRecord.message;
           if (typeof payload !== "object" || payload === null) {
             shape = "delta_missing_or_non_object";
           } else {
             const payloadRecord = payload as Record<string, unknown>;
-            deltaKeys = safeShapeKeys(payloadRecord);
+            ({ known: deltaKeys, unknown: unknownPayloadKeys } = splitKnownKeys(payloadRecord, knownPayloadSseKeys));
             shape = ["reasoning_content", "reasoning", "content"].some((key) => {
               const value = payloadRecord[key];
               return value !== undefined && value !== null &&
@@ -2741,13 +2808,28 @@ function describeRejectedSseEvent(
       }
     }
   }
+  const errorEnvelope = shape === "error_object" && raw !== undefined &&
+    typeof raw === "object" && raw !== null && !Array.isArray(raw) &&
+    Object.hasOwn(raw as Record<string, unknown>, "error")
+    ? describeSseErrorEnvelope((raw as Record<string, unknown>).error)
+    : null;
   const structure = describeSseStructure(raw);
+  const topLevelSummary = unknownKeysSummary(unknownTopLevelKeys, "sse-rejected-unknown-top-level-keys");
+  const choiceSummary = unknownKeysSummary(unknownChoiceKeys, "sse-rejected-unknown-choice-keys");
+  const payloadSummary = unknownKeysSummary(unknownPayloadKeys, "sse-rejected-unknown-payload-keys");
   const shapeFingerprint = safeAuditFingerprint({
     topLevelKeys,
+    unknownTopLevelKeyCount: topLevelSummary.count,
+    unknownTopLevelKeysFingerprint: topLevelSummary.fingerprint,
     choiceKeys,
+    unknownChoiceKeyCount: choiceSummary.count,
+    unknownChoiceKeysFingerprint: choiceSummary.fingerprint,
     deltaKeys,
+    unknownPayloadKeyCount: payloadSummary.count,
+    unknownPayloadKeysFingerprint: payloadSummary.fingerprint,
     shape,
-    structure
+    structure,
+    errorEnvelope
   });
   return Object.freeze({
     eventOrdinal: ordinal,
@@ -2755,11 +2837,87 @@ function describeRejectedSseEvent(
     dataFieldCount: dataFields.length,
     eventUtf8Bytes: Buffer.byteLength(event, "utf8"),
     topLevelKeys,
+    unknownTopLevelKeyCount: topLevelSummary.count,
+    unknownTopLevelKeysFingerprint: topLevelSummary.fingerprint,
     choiceKeys,
+    unknownChoiceKeyCount: choiceSummary.count,
+    unknownChoiceKeysFingerprint: choiceSummary.fingerprint,
     deltaKeys,
+    unknownPayloadKeyCount: payloadSummary.count,
+    unknownPayloadKeysFingerprint: payloadSummary.fingerprint,
     shape,
     structure,
+    errorEnvelope,
     shapeFingerprint
+  });
+}
+
+const maximumErrorEnvelopeFields = 32;
+
+function describeSseErrorEnvelope(
+  errorValue: unknown
+): LlmSseErrorEnvelopeAudit {
+  if (!isRecordForAudit(errorValue)) {
+    return Object.freeze({
+      present: true as const,
+      classification: "non_object" as const,
+      fieldCount: 0,
+      allowedFields: Object.freeze([]),
+      allowedNestedObjectKeys: Object.freeze([]),
+      unknownFieldCount: 0,
+      unknownKeysFingerprint: safeAuditFingerprint({
+        domain: "sse-error-envelope",
+        nonObject: true
+      }),
+      envelopeFingerprint: safeAuditFingerprint({
+        domain: "sse-error-envelope",
+        nonObject: true
+      })
+    });
+  }
+  const record = errorValue as Record<string, unknown>;
+  const keys = safeShapeKeys(record);
+  const allowedFields: LlmSseErrorEnvelopeFieldAudit[] = [];
+  const allowedNestedObjectKeys: string[] = [];
+  const unknownKeys: string[] = [];
+  for (const key of keys) {
+    if (errorEnvelopeAllowlist.has(key)) {
+      if (allowedFields.length < maximumErrorEnvelopeFields) {
+        allowedFields.push(Object.freeze({ key, type: safeJsonType(record[key]) }));
+      }
+      if (isRecordForAudit(record[key]) && errorEnvelopeNestedAllowlist.has(key)) {
+        allowedNestedObjectKeys.push(key);
+      }
+    } else {
+      unknownKeys.push(key);
+    }
+  }
+  const classification: LlmSseErrorEnvelopeClassification =
+    unknownKeys.length > 0 ? "unknown_fields_present" : "known_fields_only";
+  const unknownKeysFingerprint = safeAuditFingerprint({
+    domain: "sse-error-envelope-unknown-keys",
+    unknownKeyCount: unknownKeys.length,
+    unknownKeyHashes: unknownKeys.map((k) => createHash("sha256").update(k, "utf8").digest("hex"))
+  });
+  const envelopeFingerprint = safeAuditFingerprint({
+    domain: "sse-error-envelope",
+    classification,
+    fieldCount: keys.length,
+    allowedFieldCount: allowedFields.length,
+    allowedFields,
+    allowedNestedObjectKeys: Object.freeze([...allowedNestedObjectKeys].sort()),
+    unknownFieldCount: unknownKeys.length,
+    unknownKeysFingerprint
+  });
+  return Object.freeze({
+    present: true as const,
+    classification,
+    fieldCount: keys.length,
+    allowedFields: Object.freeze(allowedFields),
+    allowedNestedObjectKeys: Object.freeze([...allowedNestedObjectKeys].sort()),
+    unknownFieldCount: unknownKeys.length,
+    unknownKeysFingerprint,
+    envelopeFingerprint
   });
 }
 
@@ -2824,10 +2982,14 @@ function describeSseStructure(raw: unknown): LlmSseStructuralAudit {
       ...unknownShapeKeys(messageRecord, knownPayloadSseKeys)
     ])].sort()
   );
+  const topLevelSummary = unknownKeysSummary(unknownTopLevelKeys, "sse-structure-unknown-top-level-keys");
+  const choiceSummary = unknownKeysSummary(unknownChoiceKeys, "sse-structure-unknown-choice-keys");
+  const payloadSummary = unknownKeysSummary(unknownPayloadKeys, "sse-structure-unknown-payload-keys");
   const unknownKeysFingerprint = safeAuditFingerprint({
-    topLevel: unknownTopLevelKeys,
-    choice: unknownChoiceKeys,
-    payload: unknownPayloadKeys
+    domain: "sse-structure-unknown-keys",
+    topLevel: topLevelSummary,
+    choice: choiceSummary,
+    payload: payloadSummary
   });
   return Object.freeze({
     fieldTypes: Object.freeze({
@@ -2863,9 +3025,12 @@ function describeSseStructure(raw: unknown): LlmSseStructuralAudit {
     hasUsageField: top !== undefined && Object.hasOwn(top, "usage"),
     hasErrorField: top !== undefined && Object.hasOwn(top, "error"),
     hasControlField: top !== undefined && Object.hasOwn(top, "control"),
-    unknownTopLevelKeys,
-    unknownChoiceKeys,
-    unknownPayloadKeys,
+    unknownTopLevelKeyCount: topLevelSummary.count,
+    unknownTopLevelKeysFingerprint: topLevelSummary.fingerprint,
+    unknownChoiceKeyCount: choiceSummary.count,
+    unknownChoiceKeysFingerprint: choiceSummary.fingerprint,
+    unknownPayloadKeyCount: payloadSummary.count,
+    unknownPayloadKeysFingerprint: payloadSummary.fingerprint,
     unknownKeysFingerprint
   });
 }
@@ -3018,6 +3183,47 @@ function unknownShapeKeys(
       ? []
       : safeShapeKeys(record).filter((key) => !known.has(key))
   );
+}
+
+/**
+ * 将 record 的安全键名分为已知和未知两组，仅保留已知键名；
+ * 未知键名不序列化，只用于计数和域分隔指纹。
+ */
+function splitKnownKeys(
+  record: Record<string, unknown>,
+  known: ReadonlySet<string>
+): { readonly known: readonly string[]; readonly unknown: readonly string[] } {
+  const keys = safeShapeKeys(record);
+  const knownKeys: string[] = [];
+  const unknownKeys: string[] = [];
+  for (const key of keys) {
+    if (known.has(key)) knownKeys.push(key);
+    else unknownKeys.push(key);
+  }
+  return Object.freeze({
+    known: Object.freeze(knownKeys),
+    unknown: Object.freeze(unknownKeys)
+  });
+}
+
+/**
+ * 对未知键名做域分隔不可逆摘要：只保留计数和指纹，永不序列化原始键名。
+ * 指纹 = SHA-256(domain + 逐键 SHA-256(key))，与 error-envelope 未知键摘要模式一致。
+ */
+function unknownKeysSummary(
+  keys: readonly string[],
+  domain: string
+): { readonly count: number; readonly fingerprint: string } {
+  return Object.freeze({
+    count: keys.length,
+    fingerprint: safeAuditFingerprint({
+      domain,
+      unknownKeyCount: keys.length,
+      unknownKeyHashes: keys.map((k) =>
+        createHash("sha256").update(k, "utf8").digest("hex")
+      )
+    })
+  });
 }
 
 function safeAuditFingerprint(value: unknown): string {

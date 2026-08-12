@@ -448,9 +448,12 @@ describe("development smoke private checkpoint", () => {
             payloadSource: "delta",
             finishReasonClass: "stop",
             hasControlField: true,
-            unknownTopLevelKeys: ["future_top"],
-            unknownChoiceKeys: ["future_choice"],
-            unknownPayloadKeys: ["future_payload"]
+            unknownTopLevelKeyCount: 1,
+            unknownTopLevelKeysFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/u),
+            unknownChoiceKeyCount: 1,
+            unknownChoiceKeysFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/u),
+            unknownPayloadKeyCount: 1,
+            unknownPayloadKeysFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/u)
           }
         }
       });

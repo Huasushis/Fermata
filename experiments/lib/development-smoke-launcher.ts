@@ -126,7 +126,11 @@ const safePayloadFieldTypesSchema = z.object({
   refusal: safeJsonTypeSchema,
   toolCalls: safeJsonTypeSchema
 }).strict();
-const safeSseStructureSchema = z.object({
+/**
+ * Legacy ae47bbc SSE structure schema: raw unknown key arrays, no count/fingerprint.
+ * Only used for reading old checkpoints; never for writing new records.
+ */
+const legacySafeSseStructureSchema = z.object({
   fieldTypes: z.object({
     choices: safeJsonTypeSchema,
     created: safeJsonTypeSchema,
@@ -166,6 +170,52 @@ const safeSseStructureSchema = z.object({
   unknownTopLevelKeys: z.array(safeShapeKeySchema).max(32),
   unknownChoiceKeys: z.array(safeShapeKeySchema).max(32),
   unknownPayloadKeys: z.array(safeShapeKeySchema).max(32),
+  unknownKeysFingerprint: digestSchema
+}).strict();
+
+const safeSseStructureSchema = z.object({
+  fieldTypes: z.object({
+    choices: safeJsonTypeSchema,
+    created: safeJsonTypeSchema,
+    id: safeJsonTypeSchema,
+    model: safeJsonTypeSchema,
+    object: safeJsonTypeSchema,
+    serviceTier: safeJsonTypeSchema,
+    systemFingerprint: safeJsonTypeSchema,
+    usage: safeJsonTypeSchema,
+    error: safeJsonTypeSchema,
+    control: safeJsonTypeSchema,
+    choice: safeJsonTypeSchema,
+    delta: safeJsonTypeSchema,
+    message: safeJsonTypeSchema,
+    finishReason: safeJsonTypeSchema,
+    index: safeJsonTypeSchema,
+    logprobs: safeJsonTypeSchema,
+    deltaFields: safePayloadFieldTypesSchema,
+    messageFields: safePayloadFieldTypesSchema
+  }).strict(),
+  choicesLength: z.enum(["0", "1", "many"]).nullable(),
+  payloadSource: z.enum(["delta", "message", "both", "neither"]),
+  finishReasonClass: z.enum([
+    "missing",
+    "null",
+    "stop",
+    "length",
+    "content_filter",
+    "unknown_string",
+    "non_string"
+  ]),
+  finishReasonIsNull: z.boolean(),
+  finishReasonUnknownStringHash: digestSchema.nullable(),
+  hasUsageField: z.boolean(),
+  hasErrorField: z.boolean(),
+  hasControlField: z.boolean(),
+  unknownTopLevelKeyCount: z.number().int().nonnegative(),
+  unknownTopLevelKeysFingerprint: digestSchema,
+  unknownChoiceKeyCount: z.number().int().nonnegative(),
+  unknownChoiceKeysFingerprint: digestSchema,
+  unknownPayloadKeyCount: z.number().int().nonnegative(),
+  unknownPayloadKeysFingerprint: digestSchema,
   unknownKeysFingerprint: digestSchema
 }).strict();
 const acceptedEventShapeSchema = z.object({
@@ -238,7 +288,33 @@ const stageFailureKindSchema = z.enum([
   "schema_invalid",
   "permanent"
 ]);
-const safeRequestFailureSchema = z.object({
+/**
+ * Legacy ae47bbc firstRejectedEvent schema: raw key arrays, no count/fingerprint, no errorEnvelope.
+ * Only used for reading old checkpoints; never for writing new records.
+ */
+const legacyFirstRejectedEventSchema = z.object({
+  eventOrdinal: z.number().int().positive(),
+  completedEventCount: z.number().int().nonnegative(),
+  dataFieldCount: z.number().int().nonnegative(),
+  eventUtf8Bytes: z.number().int().nonnegative(),
+  topLevelKeys: z.array(safeShapeKeySchema).max(32),
+  choiceKeys: z.array(safeShapeKeySchema).max(32),
+  deltaKeys: z.array(safeShapeKeySchema).max(32),
+  shape: z.enum([
+    "json_invalid",
+    "non_object",
+    "error_object",
+    "choices_missing_or_non_array",
+    "choice_non_object",
+    "delta_missing_or_non_object",
+    "delta_field_type",
+    "finish_reason_type_or_unknown"
+  ]),
+  structure: legacySafeSseStructureSchema,
+  shapeFingerprint: digestSchema
+}).strict();
+
+export const safeRequestFailureSchema = z.object({
   kind: stageFailureKindSchema,
   code: z.enum([
     "LLM_HTTP_ERROR",
@@ -277,8 +353,14 @@ const safeRequestFailureSchema = z.object({
     dataFieldCount: z.number().int().nonnegative(),
     eventUtf8Bytes: z.number().int().nonnegative(),
     topLevelKeys: z.array(safeShapeKeySchema).max(32),
+    unknownTopLevelKeyCount: z.number().int().nonnegative(),
+    unknownTopLevelKeysFingerprint: digestSchema,
     choiceKeys: z.array(safeShapeKeySchema).max(32),
+    unknownChoiceKeyCount: z.number().int().nonnegative(),
+    unknownChoiceKeysFingerprint: digestSchema,
     deltaKeys: z.array(safeShapeKeySchema).max(32),
+    unknownPayloadKeyCount: z.number().int().nonnegative(),
+    unknownPayloadKeysFingerprint: digestSchema,
     shape: z.enum([
       "json_invalid",
       "non_object",
@@ -290,6 +372,19 @@ const safeRequestFailureSchema = z.object({
       "finish_reason_type_or_unknown"
     ]),
     structure: safeSseStructureSchema,
+    errorEnvelope: z.object({
+      present: z.literal(true),
+      classification: z.enum(["known_fields_only", "unknown_fields_present", "non_object"]),
+      fieldCount: z.number().int().nonnegative(),
+      allowedFields: z.array(z.object({
+        key: safeShapeKeySchema,
+        type: safeJsonTypeSchema
+      }).strict()).max(32),
+      allowedNestedObjectKeys: z.array(safeShapeKeySchema).max(32),
+      unknownFieldCount: z.number().int().nonnegative(),
+      unknownKeysFingerprint: digestSchema,
+      envelopeFingerprint: digestSchema
+    }).strict().nullable().optional(),
     shapeFingerprint: digestSchema
   }).strict().nullable(),
   formatFailureStage: z.enum([
@@ -321,6 +416,76 @@ const safeRequestFailureSchema = z.object({
     "choice_after_stop"
   ]).nullable()
 }).strict();
+
+/**
+ * Reader schema: accepts strict union of legacy ae47bbc OR current safe format.
+ * Hybrid records (mixing raw arrays with count/fingerprint) fail both branches.
+ * Writer/types for new records use safeRequestFailureSchema only.
+ */
+const legacySafeRequestFailureSchema = z.object({
+  kind: stageFailureKindSchema,
+  code: z.enum([
+    "LLM_HTTP_ERROR",
+    "LLM_NETWORK_FAILED",
+    "LLM_FIRST_OUTPUT_TIMEOUT",
+    "LLM_OUTPUT_IDLE_TIMEOUT",
+    "LLM_TOTAL_TIMEOUT",
+    "LLM_STREAM_INTERRUPTED",
+    "LLM_CANCELLED",
+    "LLM_REQUEST_START_BLOCKED",
+    "LLM_OUTPUT_LENGTH_LIMIT",
+    "LLM_OUTPUT_CONTENT_FILTERED",
+    "LLM_RESPONSE_BODY_TOO_LARGE",
+    "LLM_RESPONSE_FORMAT_INVALID",
+    "LLM_JSON_OUTPUT_INVALID",
+    "unknown"
+  ]),
+  httpStatus: z.number().int().min(100).max(599).nullable(),
+  requestCount: z.number().int().min(0).max(4),
+  transportAttemptCount: z.number().int().nonnegative(),
+  completedResponseCount: z.number().int().nonnegative(),
+  terminalResponseMode: z.enum(["sse", "json"]).nullable(),
+  terminalEofObserved: z.boolean(),
+  terminalFinishReasonStopObserved: z.boolean(),
+  terminalSseDoneObserved: z.boolean().nullable(),
+  jsonSchemaValidated: z.literal(false).nullable(),
+  streamEventCount: z.number().int().nonnegative(),
+  streamUtf8Bytes: z.number().int().nonnegative(),
+  streamChunkCount: z.number().int().nonnegative(),
+  usageEventCount: z.number().int().nonnegative(),
+  usageTotalTokens: z.number().int().nonnegative().nullable(),
+  acceptedEventShapes: z.array(acceptedEventShapeSchema).max(64).readonly(),
+  firstRejectedEvent: legacyFirstRejectedEventSchema.nullable(),
+  formatFailureStage: z.enum([
+    "missing_body",
+    "content_type",
+    "json_utf8",
+    "json_parse",
+    "response_shape",
+    "sse_utf8",
+    "event_json",
+    "event_shape",
+    "delta_shape",
+    "finish_shape",
+    "trailing_data"
+  ]).nullable(),
+  formatFailureSubstage: z.enum([
+    "duplicate_done",
+    "data_after_done",
+    "data_after_done_json_non_object",
+    "data_after_done_error_object",
+    "data_after_done_unknown_object_or_scan_limit",
+    "data_after_done_choices_present",
+    "data_after_done_content_or_tool_present",
+    "data_after_done_other_or_unclassifiable",
+    "data_after_done_tail_incomplete",
+    "choice_after_stop"
+  ]).nullable()
+}).strict();
+export const safeRequestFailureReadSchema = z.union([
+  safeRequestFailureSchema,
+  legacySafeRequestFailureSchema
+]);
 const completedStageSchema = z.object({
   output: z.string().min(1),
   receipt: stageReceiptSchema
@@ -488,6 +653,94 @@ const privateCheckpointSchemaForWrite = privateCheckpointBaseSchema.superRefine(
     }
   }
 );
+
+/**
+ * Read-only request ledger schema: uses safeRequestFailureReadSchema (legacy OR current union)
+ * for failureDetail. Used only for parsing checkpoint files on disk.
+ * Writer/in-memory schema (requestLedgerSchema) remains current-only.
+ */
+const requestLedgerReadSchema = z.object({
+  receipt: safeReceiptSchema,
+  timing: safeTimingSchema.optional(),
+  completedStage: completedStageSchema.optional(),
+  failureKind: stageFailureKindSchema.optional(),
+  failureDetail: safeRequestFailureReadSchema.optional()
+}).strict().superRefine((value, context) => {
+  if (
+    value.completedStage !== undefined &&
+    (value.timing === undefined || value.failureKind !== undefined)
+  ) {
+    context.addIssue({ code: "custom", message: "completed stage state invalid" });
+  }
+  if (
+    value.failureDetail !== undefined &&
+    value.failureDetail.kind !== value.failureKind
+  ) {
+    context.addIssue({ code: "custom", message: "failure detail mismatch" });
+  }
+  if (value.completedStage?.receipt.stage !== undefined &&
+      value.completedStage.receipt.stage !== value.receipt.stage) {
+    context.addIssue({ code: "custom", message: "stage binding mismatch" });
+  }
+});
+
+/**
+ * Read-only checkpoint base schema: uses requestLedgerReadSchema for requests array.
+ * Accepts legacy ae47bbc OR current checkpoint files; never used for writing.
+ */
+const privateCheckpointBaseReadSchema = z.object({
+  schemaVersion: z.literal(1),
+  profileName: z.literal("development-smoke-6x4-v1"),
+  profileFingerprint: digestSchema,
+  manifestFingerprint: digestSchema,
+  privateManifestFileSha256: digestSchema,
+  runId: digestSchema,
+  runBindingHash: digestSchema,
+  codeVersion: z.string().regex(/^[a-f0-9]{40}$/u),
+  phase: z.enum(["phase0", "phase1"]),
+  state: z.enum(["prepared", "running", "phase0_complete", "complete", "incomplete"]),
+  revision: z.number().int().positive(),
+  previousCheckpointSha256: digestSchema.nullable(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+  requests: z.array(requestLedgerReadSchema).max(30),
+  phase0Forecast: phase0ForecastSchema.nullable(),
+  phase1Forecast: phase1EtaSchema.nullable().optional(),
+  phase1Release: phase1ReleaseSchema.nullable().optional(),
+  metrics: runMetricsSchema.optional(),
+  stopReason: z.string().nullable(),
+  failureCode: safeFailureCodeSchema.nullable().optional(),
+  failureLocation: safeFailureLocationSchema.nullable().optional(),
+  accuracyClaim: z.null(),
+  includedInFinalCalibration: z.literal(false),
+  phase1Released: z.boolean()
+}).strict();
+
+/**
+ * Read-only checkpoint schema: same phase validation as privateCheckpointSchema,
+ * but accepts legacy OR current request ledger entries. Used for file read/resume path.
+ */
+export const privateCheckpointReadSchema = privateCheckpointBaseReadSchema.superRefine((value, context) => {
+  const phase1State = value.phase === "phase1";
+  if (value.phase1Released !== phase1State) {
+    context.addIssue({ code: "custom", message: "phase release state invalid" });
+  }
+  if (phase1State) {
+    if (
+      value.phase1Release === undefined ||
+      value.phase1Release === null ||
+      !["running", "complete", "incomplete"].includes(value.state)
+    ) {
+      context.addIssue({ code: "custom", message: "phase1 checkpoint invalid" });
+    }
+  } else if (
+    (value.phase1Release !== undefined && value.phase1Release !== null) ||
+    value.phase1Forecast !== undefined ||
+    value.state === "complete"
+  ) {
+    context.addIssue({ code: "custom", message: "phase0 checkpoint invalid" });
+  }
+});
 // Existing Phase 0 checkpoints omit the optional Phase 1 and metrics fields.
 // They remain readable byte-for-byte; every new revision is append-only.
 
@@ -1750,7 +2003,7 @@ function readLatestCheckpoint(runDirectory: string): PrivateCheckpoint {
     const bytes = readPrivateFile(resolve(runDirectory, name), [runDirectory]).bytes;
     let parsed: PrivateCheckpoint;
     try {
-      parsed = privateCheckpointSchema.parse(JSON.parse(bytes.toString("utf8")));
+      parsed = privateCheckpointReadSchema.parse(JSON.parse(bytes.toString("utf8"))) as PrivateCheckpoint;
     } catch {
       throw new Error("DEVELOPMENT_SMOKE_CHECKPOINT_INVALID");
     }

@@ -2013,7 +2013,9 @@ describe("chatComplete：正常路径", () => {
           eventOrdinal: 4,
           completedEventCount: 3,
           dataFieldCount: 1,
-          topLevelKeys: ["provider_control"],
+          topLevelKeys: [],
+          unknownTopLevelKeyCount: 1,
+          unknownTopLevelKeysFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/u),
           choiceKeys: [],
           deltaKeys: [],
           shape: "choices_missing_or_non_array"
@@ -2157,9 +2159,12 @@ describe("chatComplete：正常路径", () => {
         hasUsageField: true,
         hasErrorField: false,
         hasControlField: true,
-        unknownTopLevelKeys: ["future_top"],
-        unknownChoiceKeys: ["future_choice"],
-        unknownPayloadKeys: ["future_delta", "future_message"]
+        unknownTopLevelKeyCount: 1,
+        unknownTopLevelKeysFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        unknownChoiceKeyCount: 1,
+        unknownChoiceKeysFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        unknownPayloadKeyCount: 2,
+        unknownPayloadKeysFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/u)
       }
     },
     {
