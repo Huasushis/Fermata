@@ -15,6 +15,7 @@
  * 而是为了确认模型仍在工作：只有通过格式检查的非空白 content/
  * reasoning 事件才会续时，心跳、用量和 role-only 事件都不会。
  */
+import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
@@ -36,6 +37,28 @@ export interface ChatCompletionResult {
 
 /** 只记录安全的传输完成事实，不包含服务商正文、请求或响应标识。 */
 export type LlmResponseMode = "sse" | "json";
+
+export type LlmSseRejectedShape =
+  | "json_invalid"
+  | "non_object"
+  | "error_object"
+  | "choices_missing_or_non_array"
+  | "choice_non_object"
+  | "delta_missing_or_non_object"
+  | "delta_field_type"
+  | "finish_reason_type_or_unknown";
+
+export interface LlmSseRejectedEventAudit {
+  readonly eventOrdinal: number;
+  readonly completedEventCount: number;
+  readonly dataFieldCount: number;
+  readonly eventUtf8Bytes: number;
+  readonly topLevelKeys: readonly string[];
+  readonly choiceKeys: readonly string[];
+  readonly deltaKeys: readonly string[];
+  readonly shape: LlmSseRejectedShape;
+  readonly shapeFingerprint: string;
+}
 
 export interface LlmTransportReceipt {
   readonly schemaVersion: 2;
@@ -95,6 +118,14 @@ export interface LlmFailureAudit {
     readonly eofObserved: boolean;
     readonly finishReasonStopObserved: boolean;
     readonly sseDoneObserved: boolean | null;
+  };
+  readonly stream: {
+    readonly eventCount: number;
+    readonly utf8Bytes: number;
+    readonly chunkCount: number;
+    readonly usageEventCount: number;
+    readonly usageTotalTokens: number | null;
+    readonly firstRejectedEvent: LlmSseRejectedEventAudit | null;
   };
   /** null 表示尚未走到结构化 JSON 校验；false 表示校验未成功。 */
   readonly jsonSchemaValidated: false | null;
@@ -1127,6 +1158,12 @@ interface MutableLlmRequestAudit {
   eofObserved: boolean;
   finishReasonStopObserved: boolean;
   sseDoneObserved: boolean | null;
+  streamEventCount: number;
+  streamUtf8Bytes: number;
+  streamChunkCount: number;
+  usageEventCount: number;
+  usageTotalTokens: number | null;
+  firstRejectedEvent: LlmSseRejectedEventAudit | null;
 }
 
 function createMutableLlmRequestAudit(): MutableLlmRequestAudit {
@@ -1136,7 +1173,13 @@ function createMutableLlmRequestAudit(): MutableLlmRequestAudit {
     responseMode: null,
     eofObserved: false,
     finishReasonStopObserved: false,
-    sseDoneObserved: null
+    sseDoneObserved: null,
+    streamEventCount: 0,
+    streamUtf8Bytes: 0,
+    streamChunkCount: 0,
+    usageEventCount: 0,
+    usageTotalTokens: null,
+    firstRejectedEvent: null
   };
 }
 
@@ -1148,6 +1191,12 @@ function resetMutableLlmRequestAuditForAttempt(
   audit.eofObserved = false;
   audit.finishReasonStopObserved = false;
   audit.sseDoneObserved = null;
+  audit.streamEventCount = 0;
+  audit.streamUtf8Bytes = 0;
+  audit.streamChunkCount = 0;
+  audit.usageEventCount = 0;
+  audit.usageTotalTokens = null;
+  audit.firstRejectedEvent = null;
 }
 
 function rememberLlmFailureAudit(
@@ -1173,6 +1222,14 @@ function rememberLlmFailureAudit(
     finishReasonStopObserved: input.requestAudit.finishReasonStopObserved,
     sseDoneObserved: input.requestAudit.sseDoneObserved
   });
+  const stream = Object.freeze({
+    eventCount: input.requestAudit.streamEventCount,
+    utf8Bytes: input.requestAudit.streamUtf8Bytes,
+    chunkCount: input.requestAudit.streamChunkCount,
+    usageEventCount: input.requestAudit.usageEventCount,
+    usageTotalTokens: input.requestAudit.usageTotalTokens,
+    firstRejectedEvent: input.requestAudit.firstRejectedEvent
+  });
   llmFailureAudits.set(error, Object.freeze({
     schemaVersion: 1,
     requestCount: input.requestCount,
@@ -1180,6 +1237,7 @@ function rememberLlmFailureAudit(
       (input.priorTransportAttemptCount ?? 0) + input.requestAudit.attemptCount,
     completedResponses: Object.freeze(completedResponses),
     terminal,
+    stream,
     jsonSchemaValidated: input.jsonSchemaValidated
   }));
 }
@@ -1193,7 +1251,13 @@ function mutableAuditFromReceipt(
     responseMode: receipt.responseMode,
     eofObserved: true,
     finishReasonStopObserved: true,
-    sseDoneObserved: receipt.sseDoneObserved
+    sseDoneObserved: receipt.sseDoneObserved,
+    streamEventCount: 0,
+    streamUtf8Bytes: 0,
+    streamChunkCount: 0,
+    usageEventCount: 0,
+    usageTotalTokens: null,
+    firstRejectedEvent: null
   };
 }
 
@@ -1231,7 +1295,13 @@ function promoteJsonFailureAudit(
       responseMode: existing.terminal.responseMode,
       eofObserved: existing.terminal.eofObserved,
       finishReasonStopObserved: existing.terminal.finishReasonStopObserved,
-      sseDoneObserved: existing.terminal.sseDoneObserved
+      sseDoneObserved: existing.terminal.sseDoneObserved,
+      streamEventCount: existing.stream.eventCount,
+      streamUtf8Bytes: existing.stream.utf8Bytes,
+      streamChunkCount: existing.stream.chunkCount,
+      usageEventCount: existing.stream.usageEventCount,
+      usageTotalTokens: existing.stream.usageTotalTokens,
+      firstRejectedEvent: existing.stream.firstRejectedEvent
     },
     completedResponses,
     priorTransportAttemptCount,
@@ -2284,15 +2354,25 @@ async function readChatCompletionEventStream(
     currentLinePrefix: ""
   };
   const consumeEvent = (event: string): void => {
-    const hasValidOutput = consumeObservedChatCompletionEvent(
-      event,
-      state,
-      observer
-    );
-    audit.sseDoneObserved = state.sawDone;
-    audit.finishReasonStopObserved = state.sawStop;
-    resetPostDonePendingDataScan(postDonePendingDataScan, state);
-    if (hasValidOutput) observer.onValidOutput();
+    audit.streamEventCount += 1;
+    observeSseUsage(event, audit);
+    try {
+      const hasValidOutput = consumeObservedChatCompletionEvent(
+        event,
+        state,
+        observer
+      );
+      audit.sseDoneObserved = state.sawDone;
+      audit.finishReasonStopObserved = state.sawStop;
+      resetPostDonePendingDataScan(postDonePendingDataScan, state);
+      if (hasValidOutput) observer.onValidOutput();
+    } catch (error) {
+      audit.firstRejectedEvent ??= describeRejectedSseEvent(
+        event,
+        audit.streamEventCount
+      );
+      throw error;
+    }
   };
   const observePartialEventText = (text: string): void => {
     scanUnresolvedPostDoneData(
@@ -2407,8 +2487,10 @@ async function readChatCompletionEventStream(
             ? undefined
             : postDoneFailureSubstage(state.postDoneTailShape, false)
       );
+      audit.streamUtf8Bytes = totalBytes;
       if (chunk.value.byteLength > 0) {
         responseChunkCount += 1;
+        audit.streamChunkCount = responseChunkCount;
         if (responseChunkCount > maximumLlmResponseChunks) {
           if (firstProtocolError !== undefined) throw firstProtocolError;
           if (state.sawDone) {
@@ -2480,8 +2562,7 @@ async function readChatCompletionEventStream(
     }
   } catch (error) {
     if (
-      !readerFinished &&
-      state.sawDone &&
+      firstProtocolError === undefined &&
       (state.postDoneTailShape !== undefined ||
         state.postDoneTailHasUnresolvedData)
     ) {
@@ -2499,6 +2580,111 @@ async function readChatCompletionEventStream(
       // 读取结果或固定错误已经确定，不再用流清理错误覆盖它。
     }
   }
+}
+
+function observeSseUsage(event: string, audit: MutableLlmRequestAudit): void {
+  const raw = parseSseEventData(event);
+  if (typeof raw !== "object" || raw === null) return;
+  const usage = (raw as Record<string, unknown>).usage;
+  if (typeof usage !== "object" || usage === null) return;
+  audit.usageEventCount += 1;
+  const totalTokens = (usage as Record<string, unknown>).total_tokens;
+  if (Number.isSafeInteger(totalTokens) && (totalTokens as number) >= 0) {
+    audit.usageTotalTokens = totalTokens as number;
+  }
+}
+
+function describeRejectedSseEvent(
+  event: string,
+  ordinal: number
+): LlmSseRejectedEventAudit {
+  const dataFields = sseDataFields(event);
+  const raw = parseSseEventData(event);
+  let shape: LlmSseRejectedShape = "json_invalid";
+  let topLevelKeys: readonly string[] = [];
+  let choiceKeys: readonly string[] = [];
+  let deltaKeys: readonly string[] = [];
+  if (raw !== undefined) {
+    if (typeof raw !== "object" || raw === null) {
+      shape = "non_object";
+    } else {
+      const record = raw as Record<string, unknown>;
+      topLevelKeys = safeShapeKeys(record);
+      if (Object.prototype.hasOwnProperty.call(record, "error")) {
+        shape = "error_object";
+      } else if (!Array.isArray(record.choices)) {
+        shape = "choices_missing_or_non_array";
+      } else {
+        const choice = record.choices[0];
+        if (typeof choice !== "object" || choice === null) {
+          shape = "choice_non_object";
+        } else {
+          const choiceRecord = choice as Record<string, unknown>;
+          choiceKeys = safeShapeKeys(choiceRecord);
+          const delta = choiceRecord.delta ?? choiceRecord.message;
+          if (typeof delta !== "object" || delta === null) {
+            shape = "delta_missing_or_non_object";
+          } else {
+            const deltaRecord = delta as Record<string, unknown>;
+            deltaKeys = safeShapeKeys(deltaRecord);
+            shape = ["reasoning_content", "reasoning", "content"].some((key) => {
+              const value = deltaRecord[key];
+              return value !== undefined && value !== null &&
+                typeof value !== "string";
+            })
+              ? "delta_field_type"
+              : "finish_reason_type_or_unknown";
+          }
+        }
+      }
+    }
+  }
+  const shapeFingerprint = createHash("sha256").update(JSON.stringify({
+    topLevelKeys,
+    choiceKeys,
+    deltaKeys,
+    shape
+  })).digest("hex");
+  return Object.freeze({
+    eventOrdinal: ordinal,
+    completedEventCount: ordinal - 1,
+    dataFieldCount: dataFields.length,
+    eventUtf8Bytes: Buffer.byteLength(event, "utf8"),
+    topLevelKeys,
+    choiceKeys,
+    deltaKeys,
+    shape,
+    shapeFingerprint
+  });
+}
+
+function parseSseEventData(event: string): unknown {
+  const data = sseDataFields(event).join("\n");
+  if (data.length === 0 || data === "[DONE]") return undefined;
+  try {
+    return JSON.parse(data) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function sseDataFields(event: string): readonly string[] {
+  return event.split("\n").flatMap((line) =>
+    line === "data"
+      ? [""]
+      : line.startsWith("data:")
+        ? [line.slice("data:".length).trimStart()]
+        : []
+  );
+}
+
+function safeShapeKeys(record: Record<string, unknown>): readonly string[] {
+  return Object.freeze(
+    Object.keys(record)
+      .filter((key) => /^[A-Za-z_][A-Za-z0-9_]{0,63}$/u.test(key))
+      .sort()
+      .slice(0, 32)
+  );
 }
 
 function isDrainableResponseProtocolError(

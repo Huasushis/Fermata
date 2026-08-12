@@ -9,7 +9,8 @@ import {
   type ChatMessage,
   type ChatCompletionWithReceipt,
   type LlmResponseFormatFailureStage,
-  type LlmResponseFormatFailureSubstage
+  type LlmResponseFormatFailureSubstage,
+  type LlmSseRejectedEventAudit
 } from "../llm";
 import {
   runFourCallReviewDag,
@@ -60,6 +61,12 @@ export interface FourCallSafeRequestFailure {
   readonly jsonSchemaValidated: false | null;
   readonly formatFailureStage: LlmResponseFormatFailureStage | null;
   readonly formatFailureSubstage: LlmResponseFormatFailureSubstage | null;
+  readonly streamEventCount: number;
+  readonly streamUtf8Bytes: number;
+  readonly streamChunkCount: number;
+  readonly usageEventCount: number;
+  readonly usageTotalTokens: number | null;
+  readonly firstRejectedEvent: LlmSseRejectedEventAudit | null;
 }
 
 
@@ -290,6 +297,12 @@ function safeRequestFailure(
       audit?.terminal.finishReasonStopObserved ?? false,
     terminalSseDoneObserved: audit?.terminal.sseDoneObserved ?? null,
     jsonSchemaValidated: audit?.jsonSchemaValidated ?? null,
+    streamEventCount: audit?.stream.eventCount ?? 0,
+    streamUtf8Bytes: audit?.stream.utf8Bytes ?? 0,
+    streamChunkCount: audit?.stream.chunkCount ?? 0,
+    usageEventCount: audit?.stream.usageEventCount ?? 0,
+    usageTotalTokens: audit?.stream.usageTotalTokens ?? null,
+    firstRejectedEvent: audit?.stream.firstRejectedEvent ?? null,
     formatFailureStage: hasFormatFailure
       ? error.formatFailureStage ?? null
       : null,

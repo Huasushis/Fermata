@@ -265,6 +265,14 @@ describe("chatComplete：正常路径", () => {
         finishReasonStopObserved: false,
         sseDoneObserved: null
       },
+      stream: {
+        eventCount: 0,
+        utf8Bytes: 0,
+        chunkCount: 0,
+        usageEventCount: 0,
+        usageTotalTokens: null,
+        firstRejectedEvent: null
+      },
       jsonSchemaValidated: null
     });
     expect(JSON.stringify(caught)).not.toContain(privateBody);
@@ -1941,6 +1949,81 @@ describe("chatComplete：正常路径", () => {
       formatFailureStage: "event_json"
     });
     expect(cancelled).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("SSE 协议首错只审计字段形状与计数，不保存事件正文且不重试", async () => {
+    const privateSentinel = "SYNTHETIC_PRIVATE_EVENT_VALUE";
+    const body = [
+      ": heartbeat",
+      "",
+      `data: ${JSON.stringify({
+        choices: [],
+        usage: { total_tokens: 7 }
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        choices: [{ delta: { reasoning_content: "synthetic reasoning" } }]
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        provider_control: { private: privateSentinel }
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        choices: [{ delta: { content: privateSentinel } }]
+      })}`,
+      "",
+      ""
+    ].join("\n");
+    const fetchMock = vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    }));
+    let caught: unknown;
+
+    try {
+      await chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "event_shape"
+    });
+    const audit = getLlmFailureAudit(caught);
+    expect(audit).toMatchObject({
+      transportAttemptCount: 1,
+      terminal: {
+        status: 200,
+        responseMode: "sse",
+        eofObserved: true,
+        finishReasonStopObserved: false,
+        sseDoneObserved: false
+      },
+      stream: {
+        eventCount: 4,
+        chunkCount: 1,
+        usageEventCount: 1,
+        usageTotalTokens: 7,
+        firstRejectedEvent: {
+          eventOrdinal: 4,
+          completedEventCount: 3,
+          dataFieldCount: 1,
+          topLevelKeys: ["provider_control"],
+          choiceKeys: [],
+          deltaKeys: [],
+          shape: "choices_missing_or_non_array"
+        }
+      }
+    });
+    expect(audit?.stream.utf8Bytes).toBeGreaterThan(0);
+    expect(audit?.stream.firstRejectedEvent?.eventUtf8Bytes).toBeGreaterThan(0);
+    expect(audit?.stream.firstRejectedEvent?.shapeFingerprint).toMatch(
+      /^[a-f0-9]{64}$/u
+    );
+    expect(JSON.stringify(audit)).not.toContain(privateSentinel);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 

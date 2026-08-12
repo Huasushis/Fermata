@@ -186,6 +186,31 @@ const safeRequestFailureSchema = z.object({
   terminalFinishReasonStopObserved: z.boolean(),
   terminalSseDoneObserved: z.boolean().nullable(),
   jsonSchemaValidated: z.literal(false).nullable(),
+  streamEventCount: z.number().int().nonnegative(),
+  streamUtf8Bytes: z.number().int().nonnegative(),
+  streamChunkCount: z.number().int().nonnegative(),
+  usageEventCount: z.number().int().nonnegative(),
+  usageTotalTokens: z.number().int().nonnegative().nullable(),
+  firstRejectedEvent: z.object({
+    eventOrdinal: z.number().int().positive(),
+    completedEventCount: z.number().int().nonnegative(),
+    dataFieldCount: z.number().int().nonnegative(),
+    eventUtf8Bytes: z.number().int().nonnegative(),
+    topLevelKeys: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/u)).max(32),
+    choiceKeys: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/u)).max(32),
+    deltaKeys: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/u)).max(32),
+    shape: z.enum([
+      "json_invalid",
+      "non_object",
+      "error_object",
+      "choices_missing_or_non_array",
+      "choice_non_object",
+      "delta_missing_or_non_object",
+      "delta_field_type",
+      "finish_reason_type_or_unknown"
+    ]),
+    shapeFingerprint: digestSchema
+  }).strict().nullable(),
   formatFailureStage: z.enum([
     "missing_body",
     "content_type",

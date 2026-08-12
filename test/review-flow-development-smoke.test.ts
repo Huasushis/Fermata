@@ -50,6 +50,12 @@ function safeFailure(
     terminalFinishReasonStopObserved: false,
     terminalSseDoneObserved: null,
     jsonSchemaValidated: null,
+    streamEventCount: 0,
+    streamUtf8Bytes: 0,
+    streamChunkCount: 0,
+    usageEventCount: 0,
+    usageTotalTokens: null,
+    firstRejectedEvent: null,
     formatFailureStage: null,
     formatFailureSubstage: null
   };
