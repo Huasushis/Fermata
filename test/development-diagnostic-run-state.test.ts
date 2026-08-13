@@ -116,6 +116,23 @@ function buildIdentity(runId = randomUUID()): DevelopmentDiagnosticRunIdentity {
   };
 }
 
+function buildSingleSlotIdentity(runId = randomUUID()): DevelopmentDiagnosticRunIdentity {
+  const baseIdentity = buildIdentity(runId);
+  return {
+    ...baseIdentity,
+    plannedRun: {
+      schemaVersion: 1,
+      selectedSlots: ["slot-01"],
+      expectedRequestsPerSlot: 12,
+      maximumConcurrency: 12,
+      maximumTransportAttemptsPerRequest: 2,
+      globalTransportAttemptCeiling: 16,
+      phaseSchedulingBudgetMs: 90 * 60_000,
+      softStopPolicy: "stop_new_and_drain_in_flight"
+    }
+  };
+}
+
 function createTemporaryDirectory(name = "state"): string {
   const root = mkdtempSync(join(tmpdir(), "fermata-run-state-v1-"));
   temporaryRoots.push(root);
@@ -579,6 +596,169 @@ describe("development diagnostic strict run state", () => {
     expect(transitionDevelopmentDiagnosticRunState(failed, "incomplete", fixedTime).phase).toBe(
       "incomplete"
     );
+  });
+
+  it("terminalizes a single selected slot as incomplete while the unselected slot stays not_started", () => {
+    const identity = buildSingleSlotIdentity();
+    let state = advanceToRunning(identity);
+    state = applyDevelopmentDiagnosticRunEvent(state, {
+      type: "transport_intent",
+      roleFingerprint: digest("role:solver"),
+      modelFingerprint: digest("model:solver"),
+      attempt: 1,
+      at: fixedTime
+    });
+    state = applyDevelopmentDiagnosticRunEvent(state, {
+      type: "transport_reserved",
+      attemptSequence: 1,
+      at: fixedTime
+    });
+    state = applyDevelopmentDiagnosticRunEvent(state, {
+      type: "transport_started",
+      attemptSequence: 1,
+      at: fixedTime
+    });
+    state = applyDevelopmentDiagnosticRunEvent(state, {
+      type: "transport_settled",
+      attemptSequence: 1,
+      outcome: "succeeded",
+      errorCategory: null,
+      at: fixedTime
+    });
+    state = applyDevelopmentDiagnosticRunEvent(state, {
+      type: "transport_intent",
+      roleFingerprint: digest("role:solution_analyst"),
+      modelFingerprint: digest("model:solution_analyst"),
+      attempt: 1,
+      at: fixedTime
+    });
+    state = applyDevelopmentDiagnosticRunEvent(state, {
+      type: "transport_reserved",
+      attemptSequence: 2,
+      at: fixedTime
+    });
+    state = applyDevelopmentDiagnosticRunEvent(state, {
+      type: "transport_started",
+      attemptSequence: 2,
+      at: fixedTime
+    });
+    state = applyDevelopmentDiagnosticRunEvent(state, {
+      type: "transport_settled",
+      attemptSequence: 2,
+      outcome: "failed",
+      errorCategory: "permanent",
+      at: fixedTime
+    });
+    state = applyDevelopmentDiagnosticRunEvent(state, {
+      type: "termination_intent",
+      signal: "SIGINT",
+      at: fixedTime
+    });
+    state = applyDevelopmentDiagnosticRunEvent(state, {
+      type: "terminal",
+      phase: "incomplete",
+      reason: "signal",
+      at: fixedTime
+    });
+    expect(state.phase).toBe("incomplete");
+    expect(state.terminationIntent).toBe("SIGINT");
+    expect(state.terminalReason).toBe("signal");
+    expect(state.transport).toMatchObject({ active: 0, queued: 0, settled: 2 });
+    const selected = state.slots.find((slot) => slot.slot === "slot-01");
+    const unselected = state.slots.find((slot) => slot.slot === "slot-02");
+    expect(selected?.status).toBe("incomplete");
+    expect(unselected?.status).toBe("not_started");
+    expect(unselected?.completedRoleFingerprints).toEqual([]);
+    expect(unselected?.failedRoleFingerprints).toEqual([]);
+    expect(parseDevelopmentDiagnosticRunState(state)).toEqual(state);
+  });
+
+  it("terminalizes two selected slots as incomplete without demoting completed evidence", () => {
+    const identity = buildIdentity();
+    let state = advanceToRunning(identity);
+    for (const event of [
+      { type: "transport_intent" as const, roleFingerprint: digest("role:solver"), modelFingerprint: digest("model:solver"), attempt: 1, at: fixedTime },
+      { type: "transport_reserved" as const, attemptSequence: 1, at: fixedTime },
+      { type: "transport_started" as const, attemptSequence: 1, at: fixedTime },
+      { type: "transport_settled" as const, attemptSequence: 1, outcome: "failed" as const, errorCategory: "permanent" as const, at: fixedTime }
+    ]) {
+      state = applyDevelopmentDiagnosticRunEvent(state, event);
+    }
+    state = applyDevelopmentDiagnosticRunEvent(state, {
+      type: "terminal",
+      phase: "incomplete",
+      reason: "terminal_role_failure",
+      at: fixedTime
+    });
+    expect(state.phase).toBe("incomplete");
+    expect(state.terminalReason).toBe("terminal_role_failure");
+    expect(state.slots.map((slot) => slot.status)).toEqual(["incomplete", "incomplete"]);
+    expect(parseDevelopmentDiagnosticRunState(state)).toEqual(state);
+  });
+
+  it("rejects terminal incomplete when a transport attempt is still active", () => {
+    const identity = buildSingleSlotIdentity();
+    let state = advanceToRunning(identity);
+    state = applyDevelopmentDiagnosticRunEvent(state, {
+      type: "transport_intent",
+      roleFingerprint: digest("role:solver"),
+      modelFingerprint: digest("model:solver"),
+      attempt: 1,
+      at: fixedTime
+    });
+    state = applyDevelopmentDiagnosticRunEvent(state, {
+      type: "transport_reserved",
+      attemptSequence: 1,
+      at: fixedTime
+    });
+    state = applyDevelopmentDiagnosticRunEvent(state, {
+      type: "transport_started",
+      attemptSequence: 1,
+      at: fixedTime
+    });
+    expectRunStateError(
+      () =>
+        applyDevelopmentDiagnosticRunEvent(state, {
+          type: "terminal",
+          phase: "incomplete",
+          reason: "signal",
+          at: fixedTime
+        }),
+      "RUN_STATE_ACTIVE_AT_TERMINAL"
+    );
+  });
+
+  it("rejects progress that advances an unselected slot past not_started", () => {
+    const running = advanceToRunning(buildSingleSlotIdentity());
+    expect(() =>
+      updateDevelopmentDiagnosticRunProgress(
+        running,
+        settledProgress(1, [incompleteSlot("slot-01"), incompleteSlot("slot-02")], "permanent"),
+        fixedTime
+      )
+    ).toThrow();
+  });
+
+  it("preserves a completed selected slot when terminalizing a single selected run", () => {
+    const identity = buildSingleSlotIdentity();
+    const running = advanceToRunning(identity);
+    const completedProgress = updateDevelopmentDiagnosticRunProgress(
+      running,
+      settledProgress(12, [completedSlot("slot-01"), notStartedSlot("slot-02")]),
+      fixedTime
+    );
+    let state = applyDevelopmentDiagnosticRunEvent(completedProgress, {
+      type: "terminal",
+      phase: "incomplete",
+      reason: "deadline",
+      at: fixedTime
+    });
+    expect(state.phase).toBe("incomplete");
+    const selected = state.slots.find((slot) => slot.slot === "slot-01");
+    const unselected = state.slots.find((slot) => slot.slot === "slot-02");
+    expect(selected?.status).toBe("complete");
+    expect(unselected?.status).toBe("not_started");
+    expect(parseDevelopmentDiagnosticRunState(state)).toEqual(state);
   });
 
   it("rejects unknown fields, stale integrity, and identity drift", () => {

@@ -770,8 +770,11 @@ export function applyDevelopmentDiagnosticRunEvent(
         }
         phase = "incomplete";
         terminalReason = runTerminalReasonSchema.parse(event.reason);
+        const selectedSlots = new Set(state.identity.plannedRun.selectedSlots);
         for (const slot of slots) {
-          if (slot.status !== "complete") slot.status = "incomplete";
+          if (selectedSlots.has(slot.slot) && slot.status !== "complete") {
+            slot.status = "incomplete";
+          }
         }
       }
       break;
