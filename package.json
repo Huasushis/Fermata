@@ -20,6 +20,7 @@
     "experiment:update-connectivity-code-version": "node scripts/update-eval-code-version.mjs",
     "experiment:probe-difficulty-thinking": "tsx experiments/probe-difficulty-thinking.ts",
     "smoke:development": "node scripts/run-with-env.mjs --development-smoke",
+    "diagnostic:development": "node scripts/development-diagnostic-bootstrap.mjs",
     "experiment:probe-difficulty-pro": "tsx experiments/probe-difficulty-pro.ts",
     "experiment:calibrate-anchors": "tsx experiments/calibrate-anchors.ts",
     "experiment:fetch-hf-dataset": "tsx experiments/fetch-hf-dataset.ts",

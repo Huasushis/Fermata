@@ -2,7 +2,7 @@
 /**
  * 用法：node scripts/run-with-env.mjs <env文件> <命令> [参数...]
  *       node scripts/run-with-env.mjs --review-flow-evaluation <env文件> [评测参数...]
- *
+ *       node scripts/run-with-env.mjs --development-diagnostic <env文件> --state-dir <绝对目录> [--authorize-plan <fingerprint>]
  * env 文件必须放在 Fermata/private/ 内。脚本不经过 shell，只向子进程传递
  * Fermata、实验、基本运行时与代理所需的明确白名单变量；已登记的 Fermata/
  * 实验变量由文件覆盖父环境，基本运行时和代理只从父环境继承。
@@ -21,10 +21,12 @@ import { readProtectedEnvFile } from "./private-runtime.mjs";
 const usage =
   "用法：node scripts/run-with-env.mjs <env文件> <命令> [参数...]\n" +
   "      node scripts/run-with-env.mjs --review-flow-evaluation <env文件> [评测参数...]\n" +
-  "      node scripts/run-with-env.mjs --development-smoke <env文件> [--preflight|--preflight-phase1 --resume=<runId>|--network-phase0 [--resume=<runId>]|--network-phase1 --resume=<runId> --release-phase1]\n";
+  "      node scripts/run-with-env.mjs --development-smoke <env文件> [--preflight|--preflight-phase1 --resume=<runId>|--network-phase0 [--resume=<runId>]|--network-phase1 --resume=<runId> --release-phase1]\n" +
+  "      node scripts/run-with-env.mjs --development-diagnostic <env文件> --state-dir <绝对目录> [--authorize-plan <fingerprint>]\n";
 
 export const reviewFlowEvaluationModeFlag = "--review-flow-evaluation";
 export const developmentSmokeModeFlag = "--development-smoke";
+export const developmentDiagnosticModeFlag = "--development-diagnostic";
 export const reviewFlowEvaluationBootstrapPath = fileURLToPath(
   new URL("./review-flow-evaluation-bootstrap.mjs", import.meta.url)
 );
@@ -32,6 +34,12 @@ export const developmentSmokeEntrypointPath = fileURLToPath(
   new URL("../experiments/run-development-smoke.ts", import.meta.url)
 );
 export const developmentSmokeTsxPath = fileURLToPath(
+  new URL("../node_modules/tsx/dist/cli.mjs", import.meta.url)
+);
+export const developmentDiagnosticEntrypointPath = fileURLToPath(
+  new URL("../experiments/run-development-diagnostic.ts", import.meta.url)
+);
+export const developmentDiagnosticTsxPath = fileURLToPath(
   new URL("../node_modules/tsx/dist/cli.mjs", import.meta.url)
 );
 const forwardedSignals = Object.freeze(["SIGINT", "SIGTERM", "SIGHUP"]);
@@ -119,6 +127,13 @@ const allowedReviewFlowEvaluationFileEnvironmentKeys = [
 const allowedDevelopmentSmokeFileEnvironmentKeys = [
   "AETHER_API_KEY",
   "AETHER_BASE_URL"
+];
+const allowedDevelopmentDiagnosticFileEnvironmentKeys = [
+  "AETHER_API_KEY",
+  "AETHER_BASE_URL",
+  "DASHSCOPE_API_KEY",
+  "DASHSCOPE_BASE_URL",
+  "FERMATA_DEVELOPMENT_DIAGNOSTIC_MANIFEST"
 ];
 
 
@@ -288,6 +303,66 @@ export function buildDevelopmentSmokeRunEnvironment(
   };
 }
 
+export function buildDevelopmentDiagnosticRunEnvironment(
+  envFileContent,
+  parentEnvironment
+) {
+  assertSafeNodeEnvironment(parentEnvironment);
+  const fileEnvironment = parseEnvFile(envFileContent);
+  assertSafeNodeEnvironment(fileEnvironment);
+  assertNoUnknownPrefixedEnvironmentKeys(
+    parentEnvironment,
+    [
+      ...allowedDevelopmentDiagnosticFileEnvironmentKeys,
+      ...allowedProxyEnvironmentKeys,
+      ...allowedBasicEnvironmentKeys,
+      "FERMATA_DEVELOPMENT_DIAGNOSTIC_STARTUP_CONTRACT",
+      "FERMATA_DEVELOPMENT_DIAGNOSTIC_PRIVATE_ROOTS",
+      "FERMATA_DEVELOPMENT_DIAGNOSTIC_PRIVATE_ROOTS_ATTESTATION"
+    ],
+    protectedRunEnvironmentPrefixes
+  );
+  assertNoUnknownPrefixedEnvironmentKeys(
+    fileEnvironment,
+    allowedDevelopmentDiagnosticFileEnvironmentKeys,
+    [""]
+  );
+  for (const [baseUrlKey, apiKeyKey] of [
+    ["AETHER_BASE_URL", "AETHER_API_KEY"],
+    ["DASHSCOPE_BASE_URL", "DASHSCOPE_API_KEY"]
+  ]) {
+    if (
+      Object.hasOwn(fileEnvironment, baseUrlKey) !==
+      Object.hasOwn(fileEnvironment, apiKeyKey)
+    ) {
+      throw new Error("DEVELOPMENT_DIAGNOSTIC_ENV_FILE_INCOMPLETE");
+    }
+  }
+  return {
+    ...selectEnvironment(parentEnvironment, [
+      ...allowedProxyEnvironmentKeys,
+      ...allowedBasicEnvironmentKeys
+    ]),
+    ...selectEnvironment(
+      fileEnvironment,
+      allowedDevelopmentDiagnosticFileEnvironmentKeys
+    ),
+    ...selectEnvironment(parentEnvironment, [
+      "FERMATA_DEVELOPMENT_DIAGNOSTIC_STARTUP_CONTRACT",
+      "FERMATA_DEVELOPMENT_DIAGNOSTIC_PRIVATE_ROOTS",
+      "FERMATA_DEVELOPMENT_DIAGNOSTIC_PRIVATE_ROOTS_ATTESTATION"
+    ]),
+    FERMATA_RUN_WITH_ENV: "1",
+    NODE_DEBUG: "",
+    NODE_DEBUG_NATIVE: "",
+    NODE_DISABLE_COMPILE_CACHE: "1",
+    NODE_OPTIONS: "",
+    NODE_PATH: "",
+    NODE_REDIRECT_WARNINGS: "",
+    NODE_V8_COVERAGE: ""
+  };
+}
+
 
 export function createRunWithEnvSignalController() {
   let child;
@@ -378,6 +453,34 @@ export function assertDevelopmentSmokeArguments(args) {
   }
 }
 
+export function assertDevelopmentDiagnosticArguments(args) {
+  const seen = new Set();
+  let hasStateDirectory = false;
+  for (let index = 0; index < args.length; index += 2) {
+    const flag = args[index];
+    const value = args[index + 1];
+    if (
+      value === undefined ||
+      (flag !== "--state-dir" && flag !== "--authorize-plan") ||
+      seen.has(flag) ||
+      value === "--" ||
+      value.includes("\0")
+    ) {
+      throw new Error("RUN_WITH_ENV_INVALID_ARGUMENTS");
+    }
+    seen.add(flag);
+    if (flag === "--state-dir") {
+      if (!isAbsolute(value) || /[;&|`$<>\\\r\n]/u.test(value)) {
+        throw new Error("RUN_WITH_ENV_INVALID_ARGUMENTS");
+      }
+      hasStateDirectory = true;
+    } else if (!/^[0-9a-f]{64}$/u.test(value)) {
+      throw new Error("RUN_WITH_ENV_INVALID_ARGUMENTS");
+    }
+  }
+  if (!hasStateDirectory) throw new Error("RUN_WITH_ENV_INVALID_ARGUMENTS");
+}
+
 export function spawnRunCommand(command, environment, spawnProcess = spawn) {
   try {
     return spawnProcess(command[0], command.slice(1), {
@@ -404,8 +507,12 @@ export function runWithEnv(
     argv[0] === reviewFlowEvaluationModeFlag;
   const dedicatedDevelopmentSmoke =
     argv[0] === developmentSmokeModeFlag;
+  const dedicatedDevelopmentDiagnostic =
+    argv[0] === developmentDiagnosticModeFlag;
   const effectiveArguments =
-    dedicatedReviewFlowEvaluation || dedicatedDevelopmentSmoke
+    dedicatedReviewFlowEvaluation ||
+    dedicatedDevelopmentSmoke ||
+    dedicatedDevelopmentDiagnostic
       ? argv.slice(1)
       : argv;
   const [envPath, ...remainingArguments] = effectiveArguments;
@@ -413,6 +520,7 @@ export function runWithEnv(
     envPath === undefined ||
     (!dedicatedReviewFlowEvaluation &&
       !dedicatedDevelopmentSmoke &&
+      !dedicatedDevelopmentDiagnostic &&
       remainingArguments.length === 0) ||
     !isAbsolute(envPath)
   ) {
@@ -420,6 +528,21 @@ export function runWithEnv(
   }
   if (dedicatedDevelopmentSmoke) {
     assertDevelopmentSmokeArguments(remainingArguments);
+  }
+  if (dedicatedDevelopmentDiagnostic) {
+    assertDevelopmentDiagnosticArguments(remainingArguments);
+  }
+  if (
+    !dedicatedDevelopmentDiagnostic &&
+    remainingArguments.some((value) => {
+      try {
+        return resolve(value) === developmentDiagnosticEntrypointPath;
+      } catch {
+        return false;
+      }
+    })
+  ) {
+    throw new Error("RUN_WITH_ENV_INVALID_ARGUMENTS");
   }
   // 在接触可能含密钥的文件之前先拒绝会让 Node 回显或注入环境的父设置。
   assertSafeNodeEnvironment(parentEnvironment);
@@ -434,7 +557,12 @@ export function runWithEnv(
           envFileContent,
           parentEnvironment
         )
-      : buildRunEnvironment(envFileContent, parentEnvironment);
+      : dedicatedDevelopmentDiagnostic
+        ? buildDevelopmentDiagnosticRunEnvironment(
+            envFileContent,
+            parentEnvironment
+          )
+        : buildRunEnvironment(envFileContent, parentEnvironment);
   // 付费 review-flow/development-smoke 模式不能经 PATH 解析 npm/tsx 或接受任意命令。
   // 包装器固定使用当前 Node 和仓库内绝对入口；其余参数只能是对应入口的参数。
   const command = dedicatedReviewFlowEvaluation
@@ -446,7 +574,14 @@ export function runWithEnv(
           developmentSmokeEntrypointPath,
           ...remainingArguments
         ]
-      : remainingArguments;
+      : dedicatedDevelopmentDiagnostic
+        ? [
+            process.execPath,
+            developmentDiagnosticTsxPath,
+            developmentDiagnosticEntrypointPath,
+            ...remainingArguments
+          ]
+        : remainingArguments;
   if (signalController?.closed === true) return undefined;
   const child = spawnRunCommand(command, childEnvironment, spawnProcess);
   signalController?.attach(child);

@@ -241,6 +241,7 @@ export interface ReviewFlowRoleCompletionSummary {
     readonly transportAttemptCount: number;
     readonly eofVerified: true;
     readonly finishReasonStopVerified: true;
+    readonly acceptedEventShapes: RoleCompletionReceipt["responses"][number]["acceptedEventShapes"];
     readonly sseDoneObserved: true | null;
   }[];
 }
@@ -453,11 +454,171 @@ export type ReviewFlowCalibrationProjection = z.infer<
   typeof reviewFlowCalibrationProjectionSchema
 >;
 
+/**
+ * 严格 Zod 校验：角色完成摘要。
+ * 强制固定角色枚举、收据/请求/传输不变量。
+ */
+export const reviewFlowRoleCompletionSummarySchema = z
+  .object({
+    role: reviewFlowRoleSchema,
+    evidenceId: z.string().min(1).max(200),
+    receiptHash: z.union([digestSchema, z.null()]),
+    requestCount: z.union([z.literal(0), z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
+    transportAttemptCount: z.number().int().nonnegative().max(2_000),
+    responseModes: z.array(z.enum(["sse", "json"])),
+    responses: z
+      .array(
+        z
+          .object({
+            responseMode: z.enum(["sse", "json"]),
+            transportAttemptCount: z.number().int().positive().max(1_000),
+            eofVerified: z.literal(true),
+            finishReasonStopVerified: z.literal(true),
+            acceptedEventShapes: z.array(roleAcceptedEventShapeSchema).max(64).readonly(),
+            sseDoneObserved: z.union([z.literal(true), z.null()])
+          })
+          .strict()
+      )
+      .max(4)
+  })
+  .strict();
+
+/**
+ * 严格 Zod 校验：角色失败摘要。
+ * 强制固定角色枚举、失败类型枚举、协议不变量。
+ */
+export const reviewFlowRoleFailureSummarySchema = z
+  .object({
+    role: reviewFlowRoleSchema,
+    failureKind: z.enum([...reviewFlowFailureKindAllowlist] as [ReviewFlowFailureKind, ...ReviewFlowFailureKind[]]),
+    httpStatus: z.number().int().nullable(),
+    requestCount: z.union([z.literal(0), z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
+    transportAttemptCount: z.number().int().nonnegative().max(2_000),
+    completedResponseCount: z.number().int().nonnegative().max(4),
+    terminalResponseMode: z.union([z.enum(["sse", "json"]), z.null()]),
+    terminalEofObserved: z.boolean(),
+    terminalFinishReasonStopObserved: z.boolean(),
+    terminalSseDoneObserved: z.union([z.boolean(), z.null()])
+  })
+  .strict();
+
+/**
+ * 严格 Zod 校验：ReviewFlowSafeRunBinding。
+ */
+export const reviewFlowSafeRunBindingSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    problemContentHash: digestSchema,
+    problemId: z.union([z.string().min(1).max(200), z.null()]),
+    problemRevision: z.number().int().nonnegative(),
+    expectedRound: z.number().int().nonnegative(),
+    tagCatalogVersion: z.number().int().nonnegative(),
+    taskProvenanceHash: z.union([digestSchema, z.null()]),
+    anklangEvidenceExpiresAt: z.union([z.string().datetime().nullable(), z.null()]),
+    engineBuildFingerprint: z.union([digestSchema, z.null()]),
+    accuracyEvidenceFingerprint: z.union([digestSchema, z.null()]),
+    runId: z.union([z.string().min(1).max(200), z.null()]),
+    assignmentId: z.union([z.string().min(1).max(200), z.null()]),
+    runnerIdentity: z.union([z.string().min(1).max(200), z.null()])
+  })
+  .strict();
+
+/**
+ * 严格 Zod 校验：ReviewFlowIncompleteFailure。
+ * 强制角色有序子集、完成/失败不相交、failureId 从规范化基重算。
+ */
+export const reviewFlowIncompleteFailureSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    failureId: digestSchema,
+    code: z.string().min(1).max(200),
+    failureKind: z.enum([...reviewFlowFailureKindAllowlist] as [ReviewFlowFailureKind, ...ReviewFlowFailureKind[]]),
+    sourceSnapshotHash: z.union([digestSchema, z.null()]),
+    runBinding: z.union([reviewFlowSafeRunBindingSchema, z.null()]),
+    failedRoles: z.array(reviewFlowRoleFailureSummarySchema),
+    completedRoles: z.array(reviewFlowRoleCompletionSummarySchema)
+  })
+  .strict()
+  .superRefine((failure, context) => {
+    const expectedOrder = reviewFlowRoleSchema.options;
+    // 完成角色必须按固定顺序排列。
+    for (let i = 1; i < failure.completedRoles.length; i++) {
+      const prev = expectedOrder.indexOf(failure.completedRoles[i - 1]!.role);
+      const curr = expectedOrder.indexOf(failure.completedRoles[i]!.role);
+      if (prev >= curr) {
+        context.addIssue({
+          code: "custom",
+          path: ["completedRoles"],
+          message: "完成角色必须按固定顺序排列。"
+        });
+      }
+    }
+    // 完成/失败不相交。
+    const completedSet = new Set(failure.completedRoles.map((r) => r.role));
+    for (const failed of failure.failedRoles) {
+      if (completedSet.has(failed.role)) {
+        context.addIssue({
+          code: "custom",
+          path: ["failedRoles"],
+          message: "完成和失败角色集合必须不相交。"
+        });
+      }
+    }
+    // failureId 必须从规范化基重算一致。
+    const failureBase = {
+      schemaVersion: 1 as const,
+      code: failure.code,
+      failureKind: failure.failureKind,
+      sourceSnapshotHash: failure.sourceSnapshotHash,
+      runBinding: failure.runBinding,
+      failedRoles: failure.failedRoles,
+      completedRoles: failure.completedRoles
+    };
+    if (failure.failureId !== hashCanonicalValue(failureBase)) {
+      context.addIssue({
+        code: "custom",
+        path: ["failureId"],
+        message: "failureId 必须从规范化基重算一致。"
+      });
+    }
+  });
+
+/**
+ * 严格 Zod 校验：ReviewFlowCalibrationOutcome。
+ * 完整 outcome 走 reviewFlowCalibrationProjectionSchema；
+ * 不完整 outcome 走 reviewFlowIncompleteFailureSchema。
+ */
+export const reviewFlowCalibrationOutcomeSchema = z
+  .union([
+    z
+      .object({
+        status: z.literal("complete"),
+        projection: reviewFlowCalibrationProjectionSchema
+      })
+      .strict(),
+    z
+      .object({
+        status: z.literal("incomplete"),
+        failure: reviewFlowIncompleteFailureSchema
+      })
+      .strict()
+  ]);
+
 export interface ReviewFlowCalibrationInput {
   readonly taskSource: unknown;
   readonly trustedRunner: unknown;
   readonly executionContext: unknown;
   readonly requestStartGate: unknown;
+  /**
+   * 诊断/标定专用回调：当某个角色发生终态失败时，在失败分类完成后、
+   * 对等请求收束前同步调用。调用方可据此关闭请求/传输/调度门。
+   * 生产路径不设此字段。
+   */
+  readonly onTerminalRoleFailure?: (
+    role: ReviewFlowRole,
+    failureKind: ReviewFlowFailureKind,
+    error: unknown
+  ) => void;
 }
 
 export type ReviewFlowCalibrationOutcome =
@@ -570,14 +731,6 @@ export function consumeReviewFlowSubmission(
   return submission.review;
 }
 
-interface RoleSpec<TPayload> {
-  readonly role: ReviewFlowRole;
-  readonly schema: z.ZodType<TPayload>;
-  readonly inputHash: string;
-  readonly run: () => Promise<unknown>;
-  postValidate?(artifact: EvidenceArtifact<TPayload>): void;
-}
-
 interface ReviewFlowRunBinding {
   readonly problemContentHash: string;
   readonly sourceSnapshotHash: string;
@@ -585,21 +738,41 @@ interface ReviewFlowRunBinding {
   readonly safeBinding: ReviewFlowSafeRunBinding;
 }
 
+interface RoleSpec<TPayload> {
+  readonly role: ReviewFlowRole;
+  readonly schema: z.ZodType<TPayload>;
+  readonly inputHash: string;
+  readonly run: () => Promise<unknown>;
+  postValidate?(artifact: EvidenceArtifact<TPayload>): void;
+}
 interface ReviewFlowRunTracker {
   sourceSnapshotHash: string | null;
   runBinding: ReviewFlowSafeRunBinding | null;
   readonly completions: Map<ReviewFlowRole, ReviewFlowRoleCompletionSummary>;
   readonly failures: Map<ReviewFlowRole, ReviewFlowRoleFailureSummary>;
+  readonly onTerminalRoleFailure?: (
+    role: ReviewFlowRole,
+    failureKind: ReviewFlowFailureKind,
+    error: unknown
+  ) => void;
 }
 
-function createReviewFlowRunTracker(): ReviewFlowRunTracker {
+function createReviewFlowRunTracker(
+  onTerminalRoleFailure?: (
+    role: ReviewFlowRole,
+    failureKind: ReviewFlowFailureKind,
+    error: unknown
+  ) => void
+): ReviewFlowRunTracker {
   return {
     sourceSnapshotHash: null,
     runBinding: null,
     completions: new Map(),
-    failures: new Map()
+    failures: new Map(),
+    onTerminalRoleFailure
   };
 }
+
 
 interface ResolvedReviewFlowRunner {
   readonly roles: ReviewFlowRoles;
@@ -620,6 +793,11 @@ export type ReviewFlowInput =
       readonly trustedRunner: unknown;
       readonly executionContext: unknown;
       readonly requestStartGate?: unknown;
+      readonly onTerminalRoleFailure?: (
+        role: ReviewFlowRole,
+        failureKind: ReviewFlowFailureKind,
+        error: unknown
+      ) => void;
       readonly source?: never;
       readonly identities?: never;
       readonly roles?: never;
@@ -631,14 +809,13 @@ export async function runReviewEvidenceFlow(
   return runReviewEvidenceFlowTracked(input, createReviewFlowRunTracker());
 }
 
-/**
- * 生产与标定入口：任何失败都返回显式 incomplete，且只包含安全计数与协议
- * 状态。调用方不能把异常、取消、499、缺失角色或部分成功误记成完整样本。
- */
 export async function runReviewEvidenceFlowOutcome(
   input: ReviewFlowInput
 ): Promise<ReviewFlowOutcome> {
-  const tracker = createReviewFlowRunTracker();
+  const onTerminalRoleFailure = "onTerminalRoleFailure" in input && typeof input.onTerminalRoleFailure === "function"
+    ? input.onTerminalRoleFailure
+    : undefined;
+  const tracker = createReviewFlowRunTracker(onTerminalRoleFailure);
   try {
     const decision = await runReviewEvidenceFlowTracked(input, tracker);
     return deepFreeze({ status: "complete" as const, decision });
@@ -1217,6 +1394,7 @@ async function runAndSeal<TPayload>(input: {
   } catch (error) {
     input.requestStartGate?.close();
     const failureKind = classifyRoleFailure(error);
+    input.tracker.onTerminalRoleFailure?.(input.spec.role, failureKind, error);
     input.tracker.completions.delete(input.spec.role);
     const llmAudit = getLlmFailureAudit(error);
     input.tracker.failures.set(

@@ -1242,6 +1242,17 @@ AGENTS.md 第 4 节。
 | 查重判断（旧 verdict.ts） | **旧设计不可作准确性基线** | 不能替代独立 human truth 的 verdict 轴。 |
 | 四语义请求 reviewFlow | **代码离线验收进行中；准确性未实跑；生产恒关闭** | A/B/C/D、统一 formatter、全局公平调度、阶段 receipt、完整性 gate 与双轴汇总已有合成覆盖；旧实验终态仍为 0 completed / 20 failed / 72 pending / 4 orphaned，accuracy=`INCOMPLETE`。 |
 
+
+正式付费诊断必须由仓库 owner 直接使用绝对 Node 路径调用
+`scripts/development-diagnostic-bootstrap.mjs`。先用 `--print-contract --state-dir <绝对状态目录>`
+取得只含摘要的启动契约，再以同一入口和 `--approve-contract <摘要>` 明确批准；之后才可传入
+私有 env 文件和诊断参数。bootstrap 会在读取 env、加载仓库 helper、tsx 或诊断 CLI 之前，从已验证
+descriptor 把批准的完整生产源码、入口、配置、已安装递归运行时依赖及二进制复制到 owner-only、
+不可复用的 content-addressed staging 闭包；动态 import、loader、tsconfig、cwd 与 child source
+随后全部来自该闭包，结束后按 identity 安全清理。仓库 owner 直接调用该 bootstrap 是信任根；边界
+防御未确认的依赖漂移、并发替换和非 owner/组/其他用户可写路径，不声称防御 owner 恶意自替换
+bootstrap。`npm run diagnostic:development` 只是便捷入口，不是正式付费授权边界；正式运行不得
+从 npm script 开始。
 这张表应该随每一次真正跑过评测脚本之后更新。只有当前代码生成、对应脱敏汇总与完成证据存在，
 并且报告明确 `eligible=true` 时，才能把结果写成合格候选；仅有完整性为真不代表准确性达标。
 

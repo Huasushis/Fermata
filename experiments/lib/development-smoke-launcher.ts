@@ -3,6 +3,7 @@ import {
   closeSync,
   constants,
   existsSync,
+  fstatSync,
   fsyncSync,
   linkSync,
   lstatSync,
@@ -48,7 +49,28 @@ import type {
   FourCallRuntimeModels,
   FourCallSafeRequestTiming
 } from "../../src/review-flow/four-call-runtime";
-import { buildHistoricalCalibrationReviewFlowTaskSource } from "../../src/review-flow/task-source";
+import {
+  buildHistoricalCalibrationReviewFlowTaskSource,
+  type ReviewFlowTaskSourceResult
+} from "../../src/review-flow/task-source";
+import {
+  DevelopmentDiagnosticRunController,
+  expectedDiagnosticSlots,
+  type DevelopmentDiagnosticSlot
+} from "../../src/review-flow/development-diagnostic";
+import {
+  createReviewFlowLlmBundle,
+  type ReviewFlowModelConfigs
+} from "../../src/review-flow/llm-roles";
+import {
+  runReviewEvidenceFlowCalibrationOutcome,
+  type ReviewFlowCalibrationOutcome
+} from "../../src/review-flow/orchestrator";
+import {
+  reviewFlowRoleSchema,
+  type ReviewFlowRole
+} from "../../src/review-flow/schemas";
+import type { LlmStageFailureKind } from "../../src/llm-scheduler";
 import { parseYamlLite } from "../../src/yaml-lite";
 
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
@@ -325,6 +347,7 @@ export const safeRequestFailureSchema = z.object({
     "LLM_STREAM_INTERRUPTED",
     "LLM_CANCELLED",
     "LLM_REQUEST_START_BLOCKED",
+    "LLM_TRANSPORT_DENIED",
     "LLM_OUTPUT_LENGTH_LIMIT",
     "LLM_OUTPUT_CONTENT_FILTERED",
     "LLM_RESPONSE_BODY_TOO_LARGE",
@@ -433,6 +456,7 @@ const legacySafeRequestFailureSchema = z.object({
     "LLM_STREAM_INTERRUPTED",
     "LLM_CANCELLED",
     "LLM_REQUEST_START_BLOCKED",
+    "LLM_TRANSPORT_DENIED",
     "LLM_OUTPUT_LENGTH_LIMIT",
     "LLM_OUTPUT_CONTENT_FILTERED",
     "LLM_RESPONSE_BODY_TOO_LARGE",
@@ -764,6 +788,13 @@ export interface DevelopmentSmokePreparedCase {
   readonly sourceBinding: string;
   readonly source: FourCallReviewSource;
   readonly truthBindingHash: string;
+  /**
+   * 任务候选绑定指纹：assignmentId + problemContentHash + tagCatalogVersion。
+   * 由 preflight 从源文件构建的任务源计算，runner 用它校验调用方传入的
+   * taskCandidate 与 preflight 时绑定到该 slot 的任务同一。
+   * 可选：仅 `runDevelopmentDiagnosticPhase`（经 diagnostic registrar）强制要求。
+   */
+  readonly taskBindingFingerprint?: string;
 }
 
 export interface DevelopmentSmokePreflight {
@@ -786,6 +817,20 @@ export interface DevelopmentSmokePreflight {
     readonly externalAttemptCeiling: 30;
     readonly manifestFingerprint: string;
   };
+  /**
+   * 仅诊断路径（`preflightDevelopmentDiagnostic`/`runDevelopmentDiagnosticPhase`）消费；
+   * phase0/phase1 冒烟无需这两个绑定字段。真实 `preflightDevelopmentSmoke` 总是填充。
+   */
+  readonly duplicateSimilarityRejectThreshold?: number;
+  readonly experimentVersion?: string;
+  readonly configuredRoleModelsFingerprint?: string;
+  readonly difficultyAnchors?: readonly DifficultyAnchor[];
+}
+
+export interface PaidExecutionSourceContractFilesystemHooks {
+  readonly beforeDirectoryRead?: (input: { readonly sourceId: string }) => void;
+  readonly beforeFileRead?: (input: { readonly sourceId: string }) => void;
+  readonly afterFileRead?: (input: { readonly sourceId: string }) => void;
 }
 
 export interface DevelopmentSmokePreflightOptions {
@@ -796,12 +841,520 @@ export interface DevelopmentSmokePreflightOptions {
   readonly env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
   readonly modelsYamlSource?: string;
   readonly allowedPrivateRoots?: readonly string[];
+  readonly paidExecutionSourceContractFingerprint?: string;
+  readonly paidExecutionSourceContractFilesystemHooks?:
+    PaidExecutionSourceContractFilesystemHooks;
+  readonly difficultyAnchorsOverride?: readonly DifficultyAnchor[];
+}
+
+const paidExecutionEntrySourceFiles = Object.freeze([
+  "config/anchors/difficulty.json",
+  "config/models.yaml",
+  "experiments/lib/development-diagnostic-run-state.ts",
+  "experiments/lib/development-smoke-launcher.ts",
+  "experiments/run-development-diagnostic.ts",
+  "scripts/development-diagnostic-bootstrap.mjs",
+  "scripts/env-file.mjs",
+  "scripts/private-runtime.mjs",
+  "scripts/run-with-env.mjs"
+] as const);
+
+const excludedSourceTreeDirectories = new Set([
+  "__tests__",
+  "build",
+  "coverage",
+  "dist",
+  "generated",
+  "node_modules",
+  "private",
+  "test",
+  "tests"
+]);
+
+const packageExecutionContractSchema = z.object({
+  type: z.enum(["module", "commonjs"]),
+  engines: z.object({
+    node: z.string().trim().min(1).max(200)
+  }).passthrough(),
+  scripts: z.object({
+    "diagnostic:development": z.string().trim().min(1).max(2_000)
+  }).passthrough()
+}).passthrough();
+
+interface PaidExecutionSourceDigest {
+  readonly sourceId: string;
+  readonly contentSha256: string;
+}
+
+interface PaidSourceIdentity {
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly mode: bigint;
+  readonly nlink: bigint;
+  readonly uid: bigint;
+  readonly gid: bigint;
+  readonly rdev: bigint;
+  readonly size: bigint;
+  readonly mtimeNs: bigint;
+  readonly ctimeNs: bigint;
+}
+
+function paidSourceIdentity(descriptor: number): PaidSourceIdentity {
+  const stat = fstatSync(descriptor, { bigint: true });
+  return Object.freeze({
+    dev: stat.dev,
+    ino: stat.ino,
+    mode: stat.mode,
+    nlink: stat.nlink,
+    uid: stat.uid,
+    gid: stat.gid,
+    rdev: stat.rdev,
+    size: stat.size,
+    mtimeNs: stat.mtimeNs,
+    ctimeNs: stat.ctimeNs
+  });
+}
+
+function samePaidSourceIdentity(
+  left: PaidSourceIdentity,
+  right: PaidSourceIdentity
+): boolean {
+  return left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode &&
+    left.nlink === right.nlink &&
+    left.uid === right.uid &&
+    left.gid === right.gid &&
+    left.rdev === right.rdev &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs;
+}
+
+function procDescriptorPath(descriptor: number, name?: string): string {
+  return name === undefined
+    ? `/proc/self/fd/${descriptor}`
+    : `/proc/self/fd/${descriptor}/${name}`;
+}
+
+function openPaidSourceAt(
+  parentDescriptor: number,
+  name: string,
+  directory: boolean
+): number {
+  if (name.length === 0 || name === "." || name === ".." || name.includes("/")) {
+    throw new Error("invalid paid source name");
+  }
+  return openSync(
+    procDescriptorPath(parentDescriptor, name),
+    constants.O_RDONLY |
+      constants.O_NOFOLLOW |
+      (directory ? constants.O_DIRECTORY : 0)
+  );
+}
+
+function assertPaidSourceTypeAndOwner(
+  descriptor: number,
+  expectedOwner: bigint,
+  expectedType: "directory" | "file"
+): PaidSourceIdentity {
+  const stat = fstatSync(descriptor, { bigint: true });
+  if (
+    stat.uid !== expectedOwner ||
+    (expectedType === "directory" ? !stat.isDirectory() : !stat.isFile())
+  ) {
+    throw new Error("invalid paid source identity");
+  }
+  return paidSourceIdentity(descriptor);
+}
+
+function assertPaidSourceBinding(
+  parentDescriptor: number,
+  name: string,
+  expectedIdentity: PaidSourceIdentity,
+  expectedOwner: bigint,
+  expectedType: "directory" | "file"
+): void {
+  let verificationDescriptor: number | undefined;
+  try {
+    verificationDescriptor = openPaidSourceAt(
+      parentDescriptor,
+      name,
+      expectedType === "directory"
+    );
+    const currentIdentity = assertPaidSourceTypeAndOwner(
+      verificationDescriptor,
+      expectedOwner,
+      expectedType
+    );
+    if (!samePaidSourceIdentity(currentIdentity, expectedIdentity)) {
+      throw new Error("paid source binding changed");
+    }
+  } finally {
+    if (verificationDescriptor !== undefined) closeSync(verificationDescriptor);
+  }
+}
+
+function readPaidSourceDescriptor(
+  input: {
+    readonly parentDescriptor: number;
+    readonly parentIdentity: PaidSourceIdentity;
+    readonly name: string;
+    readonly descriptor: number;
+    readonly sourceId: string;
+    readonly owner: bigint;
+    readonly hooks?: PaidExecutionSourceContractFilesystemHooks;
+  }
+): Buffer {
+  const identityBefore = assertPaidSourceTypeAndOwner(
+    input.descriptor,
+    input.owner,
+    "file"
+  );
+  if (!samePaidSourceIdentity(
+    input.parentIdentity,
+    paidSourceIdentity(input.parentDescriptor)
+  )) {
+    throw new Error("paid source parent changed");
+  }
+  input.hooks?.beforeFileRead?.({ sourceId: input.sourceId });
+  assertPaidSourceBinding(
+    input.parentDescriptor,
+    input.name,
+    identityBefore,
+    input.owner,
+    "file"
+  );
+  if (!samePaidSourceIdentity(
+    input.parentIdentity,
+    paidSourceIdentity(input.parentDescriptor)
+  )) {
+    throw new Error("paid source parent changed");
+  }
+  const bytes = readFileSync(input.descriptor);
+  const identityAfter = assertPaidSourceTypeAndOwner(
+    input.descriptor,
+    input.owner,
+    "file"
+  );
+  if (
+    !samePaidSourceIdentity(identityBefore, identityAfter) ||
+    BigInt(bytes.byteLength) !== identityBefore.size
+  ) {
+    throw new Error("paid source changed while reading");
+  }
+  assertPaidSourceBinding(
+    input.parentDescriptor,
+    input.name,
+    identityBefore,
+    input.owner,
+    "file"
+  );
+  if (!samePaidSourceIdentity(
+    input.parentIdentity,
+    paidSourceIdentity(input.parentDescriptor)
+  )) {
+    throw new Error("paid source parent changed");
+  }
+  input.hooks?.afterFileRead?.({ sourceId: input.sourceId });
+  return bytes;
+}
+
+function collectPaidExecutionSrcTree(
+  input: {
+    readonly parentDescriptor: number;
+    readonly name: string;
+    readonly descriptor: number;
+    readonly sourceId: string;
+    readonly owner: bigint;
+    readonly hooks?: PaidExecutionSourceContractFilesystemHooks;
+  },
+  result: PaidExecutionSourceDigest[]
+): void {
+  const directoryIdentity = assertPaidSourceTypeAndOwner(
+    input.descriptor,
+    input.owner,
+    "directory"
+  );
+  input.hooks?.beforeDirectoryRead?.({ sourceId: input.sourceId });
+  assertPaidSourceBinding(
+    input.parentDescriptor,
+    input.name,
+    directoryIdentity,
+    input.owner,
+    "directory"
+  );
+  const names = readdirSync(procDescriptorPath(input.descriptor))
+    .sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+  if (!samePaidSourceIdentity(
+    directoryIdentity,
+    paidSourceIdentity(input.descriptor)
+  )) {
+    throw new Error("paid source directory changed");
+  }
+  for (const name of names) {
+    let childDescriptor: number | undefined;
+    try {
+      childDescriptor = openPaidSourceAt(input.descriptor, name, false);
+      if (!samePaidSourceIdentity(
+        directoryIdentity,
+        paidSourceIdentity(input.descriptor)
+      )) {
+        throw new Error("paid source directory changed");
+      }
+      const childStat = fstatSync(childDescriptor, { bigint: true });
+      if (childStat.uid !== input.owner || childStat.isSymbolicLink()) {
+        throw new Error("invalid paid source child");
+      }
+      if (childStat.isDirectory()) {
+        if (!excludedSourceTreeDirectories.has(name)) {
+          collectPaidExecutionSrcTree({
+            parentDescriptor: input.descriptor,
+            name,
+            descriptor: childDescriptor,
+            sourceId: `${input.sourceId}/${name}`,
+            owner: input.owner,
+            ...(input.hooks === undefined ? {} : { hooks: input.hooks })
+          }, result);
+        }
+      } else if (childStat.isFile()) {
+        if (
+          name.endsWith(".ts") &&
+          !name.endsWith(".test.ts") &&
+          !name.endsWith(".spec.ts")
+        ) {
+          const sourceId = `${input.sourceId}/${name}`;
+          const bytes = readPaidSourceDescriptor({
+            parentDescriptor: input.descriptor,
+            parentIdentity: directoryIdentity,
+            name,
+            descriptor: childDescriptor,
+            sourceId,
+            owner: input.owner,
+            ...(input.hooks === undefined ? {} : { hooks: input.hooks })
+          });
+          result.push(Object.freeze({
+            sourceId,
+            contentSha256: sha256(bytes)
+          }));
+        }
+      } else {
+        throw new Error("invalid paid source tree entry");
+      }
+    } finally {
+      if (childDescriptor !== undefined) closeSync(childDescriptor);
+    }
+    if (!samePaidSourceIdentity(
+      directoryIdentity,
+      paidSourceIdentity(input.descriptor)
+    )) {
+      throw new Error("paid source directory changed");
+    }
+  }
+  assertPaidSourceBinding(
+    input.parentDescriptor,
+    input.name,
+    directoryIdentity,
+    input.owner,
+    "directory"
+  );
+}
+
+function withPaidSourceParentDirectory<T>(
+  rootDescriptor: number,
+  owner: bigint,
+  directoryNames: readonly string[],
+  operation: (
+    parentDescriptor: number,
+    parentIdentity: PaidSourceIdentity
+  ) => T
+): T {
+  const descriptors = [rootDescriptor];
+  const identities: PaidSourceIdentity[] = [paidSourceIdentity(rootDescriptor)];
+  try {
+    for (const name of directoryNames) {
+      const parentDescriptor = descriptors.at(-1)!;
+      const descriptor = openPaidSourceAt(parentDescriptor, name, true);
+      identities.push(assertPaidSourceTypeAndOwner(descriptor, owner, "directory"));
+      descriptors.push(descriptor);
+    }
+    return operation(descriptors.at(-1)!, identities.at(-1)!);
+  } finally {
+    for (let index = descriptors.length - 1; index > 0; index -= 1) {
+      const descriptor = descriptors[index]!;
+      const parentDescriptor = descriptors[index - 1]!;
+      const name = directoryNames[index - 1]!;
+      try {
+        assertPaidSourceBinding(
+          parentDescriptor,
+          name,
+          identities[index]!,
+          owner,
+          "directory"
+        );
+      } finally {
+        closeSync(descriptor);
+      }
+    }
+  }
+}
+
+function readPaidExecutionEntry(
+  rootDescriptor: number,
+  owner: bigint,
+  sourceId: string,
+  hooks?: PaidExecutionSourceContractFilesystemHooks
+): Buffer {
+  const components = sourceId.split("/");
+  const name = components.pop()!;
+  return withPaidSourceParentDirectory(
+    rootDescriptor,
+    owner,
+    components,
+    (parentDescriptor, parentIdentity) => {
+      let descriptor: number | undefined;
+      try {
+        descriptor = openPaidSourceAt(parentDescriptor, name, false);
+        return readPaidSourceDescriptor({
+          parentDescriptor,
+          parentIdentity,
+          name,
+          descriptor,
+          sourceId,
+          owner,
+          ...(hooks === undefined ? {} : { hooks })
+        });
+      } finally {
+        if (descriptor !== undefined) closeSync(descriptor);
+      }
+    }
+  );
+}
+
+function paidExecutionSourceContractFingerprint(
+  repositoryRoot: string,
+  hooks?: PaidExecutionSourceContractFilesystemHooks
+): string {
+  let rootDescriptor: number | undefined;
+  try {
+    const requestedRoot = resolve(repositoryRoot);
+    rootDescriptor = openSync(
+      requestedRoot,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY
+    );
+    const rootStat = fstatSync(rootDescriptor, { bigint: true });
+    if (
+      !rootStat.isDirectory() ||
+      realpathSync(procDescriptorPath(rootDescriptor)) !== requestedRoot
+    ) {
+      throw new Error("invalid paid source root");
+    }
+    const rootIdentity = paidSourceIdentity(rootDescriptor);
+    const owner = rootIdentity.uid;
+    const sourceDigests: PaidExecutionSourceDigest[] = [];
+    let srcDescriptor: number | undefined;
+    try {
+      srcDescriptor = openPaidSourceAt(rootDescriptor, "src", true);
+      collectPaidExecutionSrcTree({
+        parentDescriptor: rootDescriptor,
+        name: "src",
+        descriptor: srcDescriptor,
+        sourceId: "src",
+        owner,
+        ...(hooks === undefined ? {} : { hooks })
+      }, sourceDigests);
+    } finally {
+      if (srcDescriptor !== undefined) closeSync(srcDescriptor);
+    }
+    for (const sourceId of paidExecutionEntrySourceFiles) {
+      sourceDigests.push(Object.freeze({
+        sourceId,
+        contentSha256: sha256(
+          readPaidExecutionEntry(rootDescriptor, owner, sourceId, hooks)
+        )
+      }));
+    }
+    const packageContract = packageExecutionContractSchema.parse(
+      JSON.parse(
+        readPaidExecutionEntry(rootDescriptor, owner, "package.json", hooks)
+          .toString("utf8")
+      )
+    );
+    if (!samePaidSourceIdentity(
+      rootIdentity,
+      paidSourceIdentity(rootDescriptor)
+    )) {
+      throw new Error("paid source root changed");
+    }
+    let rootVerificationDescriptor: number | undefined;
+    try {
+      rootVerificationDescriptor = openSync(
+        requestedRoot,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY
+      );
+      const currentRootIdentity = assertPaidSourceTypeAndOwner(
+        rootVerificationDescriptor,
+        owner,
+        "directory"
+      );
+      if (!samePaidSourceIdentity(rootIdentity, currentRootIdentity)) {
+        throw new Error("paid source root binding changed");
+      }
+    } finally {
+      if (rootVerificationDescriptor !== undefined) {
+        closeSync(rootVerificationDescriptor);
+      }
+    }
+    sourceDigests.sort((left, right) =>
+      left.sourceId < right.sourceId ? -1 : left.sourceId > right.sourceId ? 1 : 0
+    );
+    return hashCanonicalValue({
+      schemaVersion: 1,
+      sources: sourceDigests,
+      packageExecutionContract: {
+        type: packageContract.type,
+        nodeEngine: packageContract.engines.node,
+        diagnosticDevelopmentScript:
+          packageContract.scripts["diagnostic:development"]
+      }
+    });
+  } catch {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_SOURCE_CONTRACT_UNAVAILABLE");
+  } finally {
+    if (rootDescriptor !== undefined) closeSync(rootDescriptor);
+  }
+}
+
+const difficultyAnchorContractSchema = z.object({
+  contestId: z.number().int().positive(),
+  index: z.string().trim().min(1).max(10),
+  rating: z.number().int().min(800).max(3500),
+  summary: z.string().trim().min(1).max(2_000)
+}).strict();
+
+function paidExecutionContractFingerprint(input: {
+  readonly sourceContractFingerprint: string;
+  readonly duplicateSimilarityRejectThreshold: number;
+  readonly difficultyAnchors: readonly DifficultyAnchor[];
+}): string {
+  return hashCanonicalValue({
+    schemaVersion: 1,
+    sourceContractFingerprint: digestSchema.parse(input.sourceContractFingerprint),
+    duplicateSimilarityRejectThreshold: input.duplicateSimilarityRejectThreshold,
+    difficultyAnchors: input.difficultyAnchors
+  });
 }
 
 export function preflightDevelopmentSmoke(
   options: DevelopmentSmokePreflightOptions
 ): DevelopmentSmokePreflight {
   assertControlledEnvironment(options.env ?? process.env);
+  return preflightDevelopmentSmokeAfterControlledEnvironment(options);
+}
+
+function preflightDevelopmentSmokeAfterControlledEnvironment(
+  options: DevelopmentSmokePreflightOptions
+): DevelopmentSmokePreflight {
   if (!/^[a-f0-9]{40}$/u.test(options.codeVersion)) {
     throw new Error("DEVELOPMENT_SMOKE_CODE_VERSION_INVALID");
   }
@@ -822,21 +1375,36 @@ export function preflightDevelopmentSmoke(
     env: options.env ?? process.env,
     modelsYamlSource: options.modelsYamlSource
   });
-  const difficultyAnchors = loadDifficultyAnchors();
+  const difficultyAnchors = (
+    options.difficultyAnchorsOverride === undefined
+      ? loadDifficultyAnchors()
+      : z.array(difficultyAnchorContractSchema).max(50).parse(options.difficultyAnchorsOverride)
+  ).map((anchor) => Object.freeze({ ...anchor }));
   if (difficultyAnchors.length === 0) {
     throw new Error("DEVELOPMENT_SMOKE_DIFFICULTY_ANCHORS_MISSING");
   }
-  const cases = privateManifest.bindings.map((binding) => ({
-    slot: binding.slot,
-    sourceBinding: binding.slotBindingHash,
-    source: buildFourCallSource(
-      binding,
-      allowedPrivateRoots,
-      modelState.duplicateSimilarityReject,
-      difficultyAnchors
-    ),
-    truthBindingHash: binding.truth.truthBindingSha256
-  }));
+  const cases = privateManifest.bindings.map((binding) => {
+    const task = parseJson(readBoundFile(binding.source, allowedPrivateRoots));
+    const built = buildHistoricalCalibrationReviewFlowTaskSource(task, {
+      duplicateSimilarityRejectThreshold: modelState.duplicateSimilarityReject
+    });
+    return {
+      slot: binding.slot,
+      sourceBinding: binding.slotBindingHash,
+      source: buildFourCallSource(
+        binding,
+        allowedPrivateRoots,
+        modelState.duplicateSimilarityReject,
+        difficultyAnchors
+      ),
+      truthBindingHash: binding.truth.truthBindingSha256,
+      taskBindingFingerprint: hashCanonicalValue({
+        assignmentId: built.taskBinding.assignmentId,
+        problemContentHash: built.taskBinding.problemContentHash,
+        tagCatalogVersion: built.taskBinding.tagCatalogVersion
+      })
+    };
+  });
   return Object.freeze({
     manifestPath: manifestRead.realPath,
     manifestFileSha256: sha256(manifestRead.bytes),
@@ -856,8 +1424,665 @@ export function preflightDevelopmentSmoke(
       retries: 0 as const,
       externalAttemptCeiling: 30 as const,
       manifestFingerprint: summary.manifestFingerprint
+    }),
+    duplicateSimilarityRejectThreshold: modelState.duplicateSimilarityReject,
+    configuredRoleModelsFingerprint: modelState.configuredRoleModelsFingerprint,
+    difficultyAnchors: Object.freeze(difficultyAnchors),
+    experimentVersion: modelState.experimentVersion
+  });
+}
+
+/* ── 诊断预检权威：仅本模块内部持有 ── */
+
+/**
+ * 不透明诊断预检令牌：仅可由本模块 `preflightDevelopmentDiagnostic`
+ * （内部直接调用生产 `preflightDevelopmentSmoke`）经 `registerDiagnosticPreflight`
+ * 创建。调用方无法用结构相同的对象冒充——WeakMap 权威快照仅限本模块内部持有。
+ */
+export interface DevelopmentDiagnosticPreflight {
+  readonly manifestFingerprint: string;
+  readonly cases: readonly {
+    readonly slot: DevelopmentDiagnosticSlot;
+    readonly sourceBinding: string;
+    readonly source: FourCallReviewSource;
+    readonly truthBindingHash: string;
+    readonly taskBindingFingerprint: string;
+  }[];
+  readonly roleModels: ReviewFlowModelConfigs;
+  readonly roleModelsFingerprint: string;
+  readonly difficultyAnchors: readonly DifficultyAnchor[];
+  readonly includedInFinalCalibration: false;
+  readonly phase1Concept: false;
+  /**
+   * 权威绑定：preflight 令牌与 preflight 时的运行参数不可篡改地绑定。
+   * runner 必须逐一校验这些字段与调用方传入的 taskCandidates/threshold/profile/version 一致。
+   */
+  readonly duplicateSimilarityRejectThreshold: number;
+  readonly profileName: string;
+  readonly experimentVersion: string;
+  readonly paidExecutionContractFingerprint: string;
+  readonly caseBindingFingerprints: readonly string[];
+}
+
+function deepFreeze<T>(value: T): T {
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+  for (const nested of Object.values(value)) {
+    deepFreeze(nested);
+  }
+  return Object.freeze(value);
+}
+
+function diagnosticCaseBindingFingerprint(
+  entry: DevelopmentDiagnosticPreflight["cases"][number]
+): string {
+  return hashCanonicalValue({
+    slot: entry.slot,
+    sourceBinding: entry.sourceBinding,
+    truthBindingHash: entry.truthBindingHash,
+    taskBindingFingerprint: entry.taskBindingFingerprint
+  });
+}
+/**
+ * Paid diagnostic credential identity. The versioned domain and fixed-order
+ * length framing keep this digest separate from every other project hash.
+ * Only the digest is returned; credential bytes and their metadata are never
+ * placed in preflight/state/output records.
+ */
+function diagnosticCredentialIdentityFingerprint(
+  model: Pick<PipelineModelConfig, "spec" | "credentials">
+): string {
+  const hash = createHash("sha256");
+  hash.update(
+    "fermata.development-diagnostic.credential-identity\u0000v1\u0000",
+    "utf8"
+  );
+  const frame = Buffer.allocUnsafe(8);
+  for (const value of [
+    model.spec.provider,
+    model.credentials.baseUrl,
+    model.credentials.apiKey
+  ]) {
+    frame.writeBigUInt64BE(BigInt(Buffer.byteLength(value, "utf8")));
+    hash.update(frame);
+    hash.update(value, "utf8");
+  }
+  return hash.digest("hex");
+}
+
+function diagnosticProxyEnvironmentIdentityFingerprint(
+  env: NodeJS.ProcessEnv | Record<string, string | undefined>
+): string {
+  const selectedHttp = env.http_proxy ?? env.HTTP_PROXY;
+  const effectiveHttp = selectedHttp ? selectedHttp : null;
+  const selectedHttps = env.https_proxy ?? env.HTTPS_PROXY;
+  const effectiveHttps = selectedHttps ? selectedHttps : effectiveHttp;
+  const selectedNoProxy = env.no_proxy ?? env.NO_PROXY ?? "";
+  const noProxyEntries = selectedNoProxy.split(/[,\s]/u)
+    .filter((entry) => entry.length > 0)
+    .map((entry) => {
+      const parsed = entry.match(/^(.+):(\d+)$/u);
+      return {
+        hostname: (parsed?.[1] ?? entry).replace(/^\*?\./u, "").toLowerCase(),
+        port: parsed === null ? 0 : Number.parseInt(parsed[2]!, 10)
+      };
+    })
+    .sort((left, right) =>
+      left.hostname.localeCompare(right.hostname) || left.port - right.port);
+  const hash = createHash("sha256");
+  hash.update(
+    "fermata.development-diagnostic.proxy-environment-identity\u0000v1\u0000",
+    "utf8"
+  );
+  const frame = Buffer.allocUnsafe(8);
+  for (const value of [
+    effectiveHttp ?? "\u0000",
+    effectiveHttps ?? "\u0000",
+    selectedNoProxy === "*" ? "*" : JSON.stringify(noProxyEntries)
+  ]) {
+    frame.writeBigUInt64BE(BigInt(Buffer.byteLength(value, "utf8")));
+    hash.update(frame);
+    hash.update(value, "utf8");
+  }
+  return hash.digest("hex");
+}
+
+function diagnosticRoleModelsFingerprint(
+  models: ReviewFlowModelConfigs,
+  env: NodeJS.ProcessEnv | Record<string, string | undefined>
+): string {
+  return hashCanonicalValue({
+    proxyEnvironmentIdentityFingerprint:
+      diagnosticProxyEnvironmentIdentityFingerprint(env),
+    roleModels: reviewFlowRoleSchema.options.map((role) => {
+      const model = models[role];
+      return {
+        role,
+        spec: model.spec,
+        credentialIdentityFingerprint:
+          diagnosticCredentialIdentityFingerprint(model),
+        runtime: {
+          outputIdleTimeoutMs: model.runtime.outputIdleTimeoutMs,
+          firstOutputTimeoutMs: model.runtime.firstOutputTimeoutMs ?? null,
+          maximumDurationMs: model.runtime.maximumDurationMs ?? null,
+          maxAttempts: model.runtime.maxAttempts,
+          baseDelayMs: model.runtime.baseDelayMs
+        }
+      };
     })
   });
+}
+function captureDiagnosticPreflightOptions(
+  options: DevelopmentSmokePreflightOptions
+): DevelopmentSmokePreflightOptions {
+  return deepFreeze({
+    repositoryRoot: options.repositoryRoot,
+    projectRoot: options.projectRoot,
+    manifestPath: options.manifestPath,
+    codeVersion: options.codeVersion,
+    ...(options.paidExecutionSourceContractFilesystemHooks === undefined
+      ? {}
+      : {
+          paidExecutionSourceContractFilesystemHooks:
+            options.paidExecutionSourceContractFilesystemHooks
+        }),
+    ...(options.env === undefined ? {} : { env: { ...options.env } }),
+    ...(options.modelsYamlSource === undefined
+      ? {}
+      : { modelsYamlSource: options.modelsYamlSource }),
+    ...(options.allowedPrivateRoots === undefined
+      ? {}
+      : { allowedPrivateRoots: [...options.allowedPrivateRoots] }),
+    ...(options.paidExecutionSourceContractFingerprint === undefined
+      ? {}
+      : {
+          paidExecutionSourceContractFingerprint:
+            options.paidExecutionSourceContractFingerprint
+        }),
+    ...(options.difficultyAnchorsOverride === undefined
+      ? {}
+      : {
+          difficultyAnchorsOverride:
+            options.difficultyAnchorsOverride.map((anchor) => ({ ...anchor }))
+        })
+  });
+}
+
+interface DevelopmentDiagnosticTrustedExecution {
+  readonly slot: DevelopmentDiagnosticSlot;
+  readonly taskSource: ReviewFlowTaskSourceResult;
+  readonly taskSourceFingerprint: string;
+}
+
+function buildDiagnosticTrustedExecutions(
+  smoke: DevelopmentSmokePreflight,
+  options: DevelopmentSmokePreflightOptions
+): readonly DevelopmentDiagnosticTrustedExecution[] {
+  const projectRoot = realpathSync(options.projectRoot);
+  const allowedPrivateRoots = (options.allowedPrivateRoots ?? [
+    resolve(projectRoot, "Fermata/private"),
+    resolve(projectRoot, "Urmotiv/private")
+  ]).map((root) => realpathSync(root));
+  if (typeof smoke.duplicateSimilarityRejectThreshold !== "number") {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_SLOTS_INVALID");
+  }
+  const duplicateSimilarityRejectThreshold = smoke.duplicateSimilarityRejectThreshold;
+  return deepFreeze(expectedDiagnosticSlots.map((slot) => {
+    const binding = smoke.privateManifest.bindings.find((entry) => entry.slot === slot);
+    if (binding === undefined) {
+      throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_SLOT_MISSING");
+    }
+    const taskCandidate = parseJson(readBoundFile(binding.source, allowedPrivateRoots));
+    const taskSource = buildHistoricalCalibrationReviewFlowTaskSource(taskCandidate, {
+      duplicateSimilarityRejectThreshold
+    });
+    return {
+      slot,
+      taskSource,
+      taskSourceFingerprint: hashCanonicalValue(taskSource)
+    };
+  }));
+}
+
+
+interface DevelopmentDiagnosticPreflightAuthority {
+  readonly manifestFingerprint: string;
+  readonly cases: DevelopmentDiagnosticPreflight["cases"];
+  readonly roleModels: ReviewFlowModelConfigs;
+  readonly roleModelsFingerprint: string;
+  readonly paidExecutionContractFingerprint: string;
+  readonly difficultyAnchors: readonly DifficultyAnchor[];
+  readonly duplicateSimilarityRejectThreshold: number;
+  readonly profileName: string;
+  readonly experimentVersion: string;
+  readonly caseBindingFingerprints: readonly string[];
+  readonly revalidationOptions: DevelopmentSmokePreflightOptions;
+  readonly trustedExecutions: readonly DevelopmentDiagnosticTrustedExecution[];
+}
+
+const registeredDiagnosticPreflights =
+  new WeakMap<object, DevelopmentDiagnosticPreflightAuthority>();
+/**
+ * 模块私有登记器：接收 `preflightDevelopmentSmoke` 产生的 6×4 预检数据，
+ * 选取 slot-01/02，将 4 阶段模型映射为 11 角色配置，登记为不透明令牌。
+ */
+function registerDiagnosticPreflight(input: {
+  readonly manifestFingerprint: string;
+  readonly cases: readonly {
+    readonly slot: string;
+    readonly sourceBinding: string;
+    readonly source: FourCallReviewSource;
+    readonly truthBindingHash: string;
+    readonly taskBindingFingerprint?: string;
+  }[];
+  readonly fourCallModels: FourCallRuntimeModels;
+  readonly difficultyAnchors: readonly DifficultyAnchor[];
+  readonly safeSummary: {
+    readonly slots: number;
+    readonly provider: string;
+    readonly models: readonly string[];
+  };
+  readonly duplicateSimilarityRejectThreshold: number;
+  readonly profileName: string;
+  readonly experimentVersion: string;
+  readonly configuredRoleModelsFingerprint: string;
+  readonly paidExecutionContractFingerprint: string;
+  readonly revalidationOptions: DevelopmentSmokePreflightOptions;
+  readonly trustedExecutions: readonly DevelopmentDiagnosticTrustedExecution[];
+}): DevelopmentDiagnosticPreflight {
+  if (input.safeSummary.slots !== 6) {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_SLOTS_INVALID");
+  }
+  if (input.safeSummary.provider !== "aether") {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_PROVIDER_INVALID");
+  }
+  if (input.cases.length !== 6) {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_CASES_INVALID");
+  }
+  const selected = deepFreeze(expectedDiagnosticSlots.map((slot) => {
+    const found = input.cases.find((entry) => entry.slot === slot);
+    if (found === undefined) {
+      throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_SLOT_MISSING");
+    }
+    if (typeof found.taskBindingFingerprint !== "string" || found.taskBindingFingerprint.length === 0) {
+      throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_CASES_INVALID");
+    }
+    return { ...found, slot, taskBindingFingerprint: found.taskBindingFingerprint };
+  }));
+  const roleModels = mapFourCallToRoleModels(input.fourCallModels);
+  const roleModelsFingerprint = input.configuredRoleModelsFingerprint;
+  const executionContractFingerprint = input.paidExecutionContractFingerprint;
+  const difficultyAnchors = deepFreeze(input.difficultyAnchors.map((anchor) => ({ ...anchor })));
+  const caseBindingFingerprints = deepFreeze(
+    selected.map((entry) => diagnosticCaseBindingFingerprint(entry))
+  );
+  const preflight = deepFreeze({
+    manifestFingerprint: input.manifestFingerprint,
+    cases: selected,
+    roleModels,
+    roleModelsFingerprint,
+    difficultyAnchors,
+    paidExecutionContractFingerprint: executionContractFingerprint,
+    includedInFinalCalibration: false as const,
+    phase1Concept: false as const,
+    duplicateSimilarityRejectThreshold: input.duplicateSimilarityRejectThreshold,
+    profileName: input.profileName,
+    experimentVersion: input.experimentVersion,
+    caseBindingFingerprints
+  }) as DevelopmentDiagnosticPreflight;
+  registeredDiagnosticPreflights.set(preflight, {
+    manifestFingerprint: preflight.manifestFingerprint,
+    cases: preflight.cases,
+    paidExecutionContractFingerprint: preflight.paidExecutionContractFingerprint,
+    roleModels: preflight.roleModels,
+    roleModelsFingerprint: preflight.roleModelsFingerprint,
+    difficultyAnchors: preflight.difficultyAnchors,
+    duplicateSimilarityRejectThreshold: preflight.duplicateSimilarityRejectThreshold,
+    profileName: preflight.profileName,
+    experimentVersion: preflight.experimentVersion,
+    caseBindingFingerprints: preflight.caseBindingFingerprints,
+    revalidationOptions: input.revalidationOptions,
+    trustedExecutions: input.trustedExecutions
+  });
+  return preflight;
+}
+
+
+/**
+ * 模块私有验证：除 WeakMap 身份外，再核对所有公开权威字段及案例绑定指纹。
+ * 运行时只使用返回的私有快照，不信任调用方可见对象中的替代引用。
+ */
+function requireDiagnosticPreflightAuthority(
+  value: unknown
+): DevelopmentDiagnosticPreflightAuthority {
+  if (typeof value !== "object" || value === null) {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_FORBIDDEN");
+  }
+  const authority = registeredDiagnosticPreflights.get(value);
+  if (authority === undefined) {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_FORBIDDEN");
+  }
+  const preflight = value as DevelopmentDiagnosticPreflight;
+  if (
+    preflight.manifestFingerprint !== authority.manifestFingerprint ||
+    preflight.paidExecutionContractFingerprint !==
+      authority.paidExecutionContractFingerprint ||
+    preflight.cases !== authority.cases ||
+    preflight.roleModels !== authority.roleModels ||
+    preflight.roleModelsFingerprint !== authority.roleModelsFingerprint ||
+    preflight.difficultyAnchors !== authority.difficultyAnchors ||
+    preflight.duplicateSimilarityRejectThreshold !==
+      authority.duplicateSimilarityRejectThreshold ||
+    preflight.profileName !== authority.profileName ||
+    preflight.experimentVersion !== authority.experimentVersion ||
+    preflight.caseBindingFingerprints !== authority.caseBindingFingerprints ||
+    preflight.cases.length !== authority.caseBindingFingerprints.length ||
+    preflight.cases.some(
+      (entry, index) =>
+        diagnosticCaseBindingFingerprint(entry) !== authority.caseBindingFingerprints[index]
+    )
+  ) {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_FORBIDDEN");
+  }
+  return authority;
+}
+
+/**
+ * 模块私有：将生产 4 阶段模型映射为 11 角色配置。
+ * A→solver, B→difficulty, C→8 角色, D→adjudicator。
+ */
+function mapFourCallToRoleModels(
+  models: FourCallRuntimeModels
+): ReviewFlowModelConfigs {
+  const roles = reviewFlowRoleSchema.options as readonly ReviewFlowRole[];
+  const stageForRole = (role: ReviewFlowRole): "A" | "B" | "C" | "D" | "formatter" => {
+
+    switch (role) {
+      case "solver": return "A";
+      case "difficulty": return "B";
+      case "adjudicator": return "D";
+      case "solution_analyst":
+      case "technical_auditor":
+      case "editorial_judge":
+      case "contest_fit":
+      case "originality":
+      case "tags":
+      case "critic":
+      case "adversary":
+        return "C";
+      default:
+        return "formatter";
+    }
+  };
+  return deepFreeze(Object.fromEntries(
+    roles.map((role) => {
+      const config = models[stageForRole(role)];
+      return [role, {
+        spec: { ...config.spec },
+        credentials: { ...config.credentials },
+        runtime: { ...config.runtime }
+      }];
+    })
+  ) as unknown as ReviewFlowModelConfigs);
+}
+function revalidateDiagnosticPreflight(
+  authority: DevelopmentDiagnosticPreflightAuthority
+): void {
+  assertDiagnosticControlledEnvironment(
+    authority.revalidationOptions.env ?? process.env,
+    authority.revalidationOptions.manifestPath,
+    authority.revalidationOptions.paidExecutionSourceContractFingerprint,
+    authority.revalidationOptions.allowedPrivateRoots
+  );
+  const smoke = preflightDevelopmentSmokeAfterControlledEnvironment(
+    authority.revalidationOptions
+  );
+  const currentExecutions = buildDiagnosticTrustedExecutions(
+    smoke,
+    authority.revalidationOptions
+  );
+  const currentCases = expectedDiagnosticSlots.map((slot) => {
+    const found = smoke.cases.find((entry) => entry.slot === slot);
+    if (found === undefined || found.taskBindingFingerprint === undefined) {
+      throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_CHANGED");
+    }
+    return diagnosticCaseBindingFingerprint({
+      ...found,
+      slot,
+      taskBindingFingerprint: found.taskBindingFingerprint
+    });
+  });
+  const currentModelsFingerprint = diagnosticRoleModelsFingerprint(
+    mapFourCallToRoleModels(smoke.models),
+    authority.revalidationOptions.env ?? process.env
+  );
+  if (
+    smoke.safeSummary.manifestFingerprint !== authority.manifestFingerprint ||
+    smoke.duplicateSimilarityRejectThreshold !==
+      authority.duplicateSimilarityRejectThreshold ||
+    smoke.experimentVersion !== authority.experimentVersion ||
+    currentModelsFingerprint !== authority.roleModelsFingerprint ||
+    currentExecutions.length !== authority.trustedExecutions.length ||
+    currentExecutions.some(
+      (execution, index) =>
+        execution.slot !== authority.trustedExecutions[index]?.slot ||
+        execution.taskSourceFingerprint !==
+          authority.trustedExecutions[index]?.taskSourceFingerprint
+    ) ||
+    currentCases.length !== authority.caseBindingFingerprints.length ||
+    currentCases.some(
+      (fingerprint, index) => fingerprint !== authority.caseBindingFingerprints[index]
+    )
+  ) {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_CHANGED");
+  }
+}
+
+/**
+ * 模块私有：将传输门钩子注入每个 11 角色模型配置的 `runtime.onTransportDispatch`。
+ * 测试通过 `fetchRuntimeOverride` 注入离线 fetch——不改变 provider/model/thinking/budgets。
+ */
+function bindDiagnosticRoleModels(
+  models: ReviewFlowModelConfigs,
+  controller: DevelopmentDiagnosticRunController,
+  fetchOverride?: PipelineModelConfig["runtime"]["fetch"]
+): ReviewFlowModelConfigs {
+  const roles = reviewFlowRoleSchema.options as readonly ReviewFlowRole[];
+  const bound = Object.fromEntries(
+    roles.map((role) => {
+      const config = models[role];
+      const modelFingerprint = hashCanonicalValue(config.spec);
+      return [role, Object.freeze({
+        ...config,
+        runtime: Object.freeze({
+          ...config.runtime,
+          directStructuredOutput: true,
+          onTransportDispatch: () => controller.prepareTransportOrThrow({
+            role,
+            modelFingerprint
+          }),
+          dispatchTransport: <T>(execute: () => Promise<T>) =>
+            controller.dispatchTransport(execute),
+          onSafeOutputActivity: () => {
+            config.runtime.onSafeOutputActivity?.();
+            controller.markTransportFirstOutput();
+          },
+          ...(fetchOverride !== undefined ? { fetch: fetchOverride } : {})
+        })
+      })];
+    })
+  ) as unknown as ReviewFlowModelConfigs;
+  return Object.freeze(bound);
+}
+
+/**
+ * 模块私有：将诊断错误映射为调度器失败类型。
+ */
+function classifyDevelopmentDiagnosticFailure(
+  error: unknown
+): LlmStageFailureKind {
+  if (
+    error instanceof Error &&
+    error.message.startsWith("DEVELOPMENT_DIAGNOSTIC_")
+  ) {
+    return "permanent";
+  }
+  return "permanent";
+}
+
+/**
+ * 诊断预检：内部调用生产 `preflightDevelopmentSmoke`，从其返回的 6×4 预检中
+ * 选取固定的 slot-01/slot-02，将 4 阶段模型映射为 11 角色配置，
+ * 经模块私有 `registerDiagnosticPreflight` 登记为不透明令牌。
+ * 调用方只提供与 `preflightDevelopmentSmoke` 相同的选项——不接受任意 cases/models/fingerprint。
+ */
+export function preflightDevelopmentDiagnostic(
+  options: DevelopmentSmokePreflightOptions
+): DevelopmentDiagnosticPreflight {
+  const revalidationOptions = captureDiagnosticPreflightOptions(options);
+  assertDiagnosticControlledEnvironment(
+    revalidationOptions.env ?? process.env,
+    revalidationOptions.manifestPath,
+    revalidationOptions.paidExecutionSourceContractFingerprint,
+    revalidationOptions.allowedPrivateRoots
+  );
+  const smoke = preflightDevelopmentSmokeAfterControlledEnvironment(
+    revalidationOptions
+  );
+  const trustedExecutions = buildDiagnosticTrustedExecutions(
+    smoke,
+    revalidationOptions
+  );
+  if (
+    typeof smoke.duplicateSimilarityRejectThreshold !== "number" ||
+    typeof smoke.experimentVersion !== "string" ||
+    smoke.configuredRoleModelsFingerprint === undefined ||
+    smoke.difficultyAnchors === undefined
+  ) {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_SLOTS_INVALID");
+  }
+  const sourceContractFingerprint =
+    revalidationOptions.paidExecutionSourceContractFingerprint === undefined
+      ? paidExecutionSourceContractFingerprint(
+          smoke.repositoryRoot,
+          revalidationOptions.paidExecutionSourceContractFilesystemHooks
+        )
+      : digestSchema.parse(revalidationOptions.paidExecutionSourceContractFingerprint);
+  const executionContractFingerprint = paidExecutionContractFingerprint({
+    sourceContractFingerprint,
+    duplicateSimilarityRejectThreshold: smoke.duplicateSimilarityRejectThreshold,
+    difficultyAnchors: smoke.difficultyAnchors
+  });
+  return registerDiagnosticPreflight({
+    manifestFingerprint: smoke.safeSummary.manifestFingerprint,
+    cases: smoke.cases,
+    fourCallModels: smoke.models,
+    configuredRoleModelsFingerprint: smoke.configuredRoleModelsFingerprint,
+    paidExecutionContractFingerprint: executionContractFingerprint,
+    difficultyAnchors: smoke.difficultyAnchors,
+    safeSummary: smoke.safeSummary,
+    duplicateSimilarityRejectThreshold: smoke.duplicateSimilarityRejectThreshold,
+    profileName: "review-balanced",
+    experimentVersion: smoke.experimentVersion,
+    revalidationOptions,
+    trustedExecutions
+  });
+}
+
+/**
+ * 诊断运行阶段：验证 preflight 令牌来自本模块 WeakMap 权威快照，
+ * 构建标定 bundle 并运行 11 角色标定 outcome。
+ */
+export async function runDevelopmentDiagnosticPhase(input: {
+  readonly controller: DevelopmentDiagnosticRunController;
+  readonly preflight: DevelopmentDiagnosticPreflight;
+  readonly taskCandidates?: readonly {
+    readonly slot: DevelopmentDiagnosticSlot;
+    readonly taskCandidate: unknown;
+    readonly duplicateSimilarityRejectThreshold: number;
+  }[];
+  readonly fetchRuntimeOverride?: PipelineModelConfig["runtime"]["fetch"];
+  readonly engineBuildFingerprint: string;
+  readonly profileName: string;
+  readonly experimentVersion: string;
+}): Promise<readonly PromiseSettledResult<ReviewFlowCalibrationOutcome>[]> {
+  const authority = requireDiagnosticPreflightAuthority(input.preflight);
+  revalidateDiagnosticPreflight(authority);
+  const candidateSnapshot = input.taskCandidates?.map((entry) => ({
+    slot: entry.slot,
+    duplicateSimilarityRejectThreshold: entry.duplicateSimilarityRejectThreshold,
+    taskSource: buildHistoricalCalibrationReviewFlowTaskSource(entry.taskCandidate, {
+      duplicateSimilarityRejectThreshold: entry.duplicateSimilarityRejectThreshold
+    })
+  }));
+  if (
+    candidateSnapshot !== undefined &&
+    (candidateSnapshot.length !== expectedDiagnosticSlots.length ||
+      candidateSnapshot.some((entry, index) => entry.slot !== expectedDiagnosticSlots[index]))
+  ) {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_BATCH_INVALID");
+  }
+  if (input.profileName !== authority.profileName) {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_PROFILE_MISMATCH");
+  }
+  if (input.experimentVersion !== authority.experimentVersion) {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_EXPERIMENT_VERSION_MISMATCH");
+  }
+  if (candidateSnapshot !== undefined) {
+    for (const [index, entry] of candidateSnapshot.entries()) {
+      const trusted = authority.trustedExecutions[index];
+      if (trusted === undefined) {
+        throw new Error("DEVELOPMENT_DIAGNOSTIC_CASE_MISSING");
+      }
+      if (entry.duplicateSimilarityRejectThreshold !==
+          authority.duplicateSimilarityRejectThreshold) {
+        throw new Error("DEVELOPMENT_DIAGNOSTIC_THRESHOLD_MISMATCH");
+      }
+      if (hashCanonicalValue(entry.taskSource) !== trusted.taskSourceFingerprint) {
+        throw new Error("DEVELOPMENT_DIAGNOSTIC_TASK_BINDING_MISMATCH");
+      }
+    }
+  }
+  const boundRoleModels = bindDiagnosticRoleModels(
+    authority.roleModels,
+    input.controller,
+    input.fetchRuntimeOverride
+  );
+  const bundle = createReviewFlowLlmBundle({
+    models: boundRoleModels,
+    difficultyAnchors: authority.difficultyAnchors,
+    profileName: input.profileName,
+    experimentVersion: input.experimentVersion,
+    engineBuildFingerprint: input.engineBuildFingerprint,
+    productionGrant: null
+  });
+  const outcomes = await Promise.allSettled(
+    authority.trustedExecutions.map(async (execution) => {
+      const { slot, taskSource } = execution;
+      const outcome = await runReviewEvidenceFlowCalibrationOutcome({
+        taskSource,
+        trustedRunner: bundle,
+        executionContext: {
+          schemaVersion: 1,
+          runId: taskSource.taskBinding.assignmentId,
+          assignmentId: taskSource.taskBinding.assignmentId,
+          expectedRound: taskSource.source.expectedRound
+        },
+        requestStartGate: input.controller.requestStartGate,
+        onTerminalRoleFailure: (role, failureKind, error) => {
+          input.controller.recordTerminalRoleFailure(slot, role, failureKind, error);
+        }
+      });
+      input.controller.applySlotOutcome(slot, outcome);
+      return outcome;
+    })
+  );
+  await input.controller.flushLifecycleEvents();
+  if (outcomes.some((outcome) => outcome.status === "rejected")) {
+    input.controller.recordFinalFailure();
+  }
+  return Object.freeze(outcomes);
 }
 
 export async function executeDevelopmentSmokePhase0(input: {
@@ -1356,7 +2581,12 @@ function loadDevelopmentModels(input: {
   repositoryRoot: string;
   env: NodeJS.ProcessEnv | Record<string, string | undefined>;
   modelsYamlSource?: string;
-}): { models: FourCallRuntimeModels; duplicateSimilarityReject: number } {
+}): {
+  models: FourCallRuntimeModels;
+  configuredRoleModelsFingerprint: string;
+  duplicateSimilarityReject: number;
+  experimentVersion: string;
+} {
   const source = input.modelsYamlSource ??
     readFileSync(resolve(input.repositoryRoot, "config/models.yaml"), "utf8");
   let modelsConfig: z.infer<typeof modelsYamlSchema>;
@@ -1392,15 +2622,22 @@ function loadDevelopmentModels(input: {
     })
   });
   const roles = profile.reviewFlow;
+  const configuredModels: FourCallRuntimeModels = {
+    A: model(roles.solver),
+    B: model(roles.difficulty),
+    C: model(roles.editorialJudge),
+    D: model(roles.adjudicator),
+    formatter: model(roles.tags)
+  };
   return {
-    models: bindDevelopmentSmokeModels({
-      A: model(roles.solver),
-      B: model(roles.difficulty),
-      C: model(roles.editorialJudge),
-      D: model(roles.adjudicator),
-      formatter: model(roles.tags)
-    }),
-    duplicateSimilarityReject: modelsConfig.thresholds.duplicateSimilarityReject
+    models: bindDevelopmentSmokeModels(configuredModels),
+    configuredRoleModelsFingerprint:
+      diagnosticRoleModelsFingerprint(
+        mapFourCallToRoleModels(configuredModels),
+        input.env
+      ),
+    duplicateSimilarityReject: modelsConfig.thresholds.duplicateSimilarityReject,
+    experimentVersion: modelsConfig.experimentVersion
   };
 }
 
@@ -2132,6 +3369,78 @@ function assertUserOnlyPath(path: string, directory: boolean): void {
     throw new Error("DEVELOPMENT_SMOKE_PRIVATE_PATH_INVALID");
   }
   assertUserOnlyStat(value.mode, value.uid, directory);
+}
+
+function assertDiagnosticControlledEnvironment(
+  env: NodeJS.ProcessEnv | Record<string, string | undefined>,
+  manifestPath: string,
+  startupContractFingerprint: string | undefined,
+  allowedPrivateRoots: readonly string[] | undefined
+): void {
+  if (env.FERMATA_RUN_WITH_ENV !== "1") {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_WRAPPER_REQUIRED");
+  }
+  const manifestAttestation = env.FERMATA_DEVELOPMENT_DIAGNOSTIC_MANIFEST;
+  const startupAttestation =
+    env.FERMATA_DEVELOPMENT_DIAGNOSTIC_STARTUP_CONTRACT;
+  const privateRootsSource =
+    env.FERMATA_DEVELOPMENT_DIAGNOSTIC_PRIVATE_ROOTS;
+  const privateRootsAttestation =
+    env.FERMATA_DEVELOPMENT_DIAGNOSTIC_PRIVATE_ROOTS_ATTESTATION;
+  if (
+    manifestAttestation === undefined ||
+    !isAbsolute(manifestAttestation) ||
+    resolve(manifestAttestation) !== resolve(manifestPath) ||
+    startupAttestation === undefined ||
+    !digestSchema.safeParse(startupAttestation).success ||
+    (startupContractFingerprint !== undefined &&
+      startupContractFingerprint !== startupAttestation) ||
+    privateRootsSource === undefined ||
+    privateRootsAttestation === undefined ||
+    !digestSchema.safeParse(privateRootsAttestation).success
+  ) {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_BOOTSTRAP_ATTESTATION_INVALID");
+  }
+  let attestedPrivateRoots: unknown;
+  try {
+    attestedPrivateRoots = JSON.parse(privateRootsSource);
+  } catch {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_BOOTSTRAP_ATTESTATION_INVALID");
+  }
+  if (
+    !Array.isArray(attestedPrivateRoots) ||
+    attestedPrivateRoots.some((root) => typeof root !== "string" || !isAbsolute(root)) ||
+    allowedPrivateRoots === undefined ||
+    JSON.stringify(attestedPrivateRoots) !== JSON.stringify(allowedPrivateRoots) ||
+    (
+      startupContractFingerprint !== undefined &&
+      hashCanonicalValue({
+        privateRoots: attestedPrivateRoots,
+        schemaVersion: 1,
+        startupContractFingerprint
+      }) !== privateRootsAttestation
+    )
+  ) {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_BOOTSTRAP_ATTESTATION_INVALID");
+  }
+  const allowedFermataKeys = new Set([
+    "FERMATA_RUN_WITH_ENV",
+    "FERMATA_DEVELOPMENT_DIAGNOSTIC_MANIFEST",
+    "FERMATA_DEVELOPMENT_DIAGNOSTIC_STARTUP_CONTRACT",
+    "FERMATA_DEVELOPMENT_DIAGNOSTIC_PRIVATE_ROOTS",
+    "FERMATA_DEVELOPMENT_DIAGNOSTIC_PRIVATE_ROOTS_ATTESTATION"
+  ]);
+  for (const key of Object.keys(env)) {
+    if (/^(?:CODEFORCES|DASHSCOPE|EVAL|URMOTIV)_/u.test(key)) {
+      throw new Error("DEVELOPMENT_DIAGNOSTIC_ENVIRONMENT_NOT_NARROW");
+    }
+    if (/^FERMATA_/u.test(key) && !allowedFermataKeys.has(key)) {
+      throw new Error("DEVELOPMENT_DIAGNOSTIC_ENVIRONMENT_NOT_NARROW");
+    }
+  }
+  if (env.AETHER_BASE_URL === undefined || env.AETHER_API_KEY === undefined) {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_AETHER_CONFIGURATION_INVALID");
+  }
 }
 
 function assertUserOnlyStat(mode: number, uid: number, directory: boolean): void {
