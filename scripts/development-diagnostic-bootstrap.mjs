@@ -1046,15 +1046,15 @@ function attestPrivateRoots(repositoryRoot, envFile, owner) {
       failed = true;
     }
   }
+  if (failed) fail();
+  return roots;
+}
+
 function stagedStartupContract(approvedFingerprint, stagedFingerprint) {
   return canonicalDigest({
     approvedContractFingerprint: approvedFingerprint,
     schemaVersion: 1,
     stagedContractFingerprint: stagedFingerprint
-  });
-}
-    stagedContractFingerprint: stagedFingerprint,
-    stagedRoot: resolve(stageRoot)
   });
 }
 
@@ -1429,7 +1429,7 @@ async function handoffToStagedBootstrap(
     stagedFingerprint
   ];
   if (parsed.cliArguments.length > 0) {
-          stagedStartupContract(approvedFingerprint, stagedFingerprint),
+    arguments_.push("--", ...parsed.cliArguments);
   }
   return spawnAndWait(process.execPath, arguments_, {
     cwd: stageRoot,
@@ -1438,7 +1438,7 @@ async function handoffToStagedBootstrap(
       FERMATA_DEVELOPMENT_DIAGNOSTIC_PRIVATE_ROOTS: canonicalJson(privateRoots),
       FERMATA_DEVELOPMENT_DIAGNOSTIC_PRIVATE_ROOTS_ATTESTATION:
         privateRootsAttestation(
-          stagedStartupContract(approvedFingerprint, stagedFingerprint, stageRoot),
+          stagedStartupContract(approvedFingerprint, stagedFingerprint),
           privateRoots
         )
     },
@@ -1460,17 +1460,17 @@ async function main() {
   try {
     if (process.getuid === undefined || process.geteuid === undefined) fail();
     if (process.getuid() !== process.geteuid()) fail();
-      const startupContract = stagedStartupContract(
-        approved,
-        stagedFingerprint
-      );
+    const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+    const owner = BigInt(process.getuid());
+    const parsed = parseArguments(process.argv.slice(2));
+    if (parsed.mode === "staged") {
+      const approved = readApprovedContract(parsed.stateDirectory, owner);
       const stagedFingerprint =
         verifyDevelopmentDiagnosticStartupContract(repositoryRoot);
       if (stagedFingerprint !== parsed.stagedContract) fail();
       const startupContract = stagedStartupContract(
         approved,
-        stagedFingerprint,
-        repositoryRoot
+        stagedFingerprint
       );
       const privateRoots = parseAttestedPrivateRoots(
         process.env,
@@ -1480,7 +1480,8 @@ async function main() {
       await launch(repositoryRoot, parsed, startupContract, privateRoots);
       return;
     }
-    const fingerprint = verifyDevelopmentDiagnosticStartupContract(repositoryRoot);
+    const fingerprint =
+      verifyDevelopmentDiagnosticStartupContract(repositoryRoot);
     if (parsed.mode === "print") {
       process.stdout.write(`${canonicalJson({
         event: "development_diagnostic_bootstrap_contract",
@@ -1495,7 +1496,11 @@ async function main() {
       return;
     }
     const approved = readApprovedContract(parsed.stateDirectory, owner);
-    const privateRoots = attestPrivateRoots(repositoryRoot, parsed.envFile, owner);
+    const privateRoots = attestPrivateRoots(
+      repositoryRoot,
+      parsed.envFile,
+      owner
+    );
     const staged = createStagedClosure(
       parsed.stateDirectory,
       repositoryRoot,

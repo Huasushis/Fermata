@@ -2329,8 +2329,7 @@ describe("Development diagnostic — real package bootstrap", () => {
     const startupContractFingerprint = hashCanonicalValue({
       approvedContractFingerprint: fingerprint,
       schemaVersion: 1,
-      stagedContractFingerprint: staged.stagedFingerprint,
-      stagedRoot: resolve(staged.stageRoot)
+      stagedContractFingerprint: staged.stagedFingerprint
     });
     const privateRootsAttestation = hashCanonicalValue({
       privateRoots,
@@ -2389,6 +2388,151 @@ describe("Development diagnostic — real package bootstrap", () => {
     const bootstrapModule = await import(fixture.bootstrap);
     await bootstrapModule.cleanupStagedClosure(staged.stageRoot);
   });
+
+  it("authorizes the same plan across two real bootstrap invocations with different random stages", () => {
+    const fixture = createBootstrapFixture();
+    const marker = resolve(fixture.root, "private/stable-stage-authorization.json");
+    const manifestPath = resolve(
+      fixture.root,
+      "private/stable-stage-fixture/manifest.private.json"
+    );
+    mkdirSync(dirname(manifestPath), { recursive: true, mode: 0o700 });
+    writePrivateJson(manifestPath, {});
+    writePrivateFile(fixture.envFile, [
+      "AETHER_BASE_URL=http://provider-dispatch-must-not-occur.invalid",
+      "AETHER_API_KEY=provider-dispatch-must-not-occur",
+      `FERMATA_DEVELOPMENT_DIAGNOSTIC_MANIFEST=${manifestPath}`,
+      ""
+    ].join("\n"));
+    const stableStageHarness = [
+      "async function runStableStageAuthorizationHarness() {",
+      "const { writeFileSync } = await import('node:fs');",
+      `const marker = ${JSON.stringify(marker)};`,
+      "const startupContractFingerprint =",
+      "  process.env.FERMATA_DEVELOPMENT_DIAGNOSTIC_STARTUP_CONTRACT ?? '';",
+      "let paid = false;",
+      "const result = await runDevelopmentDiagnosticCli({",
+      "  argv: process.argv.slice(2),",
+      "  environment: process.env,",
+      "  stdinIsTTY: false,",
+      "  wrapperParentAttested: attestTrustedBootstrapParent(",
+      "    startupContractFingerprint,",
+      "    process.env.FERMATA_DEVELOPMENT_DIAGNOSTIC_PRIVATE_ROOTS_ATTESTATION ?? ''",
+      "  ),",
+      "  ownerIdentity: {",
+      "    realUserId: process.getuid(),",
+      "    effectiveUserId: process.geteuid(),",
+      "    repositoryOwnerId: process.getuid()",
+      "  },",
+      "  codeFingerprint: startupContractFingerprint,",
+      `  manifestFingerprint: ${JSON.stringify(digest("stable-stage-manifest"))},`,
+      `  authorityFingerprint: ${JSON.stringify(digest("stable-stage-authority"))},`,
+      "  configurationFingerprint: startupContractFingerprint,",
+      "  writeOutput: () => undefined,",
+      "  writeError: () => undefined,",
+      "  readConfirmation: async () => '',",
+      "  installSignalHandlers: () => () => undefined,",
+      "  preflight: async () => ({",
+      `    manifestFingerprint: ${JSON.stringify(digest("stable-stage-manifest"))},`,
+      "    configurationFingerprint: startupContractFingerprint",
+      "  }),",
+      "  paidExecution: async () => {",
+      "    paid = true;",
+      "    return { complete: false, reason: 'terminal_role_failure' };",
+      "  }",
+      "});",
+      "writeFileSync(marker, JSON.stringify({",
+      "  code: result.code,",
+      "  paid,",
+      "  planFingerprint: result.planFingerprint ?? null,",
+      "  stageRoot: process.cwd(),",
+      "  startupContractFingerprint",
+      "}));",
+      "process.exitCode = result.exitCode;",
+      "}",
+      "if (isDirectEntry()) void runStableStageAuthorizationHarness();",
+      ""
+    ].join("\n");
+    const childSource = readFileSync(
+      resolve(fixture.root, "experiments/run-development-diagnostic.ts"),
+      "utf8"
+    ).replace(
+      "if (isDirectEntry()) void runDirectEntry();",
+      stableStageHarness
+    );
+    writeFileSync(
+      resolve(fixture.root, "experiments/run-development-diagnostic.ts"),
+      childSource,
+      { mode: 0o600 }
+    );
+    approveBootstrapFixture(fixture);
+
+    const planned = runBootstrap(fixture, [
+      fixture.envFile,
+      "--state-dir",
+      fixture.stateDirectory
+    ]);
+    expect(planned.status, `${planned.stdout}\n${planned.stderr}`).toBe(2);
+    const first = JSON.parse(readFileSync(marker, "utf8")) as {
+      readonly code: string;
+      readonly paid: boolean;
+      readonly planFingerprint: string;
+      readonly stageRoot: string;
+      readonly startupContractFingerprint: string;
+    };
+    expect(first.code).toBe("PLAN_REQUIRES_AUTHORIZATION");
+    expect(first.paid).toBe(false);
+    expect(first.planFingerprint).toMatch(/^[a-f0-9]{64}$/u);
+
+    const authorized = runBootstrap(fixture, [
+      fixture.envFile,
+      "--state-dir",
+      fixture.stateDirectory,
+      "--",
+      "--authorize-plan",
+      first.planFingerprint
+    ]);
+    expect(authorized.status, `${authorized.stdout}\n${authorized.stderr}`).toBe(1);
+    const second = JSON.parse(readFileSync(marker, "utf8")) as typeof first;
+    expect(second.code).toBe("INCOMPLETE");
+    expect(second.paid).toBe(true);
+    expect(second.stageRoot).not.toBe(first.stageRoot);
+    expect(second.startupContractFingerprint).toBe(
+      first.startupContractFingerprint
+    );
+    expect(
+      readdirSync(fixture.stateDirectory).filter(
+        (name) => name.startsWith(".development-diagnostic-stage-")
+      )
+    ).toEqual([]);
+    const afterAuthorized = readFileSync(marker, "utf8");
+    const counters = JSON.parse(readFileSync(fixture.sentinelFile, "utf8")) as
+      typeof emptyBootstrapSentinels;
+    expect(counters.helperLoad).toBeGreaterThan(0);
+    expect(counters.envOpen).toBeGreaterThan(0);
+    expect(counters.network).toBe(0);
+    expect(counters.fetch).toBe(0);
+    expect(counters.paid).toBe(0);
+
+    writeFileSync(
+      resolve(fixture.root, "experiments/run-development-diagnostic.ts"),
+      `${childSource}\n// changed source identity\n`,
+      { mode: 0o600 }
+    );
+    const changedSource = runBootstrap(fixture, [
+      fixture.envFile,
+      "--state-dir",
+      fixture.stateDirectory,
+      "--",
+      "--authorize-plan",
+      first.planFingerprint
+    ]);
+    expect(changedSource.status).toBe(1);
+    expect(readFileSync(marker, "utf8")).toBe(afterAuthorized);
+    expect(JSON.parse(readFileSync(fixture.sentinelFile, "utf8"))).toEqual(
+      counters
+    );
+  }, 120_000);
 
   it("allows only bound bootstrap attestations through the real child preflight", () => {
     const fixture = createBootstrapFixture();

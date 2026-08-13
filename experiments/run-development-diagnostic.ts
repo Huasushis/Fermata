@@ -1117,8 +1117,7 @@ export function attestTrustedBootstrapParent(
       hashValue({
         approvedContractFingerprint: record.contractFingerprint,
         schemaVersion: 1,
-        stagedContractFingerprint,
-        stagedRoot: resolve(repositoryRoot)
+        stagedContractFingerprint
       }) !== startupContractFingerprint
     ) {
       return false;
