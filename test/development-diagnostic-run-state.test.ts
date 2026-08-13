@@ -40,7 +40,9 @@ import {
   developmentDiagnosticProfileFingerprint
 } from "../src/review-flow/development-diagnostic";
 import {
-  legacyDevelopmentDiagnosticPlannedRunContract
+  legacyDevelopmentDiagnosticPlannedRunContract,
+  parseDevelopmentDiagnosticPlannedRunContract,
+  developmentDiagnosticMaximumSchedulingBudgetMs
 } from "../src/review-flow/development-diagnostic-run-contract";
 
 const roles = [
@@ -845,6 +847,67 @@ describe("development diagnostic strict run state", () => {
         }
       })
     ).toThrow();
+  });
+});
+
+describe("development diagnostic planned-run scheduling budget boundaries", () => {
+  function baseContract(budget: number) {
+    return {
+      ...legacyDevelopmentDiagnosticPlannedRunContract,
+      selectedSlots: ["slot-01"] as const,
+      globalTransportAttemptCeiling: 16,
+      phaseSchedulingBudgetMs: budget,
+      softStopPolicy: "stop_new_and_drain_in_flight" as const
+    };
+  }
+
+  it("accepts the legacy 90m scheduling budget", () => {
+    const contract = parseDevelopmentDiagnosticPlannedRunContract(
+      baseContract(90 * 60_000)
+    );
+    expect(contract.phaseSchedulingBudgetMs).toBe(5_400_000);
+  });
+
+  it("accepts exactly 180m and retains stop_new_and_drain_in_flight", () => {
+    const contract = parseDevelopmentDiagnosticPlannedRunContract(
+      baseContract(180 * 60_000)
+    );
+    expect(contract.phaseSchedulingBudgetMs).toBe(10_800_000);
+    expect(contract.softStopPolicy).toBe("stop_new_and_drain_in_flight");
+  });
+
+  it("rejects a scheduling budget just above the 180m upper bound", () => {
+    expect(() =>
+      parseDevelopmentDiagnosticPlannedRunContract(
+        baseContract(180 * 60_000 + 1)
+      )
+    ).toThrow();
+  });
+
+  it("rejects negative, zero, and non-integer scheduling budgets", () => {
+    for (const invalid of [-1, 0, 10_800_000.5]) {
+      expect(() =>
+        parseDevelopmentDiagnosticPlannedRunContract(baseContract(invalid))
+      ).toThrow();
+    }
+  });
+
+  it("exposes the maximum scheduling budget constant as 180m", () => {
+    expect(developmentDiagnosticMaximumSchedulingBudgetMs).toBe(10_800_000);
+  });
+
+  it("round-trips a 180m contract through run-state identity binding", () => {
+    const contract = parseDevelopmentDiagnosticPlannedRunContract(
+      baseContract(180 * 60_000)
+    );
+    const identity = buildIdentity();
+    const bound = createDevelopmentDiagnosticRunState(
+      { ...identity, plannedRun: contract },
+      fixedTime
+    );
+    expect(parseDevelopmentDiagnosticRunState(bound).identity.plannedRun.phaseSchedulingBudgetMs).toBe(
+      10_800_000
+    );
   });
 });
 

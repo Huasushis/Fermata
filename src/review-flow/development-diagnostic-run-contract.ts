@@ -7,7 +7,7 @@ export type DevelopmentDiagnosticSelectedSlot = z.infer<
 
 export const developmentDiagnosticExpectedRequestsPerSlot = 12 as const;
 export const developmentDiagnosticMaximumSafeConcurrency = 16 as const;
-export const developmentDiagnosticMaximumSchedulingBudgetMs = 90 * 60 * 1_000;
+export const developmentDiagnosticMaximumSchedulingBudgetMs = 180 * 60 * 1_000;
 
 export const developmentDiagnosticPlannedRunContractSchema = z
   .object({
