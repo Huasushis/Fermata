@@ -40,6 +40,12 @@ import {
   developmentDiagnosticProfileFingerprint,
   type DevelopmentDiagnosticLifecycleEvent
 } from "../src/review-flow/development-diagnostic";
+import {
+  developmentDiagnosticExpectedRequestCount,
+  legacyDevelopmentDiagnosticPlannedRunContract,
+  parseDevelopmentDiagnosticPlannedRunContract,
+  type DevelopmentDiagnosticPlannedRunContract
+} from "../src/review-flow/development-diagnostic-run-contract";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const digestPattern = /^[0-9a-f]{64}$/u;
@@ -70,14 +76,20 @@ export interface DevelopmentDiagnosticSafePlan {
   readonly schemaVersion: 1;
   readonly runIdSummary: string;
   readonly stateIdentityFingerprint: string;
-  readonly slots: 2;
-  readonly expectedFetches: 24;
-  readonly maximumExternalAttempts: 52;
-  readonly maximumConcurrency: 4;
+  readonly slots: number;
+  readonly selectedSlots: readonly ("slot-01" | "slot-02")[];
+  readonly expectedRequestsPerSlot: 12;
+  readonly expectedFetches: number;
+  readonly maximumExternalAttempts: number;
+  readonly maximumConcurrency: number;
   readonly softStopBudgetMs: number;
+  readonly softStopPolicy:
+    | "deny_next_transport"
+    | "stop_new_and_drain_in_flight";
   readonly profileName: string;
   readonly retry: {
     readonly maximumAttemptsPerLogicalRequest: 1;
+    readonly maximumTransportAttemptsPerRequest: number;
     readonly retryableHttpStatuses: readonly [429];
   };
   readonly roles: typeof roleSummary;
@@ -88,7 +100,7 @@ export interface DevelopmentDiagnosticSafePlan {
     | {
         readonly status: "data_insufficient";
         readonly successfulSampleCount: 0;
-        readonly remainingFetches: 24;
+        readonly remainingFetches: number;
         readonly softStopBudgetMs: number;
       }
     | {
@@ -96,8 +108,8 @@ export interface DevelopmentDiagnosticSafePlan {
         readonly successfulSampleCount: number;
         readonly p50Ms: number;
         readonly p90Ms: number;
-        readonly remainingFetches: 24;
-        readonly formula: "max(remaining DAG critical path, sum remaining role p50 /4)";
+        readonly remainingFetches: number;
+        readonly formula: string;
         readonly estimateMs: number;
       };
 }
@@ -128,6 +140,7 @@ export interface DevelopmentDiagnosticHistorySample {
 export interface DevelopmentDiagnosticPaidExecutionContext {
   readonly lifecycleSink: (event: DevelopmentDiagnosticLifecycleEvent) => Promise<void>;
   readonly registerSoftStop: (close: () => void) => void;
+  readonly plannedRun: DevelopmentDiagnosticPlannedRunContract;
 }
 
 export interface DevelopmentDiagnosticPaidExecutionResult {
@@ -157,7 +170,7 @@ export interface DevelopmentDiagnosticCliRuntime {
   readonly installSignalHandlers: (
     handler: (signal: DevelopmentDiagnosticCliSignal) => void
   ) => () => void;
-  readonly preflight?: () => Promise<{
+  readonly preflight?: (plannedRun: DevelopmentDiagnosticPlannedRunContract) => Promise<{
     readonly manifestFingerprint: string;
     readonly configurationFingerprint: string;
   }>;
@@ -207,24 +220,29 @@ export function assertDevelopmentDiagnosticCliOwner(input: {
 export function parseDevelopmentDiagnosticCliArguments(argv: readonly string[]): {
   readonly stateDirectory: string;
   readonly authorizationFingerprint?: string;
+  readonly plannedRun: DevelopmentDiagnosticPlannedRunContract;
 } {
-  let stateDirectory: string | undefined;
-  let authorizationFingerprint: string | undefined;
-  const seen = new Set<string>();
+  const values = new Map<string, string>();
+  const allowedFlags = new Set([
+    "--state-dir",
+    "--authorize-plan",
+    "--slots",
+    "--max-concurrency",
+    "--transport-attempt-ceiling",
+    "--max-transport-attempts-per-request",
+    "--phase-scheduling-budget-ms",
+    "--soft-stop-policy"
+  ]);
   for (let index = 0; index < argv.length; index += 2) {
     const flag = argv[index];
     const value = argv[index + 1];
-    if (
-      value === undefined ||
-      (flag !== "--state-dir" && flag !== "--authorize-plan") ||
-      seen.has(flag)
-    ) {
+    if (value === undefined || flag === undefined || !allowedFlags.has(flag) || values.has(flag)) {
       throw new DevelopmentDiagnosticCliError("INVALID_ARGUMENTS");
     }
-    seen.add(flag);
-    if (flag === "--state-dir") stateDirectory = value;
-    else authorizationFingerprint = value;
+    values.set(flag, value);
   }
+  const stateDirectory = values.get("--state-dir");
+  const authorizationFingerprint = values.get("--authorize-plan");
   if (
     stateDirectory === undefined ||
     !isAbsolute(stateDirectory) ||
@@ -234,9 +252,51 @@ export function parseDevelopmentDiagnosticCliArguments(argv: readonly string[]):
   ) {
     throw new DevelopmentDiagnosticCliError("INVALID_ARGUMENTS");
   }
+  const slotsValue = values.get("--slots");
+  const selectedSlots = slotsValue === undefined
+    ? legacyDevelopmentDiagnosticPlannedRunContract.selectedSlots
+    : slotsValue.split(",");
+  const parseInteger = (flag: string, fallback: number): number => {
+    const value = values.get(flag);
+    if (value === undefined) return fallback;
+    if (!/^[1-9][0-9]*$/u.test(value)) {
+      throw new DevelopmentDiagnosticCliError("INVALID_ARGUMENTS");
+    }
+    return Number(value);
+  };
+  let plannedRun: DevelopmentDiagnosticPlannedRunContract;
+  try {
+    plannedRun = parseDevelopmentDiagnosticPlannedRunContract({
+      schemaVersion: 1,
+      selectedSlots,
+      expectedRequestsPerSlot: 12,
+      maximumConcurrency: parseInteger(
+        "--max-concurrency",
+        legacyDevelopmentDiagnosticPlannedRunContract.maximumConcurrency
+      ),
+      maximumTransportAttemptsPerRequest: parseInteger(
+        "--max-transport-attempts-per-request",
+        legacyDevelopmentDiagnosticPlannedRunContract.maximumTransportAttemptsPerRequest
+      ),
+      globalTransportAttemptCeiling: parseInteger(
+        "--transport-attempt-ceiling",
+        legacyDevelopmentDiagnosticPlannedRunContract.globalTransportAttemptCeiling
+      ),
+      phaseSchedulingBudgetMs: parseInteger(
+        "--phase-scheduling-budget-ms",
+        legacyDevelopmentDiagnosticPlannedRunContract.phaseSchedulingBudgetMs
+      ),
+      softStopPolicy:
+        values.get("--soft-stop-policy") ??
+        legacyDevelopmentDiagnosticPlannedRunContract.softStopPolicy
+    });
+  } catch {
+    throw new DevelopmentDiagnosticCliError("INVALID_ARGUMENTS");
+  }
   return {
     stateDirectory: resolve(stateDirectory),
-    ...(authorizationFingerprint === undefined ? {} : { authorizationFingerprint })
+    ...(authorizationFingerprint === undefined ? {} : { authorizationFingerprint }),
+    plannedRun
   };
 }
 
@@ -253,7 +313,11 @@ export function developmentDiagnosticStateIdentityFingerprint(input: {
 export function estimateDevelopmentDiagnosticEta(input: {
   readonly stateIdentityFingerprint: string;
   readonly samples: readonly DevelopmentDiagnosticHistorySample[];
+  readonly plannedRun?: DevelopmentDiagnosticPlannedRunContract;
 }): DevelopmentDiagnosticSafePlan["eta"] {
+  const plannedRun =
+    input.plannedRun ?? legacyDevelopmentDiagnosticPlannedRunContract;
+  const expectedFetches = developmentDiagnosticExpectedRequestCount(plannedRun);
   const matching = input.samples.filter((sample) =>
     sample.stateIdentityFingerprint === input.stateIdentityFingerprint &&
     digestPattern.test(sample.roleFingerprint) &&
@@ -268,31 +332,34 @@ export function estimateDevelopmentDiagnosticEta(input: {
     return Object.freeze({
       status: "data_insufficient" as const,
       successfulSampleCount: 0 as const,
-      remainingFetches: 24 as const,
-      softStopBudgetMs: developmentDiagnosticProfile.softStopBudgetMs
+      remainingFetches: expectedFetches,
+      softStopBudgetMs: plannedRun.phaseSchedulingBudgetMs
     });
   }
-  const durations = matching.map((sample) => sample.endToEndMs).sort((left, right) => left - right);
+  const durations = matching
+    .map((sample) => sample.endToEndMs)
+    .sort((left, right) => left - right);
   const percentile = (fraction: number): number =>
-    durations[Math.min(durations.length - 1, Math.ceil(durations.length * fraction) - 1)]!;
+    durations[
+      Math.min(durations.length - 1, Math.ceil(durations.length * fraction) - 1)
+    ]!;
   const p50Ms = percentile(0.5);
   const p90Ms = percentile(0.9);
   const remainingDagCriticalPathMs = p50Ms * 4;
-  const sumRemainingRoleP50DividedByFourMs = Math.ceil((p50Ms * 24) / 4);
+  const dividedByConcurrencyMs = Math.ceil(
+    (p50Ms * expectedFetches) / plannedRun.maximumConcurrency
+  );
   return Object.freeze({
     status: "estimated" as const,
     successfulSampleCount: matching.length,
     p50Ms,
     p90Ms,
-    remainingFetches: 24 as const,
-    formula: "max(remaining DAG critical path, sum remaining role p50 /4)" as const,
-    estimateMs: Math.max(
-      remainingDagCriticalPathMs,
-      sumRemainingRoleP50DividedByFourMs
-    )
+    remainingFetches: expectedFetches,
+    formula:
+      `max(remaining DAG critical path, sum remaining role p50 /${plannedRun.maximumConcurrency})`,
+    estimateMs: Math.max(remainingDagCriticalPathMs, dividedByConcurrencyMs)
   });
 }
-
 
 export function buildDevelopmentDiagnosticSafePlan(input: {
   readonly stateDirectory: string;
@@ -314,15 +381,20 @@ export function buildDevelopmentDiagnosticSafePlan(input: {
     schemaVersion: 1 as const,
     runIdSummary: hashValue(identity.runId).slice(0, 16),
     stateIdentityFingerprint,
-    slots: 2 as const,
-    expectedFetches: 24 as const,
-    maximumExternalAttempts: developmentDiagnosticProfile.maximumTotalExternalAttempts,
-    maximumConcurrency: developmentDiagnosticProfile.maximumConcurrency,
-    softStopBudgetMs: developmentDiagnosticProfile.softStopBudgetMs,
+    slots: identity.plannedRun.selectedSlots.length,
+    selectedSlots: Object.freeze([...identity.plannedRun.selectedSlots]),
+    expectedRequestsPerSlot: identity.plannedRun.expectedRequestsPerSlot,
+    expectedFetches: developmentDiagnosticExpectedRequestCount(identity.plannedRun),
+    maximumExternalAttempts: identity.plannedRun.globalTransportAttemptCeiling,
+    maximumConcurrency: identity.plannedRun.maximumConcurrency,
+    softStopBudgetMs: identity.plannedRun.phaseSchedulingBudgetMs,
+    softStopPolicy: identity.plannedRun.softStopPolicy,
     profileName: developmentDiagnosticProfile.name,
     retry: Object.freeze({
       maximumAttemptsPerLogicalRequest:
         developmentDiagnosticProfile.maximumAttemptsPerLogicalRequest,
+      maximumTransportAttemptsPerRequest:
+        identity.plannedRun.maximumTransportAttemptsPerRequest,
       retryableHttpStatuses: Object.freeze([429] as const)
     }),
     roles: roleSummary,
@@ -331,7 +403,8 @@ export function buildDevelopmentDiagnosticSafePlan(input: {
     paidExecution: "wired" as const,
     eta: estimateDevelopmentDiagnosticEta({
       stateIdentityFingerprint,
-      samples: input.historySamples ?? []
+      samples: input.historySamples ?? [],
+      plannedRun: identity.plannedRun
     })
   });
 }
@@ -421,7 +494,7 @@ export async function runDevelopmentDiagnosticCli(
     if (interrupted) return interruptedResult();
 
     ensureStateDirectory(parsedArguments.stateDirectory, runtime.ownerIdentity.effectiveUserId);
-    const preflight = await runtime.preflight?.();
+    const preflight = await runtime.preflight?.(parsedArguments.plannedRun);
     if (interrupted) return interruptedResult();
     const effectiveRuntime = {
       codeFingerprint: runtime.codeFingerprint,
@@ -430,10 +503,18 @@ export async function runDevelopmentDiagnosticCli(
       configurationFingerprint:
         preflight?.configurationFingerprint ?? runtime.configurationFingerprint
     };
-    const identity = buildRunIdentity(parsedArguments.stateDirectory, effectiveRuntime);
+    const identity = buildRunIdentity(
+      parsedArguments.stateDirectory,
+      effectiveRuntime,
+      parsedArguments.plannedRun
+    );
     lock = acquireDevelopmentDiagnosticRunLock({
       directoryPath: parsedArguments.stateDirectory,
-      runId: provisionalLockRunId(parsedArguments.stateDirectory, effectiveRuntime),
+      runId: provisionalLockRunId(
+        parsedArguments.stateDirectory,
+        effectiveRuntime,
+        parsedArguments.plannedRun
+      ),
       takeover: true
     });
     if (interrupted) return interruptedResult();
@@ -562,7 +643,8 @@ export async function runDevelopmentDiagnosticCli(
       registerSoftStop: (close) => {
         closePaidGates = close;
         if (interrupted || checkpointFailure !== undefined) close();
-      }
+      },
+      plannedRun: parsedArguments.plannedRun
     }).catch(async (error: unknown) => {
       await checkpointTail.catch(() => undefined);
       if (checkpointFailure !== undefined) throw checkpointFailure;
@@ -587,14 +669,24 @@ export async function runDevelopmentDiagnosticCli(
     await terminationCheckpoint;
     await checkpointTail;
 
+    const expectedFetches = developmentDiagnosticExpectedRequestCount(
+      parsedArguments.plannedRun
+    );
+    const selectedSlots = new Set(parsedArguments.plannedRun.selectedSlots);
     const complete =
       !interrupted &&
       paidResult.complete &&
-      state.transport.started === 24 &&
-      state.transport.settled === 24 &&
+      state.transport.started === state.attempts.length &&
+      state.transport.settled === state.attempts.length &&
+      state.attempts.filter((attempt) => attempt.outcome === "succeeded").length ===
+        expectedFetches &&
       state.transport.active === 0 &&
       state.transport.queued === 0 &&
-      state.slots.every((slot) => slot.status === "complete");
+      state.slots.every((slot) =>
+        selectedSlots.has(slot.slot)
+          ? slot.status === "complete"
+          : slot.status === "not_started"
+      );
     const terminalReason = interrupted
       ? "signal"
       : paidResult.reason ??
@@ -697,14 +789,31 @@ function buildSafeDevelopmentDiagnosticProgress(
   state: DevelopmentDiagnosticRunState,
   kind: string
 ): Readonly<Record<string, unknown>> {
-  const successfulDurations = state.attempts
-    .filter(
-      (attempt) =>
-        attempt.outcome === "succeeded" &&
-        attempt.endToEndMs !== null
-    )
-    .map((attempt) => attempt.endToEndMs!)
-    .sort((left, right) => left - right);
+  const pendingRetryDurations = new Map<string, number[]>();
+  const successfulDurations: number[] = [];
+  let failedLogicalRequests = 0;
+  for (const attempt of state.attempts) {
+    if (attempt.endToEndMs === null) continue;
+    const key = `${attempt.roleFingerprint}:${attempt.modelFingerprint}`;
+    const pending = pendingRetryDurations.get(key) ?? [];
+    if (attempt.outcome === "retryable_failed") {
+      pending.push(attempt.endToEndMs);
+      pendingRetryDurations.set(key, pending);
+      continue;
+    }
+    const retryDuration =
+      attempt.attempt > 1 && pending.length > 0 ? pending.shift()! : 0;
+    if (pending.length === 0) pendingRetryDurations.delete(key);
+    else pendingRetryDurations.set(key, pending);
+    if (attempt.outcome === "succeeded") {
+      successfulDurations.push(retryDuration + attempt.endToEndMs);
+    } else if (attempt.outcome === "failed") {
+      failedLogicalRequests += 1;
+    }
+  }
+  successfulDurations.sort((left, right) => left - right);
+  const pendingRetryRequests = [...pendingRetryDurations.values()]
+    .reduce((total, entries) => total + entries.length, 0);
   const percentile = (fraction: number): number | null =>
     successfulDurations.length === 0
       ? null
@@ -716,22 +825,39 @@ function buildSafeDevelopmentDiagnosticProgress(
         ]!;
   const elapsedMs = Math.max(0, Date.parse(state.updatedAt) - Date.parse(state.createdAt));
   const p50Ms = percentile(0.5);
-  const remainingFetches = Math.max(0, 24 - state.transport.started);
+  const expectedFetches = developmentDiagnosticExpectedRequestCount(
+    state.identity.plannedRun
+  );
+  const completedLogicalRequests = successfulDurations.length;
+  const activeRetryAttempts = state.attempts.filter(
+    (attempt) => attempt.outcome === "running" && attempt.attempt > 1
+  ).length;
+  const inFlightLogicalRequests =
+    state.transport.active +
+    Math.max(0, pendingRetryRequests - activeRetryAttempts);
+  const remainingFetches = Math.max(0, expectedFetches - completedLogicalRequests);
+  const notStartedLogicalRequests = Math.max(
+    0,
+    expectedFetches -
+      completedLogicalRequests -
+      failedLogicalRequests -
+      inFlightLogicalRequests
+  );
   return Object.freeze({
     event: "development_diagnostic_progress",
     kind,
     sequence: state.sequence,
     phase: state.phase,
     counts: Object.freeze({
-      completed: state.attempts.filter((attempt) => attempt.outcome === "succeeded").length,
-      inFlight: state.transport.active,
-      failed: state.attempts.filter((attempt) => attempt.outcome === "failed").length,
-      notStarted: Math.max(0, 24 - state.transport.intended)
+      completed: completedLogicalRequests,
+      inFlight: inFlightLogicalRequests,
+      failed: failedLogicalRequests,
+      notStarted: notStartedLogicalRequests
     }),
     throughputPerMinute:
       elapsedMs === 0
         ? null
-        : Number(((state.transport.settled * 60_000) / elapsedMs).toFixed(3)),
+        : Number(((completedLogicalRequests * 60_000) / elapsedMs).toFixed(3)),
     latency: Object.freeze({
       successfulSampleCount: successfulDurations.length,
       p50Ms,
@@ -742,15 +868,19 @@ function buildSafeDevelopmentDiagnosticProgress(
         ? Object.freeze({
             status: "data_insufficient",
             remainingFetches,
-            softStopBudgetMs: developmentDiagnosticProfile.softStopBudgetMs
+            softStopBudgetMs: state.identity.plannedRun.phaseSchedulingBudgetMs
           })
         : Object.freeze({
             status: "estimated",
             remainingFetches,
-            formula: "max(remaining DAG critical path, sum remaining role p50 /4)",
+            formula:
+              `max(remaining DAG critical path, sum remaining role p50 /${state.identity.plannedRun.maximumConcurrency})`,
             estimateMs: Math.max(
               p50Ms * 4,
-              Math.ceil((p50Ms * remainingFetches) / 4)
+              Math.ceil(
+                (p50Ms * remainingFetches) /
+                  state.identity.plannedRun.maximumConcurrency
+              )
             )
           })
   });
@@ -761,16 +891,19 @@ function provisionalLockRunId(
   runtime: Pick<
     DevelopmentDiagnosticCliRuntime,
     "codeFingerprint" | "authorityFingerprint" | "configurationFingerprint"
-  >
+  >,
+  plannedRun: DevelopmentDiagnosticPlannedRunContract
 ): string {
   return digestToUuid(hashValue({
     stateDirectory: resolve(stateDirectory),
     codeFingerprint: runtime.codeFingerprint,
     authorityFingerprint: runtime.authorityFingerprint,
     configurationFingerprint: runtime.configurationFingerprint,
+    plannedRun,
     lockPurpose: "development-diagnostic-exclusive"
   }));
 }
+
 function interruptedResult(): DevelopmentDiagnosticCliResult {
   return { exitCode: 130, code: "INTERRUPTED" };
 }
@@ -783,7 +916,8 @@ function buildRunIdentity(
     | "manifestFingerprint"
     | "authorityFingerprint"
     | "configurationFingerprint"
-  >
+  >,
+  plannedRun: DevelopmentDiagnosticPlannedRunContract
 ): DevelopmentDiagnosticRunIdentity {
   const identitySeed = hashValue({
     stateDirectory: resolve(stateDirectory),
@@ -791,7 +925,8 @@ function buildRunIdentity(
     manifestFingerprint: runtime.manifestFingerprint,
     authorityFingerprint: runtime.authorityFingerprint,
     configurationFingerprint: runtime.configurationFingerprint,
-    profileFingerprint: developmentDiagnosticProfileFingerprint
+    profileFingerprint: developmentDiagnosticProfileFingerprint,
+    plannedRun
   });
   return {
     runId: digestToUuid(identitySeed),
@@ -803,7 +938,8 @@ function buildRunIdentity(
     profile: {
       ...developmentDiagnosticProfile,
       retryableHttpStatuses: [429]
-    }
+    },
+    plannedRun
   };
 }
 
@@ -1215,7 +1351,7 @@ async function runDirectEntry(): Promise<void> {
       writeError: (text) => process.stderr.write(text),
       readConfirmation: readDefaultConfirmation,
       installSignalHandlers: installDefaultSignalHandlers,
-      preflight: async () => {
+      preflight: async (plannedRun) => {
         if (manifestPath === undefined) {
           throw new DevelopmentDiagnosticCliError("MANIFEST_REQUIRED");
         }
@@ -1227,20 +1363,24 @@ async function runDirectEntry(): Promise<void> {
           manifestPath: resolve(manifestPath),
           paidExecutionSourceContractFingerprint: startupContractFingerprint,
           allowedPrivateRoots: privateRoots
-        });
+        }, plannedRun.selectedSlots);
         return {
           manifestFingerprint: diagnosticPreflight.manifestFingerprint,
           configurationFingerprint:
             developmentDiagnosticPreflightConfigurationFingerprint(diagnosticPreflight)
         };
       },
-      paidExecution: async ({ lifecycleSink, registerSoftStop }) => {
+      paidExecution: async ({ lifecycleSink, registerSoftStop, plannedRun }) => {
         if (diagnosticPreflight === undefined) {
           throw new DevelopmentDiagnosticCliError("PREFLIGHT_REQUIRED");
         }
-        const scheduler = createDevelopmentDiagnosticScheduler();
+        const scheduler = createDevelopmentDiagnosticScheduler(
+          developmentDiagnosticProfile,
+          plannedRun
+        );
         const controller = new DevelopmentDiagnosticRunController({
           profile: developmentDiagnosticProfile,
+          plannedRun,
           manifest: {
             schemaVersion: 1,
             profileName: "development-diagnostic-2x4-v1",

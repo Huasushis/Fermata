@@ -59,8 +59,13 @@ import {
   type DevelopmentDiagnosticCliRuntime
 } from "../experiments/run-development-diagnostic";
 import {
+  developmentDiagnosticRunLockPath,
   developmentDiagnosticRunStatePath
 } from "../experiments/lib/development-diagnostic-run-state";
+import {
+  legacyDevelopmentDiagnosticPlannedRunContract,
+  type DevelopmentDiagnosticPlannedRunContract
+} from "../src/review-flow/development-diagnostic-run-contract";
 
 /* ═══════════════════════════════════════════════════════════════
  * Helpers
@@ -1310,10 +1315,16 @@ function buildContentFreeManifest(): DevelopmentDiagnosticManifest {
 function buildController(options?: {
   readonly clock?: () => number;
   readonly scheduler?: FairLlmRequestScheduler;
+  readonly plannedRun?: DevelopmentDiagnosticPlannedRunContract;
 }): DevelopmentDiagnosticRunController {
-  const scheduler = options?.scheduler ?? createDevelopmentDiagnosticScheduler();
+  const plannedRun =
+    options?.plannedRun ?? legacyDevelopmentDiagnosticPlannedRunContract;
+  const scheduler =
+    options?.scheduler ??
+    createDevelopmentDiagnosticScheduler(developmentDiagnosticProfile, plannedRun);
   return new DevelopmentDiagnosticRunController({
     profile: developmentDiagnosticProfile,
+    plannedRun,
     manifest: buildContentFreeManifest(),
     runBindingHash: digest("run-binding"),
     scheduler,
@@ -1564,6 +1575,47 @@ describe("DevelopmentDiagnosticRunController — real transport boundaries", () 
       requestGateOpen: true,
       schedulerSoftStopped: false
     });
+  });
+  it("global attempt ceiling drains the final retry then closes new scheduling", async () => {
+    const plannedRun = {
+      schemaVersion: 1 as const,
+      selectedSlots: ["slot-01"] as const,
+      expectedRequestsPerSlot: 12 as const,
+      maximumConcurrency: 12,
+      maximumTransportAttemptsPerRequest: 2,
+      globalTransportAttemptCeiling: 16,
+      phaseSchedulingBudgetMs: 90 * 60_000,
+      softStopPolicy: "stop_new_and_drain_in_flight" as const
+    };
+    const controller = buildController({ plannedRun });
+    for (let index = 0; index < 14; index += 1) {
+      controller.reserveTransportOrThrow();
+    }
+    let fetchCount = 0;
+    const result = await chatCompleteWithReceipt(
+      syntheticProvider,
+      syntheticSpec,
+      syntheticMessages,
+      diagnosticTransportRuntime(
+        controller,
+        async () => {
+          fetchCount += 1;
+          return fetchCount === 1
+            ? new Response(null, { status: 429 })
+            : successfulSseResponse();
+        },
+        { maxAttempts: 2 }
+      )
+    );
+    expect(result.receipt.transportAttemptCount).toBe(2);
+    expect(fetchCount).toBe(2);
+    expect(controller.checkpoint()).toMatchObject({
+      externalAttemptsUsed: 16,
+      stopped: true,
+      stopReason: "attempt_ceiling"
+    });
+    expect(controller.scheduler().snapshot().active).toBe(0);
+    expect(controller.requestStartGate.canStartRequest()).toBe(false);
   });
 
   it("deadline denies a queued fifth fetch while four started fetches drain", async () => {
@@ -2389,7 +2441,7 @@ describe("Development diagnostic — real package bootstrap", () => {
     await bootstrapModule.cleanupStagedClosure(staged.stageRoot);
   });
 
-  it("authorizes the same plan across two real bootstrap invocations with different random stages", () => {
+  it("plans, authorizes, and completes standalone slot-02 through two real bootstrap children", () => {
     const fixture = createBootstrapFixture();
     const marker = resolve(fixture.root, "private/stable-stage-authorization.json");
     const manifestPath = resolve(
@@ -2436,9 +2488,25 @@ describe("Development diagnostic — real package bootstrap", () => {
       `    manifestFingerprint: ${JSON.stringify(digest("stable-stage-manifest"))},`,
       "    configurationFingerprint: startupContractFingerprint",
       "  }),",
-      "  paidExecution: async () => {",
+      "  paidExecution: async (context) => {",
       "    paid = true;",
-      "    return { complete: false, reason: 'terminal_role_failure' };",
+      "    context.registerSoftStop(() => undefined);",
+      "    const roles = ['solver','solver','solution_analyst','technical_auditor','difficulty','editorial_judge','contest_fit','originality','tags','critic','adversary','adjudicator'];",
+      "    let sequence = 0;",
+      "    for (const role of roles) {",
+      "      sequence += 1;",
+      `      const modelFingerprint = ${JSON.stringify(digest("stable-stage-model"))};`,
+      "      await context.lifecycleSink({ type: 'transport_intent', sequence, role, modelFingerprint, attempt: 1 });",
+      "      await context.lifecycleSink({ type: 'transport_reserved', sequence, role, modelFingerprint, attempt: 1 });",
+      "      await context.lifecycleSink({ type: 'transport_started', sequence });",
+      "      await context.lifecycleSink({ type: 'transport_settled', sequence, outcome: 'succeeded', errorCategory: null });",
+      "    }",
+      "    for (const role of ['solver','solution_analyst','technical_auditor','difficulty','editorial_judge','contest_fit','originality','tags','critic','adversary','adjudicator']) {",
+      "      await context.lifecycleSink({ type: 'role_completed', slot: 'slot-02', role });",
+      "    }",
+      "    for (const stage of ['A','B','C','D']) await context.lifecycleSink({ type: 'stage_completed', slot: 'slot-02', stage });",
+      "    await context.lifecycleSink({ type: 'slot_outcome', slot: 'slot-02', status: 'complete' });",
+      "    return { complete: true };",
       "  }",
       "});",
       "writeFileSync(marker, JSON.stringify({",
@@ -2466,11 +2534,21 @@ describe("Development diagnostic — real package bootstrap", () => {
       { mode: 0o600 }
     );
     approveBootstrapFixture(fixture);
+    const plannedRunArguments = [
+      "--slots", "slot-02",
+      "--max-concurrency", "12",
+      "--max-transport-attempts-per-request", "2",
+      "--transport-attempt-ceiling", "16",
+      "--phase-scheduling-budget-ms", "5400000",
+      "--soft-stop-policy", "stop_new_and_drain_in_flight"
+    ] as const;
 
     const planned = runBootstrap(fixture, [
       fixture.envFile,
       "--state-dir",
-      fixture.stateDirectory
+      fixture.stateDirectory,
+      "--",
+      ...plannedRunArguments
     ]);
     expect(planned.status, `${planned.stdout}\n${planned.stderr}`).toBe(2);
     const first = JSON.parse(readFileSync(marker, "utf8")) as {
@@ -2489,12 +2567,13 @@ describe("Development diagnostic — real package bootstrap", () => {
       "--state-dir",
       fixture.stateDirectory,
       "--",
+      ...plannedRunArguments,
       "--authorize-plan",
       first.planFingerprint
     ]);
-    expect(authorized.status, `${authorized.stdout}\n${authorized.stderr}`).toBe(1);
+    expect(authorized.status, `${authorized.stdout}\n${authorized.stderr}`).toBe(0);
     const second = JSON.parse(readFileSync(marker, "utf8")) as typeof first;
-    expect(second.code).toBe("INCOMPLETE");
+    expect(second.code).toBe("COMPLETE");
     expect(second.paid).toBe(true);
     expect(second.stageRoot).not.toBe(first.stageRoot);
     expect(second.startupContractFingerprint).toBe(
@@ -2505,6 +2584,17 @@ describe("Development diagnostic — real package bootstrap", () => {
         (name) => name.startsWith(".development-diagnostic-stage-")
       )
     ).toEqual([]);
+    const completeState = JSON.parse(
+      readFileSync(developmentDiagnosticRunStatePath(fixture.stateDirectory), "utf8")
+    ) as {
+      readonly phase: string;
+      readonly identity: {
+        readonly plannedRun: { readonly selectedSlots: readonly string[] };
+      };
+    };
+    expect(completeState.phase).toBe("complete");
+    expect(completeState.identity.plannedRun.selectedSlots).toEqual(["slot-02"]);
+    expect(existsSync(developmentDiagnosticRunLockPath(fixture.stateDirectory))).toBe(false);
     const afterAuthorized = readFileSync(marker, "utf8");
     const counters = JSON.parse(readFileSync(fixture.sentinelFile, "utf8")) as
       typeof emptyBootstrapSentinels;
@@ -2524,6 +2614,7 @@ describe("Development diagnostic — real package bootstrap", () => {
       "--state-dir",
       fixture.stateDirectory,
       "--",
+      ...plannedRunArguments,
       "--authorize-plan",
       first.planFingerprint
     ]);
@@ -3601,7 +3692,10 @@ describe("createRealDevelopmentSmokeFixture — public preflight", () => {
     ).rejects.toThrow("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_FORBIDDEN");
   });
 
-  function realPreflightOf(fixture: RealSmokeFixture): DevelopmentDiagnosticPreflight {
+  function realPreflightOf(
+    fixture: RealSmokeFixture,
+    selectedSlots: readonly ("slot-01" | "slot-02")[] = expectedDiagnosticSlots
+  ): DevelopmentDiagnosticPreflight {
     return preflightDevelopmentDiagnostic({
       repositoryRoot: fixture.repositoryRoot,
       projectRoot: fixture.repositoryRoot,
@@ -3612,7 +3706,7 @@ describe("createRealDevelopmentSmokeFixture — public preflight", () => {
       paidExecutionSourceContractFingerprint:
         fixture.paidExecutionSourceContractFingerprint,
       allowedPrivateRoots: [fixture.rootDir]
-    });
+    }, selectedSlots);
   }
 
   function diagnosticRunArgs(
@@ -3676,7 +3770,91 @@ describe("createRealDevelopmentSmokeFixture — public preflight", () => {
     });
     expect(mockFetchCallCount).toBeGreaterThan(0);
   });
+  it("runs one authorized slot with exactly twelve fetches and no second slot", async () => {
+    const fixture = createRealDevelopmentSmokeFixture();
+    const plannedRun = {
+      schemaVersion: 1 as const,
+      selectedSlots: ["slot-01"] as const,
+      expectedRequestsPerSlot: 12 as const,
+      maximumConcurrency: 12,
+      maximumTransportAttemptsPerRequest: 2,
+      globalTransportAttemptCeiling: 16,
+      phaseSchedulingBudgetMs: 90 * 60_000,
+      softStopPolicy: "stop_new_and_drain_in_flight" as const
+    };
+    const preflight = realPreflightOf(fixture, plannedRun.selectedSlots);
+    const controller = buildController({ plannedRun });
+    const mock = completeElevenRoleFetch();
+    const outcomes = await runDevelopmentDiagnosticPhase({
+      controller,
+      preflight,
+      taskCandidates: fixture.taskCandidates.slice(0, 1).map((candidate) => ({
+        slot: candidate.slot as "slot-01",
+        taskCandidate: candidate.taskCandidate,
+        duplicateSimilarityRejectThreshold:
+          candidate.duplicateSimilarityRejectThreshold
+      })),
+      engineBuildFingerprint: digest("engine"),
+      fetchRuntimeOverride: mock.fetch,
+      profileName: preflight.profileName,
+      experimentVersion: preflight.experimentVersion
+    });
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]?.status).toBe("fulfilled");
+    expect(mock.total()).toBe(12);
+    expect(controller.scheduler().snapshot().maximumConcurrency).toBe(12);
+    expect(controller.checkpoint().completedSlotCount).toBe(1);
+    expect(controller.getStageSnapshot("slot-02")).toEqual({
+      A: "not_started",
+      B: "not_started",
+      C: "not_started",
+      D: "not_started",
+      F: "not_started"
+    });
+  });
 
+  it("runs standalone slot-02 with its own canonical preflight and twelve fetches", async () => {
+    const fixture = createRealDevelopmentSmokeFixture();
+    const plannedRun = {
+      schemaVersion: 1 as const,
+      selectedSlots: ["slot-02"] as const,
+      expectedRequestsPerSlot: 12 as const,
+      maximumConcurrency: 12,
+      maximumTransportAttemptsPerRequest: 2,
+      globalTransportAttemptCeiling: 16,
+      phaseSchedulingBudgetMs: 90 * 60_000,
+      softStopPolicy: "stop_new_and_drain_in_flight" as const
+    };
+    const preflight = realPreflightOf(fixture, plannedRun.selectedSlots);
+    const controller = buildController({ plannedRun });
+    const mock = completeElevenRoleFetch();
+    const candidate = fixture.taskCandidates[1]!;
+    const outcomes = await runDevelopmentDiagnosticPhase({
+      controller,
+      preflight,
+      taskCandidates: [{
+        slot: "slot-02",
+        taskCandidate: candidate.taskCandidate,
+        duplicateSimilarityRejectThreshold:
+          candidate.duplicateSimilarityRejectThreshold
+      }],
+      engineBuildFingerprint: digest("engine"),
+      fetchRuntimeOverride: mock.fetch,
+      profileName: preflight.profileName,
+      experimentVersion: preflight.experimentVersion
+    });
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]?.status).toBe("fulfilled");
+    expect(mock.total()).toBe(12);
+    expect(controller.checkpoint().completedSlotCount).toBe(1);
+    expect(controller.getStageSnapshot("slot-01")).toEqual({
+      A: "not_started",
+      B: "not_started",
+      C: "not_started",
+      D: "not_started",
+      F: "not_started"
+    });
+  });
   it("runs two complete eleven-role slots with exactly twelve fetches each", async () => {
     const fixture = createRealDevelopmentSmokeFixture();
     const preflight = realPreflightOf(fixture);

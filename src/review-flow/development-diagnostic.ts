@@ -30,6 +30,11 @@ import {
   type ReviewFlowRole
 } from "./schemas";
 import type { DifficultyAnchor } from "../pipelines/difficulty";
+import {
+  legacyDevelopmentDiagnosticPlannedRunContract,
+  parseDevelopmentDiagnosticPlannedRunContract,
+  type DevelopmentDiagnosticPlannedRunContract
+} from "./development-diagnostic-run-contract";
 
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 const diagnosticSlotSchema = z.enum(["slot-01", "slot-02"]);
@@ -211,9 +216,27 @@ export const developmentDiagnosticManifestSchema = z
     schemaVersion: z.literal(1),
     profileName: z.literal("development-diagnostic-2x4-v1"),
     profileFingerprint: z.literal(developmentDiagnosticProfileFingerprint),
-    slots: z.array(manifestSlotSchema).length(2)
+    slots: z.array(manifestSlotSchema).min(1).max(2)
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    const canonicalSlots = [...value.slots]
+      .map((entry) => entry.slot)
+      .sort(
+        (left, right) =>
+          expectedDiagnosticSlots.indexOf(left) - expectedDiagnosticSlots.indexOf(right)
+      );
+    if (
+      new Set(value.slots.map((entry) => entry.slot)).size !== value.slots.length ||
+      value.slots.some((entry, index) => entry.slot !== canonicalSlots[index])
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["slots"],
+        message: "manifest slots must be unique and canonical"
+      });
+    }
+  });
 
 export type DevelopmentDiagnosticManifest = z.infer<
   typeof developmentDiagnosticManifestSchema
@@ -221,7 +244,7 @@ export type DevelopmentDiagnosticManifest = z.infer<
 
 export interface DevelopmentDiagnosticManifestSummary {
   readonly manifestFingerprint: string;
-  readonly slotCount: 2;
+  readonly slotCount: number;
   readonly slotBindings: Readonly<Record<DevelopmentDiagnosticSlot, {
     readonly sourceBinding: string;
     readonly truthBindingHash: string;
@@ -252,7 +275,7 @@ export function summarizeDevelopmentDiagnosticManifest(
   }
   return Object.freeze({
     manifestFingerprint: hashCanonicalValue(manifest),
-    slotCount: 2,
+    slotCount: manifest.slots.length,
     slotBindings: Object.freeze(slotBindings)
   });
 }
@@ -275,9 +298,9 @@ export interface DevelopmentDiagnosticSafeRequestReceipt {
   readonly reasoningEffort: "max";
   readonly logicalAttempt: 1;
   readonly logicalRequestsUsed: number;
-  readonly logicalRequestCeiling: 10;
+  readonly logicalRequestCeiling: number;
   readonly externalAttemptsUsed: number;
-  readonly externalAttemptCeiling: 52;
+  readonly externalAttemptCeiling: number;
 }
 
 export type DevelopmentDiagnosticStopReason =
@@ -286,6 +309,7 @@ export type DevelopmentDiagnosticStopReason =
   | "final_failure"
   | "repeated_system_error"
   | "soft_stop_budget"
+  | "attempt_ceiling"
   | "manual";
 
 export interface DevelopmentDiagnosticBudgetReceipt {
@@ -297,9 +321,9 @@ export interface DevelopmentDiagnosticBudgetReceipt {
   readonly conservativeMs: 1_150_315;
   readonly expectedUtcStart: string;
   readonly expectedUtcEnd: string;
-  readonly logicalRequestCeiling: 10;
-  readonly providerTransportCeiling: 52;
-  readonly plannedPeakConcurrency: 4;
+  readonly logicalRequestCeiling: number;
+  readonly providerTransportCeiling: number;
+  readonly plannedPeakConcurrency: number;
   readonly plannedWaves: readonly { readonly wave: number; readonly maxConcurrency: number }[];
   readonly completedByStage: Readonly<Record<string, number>>;
   readonly inflightByStage: Readonly<Record<string, number>>;
@@ -343,7 +367,7 @@ export type DevelopmentDiagnosticLifecycleEvent =
       readonly sequence: number;
       readonly role: ReviewFlowRole;
       readonly modelFingerprint: string;
-      readonly attempt: 1;
+      readonly attempt: 1 | 2;
     }
   | {
       readonly type: "transport_started" | "transport_first_output";
@@ -352,7 +376,7 @@ export type DevelopmentDiagnosticLifecycleEvent =
   | {
       readonly type: "transport_settled";
       readonly sequence: number;
-      readonly outcome: "succeeded" | "failed";
+      readonly outcome: "succeeded" | "retryable_failed" | "failed";
       readonly errorCategory: DevelopmentDiagnosticLifecycleErrorCategory | null;
     }
   | {
@@ -423,6 +447,7 @@ export class TransportPreDispatchGate {
 export class DevelopmentDiagnosticRunController {
   readonly profile = developmentDiagnosticProfile;
   readonly manifest: DevelopmentDiagnosticManifest;
+  readonly plannedRun: DevelopmentDiagnosticPlannedRunContract;
   readonly manifestSummary: DevelopmentDiagnosticManifestSummary;
   readonly requestStartGate = new LlmRequestStartGate();
   readonly transportGate: TransportPreDispatchGate;
@@ -478,6 +503,7 @@ export class DevelopmentDiagnosticRunController {
       stage: ReviewFlowDagStage,
       failure: FourCallSafeRequestFailure
     ) => void;
+    readonly plannedRun?: unknown;
     readonly startedAtMs: number;
     readonly lifecycleSink?: (
       event: DevelopmentDiagnosticLifecycleEvent
@@ -488,6 +514,9 @@ export class DevelopmentDiagnosticRunController {
     if (hashCanonicalValue(parsedProfile) !== developmentDiagnosticProfileFingerprint) {
       throw new Error("DEVELOPMENT_DIAGNOSTIC_PROFILE_MISMATCH");
     }
+    this.plannedRun = parseDevelopmentDiagnosticPlannedRunContract(
+      input.plannedRun ?? legacyDevelopmentDiagnosticPlannedRunContract
+    );
     this.manifest = parseDevelopmentDiagnosticManifest(input.manifest);
     this.manifestSummary = summarizeDevelopmentDiagnosticManifest(this.manifest);
     this.#runBindingHash = digestSchema.parse(input.runBindingHash);
@@ -505,7 +534,7 @@ export class DevelopmentDiagnosticRunController {
       throw new Error("DEVELOPMENT_DIAGNOSTIC_CLOCK_INVALID");
     }
     this.transportGate = new TransportPreDispatchGate(
-      this.profile.maximumTotalExternalAttempts,
+      this.plannedRun.globalTransportAttemptCeiling,
       this.requestStartGate
     );
     this.#assertSchedulerProfile();
@@ -553,7 +582,7 @@ export class DevelopmentDiagnosticRunController {
       throw new Error("DEVELOPMENT_DIAGNOSTIC_NEW_REQUESTS_CLOSED");
     }
     const slot = diagnosticSlotSchema.parse(request.caseId);
-    if (!diagnosticSlotSet.has(slot)) {
+    if (!this.plannedRun.selectedSlots.includes(slot)) {
       throw new Error("DEVELOPMENT_DIAGNOSTIC_SLOT_INVALID");
     }
     if (request.attempt !== 1) throw new Error("DEVELOPMENT_DIAGNOSTIC_RETRY_FORBIDDEN");
@@ -569,10 +598,11 @@ export class DevelopmentDiagnosticRunController {
     const attemptsForSlot = [...this.#authorized.keys()].filter((key) =>
       key.startsWith(`${slot}:`)
     ).length;
+    const logicalRequestCeiling = this.plannedRun.selectedSlots.length * 5;
     if (attemptsForSlot >= this.profile.maximumAttemptsPerCase) {
       throw new Error("DEVELOPMENT_DIAGNOSTIC_CASE_ATTEMPT_LIMIT");
     }
-    if (this.#authorized.size >= this.profile.maximumTotalLogicalRequests) {
+    if (this.#authorized.size >= logicalRequestCeiling) {
       throw new Error("DEVELOPMENT_DIAGNOSTIC_TOTAL_REQUEST_LIMIT");
     }
     this.#assertRequestContract(request);
@@ -594,9 +624,9 @@ export class DevelopmentDiagnosticRunController {
       reasoningEffort: "max" as const,
       logicalAttempt: 1 as const,
       logicalRequestsUsed: this.#authorized.size + 1,
-      logicalRequestCeiling: 10 as const,
+      logicalRequestCeiling,
       externalAttemptsUsed: this.transportGate.used + 1,
-      externalAttemptCeiling: 52 as const
+      externalAttemptCeiling: this.plannedRun.globalTransportAttemptCeiling
     });
     this.#safeReceiptSink(receipt);
     this.#authorized.set(requestKey, receipt);
@@ -611,10 +641,18 @@ export class DevelopmentDiagnosticRunController {
     this.applySoftStopGate(this.elapsedMs());
     this.transportGate.reserveOrThrow();
   }
+  public async beforeTransport(input: {
+    readonly role: ReviewFlowRole;
+    readonly modelFingerprint: string;
+    readonly attempt?: number;
+  }): Promise<void> {
+    return this.prepareTransportOrThrow(input);
+  }
 
   public async prepareTransportOrThrow(input: {
     readonly role: ReviewFlowRole;
     readonly modelFingerprint: string;
+    readonly attempt?: number;
   }): Promise<void> {
     this.reserveTransportOrThrow();
     const sequence = this.#transportContext.getStore();
@@ -623,8 +661,29 @@ export class DevelopmentDiagnosticRunController {
     }
     const role = reviewFlowRoleSchema.parse(input.role);
     const modelFingerprint = digestSchema.parse(input.modelFingerprint);
-    this.#emitLifecycle({ type: "transport_intent", sequence, role, modelFingerprint, attempt: 1 });
-    this.#emitLifecycle({ type: "transport_reserved", sequence, role, modelFingerprint, attempt: 1 });
+    const requestedAttempt = input.attempt ?? 1;
+    if (
+      !Number.isSafeInteger(requestedAttempt) ||
+      requestedAttempt < 1 ||
+      requestedAttempt > this.plannedRun.maximumTransportAttemptsPerRequest
+    ) {
+      throw new Error("DEVELOPMENT_DIAGNOSTIC_TRANSPORT_RETRY_LIMIT");
+    }
+    const attempt = requestedAttempt as 1 | 2;
+    this.#emitLifecycle({
+      type: "transport_intent",
+      sequence,
+      role,
+      modelFingerprint,
+      attempt
+    });
+    this.#emitLifecycle({
+      type: "transport_reserved",
+      sequence,
+      role,
+      modelFingerprint,
+      attempt
+    });
     this.#emitLifecycle({ type: "transport_started", sequence });
     await this.flushLifecycleEvents();
   }
@@ -649,10 +708,16 @@ export class DevelopmentDiagnosticRunController {
             this.#emitLifecycle({
               type: "transport_settled",
               sequence,
-              outcome: "succeeded",
+              outcome: value === null ? "retryable_failed" : "succeeded",
               errorCategory: null
             });
             await this.flushLifecycleEvents();
+            if (
+              this.plannedRun.softStopPolicy === "stop_new_and_drain_in_flight" &&
+              this.transportGate.used === this.transportGate.ceiling
+            ) {
+              this.softStop("attempt_ceiling");
+            }
             return value;
           } catch (error) {
             this.#emitLifecycle({
@@ -662,6 +727,12 @@ export class DevelopmentDiagnosticRunController {
               errorCategory: classifyTerminalRoleFailure("transport", error)
             });
             await this.flushLifecycleEvents();
+            if (
+              this.plannedRun.softStopPolicy === "stop_new_and_drain_in_flight" &&
+              this.transportGate.used === this.transportGate.ceiling
+            ) {
+              this.softStop("attempt_ceiling");
+            }
             throw error;
           }
         });
@@ -674,10 +745,7 @@ export class DevelopmentDiagnosticRunController {
     const sequence = this.#transportContext.getStore();
     if (sequence !== undefined && !this.#firstOutputSequences.has(sequence)) {
       this.#firstOutputSequences.add(sequence);
-      this.#emitLifecycle({
-        type: "transport_first_output",
-        sequence
-      });
+      this.#emitLifecycle({ type: "transport_first_output", sequence });
     }
   }
 
@@ -710,8 +778,8 @@ export class DevelopmentDiagnosticRunController {
       receipt.thinkingRequest !== "enabled" ||
       receipt.reasoningEffort !== "max" ||
       receipt.logicalAttempt !== 1 ||
-      receipt.logicalRequestCeiling !== 10 ||
-      receipt.externalAttemptCeiling !== 52
+      receipt.logicalRequestCeiling !== this.plannedRun.selectedSlots.length * 5 ||
+      receipt.externalAttemptCeiling !== this.plannedRun.globalTransportAttemptCeiling
     ) {
       throw new Error("DEVELOPMENT_DIAGNOSTIC_RESTORED_REQUEST_INVALID");
     }
@@ -888,7 +956,7 @@ export class DevelopmentDiagnosticRunController {
     if (!Number.isSafeInteger(elapsedMs) || elapsedMs < 0) {
       throw new Error("DEVELOPMENT_DIAGNOSTIC_ELAPSED_INVALID");
     }
-    if (elapsedMs >= this.profile.softStopBudgetMs) {
+    if (elapsedMs >= this.plannedRun.phaseSchedulingBudgetMs) {
       this.softStop("soft_stop_budget");
     }
   }
@@ -971,7 +1039,7 @@ export class DevelopmentDiagnosticRunController {
   public checkpoint(): DevelopmentDiagnosticCheckpoint {
     const incomplete =
       this.#stopped ||
-      this.#completedSlots.size !== this.profile.anonymousSlotCount;
+      this.#completedSlots.size !== this.plannedRun.selectedSlots.length;
     return deepFreeze({
       schemaVersion: 1 as const,
       profileFingerprint: developmentDiagnosticProfileFingerprint,
@@ -1004,7 +1072,7 @@ export class DevelopmentDiagnosticRunController {
       failedByStage[stage] = 0;
       notStartedByStage[stage] = 0;
     }
-    for (const slot of expectedDiagnosticSlots) {
+    for (const slot of this.plannedRun.selectedSlots) {
       for (const stage of stages) {
         const key = `${slot}:${stage}`;
         if (this.#completedStages.has(key)) completedByStage[stage] += 1;
@@ -1023,12 +1091,11 @@ export class DevelopmentDiagnosticRunController {
       conservativeMs: 1_150_315 as const,
       expectedUtcStart: t0.toISOString(),
       expectedUtcEnd: expectedEnd.toISOString(),
-      logicalRequestCeiling: 10 as const,
-      providerTransportCeiling: 52 as const,
-      plannedPeakConcurrency: 4 as const,
+      logicalRequestCeiling: this.plannedRun.selectedSlots.length * 5,
+      providerTransportCeiling: this.plannedRun.globalTransportAttemptCeiling,
+      plannedPeakConcurrency: this.plannedRun.maximumConcurrency,
       plannedWaves: Object.freeze([
-        { wave: 1, maxConcurrency: 4 },
-        { wave: 2, maxConcurrency: 2 }
+        { wave: 1, maxConcurrency: this.plannedRun.maximumConcurrency }
       ]),
       completedByStage: Object.freeze(completedByStage),
       inflightByStage: Object.freeze(inflightByStage),
@@ -1054,7 +1121,7 @@ export class DevelopmentDiagnosticRunController {
   #assertSchedulerProfile(): void {
     const snapshot = this.#scheduler.snapshot();
     if (
-      snapshot.maximumConcurrency !== this.profile.maximumConcurrency ||
+      snapshot.maximumConcurrency !== this.plannedRun.maximumConcurrency ||
       snapshot.maximumAttemptsPerLogicalRequest !==
         this.profile.maximumAttemptsPerLogicalRequest ||
       snapshot.maximumAttemptsPerCase !== this.profile.maximumAttemptsPerCase
@@ -1086,11 +1153,13 @@ export class DevelopmentDiagnosticRunController {
 }
 
 export function createDevelopmentDiagnosticScheduler(
-  candidate: unknown = developmentDiagnosticProfile
+  candidate: unknown = developmentDiagnosticProfile,
+  plannedRunCandidate: unknown = legacyDevelopmentDiagnosticPlannedRunContract
 ): FairLlmRequestScheduler {
   const profile = parseDevelopmentDiagnosticProfile(candidate);
+  const plannedRun = parseDevelopmentDiagnosticPlannedRunContract(plannedRunCandidate);
   return new FairLlmRequestScheduler({
-    maximumConcurrency: profile.maximumConcurrency,
+    maximumConcurrency: plannedRun.maximumConcurrency,
     maximumAttemptsPerLogicalRequest: profile.maximumAttemptsPerLogicalRequest,
     maximumAttemptsPerCase: profile.maximumAttemptsPerCase
   });

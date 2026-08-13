@@ -52,6 +52,9 @@ import {
   developmentDiagnosticProfile,
   developmentDiagnosticProfileFingerprint
 } from "../src/review-flow/development-diagnostic";
+import {
+  legacyDevelopmentDiagnosticPlannedRunContract
+} from "../src/review-flow/development-diagnostic-run-contract";
 
 const roots: string[] = [];
 const fingerprint = (label: string): string =>
@@ -75,40 +78,51 @@ async function emitCompleteMockRun(
   context: Parameters<NonNullable<DevelopmentDiagnosticCliRuntime["paidExecution"]>>[0]
 ): Promise<{ readonly complete: true }> {
   context.registerSoftStop(() => undefined);
+  const requestRoles = [
+    "solver",
+    "solver",
+    ...diagnosticRoles.filter((role) => role !== "solver")
+  ] as const;
   let nextSequence = 1;
-  for (let batch = 0; batch < 6; batch += 1) {
+  const requests = context.plannedRun.selectedSlots.flatMap(() => requestRoles);
+  for (
+    let offset = 0;
+    offset < requests.length;
+    offset += context.plannedRun.maximumConcurrency
+  ) {
     await Promise.all(
-      Array.from({ length: 4 }, async () => {
-        const sequence = nextSequence;
-        nextSequence += 1;
-        const role = diagnosticRoles[(sequence - 1) % diagnosticRoles.length]!;
-        await context.lifecycleSink({
-          type: "transport_intent",
-          sequence,
-          role,
-          modelFingerprint: fingerprint(`model:${role}`),
-          attempt: 1
-        });
-        await context.lifecycleSink({
-          type: "transport_reserved",
-          sequence,
-          role,
-          modelFingerprint: fingerprint(`model:${role}`),
-          attempt: 1
-        });
-        await context.lifecycleSink({ type: "transport_started", sequence });
-        await fetch("https://mock.invalid/diagnostic");
-        await context.lifecycleSink({ type: "transport_first_output", sequence });
-        await context.lifecycleSink({
-          type: "transport_settled",
-          sequence,
-          outcome: "succeeded",
-          errorCategory: null
-        });
-      })
+      requests
+        .slice(offset, offset + context.plannedRun.maximumConcurrency)
+        .map(async (role) => {
+          const sequence = nextSequence;
+          nextSequence += 1;
+          await context.lifecycleSink({
+            type: "transport_intent",
+            sequence,
+            role,
+            modelFingerprint: fingerprint(`model:${role}`),
+            attempt: 1
+          });
+          await context.lifecycleSink({
+            type: "transport_reserved",
+            sequence,
+            role,
+            modelFingerprint: fingerprint(`model:${role}`),
+            attempt: 1
+          });
+          await context.lifecycleSink({ type: "transport_started", sequence });
+          await fetch("https://mock.invalid/diagnostic");
+          await context.lifecycleSink({ type: "transport_first_output", sequence });
+          await context.lifecycleSink({
+            type: "transport_settled",
+            sequence,
+            outcome: "succeeded",
+            errorCategory: null
+          });
+        })
     );
   }
-  for (const slot of ["slot-01", "slot-02"] as const) {
+  for (const slot of context.plannedRun.selectedSlots) {
     for (const role of diagnosticRoles) {
       await context.lifecycleSink({ type: "role_completed", slot, role });
     }
@@ -117,6 +131,54 @@ async function emitCompleteMockRun(
     }
     await context.lifecycleSink({ type: "slot_outcome", slot, status: "complete" });
   }
+  return { complete: true };
+}
+async function emitRetryCompleteMockRun(
+  context: Parameters<NonNullable<DevelopmentDiagnosticCliRuntime["paidExecution"]>>[0]
+): Promise<{ readonly complete: true }> {
+  context.registerSoftStop(() => undefined);
+  const requestRoles = [
+    "solver",
+    "solver",
+    ...diagnosticRoles.filter((role) => role !== "solver")
+  ] as const;
+  let sequence = 0;
+  for (const [requestIndex, role] of requestRoles.entries()) {
+    const attempts = requestIndex === 0 ? [1, 2] as const : [1] as const;
+    for (const attempt of attempts) {
+      sequence += 1;
+      await context.lifecycleSink({
+        type: "transport_intent",
+        sequence,
+        role,
+        modelFingerprint: fingerprint(`model:${role}`),
+        attempt
+      });
+      await context.lifecycleSink({
+        type: "transport_reserved",
+        sequence,
+        role,
+        modelFingerprint: fingerprint(`model:${role}`),
+        attempt
+      });
+      await context.lifecycleSink({ type: "transport_started", sequence });
+      await context.lifecycleSink({
+        type: "transport_settled",
+        sequence,
+        outcome: requestIndex === 0 && attempt === 1
+          ? "retryable_failed"
+          : "succeeded",
+        errorCategory: null
+      });
+    }
+  }
+  for (const role of diagnosticRoles) {
+    await context.lifecycleSink({ type: "role_completed", slot: "slot-01", role });
+  }
+  for (const stage of diagnosticStages) {
+    await context.lifecycleSink({ type: "stage_completed", slot: "slot-01", stage });
+  }
+  await context.lifecycleSink({ type: "slot_outcome", slot: "slot-01", status: "complete" });
   return { complete: true };
 }
 
@@ -315,8 +377,46 @@ describe("strict CLI arguments and owner boundary", () => {
       ])
     ).toEqual({
       stateDirectory: "/tmp/diagnostic-state",
-      authorizationFingerprint: fingerprint("plan")
+      authorizationFingerprint: fingerprint("plan"),
+      plannedRun: legacyDevelopmentDiagnosticPlannedRunContract
     });
+  });
+  it("parses and binds the controlled one-slot run contract", () => {
+    const parsed = parseDevelopmentDiagnosticCliArguments([
+      "--state-dir", "/tmp/diagnostic-state",
+      "--slots", "slot-01",
+      "--max-concurrency", "12",
+      "--max-transport-attempts-per-request", "2",
+      "--transport-attempt-ceiling", "16",
+      "--phase-scheduling-budget-ms", "5400000",
+      "--soft-stop-policy", "stop_new_and_drain_in_flight"
+    ]);
+    expect(parsed.plannedRun).toEqual({
+      schemaVersion: 1,
+      selectedSlots: ["slot-01"],
+      expectedRequestsPerSlot: 12,
+      maximumConcurrency: 12,
+      maximumTransportAttemptsPerRequest: 2,
+      globalTransportAttemptCeiling: 16,
+      phaseSchedulingBudgetMs: 5_400_000,
+      softStopPolicy: "stop_new_and_drain_in_flight"
+    });
+  });
+
+  it.each([
+    ["--slots", ""],
+    ["--slots", "slot-01,slot-01"],
+    ["--slots", "slot-02,slot-01"],
+    ["--max-concurrency", "17"],
+    ["--transport-attempt-ceiling", "11"],
+    ["--max-transport-attempts-per-request", "2", "--transport-attempt-ceiling", "12"]
+  ])("rejects invalid planned-run arguments: %s", (...runArguments) => {
+    expect(() =>
+      parseDevelopmentDiagnosticCliArguments([
+        "--state-dir", "/tmp/diagnostic-state",
+        ...runArguments
+      ])
+    ).toThrow();
   });
 
   it.each([
@@ -442,7 +542,8 @@ describe("safe plan and explicit confirmation", () => {
       profile: {
         ...developmentDiagnosticProfile,
         retryableHttpStatuses: [429]
-      }
+      },
+      plannedRun: legacyDevelopmentDiagnosticPlannedRunContract
     };
     const baseline = developmentDiagnosticStateIdentityFingerprint({
       absoluteStateDirectory: stateDirectory,
@@ -513,7 +614,8 @@ describe("safe plan and explicit confirmation", () => {
       profile: {
         ...developmentDiagnosticProfile,
         retryableHttpStatuses: [429]
-      }
+      },
+      plannedRun: legacyDevelopmentDiagnosticPlannedRunContract
     };
     const noHistory = buildDevelopmentDiagnosticSafePlan({
       stateDirectory,
@@ -762,6 +864,58 @@ describe("safe plan and explicit confirmation", () => {
       terminalFailure: null
     });
   });
+  it("authorizes and durably completes standalone slot-02 with a distinct token and clean lock", async () => {
+    const slotOneDirectory = createStateDirectoryPath("slot-one");
+    const slotTwoDirectory = createStateDirectoryPath("slot-two");
+    const commonArguments = [
+      "--max-concurrency", "12",
+      "--max-transport-attempts-per-request", "2",
+      "--transport-attempt-ceiling", "16",
+      "--phase-scheduling-budget-ms", "5400000",
+      "--soft-stop-policy", "stop_new_and_drain_in_flight"
+    ] as const;
+    const planOne = createRuntime({
+      stateDirectory: slotOneDirectory,
+      argv: ["--state-dir", slotOneDirectory, "--slots", "slot-01", ...commonArguments]
+    });
+    const planTwo = createRuntime({
+      stateDirectory: slotTwoDirectory,
+      argv: ["--state-dir", slotTwoDirectory, "--slots", "slot-02", ...commonArguments]
+    });
+    await runDevelopmentDiagnosticCli(planOne.runtime);
+    await runDevelopmentDiagnosticCli(planTwo.runtime);
+    const slotOneToken = extractPlanFingerprint(planOne.output);
+    const slotTwoToken = extractPlanFingerprint(planTwo.output);
+    expect(slotTwoToken).not.toBe(slotOneToken);
+    vi.stubGlobal("fetch", async () => new Response(null, { status: 204 }));
+    const authorized = createRuntime({
+      stateDirectory: slotTwoDirectory,
+      argv: [
+        "--state-dir", slotTwoDirectory,
+        "--slots", "slot-02",
+        ...commonArguments,
+        "--authorize-plan", slotTwoToken
+      ],
+      paidExecution: emitCompleteMockRun
+    });
+    expect(await runDevelopmentDiagnosticCli(authorized.runtime)).toEqual({
+      exitCode: 0,
+      code: "COMPLETE",
+      planFingerprint: slotTwoToken
+    });
+    expect(readPersistedPhase(slotTwoDirectory)).toBe("complete");
+    expect(() => statSync(developmentDiagnosticRunLockPath(slotTwoDirectory))).toThrow();
+    const persisted = JSON.parse(
+      readFileSync(developmentDiagnosticRunStatePath(slotTwoDirectory), "utf8")
+    ) as {
+      readonly identity: {
+        readonly runId: string;
+        readonly plannedRun: { readonly selectedSlots: readonly string[] };
+      };
+    };
+    expect(persisted.identity.plannedRun.selectedSlots).toEqual(["slot-02"]);
+    expect(persisted.identity.runId).not.toBe(slotOneToken);
+  });
   it("emits only safe plan/progress fields and never content, secret, path, or raw error sentinels", async () => {
     const stateDirectory = createStateDirectoryPath("privacy-sentinel");
     const sensitive = {
@@ -816,6 +970,76 @@ describe("safe plan and explicit confirmation", () => {
     expect(rendered).toContain('"counts"');
     expect(rendered).toContain('"latency"');
     expect(rendered).toContain('"throughputPerMinute"');
+  });
+  it("durably records a retryable attempt and cleans the single-slot lock", async () => {
+    const stateDirectory = createStateDirectoryPath("retry-complete");
+    const runArguments = [
+      "--state-dir", stateDirectory,
+      "--slots", "slot-01",
+      "--max-concurrency", "12",
+      "--max-transport-attempts-per-request", "2",
+      "--transport-attempt-ceiling", "16",
+      "--phase-scheduling-budget-ms", "5400000",
+      "--soft-stop-policy", "stop_new_and_drain_in_flight"
+    ] as const;
+    const planned = createRuntime({ stateDirectory, argv: runArguments });
+    await runDevelopmentDiagnosticCli(planned.runtime);
+    const planFingerprint = extractPlanFingerprint(planned.output);
+    const authorized = createRuntime({
+      stateDirectory,
+      argv: [...runArguments, "--authorize-plan", planFingerprint],
+      paidExecution: emitRetryCompleteMockRun
+    });
+    expect(await runDevelopmentDiagnosticCli(authorized.runtime)).toEqual({
+      exitCode: 0,
+      code: "COMPLETE",
+      planFingerprint
+    });
+    const persisted = JSON.parse(
+      readFileSync(developmentDiagnosticRunStatePath(stateDirectory), "utf8")
+    ) as {
+      readonly phase: string;
+      readonly attempts: readonly { readonly outcome: string }[];
+      readonly transport: {
+        readonly settled: number;
+        readonly active: number;
+        readonly queued: number;
+      };
+    };
+    expect(persisted.phase).toBe("complete");
+    expect(persisted.attempts).toHaveLength(13);
+    expect(persisted.attempts.filter((attempt) =>
+      attempt.outcome === "retryable_failed"
+    )).toHaveLength(1);
+    expect(persisted.transport).toMatchObject({
+      settled: 13,
+      active: 0,
+      queued: 0
+    });
+    const progress = authorized.output
+      .map((line) => JSON.parse(line) as {
+        readonly event?: string;
+        readonly kind?: string;
+        readonly counts?: {
+          readonly completed: number;
+          readonly inFlight: number;
+          readonly notStarted: number;
+        };
+        readonly eta?: { readonly remainingFetches?: number };
+      })
+      .filter((entry) =>
+        entry.event === "development_diagnostic_progress" &&
+        entry.kind === "transport_settled"
+      );
+    expect(progress[0]).toMatchObject({
+      counts: { completed: 0, inFlight: 1, notStarted: 11 },
+      eta: { remainingFetches: 12 }
+    });
+    expect(progress[1]).toMatchObject({
+      counts: { completed: 1, inFlight: 0, notStarted: 11 },
+      eta: { remainingFetches: 11 }
+    });
+    expect(() => statSync(developmentDiagnosticRunLockPath(stateDirectory))).toThrow();
   });
 
   it("performs zero fetches when real preflight fails before planning or paid execution", async () => {

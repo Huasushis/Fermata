@@ -338,7 +338,7 @@ export interface LlmRuntimeOptions {
    * fetch 不会发生，失败按确定性 fail-closed 处理。
    * 不计数逻辑请求——每个传输尝试（含 429 重试）各调用一次。
    */
-  readonly onTransportDispatch?: () => void | Promise<void>;
+  readonly onTransportDispatch?: (attempt: number) => void | Promise<void>;
   /**
    * 可选的传输级异步调度器。调度回调包住一次完整外部请求：取得并发槽位后才启动
    * 传输前检查、watchdog 与 fetch，并持有槽位直到响应正文完成或失败。拒绝排队
@@ -1676,7 +1676,7 @@ async function requestWithRetry(
         // 在并发槽位内紧邻 fetch 执行付费前检查。拒绝不会调用 fetch，也不计尝试。
         if (runtime.onTransportDispatch !== undefined) {
           try {
-            await runtime.onTransportDispatch();
+            await runtime.onTransportDispatch(attempt);
           } catch {
             throw new LlmRequestError("LLM_TRANSPORT_DENIED");
           }

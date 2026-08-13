@@ -1617,7 +1617,8 @@ interface DevelopmentDiagnosticTrustedExecution {
 
 function buildDiagnosticTrustedExecutions(
   smoke: DevelopmentSmokePreflight,
-  options: DevelopmentSmokePreflightOptions
+  options: DevelopmentSmokePreflightOptions,
+  selectedSlots: readonly DevelopmentDiagnosticSlot[]
 ): readonly DevelopmentDiagnosticTrustedExecution[] {
   const projectRoot = realpathSync(options.projectRoot);
   const allowedPrivateRoots = (options.allowedPrivateRoots ?? [
@@ -1628,7 +1629,7 @@ function buildDiagnosticTrustedExecutions(
     throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_SLOTS_INVALID");
   }
   const duplicateSimilarityRejectThreshold = smoke.duplicateSimilarityRejectThreshold;
-  return deepFreeze(expectedDiagnosticSlots.map((slot) => {
+  return deepFreeze(selectedSlots.map((slot) => {
     const binding = smoke.privateManifest.bindings.find((entry) => entry.slot === slot);
     if (binding === undefined) {
       throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_SLOT_MISSING");
@@ -1689,6 +1690,7 @@ function registerDiagnosticPreflight(input: {
   readonly configuredRoleModelsFingerprint: string;
   readonly paidExecutionContractFingerprint: string;
   readonly revalidationOptions: DevelopmentSmokePreflightOptions;
+  readonly selectedSlots: readonly DevelopmentDiagnosticSlot[];
   readonly trustedExecutions: readonly DevelopmentDiagnosticTrustedExecution[];
 }): DevelopmentDiagnosticPreflight {
   if (input.safeSummary.slots !== 6) {
@@ -1700,7 +1702,7 @@ function registerDiagnosticPreflight(input: {
   if (input.cases.length !== 6) {
     throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_CASES_INVALID");
   }
-  const selected = deepFreeze(expectedDiagnosticSlots.map((slot) => {
+  const selected = deepFreeze(input.selectedSlots.map((slot) => {
     const found = input.cases.find((entry) => entry.slot === slot);
     if (found === undefined) {
       throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_SLOT_MISSING");
@@ -1840,9 +1842,10 @@ function revalidateDiagnosticPreflight(
   );
   const currentExecutions = buildDiagnosticTrustedExecutions(
     smoke,
-    authority.revalidationOptions
+    authority.revalidationOptions,
+    authority.trustedExecutions.map((execution) => execution.slot)
   );
-  const currentCases = expectedDiagnosticSlots.map((slot) => {
+  const currentCases = authority.trustedExecutions.map(({ slot }) => {
     const found = smoke.cases.find((entry) => entry.slot === slot);
     if (found === undefined || found.taskBindingFingerprint === undefined) {
       throw new Error("DEVELOPMENT_DIAGNOSTIC_PREFLIGHT_CHANGED");
@@ -1886,6 +1889,7 @@ function revalidateDiagnosticPreflight(
 function bindDiagnosticRoleModels(
   models: ReviewFlowModelConfigs,
   controller: DevelopmentDiagnosticRunController,
+  maximumTransportAttemptsPerRequest: number,
   fetchOverride?: PipelineModelConfig["runtime"]["fetch"]
 ): ReviewFlowModelConfigs {
   const roles = reviewFlowRoleSchema.options as readonly ReviewFlowRole[];
@@ -1898,16 +1902,19 @@ function bindDiagnosticRoleModels(
         runtime: Object.freeze({
           ...config.runtime,
           directStructuredOutput: true,
-          onTransportDispatch: () => controller.prepareTransportOrThrow({
-            role,
-            modelFingerprint
-          }),
+          maxAttempts: maximumTransportAttemptsPerRequest,
           dispatchTransport: <T>(execute: () => Promise<T>) =>
             controller.dispatchTransport(execute),
           onSafeOutputActivity: () => {
             config.runtime.onSafeOutputActivity?.();
             controller.markTransportFirstOutput();
           },
+          onTransportDispatch: (attempt: number) =>
+            controller.beforeTransport({
+              role,
+              modelFingerprint,
+              attempt
+            }),
           ...(fetchOverride !== undefined ? { fetch: fetchOverride } : {})
         })
       })];
@@ -1938,8 +1945,24 @@ function classifyDevelopmentDiagnosticFailure(
  * 调用方只提供与 `preflightDevelopmentSmoke` 相同的选项——不接受任意 cases/models/fingerprint。
  */
 export function preflightDevelopmentDiagnostic(
-  options: DevelopmentSmokePreflightOptions
+  options: DevelopmentSmokePreflightOptions,
+  selectedSlots: readonly DevelopmentDiagnosticSlot[] = expectedDiagnosticSlots
 ): DevelopmentDiagnosticPreflight {
+  const sortedSlots = [...selectedSlots].sort(
+    (left, right) =>
+      expectedDiagnosticSlots.indexOf(left) - expectedDiagnosticSlots.indexOf(right)
+  );
+  if (
+    selectedSlots.length < 1 ||
+    selectedSlots.length > expectedDiagnosticSlots.length ||
+    new Set(selectedSlots).size !== selectedSlots.length ||
+    selectedSlots.some(
+      (slot, index) =>
+        !expectedDiagnosticSlots.includes(slot) || sortedSlots[index] !== slot
+    )
+  ) {
+    throw new Error("DEVELOPMENT_DIAGNOSTIC_SELECTED_SLOTS_INVALID");
+  }
   const revalidationOptions = captureDiagnosticPreflightOptions(options);
   assertDiagnosticControlledEnvironment(
     revalidationOptions.env ?? process.env,
@@ -1952,7 +1975,8 @@ export function preflightDevelopmentDiagnostic(
   );
   const trustedExecutions = buildDiagnosticTrustedExecutions(
     smoke,
-    revalidationOptions
+    revalidationOptions,
+    selectedSlots
   );
   if (
     typeof smoke.duplicateSimilarityRejectThreshold !== "number" ||
@@ -1975,6 +1999,7 @@ export function preflightDevelopmentDiagnostic(
     difficultyAnchors: smoke.difficultyAnchors
   });
   return registerDiagnosticPreflight({
+    selectedSlots,
     manifestFingerprint: smoke.safeSummary.manifestFingerprint,
     cases: smoke.cases,
     fourCallModels: smoke.models,
@@ -2018,8 +2043,10 @@ export async function runDevelopmentDiagnosticPhase(input: {
   }));
   if (
     candidateSnapshot !== undefined &&
-    (candidateSnapshot.length !== expectedDiagnosticSlots.length ||
-      candidateSnapshot.some((entry, index) => entry.slot !== expectedDiagnosticSlots[index]))
+    (candidateSnapshot.length !== authority.trustedExecutions.length ||
+      candidateSnapshot.some(
+        (entry, index) => entry.slot !== authority.trustedExecutions[index]?.slot
+      ))
   ) {
     throw new Error("DEVELOPMENT_DIAGNOSTIC_BATCH_INVALID");
   }
@@ -2047,6 +2074,7 @@ export async function runDevelopmentDiagnosticPhase(input: {
   const boundRoleModels = bindDiagnosticRoleModels(
     authority.roleModels,
     input.controller,
+    input.controller.plannedRun.maximumTransportAttemptsPerRequest,
     input.fetchRuntimeOverride
   );
   const bundle = createReviewFlowLlmBundle({

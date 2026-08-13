@@ -23,6 +23,10 @@ import {
   developmentDiagnosticProfileFingerprint,
   developmentDiagnosticProfileSchema
 } from "../../src/review-flow/development-diagnostic";
+import {
+  developmentDiagnosticExpectedRequestCount,
+  developmentDiagnosticPlannedRunContractSchema
+} from "../../src/review-flow/development-diagnostic-run-contract";
 
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
 const timestampSchema = z.string().datetime();
@@ -67,7 +71,8 @@ export const developmentDiagnosticRunIdentitySchema = z
     authorityFingerprint: digestSchema,
     configurationFingerprint: digestSchema,
     profileFingerprint: z.literal(developmentDiagnosticProfileFingerprint),
-    profile: developmentDiagnosticPaidRunProfileSchema
+    profile: developmentDiagnosticPaidRunProfileSchema,
+    plannedRun: developmentDiagnosticPlannedRunContractSchema
   })
   .strict()
   .superRefine((value, context) => {
@@ -144,11 +149,18 @@ const slotProgressSchema = z
 
 const transportAttemptSchema = z
   .object({
-    sequence: z.number().int().min(1).max(52),
+    sequence: z.number().int().min(1).max(104),
     roleFingerprint: digestSchema,
     modelFingerprint: digestSchema,
     attempt: z.number().int().min(1).max(3),
-    outcome: z.enum(["queued", "reserved", "running", "succeeded", "failed"]),
+    outcome: z.enum([
+      "queued",
+      "reserved",
+      "running",
+      "succeeded",
+      "retryable_failed",
+      "failed"
+    ]),
     queuedAt: timestampSchema,
     startAt: timestampSchema.nullable(),
     firstOutputAt: timestampSchema.nullable(),
@@ -159,7 +171,10 @@ const transportAttemptSchema = z
   .strict()
   .superRefine((value, context) => {
     const started = value.startAt !== null;
-    const terminal = value.outcome === "succeeded" || value.outcome === "failed";
+    const terminal =
+      value.outcome === "succeeded" ||
+      value.outcome === "retryable_failed" ||
+      value.outcome === "failed";
     if (
       (value.outcome === "queued" && started) ||
       (value.outcome === "reserved" && started) ||
@@ -175,12 +190,12 @@ const transportAttemptSchema = z
 
 const transportProgressSchema = z
   .object({
-    intended: z.number().int().min(0).max(52),
-    reserved: z.number().int().min(0).max(52),
-    started: z.number().int().min(0).max(52),
-    settled: z.number().int().min(0).max(52),
-    active: z.number().int().min(0).max(4),
-    queued: z.number().int().min(0).max(52),
+    intended: z.number().int().min(0).max(104),
+    reserved: z.number().int().min(0).max(104),
+    started: z.number().int().min(0).max(104),
+    settled: z.number().int().min(0).max(104),
+    active: z.number().int().min(0).max(16),
+    queued: z.number().int().min(0).max(104),
     terminalFailure: terminalFailureSchema.nullable()
   })
   .strict()
@@ -217,23 +232,70 @@ const runStatePayloadSchema = z
     terminationIntent: z.enum(["SIGINT", "SIGTERM"]).nullable(),
     terminalReason: runTerminalReasonSchema.nullable(),
     transport: transportProgressSchema,
-    attempts: z.array(transportAttemptSchema).max(52).readonly(),
+    attempts: z.array(transportAttemptSchema).max(104).readonly(),
     slots: z.tuple([slotProgressSchema, slotProgressSchema])
   })
   .strict()
   .superRefine((value, context) => {
+    const expectedRequestCount = developmentDiagnosticExpectedRequestCount(
+      value.identity.plannedRun
+    );
+    const selectedSlots = new Set(value.identity.plannedRun.selectedSlots);
+    if (value.transport.active > value.identity.plannedRun.maximumConcurrency) {
+      context.addIssue({
+        code: "custom",
+        path: ["transport", "active"],
+        message: "active transport concurrency exceeds planned run"
+      });
+    }
+    if (
+      value.transport.intended > value.identity.plannedRun.globalTransportAttemptCeiling ||
+      value.attempts.length > value.identity.plannedRun.globalTransportAttemptCeiling
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["transport", "intended"],
+        message: "transport attempt ceiling exceeded"
+      });
+    }
+    for (const [index, attempt] of value.attempts.entries()) {
+      if (
+        attempt.attempt >
+        value.identity.plannedRun.maximumTransportAttemptsPerRequest
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["attempts", index, "attempt"],
+          message: "transport attempt ordinal exceeds planned run"
+        });
+      }
+    }
+    for (const slot of value.slots) {
+      if (!selectedSlots.has(slot.slot) && slot.status !== "not_started") {
+        context.addIssue({
+          code: "custom",
+          path: ["slots"],
+          message: "unselected slot has progress"
+        });
+      }
+    }
     if (value.slots[0].slot !== "slot-01" || value.slots[1].slot !== "slot-02") {
       context.addIssue({ code: "custom", path: ["slots"], message: "fixed slot order required" });
     }
     if (
-      value.attempts.length !== value.transport.intended ||
-      value.attempts.some((attempt, index) => attempt.sequence !== index + 1) ||
-      value.attempts.filter((attempt) => attempt.outcome === "queued").length !==
-        value.transport.queued ||
-      value.attempts.filter((attempt) => attempt.startAt !== null).length !==
-        value.transport.started ||
-      value.attempts.filter((attempt) => attempt.startAt !== null && attempt.endAt !== null)
-        .length !== value.transport.settled
+      value.transport.intended !== value.attempts.length ||
+      value.transport.reserved !==
+        value.attempts.filter((attempt) => attempt.outcome !== "queued").length ||
+      value.transport.started !==
+        value.attempts.filter((attempt) => attempt.startAt !== null).length ||
+      value.transport.settled !==
+        value.attempts.filter(
+          (attempt) => attempt.startAt !== null && attempt.endAt !== null
+        ).length ||
+      value.transport.active !==
+        value.attempts.filter((attempt) => attempt.outcome === "running").length ||
+      value.transport.queued !==
+        value.attempts.filter((attempt) => attempt.outcome === "queued").length
     ) {
       context.addIssue({ code: "custom", path: ["attempts"], message: "attempt ledger mismatch" });
     }
@@ -257,16 +319,25 @@ const runStatePayloadSchema = z
     }
     if (value.phase === "complete") {
       if (
-        value.transport.started !== 24 ||
-        value.transport.settled !== 24 ||
+        value.transport.started !== value.attempts.length ||
+        value.transport.settled !== value.attempts.length ||
         value.transport.active !== 0 ||
         value.transport.queued !== 0 ||
         value.transport.terminalFailure !== null ||
         value.terminalReason !== null ||
         value.terminationIntent !== null ||
-        value.attempts.length !== 24 ||
-        value.attempts.some((attempt) => attempt.outcome !== "succeeded") ||
-        value.slots.some((slot) => slot.status !== "complete")
+        value.attempts.filter((attempt) => attempt.outcome === "succeeded").length !==
+          expectedRequestCount ||
+        value.attempts.some(
+          (attempt) =>
+            attempt.outcome !== "succeeded" &&
+            attempt.outcome !== "retryable_failed"
+        ) ||
+        value.slots.some((slot) =>
+          selectedSlots.has(slot.slot)
+            ? slot.status !== "complete"
+            : slot.status !== "not_started"
+        )
       ) {
         context.addIssue({ code: "custom", path: ["phase"], message: "complete state mismatch" });
       }
@@ -469,7 +540,7 @@ export type DevelopmentDiagnosticRunEvent =
   | {
       readonly type: "transport_settled";
       readonly attemptSequence: number;
-      readonly outcome: "succeeded" | "failed";
+      readonly outcome: "succeeded" | "retryable_failed" | "failed";
       readonly errorCategory: z.infer<typeof terminalFailureSchema> | null;
       readonly at: Date;
     }
@@ -558,7 +629,18 @@ export function applyDevelopmentDiagnosticRunEvent(
 
   switch (event.type) {
     case "transport_intent": {
-      if (attempts.length >= 52) {
+      if (
+        event.attempt >
+        state.identity.plannedRun.maximumTransportAttemptsPerRequest
+      ) {
+        throw new DevelopmentDiagnosticRunStateError(
+          "RUN_STATE_ATTEMPT_ORDINAL_LIMIT"
+        );
+      }
+      if (
+        attempts.length >=
+        state.identity.plannedRun.globalTransportAttemptCeiling
+      ) {
         throw new DevelopmentDiagnosticRunStateError("RUN_STATE_ATTEMPT_LIMIT");
       }
       attempts.push({

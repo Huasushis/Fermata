@@ -39,6 +39,9 @@ import {
   developmentDiagnosticProfile,
   developmentDiagnosticProfileFingerprint
 } from "../src/review-flow/development-diagnostic";
+import {
+  legacyDevelopmentDiagnosticPlannedRunContract
+} from "../src/review-flow/development-diagnostic-run-contract";
 
 const roles = [
   "solver",
@@ -60,6 +63,43 @@ function digest(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
+type RunStatePayload = Omit<DevelopmentDiagnosticRunState, "integritySha256">;
+
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, stableValue(entry)])
+  );
+}
+
+function resealPersistedState(
+  state: DevelopmentDiagnosticRunState,
+  mutate: (payload: RunStatePayload) => RunStatePayload
+): DevelopmentDiagnosticRunState {
+  const { integritySha256: _integritySha256, ...payload } = state;
+  const mutated = mutate(payload);
+  return {
+    ...mutated,
+    integritySha256: digest(JSON.stringify(stableValue(mutated)))
+  };
+}
+
+function buildIdentityWithMaximumTransportAttempts(
+  maximumTransportAttemptsPerRequest: 1 | 2
+): DevelopmentDiagnosticRunIdentity {
+  const identity = buildIdentity();
+  return {
+    ...identity,
+    plannedRun: {
+      ...identity.plannedRun,
+      maximumTransportAttemptsPerRequest
+    }
+  };
+}
+
 function buildIdentity(runId = randomUUID()): DevelopmentDiagnosticRunIdentity {
   return {
     runId,
@@ -71,7 +111,8 @@ function buildIdentity(runId = randomUUID()): DevelopmentDiagnosticRunIdentity {
     profile: {
       ...developmentDiagnosticProfile,
       retryableHttpStatuses: [429]
-    }
+    },
+    plannedRun: legacyDevelopmentDiagnosticPlannedRunContract
   };
 }
 
@@ -305,6 +346,224 @@ describe("development diagnostic strict run state", () => {
       "RUN_STATE_TRANSITION_INVALID"
     );
   });
+  it("persists retryable 429 attempts as terminal and honors the bound dynamic ceiling", () => {
+    const baseIdentity = buildIdentity();
+    const identity: DevelopmentDiagnosticRunIdentity = {
+      ...baseIdentity,
+      plannedRun: {
+        ...baseIdentity.plannedRun,
+        maximumTransportAttemptsPerRequest: 2,
+        globalTransportAttemptCeiling: 60
+      }
+    };
+    let retryState = advanceToRunning(identity);
+    for (const event of [
+      {
+        type: "transport_intent" as const,
+        roleFingerprint: digest("role:solver"),
+        modelFingerprint: digest("model:solver"),
+        attempt: 1 as const,
+        at: fixedTime
+      },
+      { type: "transport_reserved" as const, attemptSequence: 1, at: fixedTime },
+      { type: "transport_started" as const, attemptSequence: 1, at: fixedTime },
+      {
+        type: "transport_settled" as const,
+        attemptSequence: 1,
+        outcome: "retryable_failed" as const,
+        errorCategory: null,
+        at: fixedTime
+      },
+      {
+        type: "transport_intent" as const,
+        roleFingerprint: digest("role:solver"),
+        modelFingerprint: digest("model:solver"),
+        attempt: 2 as const,
+        at: fixedTime
+      },
+      { type: "transport_reserved" as const, attemptSequence: 2, at: fixedTime },
+      { type: "transport_started" as const, attemptSequence: 2, at: fixedTime },
+      {
+        type: "transport_settled" as const,
+        attemptSequence: 2,
+        outcome: "succeeded" as const,
+        errorCategory: null,
+        at: fixedTime
+      }
+    ]) {
+      retryState = applyDevelopmentDiagnosticRunEvent(retryState, event);
+    }
+    expect(retryState.transport).toMatchObject({
+      intended: 2,
+      started: 2,
+      settled: 2,
+      active: 0
+    });
+    expect(retryState.attempts.map((attempt) => attempt.outcome)).toEqual([
+      "retryable_failed",
+      "succeeded"
+    ]);
+
+    let ceilingState = advanceToRunning(identity);
+    for (let index = 0; index < 60; index += 1) {
+      ceilingState = applyDevelopmentDiagnosticRunEvent(ceilingState, {
+        type: "transport_intent",
+        roleFingerprint: digest(`role:${index}`),
+        modelFingerprint: digest(`model:${index}`),
+        attempt: 1,
+        at: fixedTime
+      });
+    }
+    expect(ceilingState.attempts).toHaveLength(60);
+    expectRunStateError(
+      () =>
+        applyDevelopmentDiagnosticRunEvent(ceilingState, {
+          type: "transport_intent",
+          roleFingerprint: digest("role:over-ceiling"),
+          modelFingerprint: digest("model:over-ceiling"),
+          attempt: 1,
+          at: fixedTime
+        }),
+      "RUN_STATE_ATTEMPT_LIMIT"
+    );
+  });
+  it("rejects persisted attempt ordinals above the planned per-request maximum", () => {
+    const identity = buildIdentityWithMaximumTransportAttempts(2);
+    const boundaryState = applyDevelopmentDiagnosticRunEvent(
+      advanceToRunning(identity),
+      {
+        type: "transport_intent",
+        roleFingerprint: digest("role:boundary"),
+        modelFingerprint: digest("model:boundary"),
+        attempt: 2,
+        at: fixedTime
+      }
+    );
+    expect(parseDevelopmentDiagnosticRunState(boundaryState)).toEqual(boundaryState);
+
+    const overLimitState = resealPersistedState(boundaryState, (payload) => ({
+      ...payload,
+      attempts: payload.attempts.map((attempt) => ({
+        ...attempt,
+        attempt: 3
+      }))
+    }));
+    expectRunStateError(
+      () => parseDevelopmentDiagnosticRunState(overLimitState),
+      "RUN_STATE_INVALID"
+    );
+  });
+
+  it("rejects conflicting legacy max-one persisted retry ordinals fail closed", () => {
+    const identity = buildIdentityWithMaximumTransportAttempts(2);
+    const retryState = applyDevelopmentDiagnosticRunEvent(
+      advanceToRunning(identity),
+      {
+        type: "transport_intent",
+        roleFingerprint: digest("role:legacy-conflict"),
+        modelFingerprint: digest("model:legacy-conflict"),
+        attempt: 2,
+        at: fixedTime
+      }
+    );
+    const conflictingLegacyState = resealPersistedState(retryState, (payload) => ({
+      ...payload,
+      identity: {
+        ...payload.identity,
+        plannedRun: {
+          ...payload.identity.plannedRun,
+          maximumTransportAttemptsPerRequest: 1
+        }
+      }
+    }));
+
+    expectRunStateError(
+      () => parseDevelopmentDiagnosticRunState(conflictingLegacyState),
+      "RUN_STATE_INVALID"
+    );
+  });
+
+  it("rejects live intent ordinals above the plan and accepts exact boundaries", () => {
+    const maxOneRunning = advanceToRunning(
+      buildIdentityWithMaximumTransportAttempts(1)
+    );
+    expectRunStateError(
+      () =>
+        applyDevelopmentDiagnosticRunEvent(maxOneRunning, {
+          type: "transport_intent",
+          roleFingerprint: digest("role:max-one-over"),
+          modelFingerprint: digest("model:max-one-over"),
+          attempt: 2,
+          at: fixedTime
+        }),
+      "RUN_STATE_ATTEMPT_ORDINAL_LIMIT"
+    );
+    expect(
+      applyDevelopmentDiagnosticRunEvent(maxOneRunning, {
+        type: "transport_intent",
+        roleFingerprint: digest("role:max-one-boundary"),
+        modelFingerprint: digest("model:max-one-boundary"),
+        attempt: 1,
+        at: fixedTime
+      }).attempts[0]?.attempt
+    ).toBe(1);
+
+    const maxTwoRunning = advanceToRunning(
+      buildIdentityWithMaximumTransportAttempts(2)
+    );
+    expectRunStateError(
+      () =>
+        applyDevelopmentDiagnosticRunEvent(maxTwoRunning, {
+          type: "transport_intent",
+          roleFingerprint: digest("role:max-two-over"),
+          modelFingerprint: digest("model:max-two-over"),
+          attempt: 3,
+          at: fixedTime
+        }),
+      "RUN_STATE_ATTEMPT_ORDINAL_LIMIT"
+    );
+    expect(
+      applyDevelopmentDiagnosticRunEvent(maxTwoRunning, {
+        type: "transport_intent",
+        roleFingerprint: digest("role:max-two-boundary"),
+        modelFingerprint: digest("model:max-two-boundary"),
+        attempt: 2,
+        at: fixedTime
+      }).attempts[0]?.attempt
+    ).toBe(2);
+  });
+  it("accepts only the selected slot as a complete durable run", () => {
+    const baseIdentity = buildIdentity();
+    const identity: DevelopmentDiagnosticRunIdentity = {
+      ...baseIdentity,
+      plannedRun: {
+        schemaVersion: 1,
+        selectedSlots: ["slot-01"],
+        expectedRequestsPerSlot: 12,
+        maximumConcurrency: 12,
+        maximumTransportAttemptsPerRequest: 2,
+        globalTransportAttemptCeiling: 16,
+        phaseSchedulingBudgetMs: 90 * 60_000,
+        softStopPolicy: "stop_new_and_drain_in_flight"
+      }
+    };
+    const running = advanceToRunning(identity);
+    const completedProgress = updateDevelopmentDiagnosticRunProgress(
+      running,
+      settledBoundaryProgress(),
+      fixedTime
+    );
+    const complete = transitionDevelopmentDiagnosticRunState(
+      completedProgress,
+      "complete",
+      fixedTime
+    );
+    expect(complete.phase).toBe("complete");
+    expect(complete.slots).toEqual([
+      completedSlot("slot-01"),
+      notStartedSlot("slot-02")
+    ]);
+  });
 
   it("represents an incomplete terminal run without storing raw responses", () => {
     const running = advanceToRunning(buildIdentity());
@@ -338,6 +597,18 @@ describe("development diagnostic strict run state", () => {
         parseDevelopmentDiagnosticRunState(state, {
           ...identity,
           codeFingerprint: digest("different-code")
+        }),
+      "RUN_STATE_IDENTITY_MISMATCH"
+    );
+    expectRunStateError(
+      () =>
+        parseDevelopmentDiagnosticRunState(state, {
+          ...identity,
+          plannedRun: {
+            ...identity.plannedRun,
+            selectedSlots: ["slot-01"],
+            globalTransportAttemptCeiling: 16
+          }
         }),
       "RUN_STATE_IDENTITY_MISMATCH"
     );
