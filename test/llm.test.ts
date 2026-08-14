@@ -507,6 +507,23 @@ describe("chatComplete：正常路径", () => {
     }
   );
 
+  it("provider 硬上限 384000 被接受并原样发送，项目不再保留 32k/64k 输出上限", async () => {
+    expect(maximumExplicitLlmOutputTokens).toBe(384_000);
+    const requestBodies: Record<string, unknown>[] = [];
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return completionResponse("答案");
+    });
+    await chatComplete(
+      provider,
+      spec,
+      [],
+      { ...runtime, fetch: fetchMock },
+      { maxOutputTokens: maximumExplicitLlmOutputTokens }
+    );
+    expect(requestBodies[0]?.max_tokens).toBe(384_000);
+  });
+
   it("逐段读取 SSE，并正确拼接跨字节块的推理和最终答案", async () => {
     const encoded = new TextEncoder().encode(
       [

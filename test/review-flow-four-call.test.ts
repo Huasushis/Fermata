@@ -100,7 +100,7 @@ function syntheticFourCallStage(body: {
   if (stage === "A" || stage === "B" || stage === "C" || stage === "D") {
     return stage;
   }
-  if (body.max_tokens === 32_000) {
+  if (body.max_tokens === 384_000) {
     // 语义轮不含"目标 JSON Schema"指令；格式轮与修复轮都包含该指令
     // （修复轮在格式消息后会追加 assistant/修复提示）。
     const containsSchemaInstruction = (body.messages ?? []).some(
@@ -450,14 +450,14 @@ describe("四语义请求 DAG 冻结接口", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(5);
     expect(bodies.map((body) => body.max_tokens).sort((left, right) =>
       Number(left) - Number(right)
-    )).toEqual([8_000, 12_000, 24_000, 32_000, 32_000]);
+    )).toEqual([384_000, 384_000, 384_000, 384_000, 384_000]);
     for (const body of bodies) {
       expect(body).toMatchObject({
         thinking: { type: "enabled" },
         reasoning_effort: "max"
       });
     }
-    expect(bodies.filter((body) => body.max_tokens === 32_000 && body.response_format === undefined))
+    expect(bodies.filter((body) => body.max_tokens === 384_000 && body.response_format === undefined))
       .toHaveLength(2);
     const formatBody = bodies.find((body) =>
       String((body.messages as readonly { content: string }[]).at(-1)?.content).includes(
@@ -465,12 +465,12 @@ describe("四语义请求 DAG 冻结接口", () => {
       )
     );
     expect(formatBody).toBeDefined();
-    expect(formatBody?.max_tokens).toBe(32_000);
+    expect(formatBody?.max_tokens).toBe(384_000);
   });
 });
 
 describe("两轮 A 阶段（语义→格式）", () => {
-  it("routes A through reasoning-then-format rounds with per-round 32k and reasoning=max", async () => {
+  it("routes A through reasoning-then-format rounds with per-round provider-max budget and reasoning=max", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -504,7 +504,7 @@ describe("两轮 A 阶段（语义→格式）", () => {
     expect(formatCalls).toHaveLength(1);
     for (const call of [...semanticCalls, ...formatCalls]) {
       expect(call).toMatchObject({
-        max_tokens: 32_000,
+        max_tokens: 384_000,
         thinking: { type: "enabled" },
         reasoning_effort: "max"
       });
@@ -635,8 +635,14 @@ describe("统一机器 schema", () => {
     expect(parseReviewFlowUnifiedResult(unifiedOutput())).toEqual(unifiedOutput());
   });
 
-  it("freezes stage budgets and native max request settings", () => {
-    expect(reviewFlowStageOutputBudgets).toEqual({ A: 32_000, B: 8_000, C: 24_000, D: 12_000, formatter: 8_000 });
+  it("freezes stage budgets at provider hard max (no project output cap remains)", () => {
+    expect(reviewFlowStageOutputBudgets).toEqual({
+      A: 384_000,
+      B: 384_000,
+      C: 384_000,
+      D: 384_000,
+      formatter: 384_000
+    });
   });
 });
 

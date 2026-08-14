@@ -214,9 +214,11 @@ export const developmentDiagnosticAggregateBudgetReceipt = Object.freeze({
   formatterLogicalRequestCeiling: 2 as const,
   totalLogicalRequestCeiling: 10 as const,
   providerTransportCeiling: 52 as const,
-  semanticOutputTokenCeiling: 456_000 as const,
-  formatterOutputTokenCeiling: 16_000 as const,
-  totalOutputTokenCeiling: 472_000 as const
+  // 不再有项目自设的更小输出上限：语义 8 个、formatter 2 个逻辑请求，各自按
+  // 提供商硬上限 384000 计算理论最大值；声明性预算文档，不参与运行期强制。
+  semanticOutputTokenCeiling: 3_072_000 as const,
+  formatterOutputTokenCeiling: 768_000 as const,
+  totalOutputTokenCeiling: 3_840_000 as const
 });
 
 const manifestSlotSchema = z
@@ -309,7 +311,7 @@ export interface DevelopmentDiagnosticSafeRequestReceipt {
   readonly model: "deepseek-v4-pro" | "deepseek-v4-flash";
   readonly modelFingerprint: string;
   readonly schemaFingerprint: string;
-  readonly maxOutputTokens: 32_000 | 8_000 | 24_000 | 12_000;
+  readonly maxOutputTokens: 384_000;
   readonly thinkingRequest: "enabled";
   readonly reasoningEffort: "max";
   readonly logicalAttempt: 1;

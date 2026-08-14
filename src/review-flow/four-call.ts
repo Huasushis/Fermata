@@ -3,17 +3,23 @@ import {
   FairLlmRequestScheduler,
   LlmStageRequestError
 } from "../llm-scheduler";
+import { maximumExplicitLlmOutputTokens } from "../llm";
 import { hashCanonicalValue } from "./evidence";
 
 export type ReviewFlowSemanticStage = "A" | "B" | "C" | "D";
 export type ReviewFlowDagStage = ReviewFlowSemanticStage | "formatter";
 
+/**
+ * 不再为任何阶段保留项目自设输出上限：所有阶段都显式请求提供商硬上限
+ * （DeepSeek V4 全系 384000 token）。阶段区分只保留在语义/格式轮结构与消息上，
+ * 不体现在输出预算里。
+ */
 export const reviewFlowStageOutputBudgets = Object.freeze({
-  A: 32_000,
-  B: 8_000,
-  C: 24_000,
-  D: 12_000,
-  formatter: 8_000
+  A: maximumExplicitLlmOutputTokens,
+  B: maximumExplicitLlmOutputTokens,
+  C: maximumExplicitLlmOutputTokens,
+  D: maximumExplicitLlmOutputTokens,
+  formatter: maximumExplicitLlmOutputTokens
 } satisfies Readonly<Record<ReviewFlowDagStage, number>>);
 
 export interface ReviewFlowUnifiedResult {

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { freezeReviewFlowSource, buildStatementOnlyView } from "../src/review-flow/views";
 import { buildSolverExplorationMessages } from "../src/review-flow/llm-roles";
 import { reviewFlowStageOutputBudgets } from "../src/review-flow/four-call";
+import { maximumExplicitLlmOutputTokens } from "../src/llm";
 
 const d = (v: string): string => createHash("sha256").update(v, "utf8").digest("hex");
 
@@ -66,20 +67,21 @@ describe("Stage-A prompt invariant (B2)", () => {
     expect(systemPrompt).toContain("不需要 JSON 格式");
   });
 
-  it("DeepSeek A-stage output budget remains 32000 (32k ceiling preserved)", () => {
-    expect(reviewFlowStageOutputBudgets.A).toBe(32_000);
+  it("no project 32k/64k output cap remains: every stage requests the provider hard max 384000", () => {
+    expect(maximumExplicitLlmOutputTokens).toBe(384_000);
+    expect(reviewFlowStageOutputBudgets).toEqual({
+      A: 384_000,
+      B: 384_000,
+      C: 384_000,
+      D: 384_000,
+      formatter: 384_000
+    });
   });
 
-  it("all review-flow stage budgets are nonzero and A is the largest (thinking budget preserved)", () => {
-    const budgets = reviewFlowStageOutputBudgets;
-    expect(budgets.A).toBeGreaterThan(budgets.B);
-    expect(budgets.A).toBeGreaterThan(budgets.C);
-    expect(budgets.A).toBeGreaterThan(budgets.D);
-    expect(budgets.A).toBeGreaterThan(budgets.formatter);
-    expect(budgets.B).toBeGreaterThan(0);
-    expect(budgets.C).toBeGreaterThan(0);
-    expect(budgets.D).toBeGreaterThan(0);
-    expect(budgets.formatter).toBeGreaterThan(0);
+  it("all review-flow stage budgets equal the shared provider maximum (single authority)", () => {
+    const values = Object.values(reviewFlowStageOutputBudgets);
+    expect(new Set(values).size).toBe(1);
+    expect(values[0]).toBe(maximumExplicitLlmOutputTokens);
   });
 
   it("prompt implementation digest differs across roles (identity binding is content-addressed)", () => {

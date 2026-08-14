@@ -4198,7 +4198,7 @@ describe("createRealDevelopmentSmokeFixture — public preflight", () => {
       if (typeof request.maxTokens !== "number") {
         throw new Error("EXPECTED_NUMERIC_MAX_TOKENS");
       }
-      expect(request.maxTokens).toBeLessThanOrEqual(32_000);
+      expect(request.maxTokens).toBeLessThanOrEqual(384_000);
     }
     const structuredRequests = mock.requests.filter(
       (request) => request.targetSchema !== null

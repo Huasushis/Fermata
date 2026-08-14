@@ -266,7 +266,7 @@ function stageOfBody(body: {
   ) {
     return formatStage;
   }
-  if (body.max_tokens === 32_000) {
+  if (body.max_tokens === 384_000) {
     // 语义轮不含"目标 JSON Schema"指令；格式轮与修复轮都包含该指令
     // （修复轮在格式消息后会追加 assistant/修复提示）。
     const containsSchemaInstruction = (body.messages ?? []).some(

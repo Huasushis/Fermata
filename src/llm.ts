@@ -415,8 +415,14 @@ export const maximumLlmResponseBodyBytes = 4 * 1024 * 1024;
 export const llmTransportProtocolVersion =
   "llm-stream-eof-v8-receipt-v2-failure-audit-v1" as const;
 const maximumLlmResponseChunks = 65_536;
-/** 显式输出 token 上限本身也必须有界，避免错误配置变成近似无限输出。 */
-export const maximumExplicitLlmOutputTokens = 32_000;
+/**
+ * 显式输出 token 上限按提供商硬上限设置：DeepSeek V4 全系（deepseek-v4-pro /
+ * deepseek-v4-flash）文档化最大输出为 384000 token；若字段缺失，提供商默认
+ * max_tokens=4096（更小）。因此每次请求都显式请求 384000，不再保留任何项目自设的
+ * 32k/64k 人工输出上限。唯一剩余的输出终止边界是提供商自身的硬上限，到达后按
+ * LLM_OUTPUT_LENGTH_LIMIT 终态处理（不重试、fail closed）。
+ */
+export const maximumExplicitLlmOutputTokens = 384_000;
 export const defaultLlmFirstOutputTimeoutMs = 30 * 60 * 1_000;
 export const defaultLlmMaximumDurationMs = 30 * 60 * 1_000;
 

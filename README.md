@@ -926,10 +926,12 @@ npm run experiment:calibrate-levels:detached -- \
 原生 `thinking=max` 与强制 schema，A-D 保持自然语义请求，全题末尾最多增加 1 次统一 formatter；
 formatter 只接收 A-D 已有输出并逐字段转写，不得重判。统一 schema 是唯一来源，严格声明
 required/type/enum/nullability/items，并在每层 object 使用 `additionalProperties=false`；
-运行时复验并把 schema 指纹写入 receipt。每次请求的输出上限分别为 A 32k、B 8k、C 24k、
-D 12k、formatter 8k；A-D 每题合计 76k，若需要 formatter 则每题合计最多 84k。通用 transport
-显式单请求上限为 32k。development smoke 不对健康流设置总墙钟硬杀：首个有效输出前使用
-30 分钟最终保护；首个有效输出后只执行 10 分钟无进度保护，并持续读取到服务端 EOF。
+运行时复验并把 schema 指纹写入 receipt。项目不再为任何请求设置自有的输出上限：每次请求都
+显式请求提供商硬上限 384000 token（DeepSeek V4 全系文档化最大输出；若不显式传入，提供商
+默认 max_tokens=4096，反而更小，所以必须显式设置）。唯一剩余的输出终止边界是提供商自身的
+硬上限，到达后按 LLM_OUTPUT_LENGTH_LIMIT 终态处理并 fail closed。development smoke
+不对健康流设置总墙钟硬杀：首个有效输出前使用 30 分钟最终保护；首个有效输出后只执行
+10 分钟无进度保护，并持续读取到服务端 EOF。
 
 所有模型档位共用一个请求级调度器：全局并发默认 12，可显式配置 16；20 必须同时登记已接受的
 并发探针。按样本轮转且 work-conserving，不存在三个档位上限相加。每个逻辑请求最多 3 attempts，

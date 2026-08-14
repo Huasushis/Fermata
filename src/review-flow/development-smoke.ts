@@ -123,9 +123,11 @@ export const developmentSmokeAggregateBudgetReceipt = Object.freeze({
   totalLogicalRequestCeiling: 30 as const,
   cumulativeExternalTransportCeiling:
     developmentSmokeProfile.maximumTotalExternalAttempts,
-  semanticOutputTokenCeiling: 456_000 as const,
-  formatterOutputTokenCeiling: 48_000 as const,
-  totalOutputTokenCeiling: 504_000 as const
+  // 不再有项目自设的更小输出上限：语义 24 个逻辑请求、formatter 6 个，各自按
+  // 提供商硬上限 384000 计算理论最大值；这些是声明性的预算文档，不参与运行期强制。
+  semanticOutputTokenCeiling: 9_216_000 as const,
+  formatterOutputTokenCeiling: 2_304_000 as const,
+  totalOutputTokenCeiling: 11_520_000 as const
 });
 
 
@@ -175,7 +177,7 @@ export interface DevelopmentSmokeSafeRequestReceipt {
   readonly model: "deepseek-v4-pro" | "deepseek-v4-flash";
   readonly modelFingerprint: string;
   readonly schemaFingerprint: string;
-  readonly maxOutputTokens: 32_000 | 8_000 | 24_000 | 12_000;
+  readonly maxOutputTokens: 384_000;
   readonly thinkingRequest: "enabled";
   readonly reasoningEffort: "max";
   readonly logicalAttempt: 1;

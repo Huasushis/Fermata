@@ -368,7 +368,7 @@ describe("LLM 生产 HTTP 传输层", () => {
     expect(observed.unhandledRejections).toEqual([]);
   });
 
-  it("DeepSeek V4 thinking 请求通过真实 HTTP 传输发送 native max 与 32k 有界输出", async () => {
+  it("DeepSeek V4 thinking 请求通过真实 HTTP 传输发送 native max 与提供商硬上限输出", async () => {
     let observedBody: Record<string, unknown> | undefined;
     const server = createServer((_request, response) => {
       let chunks = "";
@@ -407,14 +407,14 @@ describe("LLM 生产 HTTP 传输层", () => {
         baseDelayMs: 1,
         fetch: createUndiciLlmFetch(dispatcher)
       },
-      { maxOutputTokens: 32_000 }
+      { maxOutputTokens: 384_000 }
     );
 
     expect(result).toEqual({ content: "合成回答", reasoning: null });
     expect(observedBody).toBeDefined();
     expect(observedBody?.thinking).toEqual({ type: "enabled" });
     expect(observedBody?.reasoning_effort).toBe("max");
-    expect(observedBody?.max_tokens).toBe(32_000);
+    expect(observedBody?.max_tokens).toBe(384_000);
     expect(observedBody?.stream).toBe(true);
   });
 

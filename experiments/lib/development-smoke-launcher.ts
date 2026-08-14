@@ -307,7 +307,7 @@ const safeReceiptSchema = z.object({
   model: z.enum(["deepseek-v4-pro", "deepseek-v4-flash"]),
   modelFingerprint: digestSchema,
   schemaFingerprint: digestSchema,
-  maxOutputTokens: z.union([z.literal(32_000), z.literal(8_000), z.literal(24_000), z.literal(12_000)]),
+  maxOutputTokens: z.literal(384_000),
   thinkingRequest: z.literal("enabled"),
   reasoningEffort: z.literal("max"),
   logicalAttempt: z.literal(1),
@@ -713,7 +713,15 @@ const privateCheckpointSchemaForWrite = privateCheckpointBaseSchema.superRefine(
  */
 const requestLedgerReadSchema = z.object({
   receipt: safeReceiptSchema.extend({
-    externalAttemptCeiling: z.union([z.literal(52), z.literal(30)])
+    externalAttemptCeiling: z.union([z.literal(52), z.literal(30)]),
+    // 旧 checkpoint 里写的是各阶段旧预算（32k/24k/12k/8k），读路径保持兼容。
+    maxOutputTokens: z.union([
+      z.literal(384_000),
+      z.literal(32_000),
+      z.literal(24_000),
+      z.literal(12_000),
+      z.literal(8_000)
+    ])
   }),
   timing: safeTimingSchema.optional(),
   completedStage: completedStageSchema.optional(),

@@ -291,7 +291,7 @@ describe("development smoke profile", () => {
     const run = controller((receipt) => receipts.push(receipt));
     for (const stage of stages) run.authorizeRequest(request("slot-01", stage));
     expect(receipts.map((receipt) => receipt.maxOutputTokens))
-      .toEqual([32_000, 8_000, 24_000, 12_000, 8_000]);
+      .toEqual([384_000, 384_000, 384_000, 384_000, 384_000]);
     for (const receipt of receipts) {
       expect(receipt).toMatchObject({
         provider: "aether",
@@ -304,7 +304,7 @@ describe("development smoke profile", () => {
       expect(JSON.stringify(receipt)).not.toContain("not logged");
     }
     expect(() => controller().authorizeRequest(request("slot-01", "A", {
-      maxOutputTokens: 32_001
+      maxOutputTokens: 384_001
     }))).toThrow("DEVELOPMENT_SMOKE_REQUEST_RECEIPT_INVALID");
     expect(() => controller().authorizeRequest(request("slot-01", "A", {
       model: { ...request("slot-01", "A").model, reasoningEffort: "low" as never }
@@ -314,9 +314,9 @@ describe("development smoke profile", () => {
       formatterLogicalRequestCeiling: 6,
       totalLogicalRequestCeiling: 30,
       cumulativeExternalTransportCeiling: 52,
-      semanticOutputTokenCeiling: 456_000,
-      formatterOutputTokenCeiling: 48_000,
-      totalOutputTokenCeiling: 504_000
+      semanticOutputTokenCeiling: 9_216_000,
+      formatterOutputTokenCeiling: 2_304_000,
+      totalOutputTokenCeiling: 11_520_000
     });
     expect(
       developmentSmokeAggregateBudgetReceipt.cumulativeExternalTransportCeiling

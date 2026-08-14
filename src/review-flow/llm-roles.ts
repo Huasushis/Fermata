@@ -4,6 +4,7 @@ import {
   chatCompleteStagedSolverJsonWithReceipt,
   chatCompleteTwoRoundJsonWithReceipt,
   llmTransportProtocolVersion,
+  maximumExplicitLlmOutputTokens,
   type ChatMessage,
   type LlmJsonCompletionReceipt
 } from "../llm";
@@ -169,7 +170,7 @@ export function createReviewFlowLlmBundle(input: {
         buildSolverFormatterMessages,
         solverPayloadSchema,
         models.solver.runtime,
-        { maxOutputTokens: 32_000 }
+        { maxOutputTokens: maximumExplicitLlmOutputTokens }
       );
       const narrative = mergeNarrative(reasoning, data.narrative);
       return trustedRoleExecution({ ...data, narrative }, receipt);
@@ -178,14 +179,14 @@ export function createReviewFlowLlmBundle(input: {
       models.solution_analyst,
       buildSolutionAnalystMessages(view),
       solutionAnalystPayloadSchema,
-      24_000
+      maximumExplicitLlmOutputTokens
     ),
     technicalAuditor: async (view) => {
       const { data, receipt } = await runJson(
         models.technical_auditor,
         buildTechnicalAuditorMessages(view),
         technicalModelPayloadSchema,
-        24_000
+        maximumExplicitLlmOutputTokens
       );
       const provided = view.referenceImplementation.provided;
       return trustedRoleExecution({
@@ -223,13 +224,13 @@ export function createReviewFlowLlmBundle(input: {
       models.difficulty,
       buildDifficultyMessages(view, anchors),
       difficultyPayloadSchema,
-      8_000
+      maximumExplicitLlmOutputTokens
     ),
     editorialJudge: async (view) => runJsonRole(
       models.editorial_judge,
       buildEditorialJudgeMessages(view),
       editorialPayloadSchema,
-      24_000
+      maximumExplicitLlmOutputTokens
     ),
     contestFit: async (view) => {
       const { data, receipt } = await chatCompleteTwoRoundJsonWithReceipt(
@@ -239,7 +240,7 @@ export function createReviewFlowLlmBundle(input: {
         buildContestFitFormatterMessages,
         contestFitPayloadSchema,
         models.contest_fit.runtime,
-        { maxOutputTokens: 24_000 }
+        { maxOutputTokens: maximumExplicitLlmOutputTokens }
       );
       return trustedRoleExecution(data, receipt);
     },
@@ -251,7 +252,7 @@ export function createReviewFlowLlmBundle(input: {
         buildOriginalityFormatterMessages,
         originalityPayloadSchema,
         models.originality.runtime,
-        { maxOutputTokens: 24_000 }
+        { maxOutputTokens: maximumExplicitLlmOutputTokens }
       );
       return trustedRoleExecution(data, receipt);
     },
@@ -263,7 +264,7 @@ export function createReviewFlowLlmBundle(input: {
         buildTagsFormatterMessages,
         tagsPayloadSchema,
         models.tags.runtime,
-        { maxOutputTokens: 8_000 }
+        { maxOutputTokens: maximumExplicitLlmOutputTokens }
       );
       return trustedRoleExecution(data, receipt);
     },
@@ -271,19 +272,19 @@ export function createReviewFlowLlmBundle(input: {
       models.critic,
       buildCriticMessages(view),
       criticPayloadSchema,
-      12_000
+      maximumExplicitLlmOutputTokens
     ),
     adversary: async (view) => runJsonRole(
       models.adversary,
       buildAdversaryMessages(view),
       adversaryPayloadSchema,
-      12_000
+      maximumExplicitLlmOutputTokens
     ),
     adjudicator: async (view) => runJsonRole(
       models.adjudicator,
       buildAdjudicatorMessages(view),
       adjudicatorPayloadSchema,
-      12_000
+      maximumExplicitLlmOutputTokens
     )
   };
 
