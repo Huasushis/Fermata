@@ -1582,19 +1582,19 @@ describe("DevelopmentDiagnosticRunController — real transport boundaries", () 
       schedulerSoftStopped: false
     });
   });
-  it("global attempt ceiling drains the final retry then closes new scheduling", async () => {
+  it("global cumulative attempt ceiling drains the final retry then closes new scheduling", async () => {
     const plannedRun = {
       schemaVersion: 1 as const,
       selectedSlots: ["slot-01"] as const,
       expectedRequestsPerSlot: 12 as const,
-      maximumConcurrency: 12,
+      maximumConcurrency: 16,
       maximumTransportAttemptsPerRequest: 2,
-      globalTransportAttemptCeiling: 16,
+      globalTransportAttemptCeiling: 52,
       phaseSchedulingBudgetMs: 90 * 60_000,
       softStopPolicy: "stop_new_and_drain_in_flight" as const
     };
     const controller = buildController({ plannedRun });
-    for (let index = 0; index < 14; index += 1) {
+    for (let index = 0; index < 50; index += 1) {
       controller.reserveTransportOrThrow();
     }
     let fetchCount = 0;
@@ -1616,7 +1616,7 @@ describe("DevelopmentDiagnosticRunController — real transport boundaries", () 
     expect(result.receipt.transportAttemptCount).toBe(2);
     expect(fetchCount).toBe(2);
     expect(controller.checkpoint()).toMatchObject({
-      externalAttemptsUsed: 16,
+      externalAttemptsUsed: 52,
       stopped: true,
       stopReason: "attempt_ceiling"
     });
@@ -1994,6 +1994,169 @@ describe("Development diagnostic — scheduler-level transport retry contract", 
     expect(caseIds).toHaveLength(1);
     expect(caseIds[0]).toMatch(/^diagnostic-transport-\d{6}$/);
     expect(attemptsByCase[caseIds[0]]).toBe(2);
+  });
+});
+
+describe("Development diagnostic — active concurrency versus cumulative budget", () => {
+  const singleSlotSharedRun = {
+    schemaVersion: 1 as const,
+    selectedSlots: ["slot-01"] as const,
+    expectedRequestsPerSlot: 12 as const,
+    maximumConcurrency: 16,
+    maximumTransportAttemptsPerRequest: 2,
+    globalTransportAttemptCeiling: 52,
+    phaseSchedulingBudgetMs: 90 * 60_000,
+    softStopPolicy: "stop_new_and_drain_in_flight" as const
+  };
+  const createMatchingScheduler = () =>
+    new FairLlmRequestScheduler({
+      maximumConcurrency: 16,
+      maximumAttemptsPerLogicalRequest: 2,
+      maximumAttemptsPerCase: 5,
+      jitter: () => 0,
+      sleep: async () => undefined
+    });
+
+  it("allows sixteen simultaneous active transports and queues the seventeenth", async () => {
+    const controller = buildController({
+      plannedRun: singleSlotSharedRun,
+      scheduler: createMatchingScheduler()
+    });
+    let fetchCount = 0;
+    let releaseHeld: (() => void) | undefined;
+    let signalSixteen: (() => void) | undefined;
+    const allSixteenStarted = new Promise<void>((resolveStarted) => {
+      signalSixteen = resolveStarted;
+    });
+    const held = new Promise<void>((resolveHeld) => {
+      releaseHeld = resolveHeld;
+    });
+    const runtime = diagnosticTransportRuntime(controller, async () => {
+      fetchCount += 1;
+      if (fetchCount === 16) signalSixteen?.();
+      await held;
+      return successfulSseResponse();
+    });
+    const started = Array.from({ length: 16 }, () =>
+      chatCompleteWithReceipt(
+        syntheticProvider,
+        syntheticSpec,
+        syntheticMessages,
+        runtime
+      )
+    );
+    await allSixteenStarted;
+    const extra = chatCompleteWithReceipt(
+      syntheticProvider,
+      syntheticSpec,
+      syntheticMessages,
+      runtime
+    );
+    for (let index = 0; ; index += 1) {
+      const queuing = controller.scheduler().snapshot();
+      if (queuing.queued === 1) break;
+      await Promise.resolve();
+      if (index > 1000) throw new Error("seventeenth transport never queued");
+    }
+    expect(controller.scheduler().snapshot().active).toBe(16);
+    expect(controller.scheduler().snapshot().queued).toBe(1);
+    releaseHeld?.();
+    await Promise.all([...started, extra]);
+    expect(fetchCount).toBe(17);
+    expect(controller.scheduler().snapshot().active).toBe(0);
+    expect(controller.scheduler().snapshot().queued).toBe(0);
+    expect(controller.checkpoint().externalAttemptsUsed).toBe(17);
+    expect(controller.checkpoint().stopped).toBe(false);
+  });
+
+  it("lets cumulative attempts beyond sixteen complete within the separate total budget", async () => {
+    const controller = buildController({
+      plannedRun: singleSlotSharedRun,
+      scheduler: createMatchingScheduler()
+    });
+    let fetchCount = 0;
+    const runtime = diagnosticTransportRuntime(controller, async () => {
+      fetchCount += 1;
+      return successfulSseResponse();
+    });
+    for (let index = 0; index < 18; index += 1) {
+      const result = await chatCompleteWithReceipt(
+        syntheticProvider,
+        syntheticSpec,
+        syntheticMessages,
+        runtime
+      );
+      expect(result.receipt.transportAttemptCount).toBe(1);
+    }
+    expect(fetchCount).toBe(18);
+    expect(controller.checkpoint().externalAttemptsUsed).toBe(18);
+    expect(controller.scheduler().snapshot().active).toBe(0);
+    expect(controller.checkpoint().stopped).toBe(false);
+  });
+
+  it("keeps retries inside the shared active concurrency gate and respects max two attempts", async () => {
+    const controller = buildController({
+      plannedRun: singleSlotSharedRun,
+      scheduler: createMatchingScheduler()
+    });
+    let releaseHeld: (() => void) | undefined;
+    const held = new Promise<void>((resolveHeld) => {
+      releaseHeld = resolveHeld;
+    });
+    const heldRuntime = diagnosticTransportRuntime(controller, async () => {
+      await held;
+      return successfulSseResponse();
+    });
+    const heldSixteen = Array.from({ length: 16 }, () =>
+      chatCompleteWithReceipt(
+        syntheticProvider,
+        syntheticSpec,
+        syntheticMessages,
+        heldRuntime
+      )
+    );
+    for (let index = 0; ; index += 1) {
+      if (controller.scheduler().snapshot().active === 16) break;
+      await Promise.resolve();
+      if (index > 1000) throw new Error("sixteen active slots never reached");
+    }
+    let retryFetches = 0;
+    const retryRuntime = diagnosticTransportRuntime(controller, async () => {
+      retryFetches += 1;
+      if (retryFetches === 1) throw new LlmRequestError("LLM_STREAM_INTERRUPTED");
+      return successfulSseResponse();
+    });
+    const retried = chatCompleteWithReceipt(
+      syntheticProvider,
+      syntheticSpec,
+      syntheticMessages,
+      retryRuntime
+    );
+    for (let index = 0; index < 100; index += 1) {
+      await Promise.resolve();
+    }
+    expect(retryFetches).toBe(0);
+    releaseHeld?.();
+    await Promise.all([retried, ...heldSixteen]);
+    expect(retryFetches).toBe(2);
+    expect(controller.scheduler().snapshot().peakConcurrency).toBeLessThanOrEqual(16);
+    expect(Object.values(controller.scheduler().snapshot().attemptsByCase)).toContain(2);
+    expect(controller.checkpoint().externalAttemptsUsed).toBe(18);
+  });
+
+  it("enforces the cumulative planned-run ceiling independently of concurrency", async () => {
+    const controller = buildController({
+      plannedRun: singleSlotSharedRun,
+      scheduler: createMatchingScheduler()
+    });
+    for (let index = 0; index < 52; index += 1) {
+      controller.reserveTransportOrThrow();
+    }
+    expect(() => controller.reserveTransportOrThrow()).toThrow(
+      "TRANSPORT_GATE_DENIED"
+    );
+    expect(controller.checkpoint().externalAttemptsUsed).toBe(52);
+    expect(controller.scheduler().snapshot().active).toBe(0);
   });
 });
 
