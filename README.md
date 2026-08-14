@@ -979,8 +979,9 @@ attempt 固定拒绝。四槽先形成最多 8 个 A/B 请求，再按 DAG 推�
 每个 run 使用只增不改的原子 checkpoint 链。请求授权 receipt 在 fetch 前落盘；成功 stage 的原始
 输出和 sealed receipt 只保存在 Git 忽略私有 checkpoint 中。Phase 0、Phase 1 和全 run 分开记录安全
 聚合计数、P90 时序、失败码及 ETA；`accuracyClaim` 始终为空且不进入最终校准。两阶段共用一次预算：
-每逻辑请求最多 1 attempt、每题最多 5、整题重跑为 0、总逻辑请求和外部 attempt 都最多 30、全局
-并发 12；任何字段缺失或放大都在 fetch 前拒绝。所有错误类别均零重试。
+每逻辑请求最多 1 attempt、每题最多 5、整题重跑为 0、总逻辑请求最多 30、外部 transport 累计最多
+52、全局并发 12；声明值、聚合预算和运行 fence 全部来自同一 profile，任何字段缺失或放大都在 fetch
+前拒绝。所有错误类别均零重试。
 
 Candidate B 的协议验证使用
 `npm run experiment:probe-difficulty-thinking`。这个入口只依次检查一个人工合成的短题和三个与

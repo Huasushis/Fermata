@@ -26,9 +26,7 @@ import {
   type FourCallSafeRequestFailure,
   type FourCallSafeRequestTiming
 } from "./four-call-runtime";
-import {
-  legacyDevelopmentDiagnosticPlannedRunContract
-} from "./development-diagnostic-run-contract";
+
 
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 const anonymousSlotSchema = z.enum([
@@ -55,7 +53,7 @@ export const developmentSmokeProfileSchema = z
     maximumAttemptsPerCase: z.literal(5),
     maximumWholeCaseRetries: z.literal(0),
     maximumTotalLogicalRequests: z.literal(30),
-    maximumTotalExternalAttempts: z.literal(30),
+    maximumTotalExternalAttempts: z.literal(52),
     maximumConcurrency: z.literal(12),
     firstValidOutputTimeoutMs: z.literal(600_000),
     outputIdleTimeoutMs: z.literal(600_000),
@@ -88,7 +86,7 @@ export const developmentSmokeProfile: DevelopmentSmokeProfile = Object.freeze({
   maximumAttemptsPerCase: 5,
   maximumWholeCaseRetries: 0,
   maximumTotalLogicalRequests: 30,
-  maximumTotalExternalAttempts: 30,
+  maximumTotalExternalAttempts: 52,
   maximumConcurrency: 12,
   firstValidOutputTimeoutMs: 600_000,
   outputIdleTimeoutMs: 600_000,
@@ -110,11 +108,12 @@ export const developmentSmokeProfileFingerprint = hashCanonicalValue(
 );
 
 /**
- * 与诊断通道共用的权威外部传输累计上限（52）。逻辑请求上限仍为 30，
- * 但两轮 A 阶段的每个传输都独立计数，超过即 fail closed。
+ * 外部传输累计上限的权威来源就是本 profile（52，与诊断通道一致）。逻辑请求上限仍为 30
+ * （6 槽 × 5 请求），但两轮 A 阶段的一个逻辑请求会发起多个外部传输，每个传输都独立计数，
+ * 超过即 fail closed。声明值、聚合预算与运行 fence 全部来自同一 profile，杜绝 30/52 不一致。
  */
 export const maximumExternalTransportsPerSmokeRun =
-  legacyDevelopmentDiagnosticPlannedRunContract.globalTransportAttemptCeiling;
+  developmentSmokeProfile.maximumTotalExternalAttempts;
 export const developmentSmokeAggregateBudgetReceipt = Object.freeze({
   schemaVersion: 1 as const,
   profileName: developmentSmokeProfile.name,
@@ -122,6 +121,8 @@ export const developmentSmokeAggregateBudgetReceipt = Object.freeze({
   semanticLogicalRequestCeiling: 24 as const,
   formatterLogicalRequestCeiling: 6 as const,
   totalLogicalRequestCeiling: 30 as const,
+  cumulativeExternalTransportCeiling:
+    developmentSmokeProfile.maximumTotalExternalAttempts,
   semanticOutputTokenCeiling: 456_000 as const,
   formatterOutputTokenCeiling: 48_000 as const,
   totalOutputTokenCeiling: 504_000 as const
@@ -181,7 +182,7 @@ export interface DevelopmentSmokeSafeRequestReceipt {
   readonly logicalRequestsUsed: number;
   readonly logicalRequestCeiling: 30;
   readonly externalAttemptsUsed: number;
-  readonly externalAttemptCeiling: 30;
+  readonly externalAttemptCeiling: 52;
 }
 
 export interface DevelopmentSmokePhase0ForecastReceipt {
@@ -514,7 +515,7 @@ export class DevelopmentSmokeRunController {
       logicalRequestsUsed: this.#authorized.size + 1,
       logicalRequestCeiling: 30 as const,
       externalAttemptsUsed: this.#authorized.size + 1,
-      externalAttemptCeiling: 30 as const
+      externalAttemptCeiling: 52 as const
     });
     this.#safeReceiptSink(receipt);
     this.#authorized.set(requestKey, receipt);
@@ -549,7 +550,7 @@ export class DevelopmentSmokeRunController {
       receipt.logicalRequestsUsed !== this.#authorized.size + 1 ||
       receipt.externalAttemptsUsed !== this.#authorized.size + 1 ||
       receipt.logicalRequestCeiling !== 30 ||
-      receipt.externalAttemptCeiling !== 30
+      receipt.externalAttemptCeiling !== 52
     ) {
       throw new Error("DEVELOPMENT_SMOKE_RESTORED_REQUEST_INVALID");
     }

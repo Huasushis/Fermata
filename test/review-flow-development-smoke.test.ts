@@ -224,6 +224,14 @@ describe("development smoke profile", () => {
       ...developmentSmokeProfile,
       maximumTotalExternalAttempts: 31
     })).toThrow("DEVELOPMENT_SMOKE_PROFILE_INVALID");
+    expect(() => parseDevelopmentSmokeProfile({
+      ...developmentSmokeProfile,
+      maximumTotalExternalAttempts: 53
+    })).toThrow("DEVELOPMENT_SMOKE_PROFILE_INVALID");
+    expect(developmentSmokeProfile.maximumTotalExternalAttempts).toBe(52);
+    expect(maximumExternalTransportsPerSmokeRun).toBe(52);
+    expect(maximumExternalTransportsPerSmokeRun)
+      .toBe(developmentSmokeProfile.maximumTotalExternalAttempts);
     expect(() => new DevelopmentSmokeRunController({
       profile: developmentSmokeProfile,
       manifest: manifest(),
@@ -291,7 +299,7 @@ describe("development smoke profile", () => {
         reasoningEffort: "max",
         logicalAttempt: 1,
         logicalRequestCeiling: 30,
-        externalAttemptCeiling: 30
+        externalAttemptCeiling: 52
       });
       expect(JSON.stringify(receipt)).not.toContain("not logged");
     }
@@ -305,10 +313,14 @@ describe("development smoke profile", () => {
       semanticLogicalRequestCeiling: 24,
       formatterLogicalRequestCeiling: 6,
       totalLogicalRequestCeiling: 30,
+      cumulativeExternalTransportCeiling: 52,
       semanticOutputTokenCeiling: 456_000,
       formatterOutputTokenCeiling: 48_000,
       totalOutputTokenCeiling: 504_000
     });
+    expect(
+      developmentSmokeAggregateBudgetReceipt.cumulativeExternalTransportCeiling
+    ).toBe(maximumExternalTransportsPerSmokeRun);
   });
 
   it("restores sealed requests without resetting budget or authorizing them twice", () => {

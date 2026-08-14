@@ -90,7 +90,7 @@ function fixturePreflight(
       models: ["deepseek-v4-pro", "deepseek-v4-flash"],
       concurrency: 12,
       retries: 0,
-      externalAttemptCeiling: 30,
+      externalAttemptCeiling: 52,
       manifestFingerprint
     }
   };
@@ -808,7 +808,7 @@ describe("development smoke private checkpoint", () => {
         phase0LogicalRequestsUsed: 8,
         phase0ExternalAttemptsUsed: 8,
         logicalRequestCeiling: 30,
-        externalAttemptCeiling: 30,
+        externalAttemptCeiling: 52,
         checkpointAfterMs: 15 * 60_000,
         reestimateAfterMs: 60 * 60_000,
         closeNewStagesAfterMs: 180 * 60_000

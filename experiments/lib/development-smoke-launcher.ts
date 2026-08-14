@@ -313,8 +313,8 @@ const safeReceiptSchema = z.object({
   logicalAttempt: z.literal(1),
   logicalRequestsUsed: z.number().int().min(1).max(30),
   logicalRequestCeiling: z.literal(30),
-  externalAttemptsUsed: z.number().int().min(1).max(30),
-  externalAttemptCeiling: z.literal(30)
+  externalAttemptsUsed: z.number().int().min(1).max(52),
+  externalAttemptCeiling: z.literal(52)
 }).strict();
 const stageReceiptSchema = z.object({
   stage: z.enum(["A", "B", "C", "D", "formatter"]),
@@ -616,7 +616,7 @@ const phase1ReleaseSchema = z.object({
   phase0LogicalRequestsUsed: z.literal(8),
   phase0ExternalAttemptsUsed: z.literal(8),
   logicalRequestCeiling: z.literal(30),
-  externalAttemptCeiling: z.literal(30),
+  externalAttemptCeiling: z.literal(52),
   checkpointAfterMs: z.literal(15 * 60_000),
   reestimateAfterMs: z.literal(60 * 60_000),
   closeNewStagesAfterMs: z.literal(180 * 60_000),
@@ -712,7 +712,9 @@ const privateCheckpointSchemaForWrite = privateCheckpointBaseSchema.superRefine(
  * Writer/in-memory schema (requestLedgerSchema) remains current-only.
  */
 const requestLedgerReadSchema = z.object({
-  receipt: safeReceiptSchema,
+  receipt: safeReceiptSchema.extend({
+    externalAttemptCeiling: z.union([z.literal(52), z.literal(30)])
+  }),
   timing: safeTimingSchema.optional(),
   completedStage: completedStageSchema.optional(),
   failureKind: stageFailureKindSchema.optional(),
@@ -842,7 +844,7 @@ export interface DevelopmentSmokePreflight {
     readonly models: readonly ["deepseek-v4-pro", "deepseek-v4-flash"];
     readonly concurrency: 12;
     readonly retries: 0;
-    readonly externalAttemptCeiling: 30;
+    readonly externalAttemptCeiling: 52;
     readonly manifestFingerprint: string;
   };
   /**
@@ -1450,7 +1452,7 @@ function preflightDevelopmentSmokeAfterControlledEnvironment(
       models: Object.freeze(["deepseek-v4-pro", "deepseek-v4-flash"] as const),
       concurrency: 12 as const,
       retries: 0 as const,
-      externalAttemptCeiling: 30 as const,
+      externalAttemptCeiling: developmentSmokeProfile.maximumTotalExternalAttempts,
       manifestFingerprint: summary.manifestFingerprint
     }),
     duplicateSimilarityRejectThreshold: modelState.duplicateSimilarityReject,
@@ -2925,7 +2927,7 @@ function assertCompletedRequestSequence(
       request.receipt.logicalRequestsUsed !== index + 1 ||
       request.receipt.externalAttemptsUsed !== index + 1 ||
       request.receipt.logicalRequestCeiling !== 30 ||
-      request.receipt.externalAttemptCeiling !== 30 ||
+      request.receipt.externalAttemptCeiling !== 52 ||
       request.completedStage === undefined ||
       request.timing === undefined ||
       request.failureKind !== undefined ||
@@ -2975,7 +2977,7 @@ function buildPhase1Release(
     phase0LogicalRequestsUsed: 8 as const,
     phase0ExternalAttemptsUsed: 8 as const,
     logicalRequestCeiling: 30 as const,
-    externalAttemptCeiling: 30 as const,
+    externalAttemptCeiling: developmentSmokeProfile.maximumTotalExternalAttempts,
     checkpointAfterMs: developmentSmokeProfile.phase0CheckpointMs,
     reestimateAfterMs: developmentSmokeProfile.reestimateCheckpointMs,
     closeNewStagesAfterMs: developmentSmokeProfile.closeNewStagesAfterMs
