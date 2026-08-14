@@ -26,6 +26,7 @@ import {
   LlmJsonOutputError,
   LlmRequestError,
   getLlmFailureAudit,
+  maximumExplicitLlmOutputTokens,
   type LlmResponseFormatFailureStage,
   type LlmResponseFormatFailureSubstage,
   type LlmRuntimeOptions
@@ -203,7 +204,7 @@ async function runPlainProbe(
       probeSpec,
       plainMessages,
       { ...probeRuntime, fetch: undefined as never } as LlmRuntimeOptions,
-      { requestJson: false, maxOutputTokens: 4096 }
+      { requestJson: false, maxOutputTokens: maximumExplicitLlmOutputTokens }
     );
     return {
       ...base,
@@ -246,7 +247,7 @@ async function runJsonProbe(
       jsonMessages,
       jsonSchema,
       { ...probeRuntime, fetch: undefined as never } as LlmRuntimeOptions,
-      { maxOutputTokens: 4096 }
+      { maxOutputTokens: maximumExplicitLlmOutputTokens }
     );
     return {
       ...base,
@@ -289,7 +290,7 @@ async function runComplexProbe(
       probeSpec,
       complexMessages,
       { ...probeRuntime, fetch: undefined as never } as LlmRuntimeOptions,
-      { requestJson: false, maxOutputTokens: 8192 }
+      { requestJson: false, maxOutputTokens: maximumExplicitLlmOutputTokens }
     );
     return {
       ...base,

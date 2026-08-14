@@ -12,7 +12,7 @@
  */
 import { mkdirSync } from "node:fs";
 import { getProviderCredentials, loadConfig, type ProfileConfig, type ProviderCredentials } from "../src/config";
-import { chatComplete, type ChatMessage } from "../src/llm";
+import { chatComplete, maximumExplicitLlmOutputTokens, type ChatMessage } from "../src/llm";
 import { logError, logInfo, logWarn } from "../src/logger";
 import { difficultyAnchorsFileForExperimentSchema } from "./lib/difficulty-anchors-strict";
 import {
@@ -164,7 +164,9 @@ async function summarize(
     },
     { role: "user", content: statement }
   ];
-  const result = await chatComplete(credentials, profile.difficulty, messages, runtime);
+  const result = await chatComplete(credentials, profile.difficulty, messages, runtime, {
+    maxOutputTokens: maximumExplicitLlmOutputTokens
+  });
   return result.content.trim();
 }
 

@@ -13,7 +13,7 @@
  * 前提是参考代码是 C++（提示词里明确要求了），如果模型返回了别的语言，这两个
  * 统计量会失真，但不会报错崩溃。
  */
-import { chatComplete, type ChatMessage } from "../llm";
+import { chatComplete, maximumExplicitLlmOutputTokens, type ChatMessage } from "../llm";
 import { clampLevel, type PipelineModelConfig, type ReviewTaskProblem } from "./types";
 
 export interface DataStructureSignature {
@@ -72,7 +72,14 @@ export interface CodingResult {
 
 export async function runCodingPipeline(input: CodingPipelineInput): Promise<CodingResult> {
   const messages = buildCodingMessages(input.problem);
-  const result = await chatComplete(input.model.credentials, input.model.spec, messages, input.model.runtime);
+  const result = await chatComplete(
+    input.model.credentials,
+    input.model.spec,
+    messages,
+    input.model.runtime,
+    // 显式请求提供商硬上限，避免省略时落入提供商默认 4096。
+    { maxOutputTokens: maximumExplicitLlmOutputTokens }
+  );
   const code = (extractCodeBlock(result.content) ?? result.content).trim();
 
   const { labels, maxWeight } = detectDataStructures(code);

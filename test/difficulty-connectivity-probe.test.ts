@@ -94,7 +94,7 @@ const validRequestBody = {
   messages: [{ role: "user", content: "synthetic" }],
   thinking: { type: "enabled" },
   reasoning_effort: "max",
-  max_tokens: 2_048
+  max_tokens: 384_000
 };
 
 function validResult(): DifficultyConnectivityProbeResult {
@@ -129,7 +129,7 @@ function validCommonEvidence() {
     thinking: false as const,
     thinkingRequest: "enabled" as const,
     reasoningEffort: "max" as const,
-    maxOutputTokens: 2_048 as const,
+    maxOutputTokens: 384_000 as const,
     maximumPaidRequests: 1 as const,
     expected: 1 as const,
     completionAuthorityFileName:
@@ -217,7 +217,7 @@ describe("Candidate C 连通性请求契约", () => {
       { ...validRequestBody, thinking: { type: "disabled" } },
       { ...validRequestBody, reasoning_effort: "low" },
       { ...validRequestBody, reasoning_effort: undefined },
-      { ...validRequestBody, max_tokens: 4_096 }
+      { ...validRequestBody, max_tokens: 385_000 }
     ]) {
       expect(() => difficultyConnectivityProbeRequestBodySchema.parse(invalid)).toThrow();
     }
@@ -343,7 +343,7 @@ describe("Candidate C 单请求与真实 EOF", () => {
       model: "deepseek-v4-flash",
       thinking: { type: "enabled" },
       reasoning_effort: "max",
-      max_tokens: 2_048
+      max_tokens: 384_000
     });
 
     streamController.close();

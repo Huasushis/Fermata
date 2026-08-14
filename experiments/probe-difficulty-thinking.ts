@@ -19,6 +19,7 @@ import { z } from "zod";
 import { getProviderCredentials, loadConfig } from "../src/config";
 import {
   createUndiciLlmFetch,
+  maximumExplicitLlmOutputTokens,
   type FetchLike
 } from "../src/llm";
 import { describeError } from "../src/logger";
@@ -85,7 +86,7 @@ const thinkingRequestBodySchema = z
     messages: z.array(z.unknown()).min(1),
     thinking: z.object({ type: z.literal("enabled") }).strict(),
     reasoning_effort: z.literal("max"),
-    max_tokens: z.literal(4096)
+    max_tokens: z.literal(maximumExplicitLlmOutputTokens)
   })
   .strict();
 
@@ -470,7 +471,7 @@ async function main(): Promise<void> {
     sourceManifestSha256,
     providerIdentityFingerprint,
     anchorsFingerprint: strictAnchors.fingerprint,
-    maxOutputTokens: 4096,
+    maxOutputTokens: maximumExplicitLlmOutputTokens,
     expected: samples.length,
     revision: checkpointRevision,
     state,
@@ -649,7 +650,7 @@ async function main(): Promise<void> {
     sourceManifestSha256,
     providerIdentityFingerprint,
     anchorsFingerprint: strictAnchors.fingerprint,
-    maxOutputTokens: 4096,
+    maxOutputTokens: maximumExplicitLlmOutputTokens,
     expected: samples.length,
     succeeded,
     failed: samples.length - succeeded,

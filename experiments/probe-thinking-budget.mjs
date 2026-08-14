@@ -23,7 +23,8 @@ async function probe({ label, thinking }) {
     temperature: 0.1,
     thinking,
     reasoning_effort: "max",
-    max_tokens: 2000
+    // 与项目"不设人工输出上限"决策一致：显式请求提供商硬上限 384000。
+    max_tokens: 384_000
   };
   const startedAt = Date.now();
   try {

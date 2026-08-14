@@ -8,7 +8,7 @@
  */
 import { readFileSync } from "node:fs";
 import { z } from "zod";
-import { chatCompleteJson, type ChatMessage } from "../llm";
+import { chatCompleteJson, maximumExplicitLlmOutputTokens, type ChatMessage } from "../llm";
 import type { PipelineModelConfig, ReviewTaskProblem } from "./types";
 
 export interface DifficultyAnchor {
@@ -79,7 +79,9 @@ const rawDifficultyOutputSchema = z.object({
   rationale: z.string().trim().min(1).max(2_000)
 });
 
-const difficultyMaxOutputTokens = 2_048;
+// 与项目"不设人工输出上限"决策一致：显式请求提供商硬上限 384000，
+// 避免省略 max_tokens 时落入提供商默认 4096。
+const difficultyMaxOutputTokens = maximumExplicitLlmOutputTokens;
 
 export async function runDifficultyPipeline(input: DifficultyPipelineInput): Promise<DifficultyResult> {
   const messages = buildDifficultyMessages(input.problem, input.anchors);

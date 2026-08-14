@@ -52,7 +52,7 @@ describe("runDifficultyPipeline：整体接线", () => {
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       expect(body).toMatchObject({
-        max_tokens: 2_048,
+        max_tokens: 384_000,
         thinking: { type: "enabled" },
         reasoning_effort: "max"
       });
@@ -121,7 +121,7 @@ describe("runDifficultyPipeline：整体接线", () => {
     expect(result.rating).toBe(3_300);
     expect(result.confidence).toBe(0.4);
     expect(requestBody).toBeDefined();
-    expect(requestBody?.max_tokens).toBe(2_048);
+    expect(requestBody?.max_tokens).toBe(384_000);
     expect(requestBody?.thinking).toEqual({ type: "enabled" });
     expect(requestBody?.reasoning_effort).toBe("max");
     expect(requestBody).not.toHaveProperty("response_format");
@@ -152,7 +152,7 @@ describe("runDifficultyPipeline：整体接线", () => {
   it("没有锚点时也能正常工作（只是提示词里不带锚点）", async () => {
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body));
-      expect(body.max_tokens).toBe(2_048);
+      expect(body.max_tokens).toBe(384_000);
       const joined = body.messages.map((m: { content: string }) => m.content).join("\n");
       expect(joined).not.toContain("参考锚点");
       return completionResponse('{"rating": 900, "confidence": 0.5, "rationale": "简单"}');
@@ -206,7 +206,7 @@ describe("runDifficultyPipeline：整体接线", () => {
 
     expect(result.rating).toBe(2_100);
     expect(requestBodies).toHaveLength(2);
-    expect(requestBodies.map((body) => body.max_tokens)).toEqual([2_048, 2_048]);
+    expect(requestBodies.map((body) => body.max_tokens)).toEqual([384_000, 384_000]);
     expect(requestBodies.map((body) => body.thinking)).toEqual([
       { type: "enabled" },
       { type: "enabled" }

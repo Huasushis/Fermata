@@ -30,7 +30,7 @@ import {
   readProtectedEnvFile
 } from "../scripts/private-runtime.mjs";
 import { getProviderCredentials, loadConfig, type ModelSpec } from "../src/config";
-import { createUndiciLlmFetch, type FetchLike } from "../src/llm";
+import { createUndiciLlmFetch, maximumExplicitLlmOutputTokens, type FetchLike } from "../src/llm";
 import { describeError } from "../src/logger";
 import {
   runDifficultyPipeline,
@@ -45,7 +45,7 @@ export const difficultyProProbeExperimentVersion =
   "experiment-2026-08-difficulty-pro-default-request-v1";
 export const difficultyProProbeLabel =
   "difficulty-pro-default-request-probe-20260801-a";
-export const difficultyProProbeMaxOutputTokens = 2_048;
+export const difficultyProProbeMaxOutputTokens = maximumExplicitLlmOutputTokens;
 
 const repositoryDirectory = fileURLToPath(new URL("../", import.meta.url));
 const runnerRepositoryPath = "experiments/probe-difficulty-pro.ts";

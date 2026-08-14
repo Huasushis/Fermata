@@ -115,7 +115,8 @@ async function main(): Promise<void> {
     messages: [{ role: "user", content: "请用一句话回答：1+1 等于几？只输出答案数字。" }],
     thinking: { type: "enabled" },
     reasoning_effort: "max",
-    max_tokens: 4096
+    // 与项目"不设人工输出上限"决策一致：显式请求提供商硬上限 384000。
+    max_tokens: 384_000
   });
 
   console.log("--- sending streaming request ---");

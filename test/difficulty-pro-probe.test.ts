@@ -33,7 +33,7 @@ const validRequestBody = {
   temperature: 0.2,
   stream: true,
   messages: [{ role: "user", content: "synthetic" }],
-  max_tokens: 2048
+  max_tokens: 384_000
 };
 
 function result(
@@ -167,11 +167,11 @@ describe("Candidate D 私有输入契约", () => {
 });
 
 describe("Candidate D 单次请求门", () => {
-  it("请求体固定为 pro/0.2/2048 且不允许显式思考字段", () => {
+  it("请求体固定为 pro/0.2/384000 且不允许显式思考字段", () => {
     expect(difficultyProProbeRequestBodySchema.parse(validRequestBody)).toEqual(validRequestBody);
     for (const invalid of [
       { ...validRequestBody, model: "deepseek-v4-flash" },
-      { ...validRequestBody, max_tokens: 4096 },
+      { ...validRequestBody, max_tokens: 385_000 },
       { ...validRequestBody, thinking: { type: "disabled" } },
       { ...validRequestBody, reasoning_effort: "low" }
     ]) {

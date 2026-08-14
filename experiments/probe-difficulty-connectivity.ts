@@ -44,6 +44,7 @@ import {
 } from "../src/config";
 import {
   createUndiciLlmFetch,
+  maximumExplicitLlmOutputTokens,
   type FetchLike,
   type LlmRequestError,
   type LlmResponseFormatFailureStage,
@@ -72,7 +73,7 @@ export const difficultyConnectivityPreviousProbeLabels = [
 ] as const;
 export const difficultyConnectivityProbeLabel =
   "difficulty-candidate-c-connectivity-probe-20260802-f";
-export const difficultyConnectivityProbeMaxOutputTokens = 2_048;
+export const difficultyConnectivityProbeMaxOutputTokens = maximumExplicitLlmOutputTokens;
 
 const repositoryDirectory = fileURLToPath(new URL("../", import.meta.url));
 const runnerRepositoryPath = "experiments/probe-difficulty-connectivity.ts";

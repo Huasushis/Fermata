@@ -931,7 +931,12 @@ required/type/enum/nullability/items，并在每层 object 使用 `additionalPro
 默认 max_tokens=4096，反而更小，所以必须显式设置）。唯一剩余的输出终止边界是提供商自身的
 硬上限，到达后按 LLM_OUTPUT_LENGTH_LIMIT 终态处理并 fail closed。development smoke
 不对健康流设置总墙钟硬杀：首个有效输出前使用 30 分钟最终保护；首个有效输出后只执行
-10 分钟无进度保护，并持续读取到服务端 EOF。
+10 分钟无进度保护，并持续读取到服务端 EOF。同一硬上限约束覆盖所有生产流水线
+（difficulty/thinking/coding/verdict）与实验探针：任何请求只要省略 max_tokens 就会落入
+提供商默认 4096，因此全部显式传 384000，不再保留难度流水线的 2048 或探针的小上限。
+仓库级不变量测试 `test/no-artificial-output-cap.test.ts` 会扫描 src/ 与 experiments/
+（不含历史 results/）源文件，若任何一行重新引入低于 384000 的人工上限关键字+数值组合
+即失败；旧 checkpoint 读路径保留的 32k/24k/12k/8k 反向兼容 union 是唯一显式豁免。
 
 所有模型档位共用一个请求级调度器：全局并发默认 12，可显式配置 16；20 必须同时登记已接受的
 并发探针。按样本轮转且 work-conserving，不存在三个档位上限相加。每个逻辑请求最多 3 attempts，
@@ -997,10 +1002,13 @@ Candidate B 的协议验证使用
 2048 输出上限的第一轮探针在第一道公开高难题上明确得到
 `LLM_OUTPUT_LENGTH_LIMIT`，所以完整性为假，也没有启动 83 题实验。按预先登记的唯一升级条件，
 第二轮只把上限改为 4096，但同一道公开题仍得到相同失败码；因此没有继续提高上限，Candidate B 已
-停止。两份不完整报告都已保留，后续候选不得把它们改写成成功结果。
+停止。两份不完整报告都已保留，后续候选不得把它们改写成成功结果。此后的项目决策取消了所有人工
+输出上限（见上文），探针 runner 现在同样显式请求提供商硬上限 384000；这两份历史报告保留各自
+2048/4096 当时的记录，不改写。
 
 Candidate D 使用独立入口 `npm run experiment:probe-difficulty-pro`，不会读取或改写 Candidate B
-报告。入口固定依次检查人工短题与公开题 CF 2006E，固定 2048 输出上限、每题最多一次真实 fetch，
+报告。入口固定依次检查人工短题与公开题 CF 2006E，显式请求提供商硬上限 384000 token（与项目不设人工
+输出上限决策一致，见上文）、每题最多一次真实 fetch，
 并在付费前持久化 active 检查点；首题失败后不会发送第二题。成功必须同时满足输出 schema、
 `finish_reason=stop` 和真实 HTTP EOF。运行前还会核对完整 Git HEAD、runner 自身 SHA-256、
 tracked/untracked 干净状态、Candidate C 锚点、public83 零重叠、模型配置和当前服务身份指纹。
