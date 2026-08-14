@@ -807,7 +807,7 @@ describe("development diagnostic strict run state", () => {
       { ...identity, profileFingerprint: digest("other-profile") },
       { ...identity, profile: { ...identity.profile, maximumTotalExternalAttempts: 53 } },
       { ...identity, profile: { ...identity.profile, maximumConcurrency: 5 } },
-      { ...identity, profile: { ...identity.profile, maximumAttemptsPerLogicalRequest: 2 } },
+      { ...identity, profile: { ...identity.profile, maximumAttemptsPerLogicalRequest: 3 } },
       { ...identity, profile: { ...identity.profile, retryableHttpStatuses: [500] } },
       { ...identity, profile: { ...identity.profile, softStopBudgetMs: 1 } }
     ]) {

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { getLlmFailureAudit, LlmRequestStartGate } from "../llm";
 import {
   FairLlmRequestScheduler,
+  LlmStageRequestError,
   type LlmStageFailureKind
 } from "../llm-scheduler";
 import { hashCanonicalValue } from "./evidence";
@@ -128,6 +129,21 @@ function classifyTerminalRoleFailure(
   if (code === "LLM_STREAM_INTERRUPTED") return "stream_interrupted";
   return mapFailureKind(failureKind);
 }
+
+/**
+ * 诊断通道调度器级重试的确定性准入：只允许 llm.ts 在传输边界内可抛出的瞬态编码。
+ * 已接收首段输出后中断（LLM_STREAM_INTERRUPTED）与连接失败（LLM_NETWORK_FAILED）
+ * 重试，二者经 classifyTerminalRoleFailure 恒映射为 stream_interrupted/connect；
+ * LLM_HTTP_ERROR 在 chatCompleteWithReceipt 层构造，不会到达本边界。取消、超时、
+ * schema/解析、输出超限、策略拒绝及无法识别编码一律不重试——即使它们经
+ * classifyTerminalRoleFailure 回退分类为 connect。
+ */
+function isDiagnosticRetryable(error: unknown): boolean {
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? String(error.code)
+    : "";
+  return code === "LLM_STREAM_INTERRUPTED" || code === "LLM_NETWORK_FAILED";
+}
 /**
  * 2×4 诊断配置：恰好 2 个固定槽位、每个槽位 A/B/C/D 四阶段（格式化器仅按需），
  * 不参与最终准确率标定，不含 Phase1 概念。
@@ -138,11 +154,11 @@ export const developmentDiagnosticProfileSchema = z
     anonymousSlotCount: z.literal(2),
     semanticRequestsPerSlot: z.literal(4),
     maximumFormatterRequestsPerSlot: z.literal(1),
-    maximumAttemptsPerLogicalRequest: z.literal(1),
+    maximumAttemptsPerLogicalRequest: z.literal(2),
     maximumAttemptsPerCase: z.literal(5),
     maximumWholeCaseRetries: z.literal(0),
     maximumTotalLogicalRequests: z.literal(10),
-    maximumTotalExternalAttempts: z.literal(52),
+    maximumTotalExternalAttempts: z.literal(16),
     maximumConcurrency: z.literal(4),
     firstValidOutputTimeoutMs: z.literal(600_000),
     outputIdleTimeoutMs: z.literal(600_000),
@@ -167,11 +183,11 @@ export const developmentDiagnosticProfile: DevelopmentDiagnosticProfile = Object
   anonymousSlotCount: 2,
   semanticRequestsPerSlot: 4,
   maximumFormatterRequestsPerSlot: 1,
-  maximumAttemptsPerLogicalRequest: 1,
+  maximumAttemptsPerLogicalRequest: 2,
   maximumAttemptsPerCase: 5,
   maximumWholeCaseRetries: 0,
   maximumTotalLogicalRequests: 10,
-  maximumTotalExternalAttempts: 52,
+  maximumTotalExternalAttempts: 16,
   maximumConcurrency: 4,
   firstValidOutputTimeoutMs: 600_000,
   outputIdleTimeoutMs: 600_000,
@@ -197,7 +213,7 @@ export const developmentDiagnosticAggregateBudgetReceipt = Object.freeze({
   semanticLogicalRequestCeiling: 8 as const,
   formatterLogicalRequestCeiling: 2 as const,
   totalLogicalRequestCeiling: 10 as const,
-  providerTransportCeiling: 52 as const,
+  providerTransportCeiling: 16 as const,
   semanticOutputTokenCeiling: 456_000 as const,
   formatterOutputTokenCeiling: 16_000 as const,
   totalOutputTokenCeiling: 472_000 as const
@@ -471,6 +487,7 @@ export class DevelopmentDiagnosticRunController {
   readonly #completedSlots = new Set<DevelopmentDiagnosticSlot>();
   readonly #failedStages = new Set<string>();
   #transportSequence = 0;
+  #dispatchId = 0;
   #firstFailureKind: LlmStageFailureKind | null = null;
   readonly #startedAtMs: number;
   readonly #clock: () => number;
@@ -689,56 +706,77 @@ export class DevelopmentDiagnosticRunController {
   }
 
   /**
-   * Holds the shared scheduler slot until the response body settles. All earlier lifecycle events,
-   * including the durable dispatch-start checkpoint, must succeed before execute can reach fetch.
+   * 为一次外部传输分配稳定 caseId，并允许调度器在同一逻辑传输内按可重试分类重试。
+   * 每次重试都是新一次传输（独立 sequence/预留），但 caseId 恒定，供调度器做按 case 计数。
+   * 可重试分类在非末次尝试时包装为 LlmStageRequestError 交还调度器；末次或不可重试分类
+   * 原样抛出，保持原始 LlmRequestError 的 .code，供终结分类读回正确错误身份。
    */
   public async dispatchTransport<T>(execute: () => Promise<T>): Promise<T> {
-    const sequence = ++this.#transportSequence;
-    const transportId = sequence.toString().padStart(6, "0");
-    const result = await this.#scheduler.runLogicalRequest({
-      caseId: `diagnostic-transport-${transportId}`,
-      requestId: "fetch",
-      execute: async (attempt) => {
-        if (attempt !== 1) {
-          throw new Error("DEVELOPMENT_DIAGNOSTIC_RETRY_FORBIDDEN");
+    const dispatchId = ++this.#dispatchId;
+    const caseId = `diagnostic-transport-${dispatchId.toString().padStart(6, "0")}`;
+    try {
+      const result = await this.#scheduler.runLogicalRequest({
+        caseId,
+        requestId: "fetch",
+        execute: async (attempt) => {
+          const sequence = ++this.#transportSequence;
+          return this.#transportContext.run(sequence, async () => {
+            try {
+              const value = await execute();
+              this.#emitLifecycle({
+                type: "transport_settled",
+                sequence,
+                outcome: value === null ? "retryable_failed" : "succeeded",
+                errorCategory: null
+              });
+              await this.flushLifecycleEvents();
+              this.#softStopAtCeilingIfNeeded();
+              return value;
+            } catch (error) {
+              const category = classifyTerminalRoleFailure("transport", error);
+              const finalAttempt =
+                attempt >= this.profile.maximumAttemptsPerLogicalRequest;
+              if (isDiagnosticRetryable(error) && !finalAttempt) {
+                this.#emitLifecycle({
+                  type: "transport_settled",
+                  sequence,
+                  outcome: "retryable_failed",
+                  errorCategory: null
+                });
+                await this.flushLifecycleEvents();
+                this.#softStopAtCeilingIfNeeded();
+                throw new LlmStageRequestError(category, { cause: error });
+              }
+              this.#emitLifecycle({
+                type: "transport_settled",
+                sequence,
+                outcome: "failed",
+                errorCategory: category
+              });
+              await this.flushLifecycleEvents();
+              this.#softStopAtCeilingIfNeeded();
+              throw error;
+            }
+          });
         }
-        return this.#transportContext.run(sequence, async () => {
-          try {
-            const value = await execute();
-            this.#emitLifecycle({
-              type: "transport_settled",
-              sequence,
-              outcome: value === null ? "retryable_failed" : "succeeded",
-              errorCategory: null
-            });
-            await this.flushLifecycleEvents();
-            if (
-              this.plannedRun.softStopPolicy === "stop_new_and_drain_in_flight" &&
-              this.transportGate.used === this.transportGate.ceiling
-            ) {
-              this.softStop("attempt_ceiling");
-            }
-            return value;
-          } catch (error) {
-            this.#emitLifecycle({
-              type: "transport_settled",
-              sequence,
-              outcome: "failed",
-              errorCategory: classifyTerminalRoleFailure("transport", error)
-            });
-            await this.flushLifecycleEvents();
-            if (
-              this.plannedRun.softStopPolicy === "stop_new_and_drain_in_flight" &&
-              this.transportGate.used === this.transportGate.ceiling
-            ) {
-              this.softStop("attempt_ceiling");
-            }
-            throw error;
-          }
-        });
+      });
+      return result.value;
+    } catch (error) {
+      // 调度器耗尽后可能原样抛回 LlmStageRequestError；解包回原始错误以保留 .code。
+      if (error instanceof LlmStageRequestError && error.cause !== undefined) {
+        throw error.cause;
       }
-    });
-    return result.value;
+      throw error;
+    }
+  }
+
+  #softStopAtCeilingIfNeeded(): void {
+    if (
+      this.plannedRun.softStopPolicy === "stop_new_and_drain_in_flight" &&
+      this.transportGate.used === this.transportGate.ceiling
+    ) {
+      this.softStop("attempt_ceiling");
+    }
   }
 
   public markTransportFirstOutput(): void {

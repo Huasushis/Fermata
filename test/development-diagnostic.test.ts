@@ -29,6 +29,7 @@ import {
   TransportPreDispatchGate,
   createDevelopmentDiagnosticScheduler,
   expectedDiagnosticSlots,
+  type DevelopmentDiagnosticLifecycleEvent,
   type DevelopmentDiagnosticManifest
 } from "../src/review-flow/development-diagnostic";
 import {
@@ -38,6 +39,7 @@ import {
 import { FairLlmRequestScheduler } from "../src/llm-scheduler";
 import {
   chatCompleteWithReceipt,
+  LlmRequestError,
   LlmRequestStartGate,
   type LlmRuntimeOptions
 } from "../src/llm";
@@ -1316,6 +1318,9 @@ function buildController(options?: {
   readonly clock?: () => number;
   readonly scheduler?: FairLlmRequestScheduler;
   readonly plannedRun?: DevelopmentDiagnosticPlannedRunContract;
+  readonly lifecycleSink?: (
+    event: DevelopmentDiagnosticLifecycleEvent
+  ) => Promise<void>;
 }): DevelopmentDiagnosticRunController {
   const plannedRun =
     options?.plannedRun ?? legacyDevelopmentDiagnosticPlannedRunContract;
@@ -1328,6 +1333,7 @@ function buildController(options?: {
     manifest: buildContentFreeManifest(),
     runBindingHash: digest("run-binding"),
     scheduler,
+    lifecycleSink: options?.lifecycleSink,
     startedAtMs: 0,
     clock: options?.clock ?? (() => 0)
   });
@@ -1867,6 +1873,128 @@ describe("Development diagnostic — real terminal failure paths", () => {
       expect(controller.scheduler().snapshot().softStopped).toBe(true);
     }
   );
+});
+
+describe("Development diagnostic — scheduler-level transport retry contract", () => {
+  it("retries LLM_STREAM_INTERRUPTED once; exhaustion preserves stream_interrupted identity", async () => {
+    const events: DevelopmentDiagnosticLifecycleEvent[] = [];
+    const controller = buildController({
+      lifecycleSink: async (event) => {
+        events.push(event);
+      }
+    });
+    const settled: Array<{
+      sequence: number;
+      outcome: string;
+      errorCategory: string | null;
+    }> = [];
+    let fetchCount = 0;
+    const runtime = diagnosticTransportRuntime(controller, async () => {
+      fetchCount += 1;
+      throw new LlmRequestError("LLM_STREAM_INTERRUPTED");
+    });
+    await expect(
+      chatCompleteWithReceipt(
+        syntheticProvider,
+        syntheticSpec,
+        syntheticMessages,
+        runtime
+      )
+    ).rejects.toMatchObject({ code: "LLM_STREAM_INTERRUPTED" });
+    for (const event of events) {
+      if (event.type === "transport_settled") {
+        settled.push({
+          sequence: event.sequence,
+          outcome: event.outcome,
+          errorCategory: event.errorCategory
+        });
+      }
+    }
+    expect(fetchCount).toBe(2);
+    expect(settled).toEqual([
+      { sequence: 1, outcome: "retryable_failed", errorCategory: null },
+      { sequence: 2, outcome: "failed", errorCategory: "stream_interrupted" }
+    ]);
+    const snapshot = controller.scheduler().snapshot();
+    expect(Object.values(snapshot.attemptsByCase)).toEqual([2]);
+    expect(snapshot.active).toBe(0);
+    expect(snapshot.queued).toBe(0);
+    expect(controller.checkpoint().externalAttemptsUsed).toBe(2);
+  });
+
+  it("retries LLM_NETWORK_FAILED once and succeeds on the second attempt", async () => {
+    const controller = buildController();
+    let fetchCount = 0;
+    const runtime = diagnosticTransportRuntime(controller, async () => {
+      fetchCount += 1;
+      if (fetchCount === 1) {
+        throw new LlmRequestError("LLM_NETWORK_FAILED");
+      }
+      return successfulSseResponse();
+    });
+    const result = await chatCompleteWithReceipt(
+      syntheticProvider,
+      syntheticSpec,
+      syntheticMessages,
+      runtime
+    );
+    expect(result.receipt.transportAttemptCount).toBe(2);
+    expect(fetchCount).toBe(2);
+    expect(controller.checkpoint().externalAttemptsUsed).toBe(2);
+    expect(Object.values(controller.scheduler().snapshot().attemptsByCase)).toEqual([2]);
+  });
+
+  it.each([
+    ["LLM_CANCELLED"],
+    ["LLM_TRANSPORT_DENIED"],
+    ["LLM_REQUEST_START_BLOCKED"],
+    ["LLM_FIRST_OUTPUT_TIMEOUT"],
+    ["LLM_OUTPUT_IDLE_TIMEOUT"],
+    ["LLM_TOTAL_TIMEOUT"],
+    ["LLM_RESPONSE_FORMAT_INVALID"],
+    ["LLM_RESPONSE_BODY_TOO_LARGE"],
+    ["LLM_OUTPUT_LENGTH_LIMIT"]
+  ] as const)("never retries non-eligible code %s", async (code) => {
+    const controller = buildController();
+    let fetchCount = 0;
+    const runtime = diagnosticTransportRuntime(controller, async () => {
+      fetchCount += 1;
+      throw new LlmRequestError(code as LlmRequestError["code"]);
+    });
+    await expect(
+      chatCompleteWithReceipt(
+        syntheticProvider,
+        syntheticSpec,
+        syntheticMessages,
+        runtime
+      )
+    ).rejects.toMatchObject({ code });
+    expect(fetchCount).toBe(1);
+    expect(Object.values(controller.scheduler().snapshot().attemptsByCase)).toEqual([1]);
+    expect(controller.checkpoint().externalAttemptsUsed).toBe(1);
+  });
+
+  it("keeps a single dispatched caseId stable across scheduler retries", async () => {
+    const controller = buildController();
+    let fetchCount = 0;
+    const runtime = diagnosticTransportRuntime(controller, async () => {
+      fetchCount += 1;
+      throw new LlmRequestError("LLM_STREAM_INTERRUPTED");
+    });
+    await expect(
+      chatCompleteWithReceipt(
+        syntheticProvider,
+        syntheticSpec,
+        syntheticMessages,
+        runtime
+      )
+    ).rejects.toMatchObject({ code: "LLM_STREAM_INTERRUPTED" });
+    const attemptsByCase = controller.scheduler().snapshot().attemptsByCase;
+    const caseIds = Object.keys(attemptsByCase);
+    expect(caseIds).toHaveLength(1);
+    expect(caseIds[0]).toMatch(/^diagnostic-transport-\d{6}$/);
+    expect(attemptsByCase[caseIds[0]]).toBe(2);
+  });
 });
 
 describe("Development diagnostic — real package bootstrap", () => {

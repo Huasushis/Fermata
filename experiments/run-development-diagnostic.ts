@@ -88,7 +88,7 @@ export interface DevelopmentDiagnosticSafePlan {
     | "stop_new_and_drain_in_flight";
   readonly profileName: string;
   readonly retry: {
-    readonly maximumAttemptsPerLogicalRequest: 1;
+    readonly maximumAttemptsPerLogicalRequest: 2;
     readonly maximumTransportAttemptsPerRequest: number;
     readonly retryableHttpStatuses: readonly [429];
   };
