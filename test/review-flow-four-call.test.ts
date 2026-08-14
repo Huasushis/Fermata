@@ -13,7 +13,9 @@ import {
 } from "../src/llm-scheduler";
 import { LlmRequestError, LlmResponseFormatError } from "../src/llm";
 import {
-  runProductionFourCallReviewDag
+  runProductionFourCallReviewDag,
+  type FourCallRequestLifecycle,
+  type FourCallSafeRequestFailure
 } from "../src/review-flow/four-call-runtime";
 import type { PipelineModelConfig } from "../src/pipelines/types";
 import { classifyTransportFailure } from "../src/review-flow/four-call-runtime";
@@ -76,6 +78,112 @@ function stageOutput(stage: "A" | "B" | "C" | "D" | "formatter"): string {
   if (stage === "formatter") return JSON.stringify(output);
   const property = { A: "a", B: "b", C: "c", D: "d" }[stage] as "a" | "b" | "c" | "d";
   return JSON.stringify(output[property]);
+}
+
+/**
+ * 识别合成请求体中的四阶段：B/C/D 通过 response_format 名称；两轮 A 阶段
+ * 两轮都不带 response_format，靠 max_tokens=32000 与末条用户消息是否含
+ * "目标 JSON Schema"区分语义轮与格式轮。
+ */
+function syntheticFourCallStage(body: {
+  readonly max_tokens?: number;
+  readonly response_format?: {
+    readonly json_schema?: { readonly name?: string };
+  };
+  readonly messages?: readonly { readonly content?: unknown }[];
+}): "A" | "A_FORMAT" | "B" | "C" | "D" | undefined {
+  const responseFormat = body.response_format as
+    | { readonly json_schema?: { readonly name?: string } }
+    | undefined;
+  const stage = responseFormat?.json_schema?.name
+    ?.match(/_([abcd])_v1$/u)?.[1]?.toUpperCase();
+  if (stage === "A" || stage === "B" || stage === "C" || stage === "D") {
+    return stage;
+  }
+  if (body.max_tokens === 32_000) {
+    // 语义轮不含"目标 JSON Schema"指令；格式轮与修复轮都包含该指令
+    // （修复轮在格式消息后会追加 assistant/修复提示）。
+    const containsSchemaInstruction = (body.messages ?? []).some(
+      (message) =>
+        typeof message.content === "string" &&
+        message.content.includes("目标 JSON Schema")
+    );
+    return containsSchemaInstruction ? "A_FORMAT" : "A";
+  }
+  return undefined;
+}
+
+function syntheticJsonCompletion(content: string): Response {
+  return new Response(JSON.stringify({
+    choices: [{
+      message: { role: "assistant", content },
+      finish_reason: "stop"
+    }]
+  }), { status: 200, headers: { "Content-Type": "application/json" } });
+}
+
+function syntheticJsonCompletionFinish(content: string, finishReason: string): Response {
+  return new Response(JSON.stringify({
+    choices: [{
+      message: { role: "assistant", content },
+      finish_reason: finishReason
+    }]
+  }), { status: 200, headers: { "Content-Type": "application/json" } });
+}
+
+function fourCallSource() {
+  return {
+    statement: "statement",
+    referenceSolution: "solution",
+    technicalContext: null,
+    historicalTasteRubric: null,
+    difficultyAnchors: [],
+    labelCatalog: ["dp"],
+    hardRules: []
+  };
+}
+
+function twoRoundRuntimeModel(
+  fetchImpl: NonNullable<PipelineModelConfig["runtime"]["fetch"]>
+): PipelineModelConfig {
+  return {
+    credentials: { baseUrl: "https://provider.example/v1", apiKey: "synthetic-key" },
+    spec: {
+      provider: "aether",
+      model: "deepseek-v4-pro",
+      temperature: 0,
+      thinking: false,
+      thinkingRequest: "enabled",
+      reasoningEffort: "max"
+    },
+    runtime: {
+      outputIdleTimeoutMs: 600_000,
+      firstOutputTimeoutMs: 600_000,
+      maximumDurationMs: 1_800_000,
+      maxAttempts: 3,
+      baseDelayMs: 500,
+      fetch: fetchImpl
+    }
+  };
+}
+
+function twoRoundDagArgs(fetchImpl: NonNullable<PipelineModelConfig["runtime"]["fetch"]>, lifecycle?: FourCallRequestLifecycle) {
+  const runtimeModel = twoRoundRuntimeModel(fetchImpl);
+  return {
+    caseId: "production-two-round",
+    sourceBinding: digestB,
+    source: fourCallSource(),
+    models: {
+      A: runtimeModel,
+      B: runtimeModel,
+      C: runtimeModel,
+      D: runtimeModel,
+      formatter: runtimeModel
+    },
+    nativeSchemaCompatible: true,
+    scheduler: new FairLlmRequestScheduler({ maximumConcurrency: 12, jitter: () => 0 }),
+    ...(lifecycle === undefined ? {} : { lifecycle })
+  };
 }
 
 describe("四语义请求 DAG 冻结接口", () => {
@@ -272,21 +380,25 @@ describe("四语义请求 DAG 冻结接口", () => {
       }
     })).resolves.toMatchObject({ reusedStages: ["B"] });
   });
-  it("production adapter emits exactly four native-max semantic requests with stage budgets", async () => {
+  it("production adapter emits two-round A plus single-round B/C/D with stage budgets", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       bodies.push(body);
-      const responseFormat = body.response_format as {
-        readonly json_schema?: { readonly name?: string };
-      };
-      const stage = responseFormat.json_schema?.name?.match(/_([abcd])_v1$/u)?.[1]?.toUpperCase();
-      if (stage !== "A" && stage !== "B" && stage !== "C" && stage !== "D") {
+      const stage = syntheticFourCallStage(body);
+      if (stage === undefined) {
         throw new Error("unexpected synthetic stage");
       }
       return new Response(JSON.stringify({
         choices: [{
-          message: { role: "assistant", content: stageOutput(stage) },
+          message: {
+            role: "assistant",
+            content: stage === "A"
+              ? "合成盲解自由文本，不包含 JSON。"
+              : stage === "A_FORMAT"
+                ? stageOutput("A")
+                : stageOutput(stage)
+          },
           finish_reason: "stop"
         }]
       }), { status: 200, headers: { "Content-Type": "application/json" } });
@@ -334,16 +446,179 @@ describe("四语义请求 DAG 冻结接口", () => {
     });
     expect(result.semanticRequestCount).toBe(4);
     expect(result.formatterRequestCount).toBe(0);
-    expect(fetchImpl).toHaveBeenCalledTimes(4);
+    // A 语义轮 + A 格式轮 + B/C/D 各一次
+    expect(fetchImpl).toHaveBeenCalledTimes(5);
     expect(bodies.map((body) => body.max_tokens).sort((left, right) =>
       Number(left) - Number(right)
-    )).toEqual([8_000, 12_000, 24_000, 32_000]);
+    )).toEqual([8_000, 12_000, 24_000, 32_000, 32_000]);
     for (const body of bodies) {
       expect(body).toMatchObject({
         thinking: { type: "enabled" },
         reasoning_effort: "max"
       });
     }
+    expect(bodies.filter((body) => body.max_tokens === 32_000 && body.response_format === undefined))
+      .toHaveLength(2);
+    const formatBody = bodies.find((body) =>
+      String((body.messages as readonly { content: string }[]).at(-1)?.content).includes(
+        "目标 JSON Schema"
+      )
+    );
+    expect(formatBody).toBeDefined();
+    expect(formatBody?.max_tokens).toBe(32_000);
+  });
+});
+
+describe("两轮 A 阶段（语义→格式）", () => {
+  it("routes A through reasoning-then-format rounds with per-round 32k and reasoning=max", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      const stage = syntheticFourCallStage(body);
+      if (stage === undefined) {
+        throw new Error("unexpected synthetic stage");
+      }
+      if (stage === "A") {
+        return syntheticJsonCompletion("合成盲解自由文本，不包含 JSON。");
+      }
+      if (stage === "A_FORMAT") {
+        return syntheticJsonCompletion(stageOutput("A"));
+      }
+      return syntheticJsonCompletion(stageOutput(stage));
+    });
+
+    const result = await runProductionFourCallReviewDag(
+      twoRoundDagArgs(fetchImpl)
+    );
+    expect(result.semanticRequestCount).toBe(4);
+    expect(fetchImpl).toHaveBeenCalledTimes(5);
+
+    const semanticCalls = bodies.filter((body) =>
+      syntheticFourCallStage(body) === "A"
+    );
+    const formatCalls = bodies.filter((body) =>
+      syntheticFourCallStage(body) === "A_FORMAT"
+    );
+    expect(semanticCalls).toHaveLength(1);
+    expect(formatCalls).toHaveLength(1);
+    for (const call of [...semanticCalls, ...formatCalls]) {
+      expect(call).toMatchObject({
+        max_tokens: 32_000,
+        thinking: { type: "enabled" },
+        reasoning_effort: "max"
+      });
+      expect(call.response_format).toBeUndefined();
+    }
+  });
+
+  it("format round is format-only: a malformed format is repaired exactly once", async () => {
+    let formatAttempts = 0;
+    const failures: FourCallSafeRequestFailure[] = [];
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const stage = syntheticFourCallStage(JSON.parse(String(init?.body)));
+      if (stage === undefined) {
+        throw new Error("unexpected synthetic stage");
+      }
+      if (stage === "A") {
+        return syntheticJsonCompletion("合成盲解自由文本。");
+      }
+      if (stage === "A_FORMAT") {
+        formatAttempts += 1;
+        if (formatAttempts === 1) {
+          return syntheticJsonCompletion("这不是合法 JSON，仅演示格式轮修复。");
+        }
+        return syntheticJsonCompletion(stageOutput("A"));
+      }
+      return syntheticJsonCompletion(stageOutput(stage));
+    });
+
+    const result = await runProductionFourCallReviewDag(
+      twoRoundDagArgs(fetchImpl, {
+        beforeRequest: () => undefined,
+        requestCompleted: () => undefined,
+        requestFailed: (_request, failure) => {
+          failures.push(failure);
+        }
+      })
+    );
+    expect(result.semanticRequestCount).toBe(4);
+    expect(formatAttempts).toBe(2);
+    expect(fetchImpl).toHaveBeenCalledTimes(6); // A 语义 + A 格式 + A 修复 + B/C/D
+    expect(failures).toHaveLength(0);
+  });
+
+  it("treats an output-limited format round as terminal without retry and reports both-round identity", async () => {
+    let formatAttempts = 0;
+    const failures: FourCallSafeRequestFailure[] = [];
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const stage = syntheticFourCallStage(JSON.parse(String(init?.body)));
+      if (stage === undefined) {
+        throw new Error("unexpected synthetic stage");
+      }
+      if (stage === "A") {
+        return syntheticJsonCompletion("合成盲解自由文本。");
+      }
+      if (stage === "A_FORMAT") {
+        formatAttempts += 1;
+        return syntheticJsonCompletionFinish("截断输出", "length");
+      }
+      return syntheticJsonCompletion(stageOutput(stage));
+    });
+
+    await expect(runProductionFourCallReviewDag(
+      twoRoundDagArgs(fetchImpl, {
+        beforeRequest: () => undefined,
+        requestCompleted: () => undefined,
+        requestFailed: (_request, failure) => {
+          failures.push(failure);
+        }
+      })
+    )).rejects.toMatchObject({
+      kind: "output_limit",
+      cause: { code: "LLM_OUTPUT_LENGTH_LIMIT" }
+    });
+    expect(formatAttempts).toBe(1); // 终态，无重试、无修复轮
+    expect(failures).toHaveLength(1);
+    expect(failures[0]!).toMatchObject({
+      kind: "output_limit",
+      code: "LLM_OUTPUT_LENGTH_LIMIT",
+      requestCount: 2,
+      transportAttemptCount: 2,
+      completedResponseCount: 1
+    });
+  });
+
+  it("keeps B/C/D single-round with one external transport each", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      const stage = syntheticFourCallStage(body);
+      if (stage === undefined) {
+        throw new Error("unexpected synthetic stage");
+      }
+      if (stage === "A") {
+        return syntheticJsonCompletion("合成盲解自由文本。");
+      }
+      if (stage === "A_FORMAT") {
+        return syntheticJsonCompletion(stageOutput("A"));
+      }
+      return syntheticJsonCompletion(stageOutput(stage));
+    });
+
+    const result = await runProductionFourCallReviewDag(
+      twoRoundDagArgs(fetchImpl)
+    );
+    expect(result.semanticRequestCount).toBe(4);
+    for (const stage of ["B", "C", "D"] as const) {
+      const calls = bodies.filter((body) => syntheticFourCallStage(body) === stage);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.max_tokens).toBe(
+        reviewFlowStageOutputBudgets[stage]
+      );
+    }
+    expect(fetchImpl).toHaveBeenCalledTimes(5);
   });
 });
 

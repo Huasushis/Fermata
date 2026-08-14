@@ -16,6 +16,7 @@ import {
   developmentSmokePhaseSlots,
   developmentSmokeProfile,
   developmentSmokeProfileFingerprint,
+  maximumExternalTransportsPerSmokeRun,
   parseDevelopmentSmokeManifest,
   parseDevelopmentSmokeProfile,
   runDevelopmentSmokePhase,
@@ -30,7 +31,11 @@ import {
   type FourCallRequest,
   type ReviewFlowDagStage
 } from "../src/review-flow/four-call";
-import type { FourCallSafeRequestFailure } from "../src/review-flow/four-call-runtime";
+import type {
+  FourCallSafeRequestFailure,
+  FourCallSafeRequestTiming,
+  FourCallSafeRoundReceipt
+} from "../src/review-flow/four-call-runtime";
 import { hashCanonicalValue } from "../src/review-flow/evidence";
 
 const digest = (character: string): string => character.repeat(64);
@@ -508,6 +513,115 @@ describe("development smoke profile", () => {
     });
   });
 
+});
+
+describe("两轮 A 外部传输预算", () => {
+  it("counts each external transport and fails closed at the authoritative 52 ceiling", () => {
+    const run = controller();
+    const lifecycle = run.lifecycle();
+    const stageA = request("slot-01", "A");
+    for (
+      let index = 0;
+      index < maximumExternalTransportsPerSmokeRun;
+      index += 1
+    ) {
+      lifecycle.beforeTransport?.(stageA);
+    }
+    expect(run.checkpoint().externalTransportsUsed).toBe(
+      maximumExternalTransportsPerSmokeRun
+    );
+    expect(run.checkpoint().logicalRequestsUsed).toBe(0);
+    expect(() => lifecycle.beforeTransport?.(stageA)).toThrow(
+      "DEVELOPMENT_SMOKE_EXTERNAL_ATTEMPT_LIMIT"
+    );
+    expect(run.checkpoint().stopped).toBe(false);
+  });
+
+  it("seeds cumulative transports from restored timings and surfaces them in the checkpoint", () => {
+    const receipts: DevelopmentSmokeSafeRequestReceipt[] = [];
+    const first = controller((receipt) => receipts.push(receipt));
+    const stageA = request("slot-01", "A");
+    first.authorizeRequest(stageA);
+    const timing: FourCallSafeRequestTiming = {
+      firstValidOutputMs: 1_000,
+      endToEndMs: 2_000,
+      validOutputEventCount: 2,
+      outputUtf8Bytes: 100,
+      acceptedEventShapes: [],
+      externalTransportAttemptsUsed: 2,
+      rounds: [
+        {
+          round: "semantic",
+          firstValidOutputMs: 500,
+          endToEndMs: 1_200,
+          validOutputEventCount: 1,
+          transportAttemptCount: 1,
+          eofVerified: true,
+          acceptedEventShapes: []
+        },
+        {
+          round: "format",
+          firstValidOutputMs: 1_100,
+          endToEndMs: 1_900,
+          validOutputEventCount: 1,
+          transportAttemptCount: 1,
+          eofVerified: true,
+          acceptedEventShapes: []
+        }
+      ]
+    };
+    first.recordRequestCompleted(stageA, timing);
+    const restored = controller();
+    restored.restoreCompletedRequest(receipts[0]!, timing);
+    expect(restored.checkpoint()).toMatchObject({
+      logicalRequestsUsed: 1,
+      externalTransportsUsed: 2
+    });
+  });
+
+  it("rejects round-order and transport-sum corruption through restore", () => {
+    const receipts: DevelopmentSmokeSafeRequestReceipt[] = [];
+    const first = controller((receipt) => receipts.push(receipt));
+    const stageA = request("slot-01", "A");
+    first.authorizeRequest(stageA);
+    const semanticRound: FourCallSafeRoundReceipt = {
+      round: "semantic",
+      firstValidOutputMs: 500,
+      endToEndMs: 1_200,
+      validOutputEventCount: 1,
+      transportAttemptCount: 1,
+      eofVerified: true,
+      acceptedEventShapes: []
+    };
+    const formatRound: FourCallSafeRoundReceipt = {
+      round: "format",
+      firstValidOutputMs: 1_100,
+      endToEndMs: 1_900,
+      validOutputEventCount: 1,
+      transportAttemptCount: 1,
+      eofVerified: true,
+      acceptedEventShapes: []
+    };
+    const baseTiming = {
+      firstValidOutputMs: 1_000,
+      endToEndMs: 2_000,
+      validOutputEventCount: 2,
+      outputUtf8Bytes: 100,
+      acceptedEventShapes: [],
+      externalTransportAttemptsUsed: 2,
+      rounds: [semanticRound, formatRound]
+    };
+    const wrongOrder = controller();
+    expect(() => wrongOrder.restoreCompletedRequest(receipts[0]!, {
+      ...baseTiming,
+      rounds: [formatRound, semanticRound]
+    })).toThrow("DEVELOPMENT_SMOKE_TIMING_INVALID");
+    const wrongSum = controller();
+    expect(() => wrongSum.restoreCompletedRequest(receipts[0]!, {
+      ...baseTiming,
+      externalTransportAttemptsUsed: 3
+    })).toThrow("DEVELOPMENT_SMOKE_TIMING_INVALID");
+  });
 });
 
 describe("development smoke transport timing", () => {

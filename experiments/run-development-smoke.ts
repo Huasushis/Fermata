@@ -123,6 +123,7 @@ export async function runDevelopmentSmokeCli(
     process.stdout.write(`${JSON.stringify({
       status: result.state === "phase0_complete" ? "PHASE0-COMPLETE" : "INCOMPLETE",
       requestCount: result.requestCount,
+      runId: result.runId,
       runBindingPrefix: result.runId.slice(0, 12),
       accuracyClaim: null,
       includedInFinalCalibration: false,
@@ -140,6 +141,7 @@ export async function runDevelopmentSmokeCli(
     phase0RequestCount: result.phase0RequestCount,
     phase1RequestCount: result.phase1RequestCount,
     requestCount: result.requestCount,
+    runId: result.runId,
     runBindingPrefix: result.runId.slice(0, 12),
     metrics: result.metrics,
     accuracyClaim: null,

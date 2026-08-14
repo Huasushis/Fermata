@@ -195,20 +195,14 @@ function validOfflineTransport(
   entered?: (stage: "A" | "B" | "C" | "D") => void
 ) {
   return vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body)) as {
-      readonly response_format?: {
-        readonly json_schema?: { readonly name?: string };
-      };
-    };
-    const stage = body.response_format?.json_schema?.name
-      ?.match(/_([abcd])_v1$/u)?.[1]?.toUpperCase();
-    if (stage !== "A" && stage !== "B" && stage !== "C" && stage !== "D") {
+    const stage = stageOfBody(JSON.parse(String(init?.body)));
+    if (stage === undefined) {
       throw new Error("SYNTHETIC_STAGE_INVALID");
     }
-    entered?.(stage);
+    entered?.(stage === "A_FORMAT" ? "A" : stage);
     return new Response(JSON.stringify({
       choices: [{
-        message: { role: "assistant", content: validStageOutput(stage) },
+        message: { role: "assistant", content: syntheticContentFor(stage) },
         finish_reason: "stop"
       }]
     }), {
@@ -220,14 +214,8 @@ function validOfflineTransport(
 
 function validOfflineSseTransport() {
   return vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body)) as {
-      readonly response_format?: {
-        readonly json_schema?: { readonly name?: string };
-      };
-    };
-    const stage = body.response_format?.json_schema?.name
-      ?.match(/_([abcd])_v1$/u)?.[1]?.toUpperCase();
-    if (stage !== "A" && stage !== "B" && stage !== "C" && stage !== "D") {
+    const stage = stageOfBody(JSON.parse(String(init?.body)));
+    if (stage === undefined) {
       throw new Error("SYNTHETIC_STAGE_INVALID");
     }
     return new Response([
@@ -239,7 +227,7 @@ function validOfflineSseTransport() {
       })}`,
       "",
       `data: ${JSON.stringify({
-        choices: [{ delta: { content: validStageOutput(stage) } }]
+        choices: [{ delta: { content: syntheticContentFor(stage) } }]
       })}`,
       "",
       'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
@@ -254,6 +242,53 @@ function validOfflineSseTransport() {
   });
 }
 
+type SyntheticStage = "A" | "A_FORMAT" | "B" | "C" | "D";
+
+/**
+ * 从请求体识别合成阶段：B/C/D 通过 response_format 名称；
+ * 两轮 A 阶段两轮都不带 response_format，靠 max_tokens=32000 加最后一轮
+ * 用户消息是否含"目标 JSON Schema"区分语义轮与格式轮。
+ */
+function stageOfBody(body: {
+  readonly max_tokens?: number;
+  readonly response_format?: {
+    readonly json_schema?: { readonly name?: string };
+  };
+  readonly messages?: readonly { readonly content?: unknown }[];
+}): SyntheticStage | undefined {
+  const formatStage = body.response_format?.json_schema?.name
+    ?.match(/_([abcd])_v1$/u)?.[1]?.toUpperCase();
+  if (
+    formatStage === "A" ||
+    formatStage === "B" ||
+    formatStage === "C" ||
+    formatStage === "D"
+  ) {
+    return formatStage;
+  }
+  if (body.max_tokens === 32_000) {
+    // 语义轮不含"目标 JSON Schema"指令；格式轮与修复轮都包含该指令
+    // （修复轮在格式消息后会追加 assistant/修复提示）。
+    const containsSchemaInstruction = (body.messages ?? []).some(
+      (message) =>
+        typeof message.content === "string" &&
+        message.content.includes("目标 JSON Schema")
+    );
+    return containsSchemaInstruction ? "A_FORMAT" : "A";
+  }
+  return undefined;
+}
+
+function syntheticContentFor(stage: SyntheticStage): string {
+  if (stage === "A") {
+    return "合成盲解自由文本，不包含 JSON。";
+  }
+  if (stage === "A_FORMAT") {
+    return validStageOutput("A");
+  }
+  return validStageOutput(stage);
+}
+
 async function completeSyntheticPhase0(root: string) {
   const transport = validOfflineTransport();
   const preflight = {
@@ -266,7 +301,8 @@ async function completeSyntheticPhase0(root: string) {
     now: () => t0
   });
   expect(result).toMatchObject({ state: "phase0_complete", requestCount: 8 });
-  expect(transport).toHaveBeenCalledTimes(8);
+  // 阶段 A 两轮各占一次外部传输：2 slot × (A:2 + B/C/D:3) = 10
+  expect(transport).toHaveBeenCalledTimes(10);
   return { preflight, result, transport, t0 };
 }
 
@@ -350,32 +386,121 @@ describe("development smoke private checkpoint", () => {
     )) as {
       readonly requests: readonly {
         readonly timing?: {
+          readonly externalTransportAttemptsUsed?: number;
           readonly acceptedEventShapes?: readonly {
             readonly category: string;
             readonly shapeFingerprint: string;
             readonly count: number;
+          }[];
+          readonly rounds?: readonly {
+            readonly acceptedEventShapes: readonly {
+              readonly category: string;
+              readonly shapeFingerprint: string;
+              readonly count: number;
+            }[];
           }[];
         };
       }[];
     };
 
     expect(result).toMatchObject({ state: "phase0_complete", requestCount: 8 });
-    expect(transport).toHaveBeenCalledTimes(8);
+    // 阶段 A 两轮各占一次外部传输：2 slot × (A:2 + B/C/D:3) = 10
+    expect(transport).toHaveBeenCalledTimes(10);
     expect(checkpoint.requests).toHaveLength(8);
+    const fiveShapes = [
+      { category: "content", count: 1 },
+      { category: "done", count: 1 },
+      { category: "finish", count: 1 },
+      { category: "metadata", count: 1 },
+      { category: "usage", count: 1 }
+    ];
     for (const request of checkpoint.requests) {
-      expect(request.timing?.acceptedEventShapes?.map(({ category, count }) => ({
-        category,
-        count
-      }))).toEqual([
-        { category: "content", count: 1 },
-        { category: "done", count: 1 },
-        { category: "finish", count: 1 },
-        { category: "metadata", count: 1 },
-        { category: "usage", count: 1 }
-      ]);
+      if (request.timing?.rounds !== undefined) {
+        // 两轮 A：逐轮 5 种形状，聚合为两轮平铺
+        expect(request.timing.rounds.map((round) =>
+          round.acceptedEventShapes.map(({ category, count }) => ({
+            category,
+            count
+          }))
+        )).toEqual([fiveShapes, fiveShapes]);
+        expect(request.timing.acceptedEventShapes?.map(({ category, count }) => ({
+          category,
+          count
+        }))).toEqual([...fiveShapes, ...fiveShapes]);
+        expect(request.timing.externalTransportAttemptsUsed).toBe(2);
+      } else {
+        expect(request.timing?.acceptedEventShapes?.map(({ category, count }) => ({
+          category,
+          count
+        }))).toEqual(fiveShapes);
+        expect(request.timing?.externalTransportAttemptsUsed).toBe(1);
+      }
       for (const shape of request.timing?.acceptedEventShapes ?? []) {
         expect(shape.shapeFingerprint).toMatch(/^[a-f0-9]{64}$/u);
       }
+    }
+  });
+
+  it("persists two-round A round receipts and transport accounting", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fermata-smoke-two-round-a-"));
+    temporaryRoots.push(root);
+    chmodSync(root, 0o700);
+    const transport = validOfflineSseTransport();
+    const preflight = {
+      ...fixturePreflight(root),
+      models: offlineModels(transport)
+    };
+
+    const result = await executeDevelopmentSmokePhase0({ preflight });
+    const checkpoint = JSON.parse(readFileSync(
+      checkpointPaths(preflight, result.runId).at(-1)!,
+      "utf8"
+    )) as {
+      readonly requests: readonly {
+        readonly receipt: { readonly stage: string };
+        readonly timing?: {
+          readonly externalTransportAttemptsUsed?: number;
+          readonly rounds?: readonly {
+            readonly round: string;
+            readonly firstValidOutputMs: number | null;
+            readonly endToEndMs: number;
+            readonly validOutputEventCount: number;
+            readonly transportAttemptCount: number;
+            readonly eofVerified: boolean;
+          }[];
+        };
+      }[];
+    };
+
+    expect(result.state).toBe("phase0_complete");
+    const stageA = checkpoint.requests.filter(
+      (request) => request.receipt.stage === "A"
+    );
+    expect(stageA).toHaveLength(2);
+    for (const request of stageA) {
+      expect(request.timing?.externalTransportAttemptsUsed).toBe(2);
+      expect(request.timing?.rounds?.map((round) => round.round)).toEqual([
+        "semantic",
+        "format"
+      ]);
+      for (const round of request.timing?.rounds ?? []) {
+        expect(round.transportAttemptCount).toBe(1);
+        expect(round.eofVerified).toBe(true);
+        expect(round.endToEndMs).toBeGreaterThanOrEqual(0);
+        expect(round.firstValidOutputMs).toBeGreaterThanOrEqual(0);
+        expect(round.validOutputEventCount).toBeGreaterThanOrEqual(1);
+      }
+      const [semantic, format] = request.timing?.rounds ?? [];
+      expect(semantic?.endToEndMs).toBeDefined();
+      expect(format?.endToEndMs).toBeDefined();
+    }
+    const singleStage = checkpoint.requests.filter(
+      (request) => request.receipt.stage !== "A"
+    );
+    expect(singleStage).toHaveLength(6);
+    for (const request of singleStage) {
+      expect(request.timing?.externalTransportAttemptsUsed).toBe(1);
+      expect(request.timing?.rounds).toBeUndefined();
     }
   });
 
@@ -465,21 +590,20 @@ describe("development smoke private checkpoint", () => {
     const root = mkdtempSync(join(tmpdir(), "fermata-smoke-primary-failure-"));
     temporaryRoots.push(root);
     chmodSync(root, 0o700);
-    let stageACalls = 0;
+    // 跨两个 slot 的第二次 A 格式轮返回 400，制造 primary HTTP failure；
+    // 其余阶段全部有效，因此在两个 slot 上只有这一个请求失败。
+    let formatRoundCalls = 0;
     const transport = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body)) as {
-        readonly response_format?: {
-          readonly json_schema?: { readonly name?: string };
-        };
-      };
-      const stage = body.response_format?.json_schema?.name
-        ?.match(/_([abcd])_v1$/u)?.[1]?.toUpperCase();
-      if (stage === "A" && ++stageACalls === 2) {
+      const stage = stageOfBody(JSON.parse(String(init?.body)));
+      if (stage === undefined) {
+        throw new Error("SYNTHETIC_STAGE_INVALID");
+      }
+      if (stage === "A_FORMAT" && ++formatRoundCalls === 2) {
         return new Response(null, { status: 400 });
       }
       return new Response(JSON.stringify({
         choices: [{
-          message: { role: "assistant", content: "{}" },
+          message: { role: "assistant", content: syntheticContentFor(stage) },
           finish_reason: "stop"
         }]
       }), {
@@ -509,7 +633,9 @@ describe("development smoke private checkpoint", () => {
     );
 
     expect(result).toMatchObject({ state: "incomplete", requestCount: 4 });
-    expect(transport).toHaveBeenCalledTimes(4);
+    // 软停发生在任一 slot 的 C/D 编排之前：两 slot 各完成 A(语义+格式) 与 B，
+    // 一次 400 落在 slot-02 A 的格式轮 → 共 6 次外部传输、4 个逻辑请求入账。
+    expect(transport).toHaveBeenCalledTimes(6);
     expect(checkpoint.failureCode).toBe("permanent");
     expect(checkpoint.phase1Released).toBe(false);
     expect(failedRequests).toHaveLength(1);
@@ -517,14 +643,15 @@ describe("development smoke private checkpoint", () => {
       kind: "permanent",
       code: "LLM_HTTP_ERROR",
       httpStatus: 400,
-      requestCount: 1,
-      transportAttemptCount: 1,
-      completedResponseCount: 0,
+      requestCount: 2,
+      transportAttemptCount: 2,
+      completedResponseCount: 1,
       terminalResponseMode: null,
       terminalEofObserved: false,
       terminalFinishReasonStopObserved: false,
       terminalSseDoneObserved: null,
-      jsonSchemaValidated: null,
+      // 语义轮已完成、格式轮 HTTP 失败：JSON 从未通过校验
+      jsonSchemaValidated: false,
       formatFailureStage: null,
       formatFailureSubstage: null
     });
@@ -625,7 +752,7 @@ describe("development smoke private checkpoint", () => {
       networkCalls: 0,
       checkpointAppended: false
     });
-    expect(completed.transport).toHaveBeenCalledTimes(8);
+    expect(completed.transport).toHaveBeenCalledTimes(10);
     expect(checkpointPaths(completed.preflight, completed.result.runId))
       .toEqual(pathsBefore);
     expect(pathsBefore.map((path) => sha256(readFileSync(path))))
@@ -661,7 +788,7 @@ describe("development smoke private checkpoint", () => {
     expect(concurrentFailure).toMatchObject({
       message: "DEVELOPMENT_SMOKE_RUN_LOCKED"
     });
-    expect(completed.transport).toHaveBeenCalledTimes(8);
+    expect(completed.transport).toHaveBeenCalledTimes(10);
 
     const releasedPaths = checkpointPaths(
       completed.preflight,
@@ -719,7 +846,7 @@ describe("development smoke private checkpoint", () => {
       phase1RequestCount: 16,
       requestCount: 24
     });
-    expect(completed.transport).toHaveBeenCalledTimes(24);
+    expect(completed.transport).toHaveBeenCalledTimes(30);
     const finalCheckpoint = JSON.parse(readFileSync(
       checkpointPaths(completed.preflight, completed.result.runId).at(-1)!,
       "utf8"
@@ -779,7 +906,7 @@ describe("development smoke private checkpoint", () => {
       resumeRunId: completed.result.runId,
       now: () => new Date(completed.t0.getTime() + 16 * 60_000)
     })).toThrow();
-    expect(completed.transport).toHaveBeenCalledTimes(8);
+    expect(completed.transport).toHaveBeenCalledTimes(10);
   });
 
   it.each([
@@ -840,6 +967,6 @@ describe("development smoke private checkpoint", () => {
       resumeRunId: completed.result.runId,
       now: () => new Date(completed.t0.getTime() + 16 * 60_000)
     })).toThrow();
-    expect(completed.transport).toHaveBeenCalledTimes(8);
+    expect(completed.transport).toHaveBeenCalledTimes(10);
   });
 });

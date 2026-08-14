@@ -26,6 +26,9 @@ import {
   type FourCallSafeRequestFailure,
   type FourCallSafeRequestTiming
 } from "./four-call-runtime";
+import {
+  legacyDevelopmentDiagnosticPlannedRunContract
+} from "./development-diagnostic-run-contract";
 
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 const anonymousSlotSchema = z.enum([
@@ -105,6 +108,13 @@ export const developmentSmokeProfile: DevelopmentSmokeProfile = Object.freeze({
 export const developmentSmokeProfileFingerprint = hashCanonicalValue(
   developmentSmokeProfile
 );
+
+/**
+ * 与诊断通道共用的权威外部传输累计上限（52）。逻辑请求上限仍为 30，
+ * 但两轮 A 阶段的每个传输都独立计数，超过即 fail closed。
+ */
+export const maximumExternalTransportsPerSmokeRun =
+  legacyDevelopmentDiagnosticPlannedRunContract.globalTransportAttemptCeiling;
 export const developmentSmokeAggregateBudgetReceipt = Object.freeze({
   schemaVersion: 1 as const,
   profileName: developmentSmokeProfile.name,
@@ -196,6 +206,7 @@ export interface DevelopmentSmokeCheckpoint {
   readonly phase: "phase0" | "phase1";
   readonly logicalRequestsUsed: number;
   readonly externalAttemptsUsed: number;
+  readonly externalTransportsUsed: number;
   readonly completedRequestCount: number;
   readonly completedSlotCount: number;
   readonly stopped: boolean;
@@ -364,6 +375,7 @@ export class DevelopmentSmokeRunController {
   readonly #authorized = new Map<string, DevelopmentSmokeSafeRequestReceipt>();
   readonly #completed = new Map<string, FourCallSafeRequestTiming>();
   readonly #completedSlots = new Set<DevelopmentSmokeAnonymousSlot>();
+  #externalTransportsUsed = 0;
   #consecutiveSystemFailures = 0;
   readonly #startedAtMs: number;
   readonly #clock: () => number;
@@ -436,8 +448,22 @@ export class DevelopmentSmokeRunController {
           failure
         );
         this.recordFailure(failure.kind);
+      },
+      beforeTransport: (request: FourCallRequest) => {
+        this.#assertTransportBudget(request);
       }
     });
+  }
+
+  #assertTransportBudget(request: FourCallRequest): void {
+    if (this.#stopped || !this.requestStartGate.canStartRequest()) {
+      throw new Error("DEVELOPMENT_SMOKE_NEW_REQUESTS_CLOSED");
+    }
+    if (this.#externalTransportsUsed >= maximumExternalTransportsPerSmokeRun) {
+      throw new Error("DEVELOPMENT_SMOKE_EXTERNAL_ATTEMPT_LIMIT");
+    }
+    anonymousSlotSchema.parse(request.caseId);
+    this.#externalTransportsUsed += 1;
   }
 
   public authorizeRequest(
@@ -530,6 +556,7 @@ export class DevelopmentSmokeRunController {
     assertSafeTiming(timing);
     this.#authorized.set(key, deepFreeze({ ...receipt }));
     this.#completed.set(key, deepFreeze({ ...timing }));
+    this.#externalTransportsUsed += timing.externalTransportAttemptsUsed ?? 0;
   }
 
   public recordRequestCompleted(
@@ -723,6 +750,7 @@ export class DevelopmentSmokeRunController {
       phase: this.#phase,
       logicalRequestsUsed: this.#authorized.size,
       externalAttemptsUsed: this.#authorized.size,
+      externalTransportsUsed: this.#externalTransportsUsed,
       completedRequestCount: this.#completed.size,
       completedSlotCount: this.#completedSlots.size,
       stopped: this.#stopped,
@@ -902,6 +930,52 @@ function assertSafeTiming(timing: FourCallSafeRequestTiming): void {
     timing.outputUtf8Bytes < 1
   ) {
     throw new Error("DEVELOPMENT_SMOKE_TIMING_INVALID");
+  }
+  const transports = timing.externalTransportAttemptsUsed;
+  if (
+    transports !== undefined &&
+    (!Number.isSafeInteger(transports) ||
+      transports < 1 ||
+      transports > maximumExternalTransportsPerSmokeRun)
+  ) {
+    throw new Error("DEVELOPMENT_SMOKE_TIMING_INVALID");
+  }
+  const rounds = timing.rounds;
+  if (rounds !== undefined) {
+    const expectedOrder = ["semantic", "format", "format_repair"] as const;
+    if (rounds.length < 2 || rounds.length > 3) {
+      throw new Error("DEVELOPMENT_SMOKE_TIMING_INVALID");
+    }
+    let roundTransportSum = 0;
+    rounds.forEach((round, index) => {
+      if (round.round !== expectedOrder[index]) {
+        throw new Error("DEVELOPMENT_SMOKE_TIMING_INVALID");
+      }
+      if (
+        (round.firstValidOutputMs !== null &&
+          (!Number.isSafeInteger(round.firstValidOutputMs) ||
+            round.firstValidOutputMs < 0)) ||
+        !Number.isSafeInteger(round.endToEndMs) ||
+        round.endToEndMs < 0 ||
+        !Number.isSafeInteger(round.validOutputEventCount) ||
+        round.validOutputEventCount < 1 ||
+        !Number.isSafeInteger(round.transportAttemptCount) ||
+        round.transportAttemptCount < 1 ||
+        round.eofVerified !== true
+      ) {
+        throw new Error("DEVELOPMENT_SMOKE_TIMING_INVALID");
+      }
+      if (
+        round.firstValidOutputMs !== null &&
+        round.firstValidOutputMs > round.endToEndMs
+      ) {
+        throw new Error("DEVELOPMENT_SMOKE_TIMING_INVALID");
+      }
+      roundTransportSum += round.transportAttemptCount;
+    });
+    if (transports !== undefined && transports !== roundTransportSum) {
+      throw new Error("DEVELOPMENT_SMOKE_TIMING_INVALID");
+    }
   }
 }
 

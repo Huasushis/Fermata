@@ -1002,7 +1002,7 @@ function stableJsonSchema(value: unknown): unknown {
   );
 }
 
-function serializeTargetJsonSchema<T>(schema: z.ZodType<T>): string {
+export function serializeTargetJsonSchema<T>(schema: z.ZodType<T>): string {
   return JSON.stringify(stableJsonSchema(z.toJSONSchema(schema)), null, 2);
 }
 
@@ -1035,6 +1035,20 @@ function directStructuredMessages<T>(
 }
 
 /**
+ * 两轮 JSON 设计的可选轮次审计回调。只用于透明观测（例如为每个轮次单独记录
+ * 首次有效输出时间与传输证据），不改变提示词、模型配置、schema 或失败语义。
+ */
+export interface TwoRoundJsonRoundAudit {
+  /** 每一轮（语义 / 格式 / 格式修复）真正发起传输前调用。 */
+  readonly onRoundStart: (round: "semantic" | "format" | "format_repair") => void;
+  /** 该轮传输完成且通过传输级校验后调用；轮次失败时不调用。 */
+  readonly onRoundSettled: (
+    round: "semantic" | "format" | "format_repair",
+    receipt: LlmTransportReceipt
+  ) => void;
+}
+
+/**
  * 两轮 JSON 设计：第一轮让模型用自然语言完成语义判断（不强制 JSON），
  * 第二轮只做格式化——把第一轮的文本转换为满足 schema 的 JSON，不重新判断。
  * 两轮都使用相同的模型配置（含 thinking/reasoning_effort）。
@@ -1047,7 +1061,8 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
   formatterMessages: (semanticOutput: string, semanticReasoning: string | null) => ChatMessage[],
   schema: z.ZodType<T>,
   runtime: LlmRuntimeOptions,
-  options: ChatCompletionJsonOptions = {}
+  options: ChatCompletionJsonOptions = {},
+  roundAudit?: TwoRoundJsonRoundAudit
 ): Promise<{ data: T; reasoning: string | null; receipt: LlmJsonCompletionReceipt }> {
   if (runtime.directStructuredOutput === true) {
     return chatCompleteJsonWithReceipt(
@@ -1060,6 +1075,7 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
     );
   }
   let semantic: ChatCompletionWithReceipt;
+  roundAudit?.onRoundStart("semantic");
   try {
     semantic = await chatCompleteWithReceipt(provider, spec, semanticMessages, runtime, {
       requestJson: false,
@@ -1070,6 +1086,7 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
     promoteJsonFailureAudit(error, 1, [], 0);
     throw error;
   }
+  roundAudit?.onRoundSettled("semantic", semantic.receipt);
 
   const formatMessages = formatterMessages(semantic.content, semantic.reasoning);
   const jsonInstruction: ChatMessage = {
@@ -1078,6 +1095,7 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
   };
   const firstFormatMessages: ChatMessage[] = [jsonInstruction, ...formatMessages];
   let firstFormat: ChatCompletionWithReceipt;
+  roundAudit?.onRoundStart("format");
   try {
     firstFormat = await chatCompleteWithReceipt(provider, spec, firstFormatMessages, runtime, {
       requestJson: false,
@@ -1088,6 +1106,7 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
     promoteJsonFailureAudit(error, 2, [semantic.receipt], semantic.receipt.transportAttemptCount);
     throw error;
   }
+  roundAudit?.onRoundSettled("format", firstFormat.receipt);
   const firstAttempt = tryParseAndValidate(firstFormat.content, schema);
   if (firstAttempt.success) {
     return {
@@ -1114,6 +1133,7 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
     }
   ];
   let secondFormat: ChatCompletionWithReceipt;
+  roundAudit?.onRoundStart("format_repair");
   try {
     secondFormat = await chatCompleteWithReceipt(provider, spec, repairMessages, runtime, {
       requestJson: false,
@@ -1128,6 +1148,7 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
     );
     throw error;
   }
+  roundAudit?.onRoundSettled("format_repair", secondFormat.receipt);
   const secondAttempt = tryParseAndValidate(secondFormat.content, schema);
   if (secondAttempt.success) {
     return {

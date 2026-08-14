@@ -1,26 +1,32 @@
 import type { PipelineModelConfig } from "../pipelines/types";
 import {
+  chatCompleteTwoRoundJsonWithReceipt,
   chatCompleteWithReceipt,
   getLlmFailureAudit,
   LlmJsonOutputError,
   LlmRequestError,
   LlmResponseBodyTooLargeError,
   LlmResponseFormatError,
+  serializeTargetJsonSchema,
   type ChatMessage,
   type ChatCompletionWithReceipt,
+  type LlmJsonCompletionReceipt,
+  type LlmRuntimeOptions,
   type LlmSseAcceptedShapeAudit,
   type LlmResponseFormatFailureStage,
   type LlmResponseFormatFailureSubstage,
   type LlmSseRejectedEventAudit
 } from "../llm";
 import {
+  reviewFlowStageAZodSchema,
   runFourCallReviewDag,
   type FourCallDagResult,
   type FourCallModelBinding,
   type FourCallReviewSource,
   type FourCallModelBindings,
   type FourCallRequest,
-  type FourCallResponse
+  type FourCallResponse,
+  type ReviewFlowStageAPayload
 } from "./four-call";
 import {
   FairLlmRequestScheduler,
@@ -37,12 +43,32 @@ export interface FourCallRuntimeModels {
   readonly D: PipelineModelConfig;
   readonly formatter: PipelineModelConfig;
 }
+export type FourCallSafeRoundName = "semantic" | "format" | "format_repair";
+
+/** 两轮（语义→格式）A 阶段中单个轮次的消毒观测；只含协议状态与计数。 */
+export interface FourCallSafeRoundReceipt {
+  readonly round: FourCallSafeRoundName;
+  readonly firstValidOutputMs: number | null;
+  readonly endToEndMs: number;
+  readonly validOutputEventCount: number;
+  readonly transportAttemptCount: number;
+  readonly eofVerified: true;
+  readonly acceptedEventShapes: readonly LlmSseAcceptedShapeAudit[];
+}
+
 export interface FourCallSafeRequestTiming {
   readonly firstValidOutputMs: number;
   readonly endToEndMs: number;
   readonly validOutputEventCount: number;
   readonly outputUtf8Bytes: number;
   readonly acceptedEventShapes: readonly LlmSseAcceptedShapeAudit[];
+  /**
+   * 该逻辑请求实际消耗的外部传输次数（每轮一次，含修复轮）。单轮阶段固定为 1；
+   * A 阶段等于两个轮次的 transportAttemptCount 之和。旧调用方可能不写该字段。
+   */
+  readonly externalTransportAttemptsUsed?: number;
+  /** 仅两轮 A 阶段写入：语义→格式（→格式修复）的逐轮观测。 */
+  readonly rounds?: readonly FourCallSafeRoundReceipt[];
 }
 export interface FourCallSafeRequestFailure {
   readonly kind: LlmStageFailureKind;
@@ -76,6 +102,11 @@ export interface FourCallSafeRequestFailure {
 export interface FourCallRequestLifecycle {
   /** 在任何可能计费的 fetch 前同步执行；抛错即 fail closed。 */
   readonly beforeRequest: (request: FourCallRequest) => void;
+  /**
+   * 在每一次可能计费的外部传输真正发起前执行（两轮 A 阶段每轮一次）；
+   * 抛错即 fail closed，由传输层转换为 LLM_TRANSPORT_DENIED，不会发起 fetch。
+   */
+  readonly beforeTransport?: (request: FourCallRequest) => void;
   readonly requestCompleted: (
     request: FourCallRequest,
     timing: FourCallSafeRequestTiming
@@ -159,6 +190,9 @@ async function executeProductionCall(
   lifecycle?: FourCallRequestLifecycle
 ): Promise<FourCallResponse> {
   assertRequestMatchesConfig(request.model, config);
+  if (request.stage === "A") {
+    return executeProductionStageATwoRound(request, config, lifecycle);
+  }
   const startedAt = Date.now();
   let firstValidOutputMs: number | null = null;
   let validOutputEventCount = 0;
@@ -168,16 +202,10 @@ async function executeProductionCall(
       config.credentials,
       config.spec,
       request.messages as ChatMessage[],
-      {
-        ...config.runtime,
-        // 逐阶段逻辑重试由 FairLlmRequestScheduler 统一计数，传输层不得再暗中重试。
-        maxAttempts: 1,
-        onSafeOutputActivity: () => {
-          config.runtime.onSafeOutputActivity?.();
-          validOutputEventCount += 1;
-          firstValidOutputMs ??= Date.now() - startedAt;
-        }
-      },
+      buildCallRuntime(request, config, lifecycle, startedAt, () => {
+        validOutputEventCount += 1;
+        firstValidOutputMs ??= Date.now() - startedAt;
+      }),
       {
         maxOutputTokens: request.maxOutputTokens,
         responseJsonSchema: request.schema === null
@@ -209,12 +237,190 @@ async function executeProductionCall(
     endToEndMs: Date.now() - startedAt,
     validOutputEventCount,
     outputUtf8Bytes: Buffer.byteLength(completion.content, "utf8"),
-    acceptedEventShapes: completion.receipt.acceptedEventShapes
+    acceptedEventShapes: completion.receipt.acceptedEventShapes,
+    externalTransportAttemptsUsed: completion.receipt.transportAttemptCount
   }));
   return {
     output: completion.content,
     eofVerified: completion.receipt.eofVerified
   };
+}
+
+/**
+ * 构造传输层运行时：逐阶段逻辑重试统一交由 FairLlmRequestScheduler 计数，
+ * 传输层不再暗中重试；活动回调先通知调用方再累计；若调用方注册了 transport
+ * 前置校验点，则在每次可能计费的 fetch 前执行（抛错即 fail closed）。
+ */
+function buildCallRuntime(
+  request: FourCallRequest,
+  config: PipelineModelConfig,
+  lifecycle: FourCallRequestLifecycle | undefined,
+  startedAt: number,
+  onActivity: () => void
+): LlmRuntimeOptions {
+  const configuredDispatch = config.runtime.onTransportDispatch;
+  const beforeTransport = lifecycle?.beforeTransport;
+  return Object.freeze({
+    ...config.runtime,
+    maxAttempts: 1,
+    onSafeOutputActivity: () => {
+      config.runtime.onSafeOutputActivity?.();
+      onActivity();
+    },
+    ...(configuredDispatch !== undefined || beforeTransport !== undefined
+      ? {
+          onTransportDispatch: async (attempt: number) => {
+            try {
+              await configuredDispatch?.(attempt);
+            } finally {
+              beforeTransport?.(request);
+            }
+          }
+        }
+      : {})
+  });
+}
+
+/** A 阶段（盲解）两轮路径：语义轮自由文本 → 格式轮只做 JSON Schema 转换。 */
+async function executeProductionStageATwoRound(
+  request: FourCallRequest,
+  config: PipelineModelConfig,
+  lifecycle?: FourCallRequestLifecycle
+): Promise<FourCallResponse> {
+  const startedAt = Date.now();
+  let firstValidOutputMs: number | null = null;
+  let validOutputEventCount = 0;
+  let currentRoundAcc: MutableRoundAccumulator | null = null;
+  const rounds: FourCallSafeRoundReceipt[] = [];
+  let result: {
+    data: ReviewFlowStageAPayload;
+    reasoning: string | null;
+    receipt: LlmJsonCompletionReceipt;
+  };
+  try {
+    result = await chatCompleteTwoRoundJsonWithReceipt(
+      config.credentials,
+      config.spec,
+      request.messages as ChatMessage[],
+      reviewFlowStageAFormatterMessages,
+      reviewFlowStageAZodSchema,
+      buildCallRuntime(request, config, lifecycle, startedAt, () => {
+        validOutputEventCount += 1;
+        firstValidOutputMs ??= Date.now() - startedAt;
+        if (currentRoundAcc !== null) {
+          currentRoundAcc.validOutputEventCount += 1;
+          currentRoundAcc.firstValidOutputMs ??=
+            Date.now() - currentRoundAcc.startedAtMs;
+        }
+      }),
+      {
+        maxOutputTokens: request.maxOutputTokens
+      },
+      {
+        onRoundStart: (round) => {
+          currentRoundAcc = {
+            round,
+            startedAtMs: Date.now(),
+            firstValidOutputMs: null,
+            validOutputEventCount: 0
+          };
+        },
+        onRoundSettled: (round, transport) => {
+          if (currentRoundAcc !== null && currentRoundAcc.round === round) {
+            rounds.push(reviewFlowSafeRoundReceipt(currentRoundAcc, transport));
+          }
+          currentRoundAcc = null;
+        }
+      }
+    );
+  } catch (error) {
+    const classified = classifyTransportFailure(error);
+    lifecycle?.requestFailed(
+      request,
+      safeRequestFailure(error, classified.kind)
+    );
+    throw classified;
+  }
+  if (firstValidOutputMs === null || validOutputEventCount < 1) {
+    const classified = new LlmStageRequestError("stream_interrupted");
+    lifecycle?.requestFailed(
+      request,
+      safeRequestFailure(classified, classified.kind)
+    );
+    throw classified;
+  }
+  const output = JSON.stringify(result.data);
+  lifecycle?.requestCompleted(request, Object.freeze({
+    firstValidOutputMs,
+    endToEndMs: Date.now() - startedAt,
+    validOutputEventCount,
+    outputUtf8Bytes: Buffer.byteLength(output, "utf8"),
+    acceptedEventShapes: result.receipt.responses.flatMap(
+      (transport) => transport.acceptedEventShapes
+    ),
+    externalTransportAttemptsUsed: result.receipt.transportAttemptCount,
+    rounds: Object.freeze([...rounds])
+  }));
+  return { output, eofVerified: true };
+}
+
+interface MutableRoundAccumulator {
+  readonly round: FourCallSafeRoundName;
+  readonly startedAtMs: number;
+  firstValidOutputMs: number | null;
+  validOutputEventCount: number;
+}
+
+function reviewFlowSafeRoundReceipt(
+  acc: MutableRoundAccumulator,
+  transport: ChatCompletionWithReceipt["receipt"]
+): FourCallSafeRoundReceipt {
+  return Object.freeze({
+    round: acc.round,
+    firstValidOutputMs: acc.firstValidOutputMs,
+    endToEndMs: Date.now() - acc.startedAtMs,
+    validOutputEventCount: acc.validOutputEventCount,
+    transportAttemptCount: transport.transportAttemptCount,
+    // 结算钩子在 assertStructuredCompletionTransport 之后才触发，
+    // 因此此处 eofVerified 恒为 true。
+    eofVerified: transport.eofVerified as true,
+    acceptedEventShapes: transport.acceptedEventShapes
+  });
+}
+
+/**
+ * A 阶段格式轮消息：把语义轮的自由文本转换为满足 A schema 的 JSON。
+ * 明确指示"只做格式转换、不重新判断"，与两轮帮助器契约一致。
+ */
+function reviewFlowStageAFormatterMessages(
+  semanticOutput: string,
+  semanticReasoning: string | null
+): ChatMessage[] {
+  return [
+    {
+      role: "user",
+      content: [
+        "以下内容是第一阶段盲解判断的文字（目标与思路）。请只把这段内容转换为符合要求的 JSON，不得重新判断、补充或删除任何信息：",
+        semanticOutput
+      ].join("\n")
+    },
+    ...(semanticReasoning === null || semanticReasoning.trim() === ""
+      ? []
+      : [{
+          role: "user" as const,
+          content: [
+            "以下是第一阶段判断的理由，仅用于理解原判断，不得据此重新判断或改写内容：",
+            semanticReasoning
+          ].join("\n")
+        }]),
+    {
+      role: "user",
+      content: [
+        "目标 JSON Schema：",
+        serializeTargetJsonSchema(reviewFlowStageAZodSchema)
+      ].join("\n")
+    }
+  ];
 }
 
 function modelBinding(config: PipelineModelConfig): FourCallModelBinding {

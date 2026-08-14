@@ -1,3 +1,4 @@
+import { z } from "zod";
 import {
   FairLlmRequestScheduler,
   LlmStageRequestError
@@ -75,6 +76,21 @@ const signalArraySchema = Object.freeze({
   items: Object.freeze({ type: "string", minLength: 1, maxLength: 4_000 }),
   maxItems: 100
 } satisfies MachineJsonSchema);
+
+/**
+ * A 阶段（盲解）载荷的 zod 镜像，与 reviewFlowUnifiedJsonSchema.properties.a 逐项一致
+ * （含 additionalProperties: false）。仅供两轮帮助器的格式轮/修复轮做 JSON Schema 校验，
+ * 不参与 machine schema 指纹，也不用于 DAG 的机器校验。
+ */
+export const reviewFlowStageAZodSchema = z
+  .object({
+    solvable: z.boolean(),
+    blindSolution: z.string().min(1).max(500_000),
+    positiveSignals: z.array(z.string().min(1).max(4_000)).max(100),
+    negativeSignals: z.array(z.string().min(1).max(4_000)).max(100)
+  })
+  .strict();
+export type ReviewFlowStageAPayload = z.infer<typeof reviewFlowStageAZodSchema>;
 
 /** A/B/C/D 与末尾 formatter 共用的唯一机器 schema 定义。 */
 export const reviewFlowUnifiedJsonSchema = Object.freeze({

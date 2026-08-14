@@ -255,15 +255,43 @@ const acceptedEventShapeSchema = z.object({
   count: z.number().int().positive()
 }).strict();
 
+const safeRoundReceiptSchema = z.object({
+  round: z.enum(["semantic", "format", "format_repair"]),
+  firstValidOutputMs: z.number().int().nonnegative().nullable(),
+  endToEndMs: z.number().int().nonnegative(),
+  validOutputEventCount: z.number().int().positive(),
+  transportAttemptCount: z.number().int().positive(),
+  eofVerified: z.literal(true),
+  acceptedEventShapes: z.array(acceptedEventShapeSchema).max(64).readonly()
+}).strict();
+
 const safeTimingSchema = z.object({
   firstValidOutputMs: z.number().int().nonnegative(),
   endToEndMs: z.number().int().nonnegative(),
   validOutputEventCount: z.number().int().positive(),
   outputUtf8Bytes: z.number().int().positive(),
-  acceptedEventShapes: z.array(acceptedEventShapeSchema).max(64).readonly()
+  acceptedEventShapes: z.array(acceptedEventShapeSchema).max(64).readonly(),
+  externalTransportAttemptsUsed: z.number().int().min(1).max(104).optional(),
+  rounds: z.array(safeRoundReceiptSchema).min(2).max(3).readonly().optional()
 }).strict().superRefine((value, context) => {
   if (value.endToEndMs < value.firstValidOutputMs) {
     context.addIssue({ code: "custom", message: "invalid timing order" });
+  }
+  if (value.rounds !== undefined) {
+    const expectedOrder = ["semantic", "format", "format_repair"] as const;
+    if (value.rounds.some((round, index) => round.round !== expectedOrder[index])) {
+      context.addIssue({ code: "custom", message: "invalid round order" });
+    }
+    const roundTransportSum = value.rounds.reduce(
+      (sum, round) => sum + round.transportAttemptCount,
+      0
+    );
+    if (
+      value.externalTransportAttemptsUsed !== undefined &&
+      value.externalTransportAttemptsUsed !== roundTransportSum
+    ) {
+      context.addIssue({ code: "custom", message: "round transport mismatch" });
+    }
   }
 });
 const safeReceiptSchema = z.object({
