@@ -5,7 +5,7 @@ import {
   getLlmFailureAudit,
   LlmJsonOutputError,
   LlmRequestError,
-  LlmResponseBodyTooLargeError,
+  LlmRetainedTextTooLargeError,
   LlmResponseFormatError,
   serializeTargetJsonSchema,
   type ChatMessage,
@@ -74,7 +74,7 @@ export interface FourCallSafeRequestFailure {
   readonly kind: LlmStageFailureKind;
   readonly code:
     | LlmRequestError["code"]
-    | "LLM_RESPONSE_BODY_TOO_LARGE"
+    | "LLM_RETAINED_TEXT_TOO_LARGE"
     | "LLM_RESPONSE_FORMAT_INVALID"
     | "LLM_JSON_OUTPUT_INVALID"
     | "unknown";
@@ -488,11 +488,11 @@ function safeRequestFailure(
 ): FourCallSafeRequestFailure {
   const audit = getLlmFailureAudit(error);
   const recognized = error instanceof LlmRequestError ||
-    error instanceof LlmResponseBodyTooLargeError ||
+    error instanceof LlmRetainedTextTooLargeError ||
     error instanceof LlmResponseFormatError ||
     error instanceof LlmJsonOutputError;
+  // 保留文本护栏错误不带格式阶段字段（它不是协议层位置）。
   const hasFormatFailure = error instanceof LlmRequestError ||
-    error instanceof LlmResponseBodyTooLargeError ||
     error instanceof LlmResponseFormatError;
   return Object.freeze({
     kind,

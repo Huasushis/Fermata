@@ -9,14 +9,13 @@ import {
   LlmRequestStartGate,
   LlmJsonOutputError,
   LlmRequestError,
-  LlmResponseBodyTooLargeError,
+  LlmRetainedTextTooLargeError,
   LlmResponseFormatError,
   maximumExplicitLlmOutputTokens,
-  maximumLlmResponseBodyBytes,
+  maximumRetainedLlmTextLength,
   withLlmRequestStartGate,
   type ModelCallSpec
 } from "../src/llm";
-import { logError } from "../src/logger";
 
 const provider = { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" };
 const spec = { model: "test-model", temperature: 0.2, thinking: false };
@@ -1662,7 +1661,7 @@ describe("chatComplete：正常路径", () => {
     }
   });
 
-  it("metadata 后正文超限不能被归为 metadata-only", async () => {
+  it("metadata 后超长完整尾部按尾部形状分类，不再触发旧 4 MiB 字节上限", async () => {
     const encoder = new TextEncoder();
     let cancelled = false;
     let streamController!: ReadableStreamDefaultController<Uint8Array>;
@@ -1687,14 +1686,18 @@ describe("chatComplete：正常路径", () => {
         sseDataEvent(JSON.stringify(strictUsageMetadataEvent()))
     ));
     await new Promise<void>((resolve) => setImmediate(resolve));
-    streamController.enqueue(new Uint8Array(maximumLlmResponseBodyBytes));
+    // 超过旧 4 MiB 上限的单个完整 data 行：正文按形状分类而不是按字节数拒绝。
+    streamController.enqueue(encoder.encode(
+      sseDataEvent("a".repeat(5 * 1024 * 1024))
+    ));
+    streamController.close();
     const error = await resultPromise.catch((caught: unknown) => caught);
     expect(error).toMatchObject({
-      code: "LLM_RESPONSE_BODY_TOO_LARGE",
+      code: "LLM_RESPONSE_FORMAT_INVALID",
       formatFailureStage: "trailing_data",
-      formatFailureSubstage: "data_after_done_tail_incomplete"
+      formatFailureSubstage: "data_after_done_json_syntax_invalid"
     });
-    expect(cancelled).toBe(true);
+    expect(cancelled).toBe(false);
   });
 
   it("终止序列子阶段在运行时也是闭集，非法值不会进入错误对象", () => {
@@ -1709,10 +1712,6 @@ describe("chatComplete：正常路径", () => {
       () => new LlmRequestError(
         "LLM_STREAM_INTERRUPTED",
         undefined,
-        "trailing_data",
-        sensitiveValue as "duplicate_done"
-      ),
-      () => new LlmResponseBodyTooLargeError(
         "trailing_data",
         sensitiveValue as "duplicate_done"
       )
@@ -1745,12 +1744,6 @@ describe("chatComplete：正常路径", () => {
     {
       mode: "cancelled",
       expectedCode: "LLM_CANCELLED",
-      expectedCancelled: true,
-      expectedSubstage: "data_after_done_tail_incomplete"
-    },
-    {
-      mode: "body_too_large",
-      expectedCode: "LLM_RESPONSE_BODY_TOO_LARGE",
       expectedCancelled: true,
       expectedSubstage: "data_after_done_tail_incomplete"
     }
@@ -1795,8 +1788,6 @@ describe("chatComplete：正常路径", () => {
         streamController.error(new Error(sensitiveTransportText));
       } else if (mode === "cancelled") {
         taskController.abort();
-      } else {
-        streamController.enqueue(new Uint8Array(maximumLlmResponseBodyBytes));
       }
 
       const error = await resultPromise.catch((caught: unknown) => caught);
@@ -2519,7 +2510,7 @@ describe("chatComplete：正常路径", () => {
     expect(cancelled).toBe(false);
   });
 
-  it("协议首错后的排空仍受累计字节上限约束，超限时取消且保留首错阶段", async () => {
+  it("协议首错后的排空不再受累计字节上限约束，超限排空到 EOF 仍保留首错阶段", async () => {
     let cancelled = false;
     let streamController!: ReadableStreamDefaultController<Uint8Array>;
     const body = new ReadableStream<Uint8Array>({
@@ -2543,13 +2534,16 @@ describe("chatComplete：正常路径", () => {
 
     streamController.enqueue(new TextEncoder().encode("data: {not-json}\n\n"));
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    streamController.enqueue(new Uint8Array(maximumLlmResponseBodyBytes));
+    // 超过旧 4 MiB 上限的排空正文：逐块丢弃直到真实 EOF，不再按字节数报错，
+    // 同时保留首错阶段而不是被中断覆盖。
+    streamController.enqueue(new Uint8Array(6 * 1024 * 1024));
+    streamController.close();
 
     await expect(resultPromise).rejects.toMatchObject({
-      code: "LLM_RESPONSE_BODY_TOO_LARGE",
+      code: "LLM_RESPONSE_FORMAT_INVALID",
       formatFailureStage: "event_json"
     });
-    expect(cancelled).toBe(true);
+    expect(cancelled).toBe(false);
   });
 });
 
@@ -3028,7 +3022,7 @@ describe("chatComplete：按输出活动判断是否停住", () => {
   });
 });
 
-describe("chatComplete：响应正文大小限制", () => {
+describe("chatComplete：响应正文大小与保留护栏", () => {
   it("拒绝损坏的 UTF-8，不把替换字符当成模型内容", async () => {
     for (const contentType of ["application/json", "text/event-stream"]) {
       const fetchMock = vi.fn(
@@ -3068,14 +3062,13 @@ describe("chatComplete：响应正文大小限制", () => {
     ).resolves.toMatchObject({ content: "分块中文回答" });
   });
 
-  it("正文恰好等于固定字节上限时允许读取", async () => {
+  it("非流 JSON 正文超过旧 4 MiB 字节上限仍完整解析", async () => {
     const prefix = '{"choices":[{"message":{"content":"';
     const suffix = '"},"finish_reason":"stop"}]}';
-    const fixedBytes = new TextEncoder().encode(prefix + suffix).byteLength;
-    const content = "a".repeat(maximumLlmResponseBodyBytes - fixedBytes);
+    const content = "a".repeat(5 * 1024 * 1024 - 128);
     const responseBody = prefix + content + suffix;
-    expect(new TextEncoder().encode(responseBody).byteLength).toBe(
-      maximumLlmResponseBodyBytes
+    expect(new TextEncoder().encode(responseBody).byteLength).toBeGreaterThan(
+      4 * 1024 * 1024
     );
     const fetchMock = vi.fn(
       async () => new Response(responseBody, {
@@ -3087,68 +3080,99 @@ describe("chatComplete：响应正文大小限制", () => {
       ...runtime,
       fetch: fetchMock
     });
-    expect(result.content.length).toBe(content.length);
+    expect(result.content).toBe(content);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("按 UTF-8 字节拒绝超限正文，取消流且不重试或泄露内容", async () => {
-    const sensitiveBody = "不应进入异常或日志的正文";
-    const sensitiveCancelError = "不应进入异常或日志的取消错误";
-    const oversizedText =
-      sensitiveBody +
-      "题".repeat(Math.floor(maximumLlmResponseBodyBytes / 3) + 1);
-    expect(oversizedText.length).toBeLessThan(maximumLlmResponseBodyBytes);
-    const oversizedBytes = new TextEncoder().encode(oversizedText);
-    expect(oversizedBytes.byteLength).toBeGreaterThan(maximumLlmResponseBodyBytes);
-    const splitAt = Math.floor(oversizedBytes.byteLength / 2);
-    const firstChunk = oversizedBytes.slice(0, splitAt);
-    const secondChunk = oversizedBytes.slice(splitAt);
-    expect(firstChunk.byteLength).toBeLessThan(maximumLlmResponseBodyBytes);
-    expect(secondChunk.byteLength).toBeLessThan(maximumLlmResponseBodyBytes);
-
-    let cancelled = false;
-    let requestSignal: AbortSignal | undefined;
-    const fetchMock = vi.fn(
-      async (_url: string | URL | Request, init?: RequestInit) => {
-        requestSignal = init?.signal ?? undefined;
-        const body = new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(firstChunk);
-            controller.enqueue(secondChunk);
-          },
-          cancel() {
-            cancelled = true;
-            return Promise.reject(new Error(sensitiveCancelError));
-          }
-        });
-        return new Response(body, {
-          status: 200,
-          headers: { "Content-Type": "text/event-stream" }
-        });
-      }
+  it("长 reasoning=max 式响应超过旧 4 MiB 字节上限时流式读完并正常收尾", async () => {
+    const reasoningDelta = "a".repeat(1024 * 1024);
+    const events = [
+      ...[0, 1, 2, 3].map(() => JSON.stringify({
+        choices: [{ index: 0, delta: { reasoning_content: reasoningDelta } }]
+      })),
+      JSON.stringify({
+        choices: [{ index: 0, delta: { content: "合成完整答案" } }]
+      }),
+      JSON.stringify({
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+      }),
+      "[DONE]"
+    ];
+    const responseBody = events.map((event) => `data: ${event}\n\n`).join("");
+    expect(new TextEncoder().encode(responseBody).byteLength).toBeGreaterThan(
+      4 * 1024 * 1024
     );
-    const error = await chatComplete(provider, spec, [], {
+    const fetchMock = vi.fn(
+      async () => new Response(responseBody, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      })
+    );
+    const result = await chatComplete(
+      provider,
+      { ...spec, thinking: true },
+      [],
+      { ...runtime, fetch: fetchMock }
+    );
+    expect(result.content).toBe("合成完整答案");
+    expect(result.reasoning).toBe(reasoningDelta.repeat(4));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("防护护栏：单个未结束事件超过防御上限时以永久错误拒绝且不重试", async () => {
+    let cancelled = false;
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+      },
+      cancel() {
+        cancelled = true;
+      }
+    });
+    const fetchMock = vi.fn(
+      async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      })
+    );
+    const resultPromise = chatComplete(provider, spec, [], {
       ...runtime,
       fetch: fetchMock
-    }).catch((caught: unknown) => caught);
+    });
+    // 单个无换行的 data 行，累计超过防御上限（24576000 单位）。
+    streamController.enqueue(new TextEncoder().encode(
+      "data: " + "a".repeat(maximumRetainedLlmTextLength + 1)
+    ));
 
-    expect(error).toBeInstanceOf(LlmResponseBodyTooLargeError);
-    expect(error).toMatchObject({ code: "LLM_RESPONSE_BODY_TOO_LARGE" });
-    expect((error as Error).message).not.toContain(sensitiveBody);
-    expect((error as Error).message).not.toContain(sensitiveCancelError);
+    const error = await resultPromise.catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(LlmRetainedTextTooLargeError);
+    expect(error).toMatchObject({ code: "LLM_RETAINED_TEXT_TOO_LARGE" });
     expect(cancelled).toBe(true);
-    expect(requestSignal?.aborted).toBe(true);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 
-    const write = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-    try {
-      logError("模型响应过大", error);
-      const output = write.mock.calls.map(([value]) => String(value)).join("");
-      expect(output).toContain('errorCode="LLM_RESPONSE_BODY_TOO_LARGE"');
-      expect(output).not.toContain(sensitiveBody);
-      expect(output).not.toContain(sensitiveCancelError);
-    } finally {
-      write.mockRestore();
-    }
+  it("防护护栏：跨多个事件累计保留文本超过防御上限时以永久错误拒绝", async () => {
+    const delta = "a".repeat(13 * 1024 * 1024);
+    const responseBody = [0, 1].map(() => `data: ${JSON.stringify({
+      choices: [{ index: 0, delta: { content: delta } }]
+    })}\n\n`).join("");
+    // 两个事件各 13 MiB 单位，单个事件低于护栏，累计超过 24576000。
+    const fetchMock = vi.fn(
+      async () => new Response(responseBody, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      })
+    );
+    const error = await chatComplete(
+      provider,
+      { ...spec, thinking: true },
+      [],
+      { ...runtime, fetch: fetchMock }
+    ).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(LlmRetainedTextTooLargeError);
+    expect(error).toMatchObject({ code: "LLM_RETAINED_TEXT_TOO_LARGE" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

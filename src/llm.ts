@@ -409,11 +409,16 @@ export interface ChatCompletionJsonOptions {
   readonly maxOutputTokens?: number;
 }
 
-/** 模型响应正文的固定上限，按 UTF-8 原始字节计算。 */
-export const maximumLlmResponseBodyBytes = 4 * 1024 * 1024;
-/** 修改 EOF/终止状态机或 receipt 语义时必须显式递增并重新标定。 */
+/**
+ * 修改 EOF/终止状态机或 receipt 语义时必须显式递增并重新标定。
+ *
+ * v9：删除固定 4 MiB 响应正文总上限。流式路径本按增量解析，原始正文只计数
+ * 不保留；现在长 reasoning=max 响应可以流式读完并正常结束（见
+ * maximumRetainedLlmTextLength 的防御性护栏）。DONE 后尾部分类、分块上限、
+ * 看门狗与失败语义不变。
+ */
 export const llmTransportProtocolVersion =
-  "llm-stream-eof-v8-receipt-v2-failure-audit-v1" as const;
+  "llm-stream-eof-v9-receipt-v2-failure-audit-v1" as const;
 const maximumLlmResponseChunks = 65_536;
 /**
  * 显式输出 token 上限按提供商硬上限设置：DeepSeek V4 全系（deepseek-v4-pro /
@@ -423,6 +428,15 @@ const maximumLlmResponseChunks = 65_536;
  * LLM_OUTPUT_LENGTH_LIMIT 终态处理（不重试、fail closed）。
  */
 export const maximumExplicitLlmOutputTokens = 384_000;
+/**
+ * 解析后保留文本的防御性上限，单位是 UTF-16 长度（value.length），按提供商硬
+ * 上限推导：384000 token × 64 单位/token = 24576000。真实提供商在硬上限内
+ * 远达不到（DeepSeek 实际约 8–10 单位/token），所以它永远不会限制合法输出；
+ * 它只是针对恶意或损坏上游的堆内存护栏。原始响应正文（SSE 线格式）不再有
+ * 任何总字节上限：流式路径逐增量解析，正文按字节只计数不保留。
+ */
+export const maximumRetainedLlmTextLength =
+  maximumExplicitLlmOutputTokens * 64;
 export const defaultLlmFirstOutputTimeoutMs = 30 * 60 * 1_000;
 export const defaultLlmMaximumDurationMs = 30 * 60 * 1_000;
 
@@ -588,26 +602,16 @@ export class LlmRequestError extends Error {
   }
 }
 
-/** 响应正文超过固定上限。异常只带固定说明，不保留任何正文片段。 */
-export class LlmResponseBodyTooLargeError extends Error {
-  public readonly code = "LLM_RESPONSE_BODY_TOO_LARGE";
-  public readonly formatFailureStage: LlmResponseFormatFailureStage | undefined;
-  public readonly formatFailureSubstage:
-    | LlmResponseFormatFailureSubstage
-    | undefined;
+/**
+ * 解析后保留文本超过防御性上限（LLM_RETAINED_TEXT_TOO_LARGE）。
+ * 异常只带固定说明，不保留任何正文片段；按永久错误处理，不重试。
+ */
+export class LlmRetainedTextTooLargeError extends Error {
+  public readonly code = "LLM_RETAINED_TEXT_TOO_LARGE";
 
-  public constructor(
-    formatFailureStage?: LlmResponseFormatFailureStage,
-    formatFailureSubstage?: LlmResponseFormatFailureSubstage
-  ) {
-    super("模型服务响应正文超过大小限制。");
-    this.name = "LlmResponseBodyTooLargeError";
-    assertSafeFormatFailureSubstage(
-      formatFailureStage,
-      formatFailureSubstage
-    );
-    this.formatFailureStage = formatFailureStage;
-    this.formatFailureSubstage = formatFailureSubstage;
+  public constructor() {
+    super("模型响应解析后保留文本超过防御性上限。");
+    this.name = "LlmRetainedTextTooLargeError";
   }
 }
 
@@ -1797,7 +1801,7 @@ async function requestWithRetry(
           );
         }
         if (
-          error instanceof LlmResponseBodyTooLargeError ||
+          error instanceof LlmRetainedTextTooLargeError ||
           error instanceof LlmResponseFormatError ||
           error instanceof LlmRequestError
         ) {
@@ -2231,7 +2235,6 @@ async function readResponseTextWithLimit(
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8", { fatal: true });
   let text = "";
-  let totalBytes = 0;
   let readerFinished = false;
   let readerErrored = false;
   let firstProtocolError: LlmResponseFormatError | undefined;
@@ -2249,17 +2252,12 @@ async function readResponseTextWithLimit(
         if (firstProtocolError !== undefined) throw firstProtocolError;
         try {
           text += decoder.decode();
+          assertRetainedLlmTextLength(text.length);
           return text;
         } catch {
           throw new LlmResponseFormatError("json_utf8");
         }
       }
-      totalBytes = addResponseChunkSize(
-        totalBytes,
-        chunk.value.byteLength,
-        firstProtocolError?.formatFailureStage,
-        firstProtocolError?.formatFailureSubstage
-      );
       if (firstProtocolError !== undefined) {
         if (chunk.value.byteLength > 0) {
           observer.onInvalidResponseDrainActivity();
@@ -2268,6 +2266,7 @@ async function readResponseTextWithLimit(
       }
       try {
         text += decoder.decode(chunk.value, { stream: true });
+        assertRetainedLlmTextLength(text.length);
       } catch {
         firstProtocolError = new LlmResponseFormatError("json_utf8");
         // 首错后的正文不再解码或拼接；清除已收内容，只保留固定阶段。
@@ -2302,7 +2301,6 @@ async function drainResponseAfterProtocolError(
   const reader = response.body.getReader();
   let readerFinished = false;
   let readerErrored = false;
-  let totalBytes = 0;
   observer.onInvalidResponseDrainStarted(
     firstProtocolError.formatFailureStage,
     firstProtocolError.formatFailureSubstage
@@ -2321,12 +2319,6 @@ async function drainResponseAfterProtocolError(
         audit.eofObserved = true;
         throw firstProtocolError;
       }
-      totalBytes = addResponseChunkSize(
-        totalBytes,
-        chunk.value.byteLength,
-        firstProtocolError.formatFailureStage,
-        firstProtocolError.formatFailureSubstage
-      );
       // 排空阶段不解码、不拼接、不解析，也不保留任何响应字节。
       if (chunk.value.byteLength > 0) {
         observer.onInvalidResponseDrainActivity();
@@ -2833,30 +2825,7 @@ async function readChatCompletionEventStream(
       ) {
         observer.onInvalidResponseDrainActivity();
       }
-      if (
-        state.sawDone &&
-        chunk.value.byteLength > maximumLlmResponseBodyBytes - totalBytes
-      ) {
-        updatePostDoneTailShape(
-          state,
-          "unknown_object_or_scan_limit",
-          observer
-        );
-      }
-      totalBytes = addResponseChunkSize(
-        totalBytes,
-        chunk.value.byteLength,
-        firstProtocolError instanceof LlmResponseFormatError
-          ? firstProtocolError.formatFailureStage
-          : state.postDoneTailShape === undefined
-            ? undefined
-            : "trailing_data",
-        firstProtocolError instanceof LlmResponseFormatError
-          ? firstProtocolError.formatFailureSubstage
-          : state.postDoneTailShape === undefined
-            ? undefined
-            : postDoneFailureSubstage(state.postDoneTailShape, false)
-      );
+      totalBytes = addResponseChunkSize(totalBytes, chunk.value.byteLength);
       audit.streamUtf8Bytes = totalBytes;
       if (chunk.value.byteLength > 0) {
         responseChunkCount += 1;
@@ -3553,6 +3522,7 @@ function appendEventStreamEventText(
   if (text.length === 0) return;
   buffer.fragments.push(text);
   buffer.length += text.length;
+  assertRetainedLlmTextLength(buffer.length);
   if (buffer.fragments.length >= maximumEventStreamFragmentsPerBlock) {
     buffer.blocks.push(buffer.fragments.join(""));
     buffer.fragments.length = 0;
@@ -3830,6 +3800,7 @@ function consumeChatCompletionEvent(
     state.content += part.content;
     hasValidOutput ||= /\S/u.test(part.content);
   }
+  assertRetainedLlmTextLength(state.reasoning.length + state.content.length);
   if (choiceRecord.finish_reason === "stop") {
     state.sawStop = true;
   }
@@ -3873,19 +3844,20 @@ function chatCompletionStreamResult(state: ChatCompletionStreamState): unknown {
   };
 }
 
-function addResponseChunkSize(
-  totalBytes: number,
-  nextBytes: number,
-  formatFailureStage?: LlmResponseFormatFailureStage,
-  formatFailureSubstage?: LlmResponseFormatFailureSubstage
-): number {
-  if (nextBytes > maximumLlmResponseBodyBytes - totalBytes) {
-    throw new LlmResponseBodyTooLargeError(
-      formatFailureStage,
-      formatFailureSubstage
-    );
-  }
+/**
+ * 被动计数：累计响应正文已读字节，只用于审计字段，不再做任何大小检查。
+ * 原始正文总量没有固定上限；流式路径逐增量解析，正文从不在内存中整体保留。
+ */
+function addResponseChunkSize(totalBytes: number, nextBytes: number): number {
   return totalBytes + nextBytes;
+}
+
+/** 解析后保留文本（事件缓冲、抽取出的 reasoning/content、非流 JSON 正文）
+ * 的每个唯一逐步累加点都必须经过这个护栏。正常提供商输出不可能触达。 */
+function assertRetainedLlmTextLength(length: number): void {
+  if (length > maximumRetainedLlmTextLength) {
+    throw new LlmRetainedTextTooLargeError();
+  }
 }
 
 function cancelReaderWithoutReplacingResult(

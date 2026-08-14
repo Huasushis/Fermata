@@ -1635,9 +1635,11 @@ function classifyRoleFailure(error: unknown): ReviewFlowFailureKind {
   if (["LLM_CANCELLED", "LLM_REQUEST_START_BLOCKED"].includes(String(code))) {
     return "cancelled";
   }
-  if (["LLM_OUTPUT_LENGTH_LIMIT", "LLM_RESPONSE_BODY_TOO_LARGE"].includes(String(code))) {
+  if (code === "LLM_OUTPUT_LENGTH_LIMIT") {
     return "output_limit";
   }
+  // 防御性保留文本护栏：正常提供商输出不可能触达，视为内部护栏而非输出上限。
+  if (code === "LLM_RETAINED_TEXT_TOO_LARGE") return "role_internal";
   if (code === "LLM_OUTPUT_CONTENT_FILTERED") return "content_filtered";
   if (code === "LLM_RESPONSE_FORMAT_INVALID") return "protocol";
   if (code === "LLM_JSON_OUTPUT_INVALID") return "schema_output";

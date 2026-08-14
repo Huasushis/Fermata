@@ -1952,7 +1952,7 @@ describe("Development diagnostic — scheduler-level transport retry contract", 
     ["LLM_OUTPUT_IDLE_TIMEOUT"],
     ["LLM_TOTAL_TIMEOUT"],
     ["LLM_RESPONSE_FORMAT_INVALID"],
-    ["LLM_RESPONSE_BODY_TOO_LARGE"],
+    ["LLM_RETAINED_TEXT_TOO_LARGE"],
     ["LLM_OUTPUT_LENGTH_LIMIT"]
   ] as const)("never retries non-eligible code %s", async (code) => {
     const controller = buildController();

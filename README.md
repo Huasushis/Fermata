@@ -912,10 +912,14 @@ npm run experiment:calibrate-levels:detached -- \
 配置只接受 10 至 30 分钟的有界值；不得恢复 120 秒总时限。
 旧实验的 `LEVELS_LLM_*` 约束按冻结 checkpoint 解释；新四调用 scheduler 的 attempts 和 duration
 由本节前述固定契约控制。旧的 `LEVELS_LLM_TIMEOUT_MS` 已不再支持，设置后会明确报错。
-`EVAL_CONCURRENCY` 决定同时处理几道题，只接受 1 到 32 的整数。模型响应正文按 UTF-8 原始字节
-计算，固定最多读取 4 MiB（约 4 MB）；超过后立即停止读取，并且错误和日志都不会包含响应正文。
-流式响应还固定最多读取 65536 个非空网络分块；分块是底层每次交给客户端的一小段字节。超过上限
-说明响应被异常细碎地发送，客户端会停止并按固定格式错误处理，避免大量微小分块让超时保护无法及时运行。
+`EVAL_CONCURRENCY` 决定同时处理几道题，只接受 1 到 32 的整数。流式响应按增量解析，原始正文按
+字节只计数不保留，不再有固定总字节上限：长 `reasoning=max` 深度推理会一口气给出超过 4 MiB 的
+思考正文，客户端必须流式读完并等服务端自然结束。唯一的防御性上限是解析后保留文本长度
+（`maximumRetainedLlmTextLength` = 24576000 个 UTF-16 单位，由提供商硬上限 384000 token × 64 推导，
+正常提供商输出永远到不了）：它只防恶意或损坏上游撑爆堆内存，触发即永久失败 `LLM_RETAINED_TEXT_TOO_LARGE`，
+不重试，且错误和日志都不包含正文。流式响应还固定最多读取 65536 个非空网络分块；分块是底层每次
+交给客户端的一小段字节。超过上限说明响应被异常细碎地发送，客户端会停止并按固定格式错误处理，
+避免大量微小分块让超时保护无法及时运行。
 
 正式服务已有的 `settings.json` 会保留上次保存的 `experimentVersion`，不会因为替换
 `models.yaml` 自动改变。当前配置版本是
@@ -1095,7 +1099,7 @@ failed=1、complete=false，request/fetch 都精确为 1。服务返回 HTTP 200
 扫描上限；非空 choices；以及正文或工具字段。多个事件只保留危险优先级最高的一个枚举，
 不保存各类是否同时出现、出现次数、原始事件、字段名、字段值、正文、长度或计数。无论最终
 类别是什么，只要 DONE 后出现 data，仍必须排空到真实 HTTP EOF 后以固定格式错误失败；EOF
-前的中断、超时、取消、正文上限或分块上限只能记录 `data_after_done_tail_incomplete`。
+前的中断、超时、取消或分块上限只能记录 `data_after_done_tail_incomplete`。
 
 f 的唯一标签是 `difficulty-candidate-c-connectivity-probe-20260802-f`，产物 schema 是第 4 版；
 a/b/c/d/e 都列入不可重放的历史标签。f 仍未运行，而正式 `models.yaml` 已升级到新的多角色审题
