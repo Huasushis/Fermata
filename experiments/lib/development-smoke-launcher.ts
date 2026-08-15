@@ -256,7 +256,7 @@ const acceptedEventShapeSchema = z.object({
 }).strict();
 
 const safeRoundReceiptSchema = z.object({
-  round: z.enum(["semantic", "format", "format_repair"]),
+  round: z.enum(["semantic", "format", "format_repair", "salvage_finalization", "salvage_finalization_repair"]),
   firstValidOutputMs: z.number().int().nonnegative().nullable(),
   endToEndMs: z.number().int().nonnegative(),
   validOutputEventCount: z.number().int().positive(),
@@ -272,14 +272,26 @@ const safeTimingSchema = z.object({
   outputUtf8Bytes: z.number().int().positive(),
   acceptedEventShapes: z.array(acceptedEventShapeSchema).max(64).readonly(),
   externalTransportAttemptsUsed: z.number().int().min(1).max(104).optional(),
-  rounds: z.array(safeRoundReceiptSchema).min(2).max(3).readonly().optional()
+  rounds: z.array(safeRoundReceiptSchema).min(2).max(4).readonly().optional()
 }).strict().superRefine((value, context) => {
   if (value.endToEndMs < value.firstValidOutputMs) {
     context.addIssue({ code: "custom", message: "invalid timing order" });
   }
   if (value.rounds !== undefined) {
-    const expectedOrder = ["semantic", "format", "format_repair"] as const;
-    if (value.rounds.some((round, index) => round.round !== expectedOrder[index])) {
+    // 正常路径：semantic → format [→ format_repair]
+    // 抢救路径：salvage_finalization [→ salvage_finalization_repair]
+    // （语义轮抢救时不产生 FourCallSafeRoundReceipt，因为它不是 LlmTransportReceipt）
+    const validOrders: readonly (readonly string[])[] = [
+      ["semantic", "format"],
+      ["semantic", "format", "format_repair"],
+      ["salvage_finalization"],
+      ["salvage_finalization", "salvage_finalization_repair"]
+    ];
+    const actualOrder = value.rounds.map((r) => r.round);
+    if (!validOrders.some((valid) =>
+      actualOrder.length === valid.length &&
+      actualOrder.every((round, index) => round === valid[index])
+    )) {
       context.addIssue({ code: "custom", message: "invalid round order" });
     }
     const roundTransportSum = value.rounds.reduce(

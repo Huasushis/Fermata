@@ -246,6 +246,62 @@ export interface LlmJsonCompletionReceipt {
 }
 
 /**
+ * 抢救传输 receipt：当 finish_reason="length" 且 reasoning 非空、content 为空
+ * 时，salvage 路径接受此传输作为可抢救的分析结果。不包含原始 reasoning 内容，
+ * 只记录安全计数（salvagedReasoningLength），供审计和最终化阶段使用。
+ * finishReasonStopVerified 为 false（因为不是正常 stop），finishReason 为 "length"。
+ */
+export interface LlmSalvageTransportReceipt {
+  readonly schemaVersion: 2;
+  readonly transportAttemptCount: number;
+  readonly eofVerified: true;
+  readonly responseMode: LlmResponseMode;
+  readonly finishReasonStopVerified: false;
+  readonly finishReasonLengthSalvaged: true;
+  readonly salvagedReasoningLength: number;
+  readonly acceptedEventShapes: readonly LlmSseAcceptedShapeAudit[];
+  readonly sseDoneObserved: boolean | null;
+}
+
+/**
+ * chatCompleteSalvageableWithReceipt 的返回值。salvaged 为 true 时 content 为空、
+ * reasoning 为非空分析文本（仅在内存中传递给 finalizer，不写入 receipt、日志或磁盘）；
+ * salvaged 为 false 时等价于正常 ChatCompletionWithReceipt。
+ */
+export type ChatCompletionSalvageableResult =
+  | {
+      readonly content: string;
+      readonly reasoning: string | null;
+      readonly salvaged: false;
+      readonly receipt: LlmTransportReceipt;
+    }
+  | {
+      readonly content: "";
+      readonly reasoning: string;
+      readonly salvaged: true;
+      readonly receipt: LlmSalvageTransportReceipt;
+    };
+
+/**
+ * reasoning salvage → JSON finalizer 完整流程的 receipt。
+ * analysisSalvaged 为 true 表示分析轮在 finish_reason="length" 后被抢救，
+ * 并通过独立 finalizer 阶段提取结构化结论。
+ * 不包含原始 reasoning；analysisReceipt 是抢救传输的安全摘要，
+ * finalizationReceipt 是 finalizer 轮的正常传输 receipt。
+ */
+export interface LlmReasoningSalvageJsonReceipt {
+  readonly schemaVersion: 2;
+  readonly analysisSalvaged: true;
+  readonly requestCount: 2 | 3;
+  readonly transportAttemptCount: number;
+  readonly eofVerified: true;
+  readonly jsonSchemaValidated: true;
+  readonly responses:
+    | readonly [LlmSalvageTransportReceipt, LlmTransportReceipt]
+    | readonly [LlmSalvageTransportReceipt, LlmTransportReceipt, LlmTransportReceipt];
+}
+
+/**
  * 失败路径的安全审计摘要。它只含协议状态与计数，绝不保存请求、题面、
  * 响应正文、服务商错误说明或响应标识。WeakMap 绑定保证这些字段不会因
  * 序列化 Error 意外进入普通日志。
@@ -412,13 +468,17 @@ export interface ChatCompletionJsonOptions {
 /**
  * 修改 EOF/终止状态机或 receipt 语义时必须显式递增并重新标定。
  *
+ * v10：新增 opt-in reasoning-length salvage 路径。当 salvageOnLengthLimit 启用时，
+ * finish_reason="length" 且 reasoning 非空、content 为空的 SSE 流不再抛
+ * LLM_OUTPUT_LENGTH_LIMIT，而是标记为 salvaged 并返回 reasoning，交由独立
+ * finalizer 阶段提取结构化结论。正常 finish_reason="stop" 路径完全不受影响。
  * v9：删除固定 4 MiB 响应正文总上限。流式路径本按增量解析，原始正文只计数
  * 不保留；现在长 reasoning=max 响应可以流式读完并正常结束（见
  * maximumRetainedLlmTextLength 的防御性护栏）。DONE 后尾部分类、分块上限、
  * 看门狗与失败语义不变。
  */
 export const llmTransportProtocolVersion =
-  "llm-stream-eof-v9-receipt-v2-failure-audit-v1" as const;
+  "llm-stream-eof-v10-receipt-v2-failure-audit-v1" as const;
 const maximumLlmResponseChunks = 65_536;
 /**
  * 显式输出 token 上限按提供商硬上限设置：DeepSeek V4 全系（deepseek-v4-pro /
@@ -853,6 +913,176 @@ export async function chatCompleteWithReceipt(
 }
 
 /**
+ * 与 chatCompleteWithReceipt 相同，但启用 reasoning-length salvage：当
+ * finish_reason="length" 且 reasoning 非空、content 为空时，不抛
+ * LLM_OUTPUT_LENGTH_LIMIT，而是返回 salvaged=true 和完整 reasoning 文本。
+ * reasoning 仅在内存中返回给调用方用于 finalizer 阶段，不写入 receipt。
+ * 正常 finish_reason="stop" 路径完全不受影响（salvaged=false）。
+ */
+export async function chatCompleteSalvageableWithReceipt(
+  provider: ProviderCredentialsLike,
+  spec: ModelCallSpec,
+  messages: ChatMessage[],
+  runtime: LlmRuntimeOptions,
+  options: ChatCompletionOptions = {}
+): Promise<ChatCompletionSalvageableResult> {
+  validateThinkingRequest(spec);
+  const fetchImpl = runtime.fetch ?? productionLlmFetch;
+  const url = new URL("chat/completions", ensureTrailingSlash(provider.baseUrl));
+  const body: Record<string, unknown> = {
+    model: spec.model,
+    temperature: spec.temperature,
+    stream: true,
+    messages
+  };
+  if (options.requestJson === true && options.responseJsonSchema !== undefined) {
+    throw new Error("LLM_RESPONSE_FORMAT_CONFLICT");
+  }
+  if (options.responseJsonSchema !== undefined) {
+    if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/u.test(options.responseJsonSchema.name)) {
+      throw new Error("LLM_RESPONSE_SCHEMA_NAME_INVALID");
+    }
+    body.response_format = {
+      type: "json_schema",
+      json_schema: {
+        name: options.responseJsonSchema.name,
+        strict: true,
+        schema: options.responseJsonSchema.schema
+      }
+    };
+  } else if (options.requestJson === true) {
+    body.response_format = { type: "json_object" };
+  }
+  if (spec.thinkingRequest !== undefined) {
+    body.thinking = { type: spec.thinkingRequest };
+  }
+  if (spec.reasoningEffort !== undefined) {
+    body.reasoning_effort = spec.reasoningEffort;
+  }
+  if (options.maxOutputTokens !== undefined) {
+    body.max_tokens = validateMaxOutputTokens(options.maxOutputTokens);
+  }
+
+  const requestAudit = createMutableLlmRequestAudit();
+  let response: Awaited<ReturnType<typeof requestWithRetry>>;
+  try {
+    response = await requestWithRetry(
+      fetchImpl,
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream, application/json",
+          Authorization: `Bearer ${provider.apiKey}`
+        },
+        body: JSON.stringify(body)
+      },
+      runtime,
+      requestAudit,
+      true
+    );
+  } catch (error) {
+    rememberLlmFailureAudit(error, {
+      requestCount: 1,
+      requestAudit,
+      jsonSchemaValidated: null
+    });
+    throw error;
+  }
+
+  if (!response.ok) {
+    const error = new LlmRequestError(
+      "LLM_HTTP_ERROR",
+      response.status,
+      undefined,
+      undefined,
+      response.retryAfterMs
+    );
+    rememberLlmFailureAudit(error, {
+      requestCount: 1,
+      requestAudit,
+      jsonSchemaValidated: null
+    });
+    throw error;
+  }
+  if (response.salvaged) {
+    // 抢救路径：从 raw stream result 提取 reasoning，不提取 content（content 为空）。
+    const reasoning = extractSalvagedReasoning(response.raw);
+    return {
+      content: "",
+      reasoning,
+      salvaged: true,
+      receipt: {
+        schemaVersion: 2,
+        transportAttemptCount: response.attemptCount,
+        eofVerified: true,
+        responseMode: response.responseMode as LlmResponseMode,
+        finishReasonStopVerified: false,
+        finishReasonLengthSalvaged: true,
+        salvagedReasoningLength: reasoning.length,
+        acceptedEventShapes: acceptedShapeAudit(requestAudit),
+        sseDoneObserved: response.sseDoneObserved
+      }
+    };
+  }
+  if (response.responseMode === null || !response.finishReasonStopVerified) {
+    const error = new LlmResponseFormatError("response_shape");
+    rememberLlmFailureAudit(error, {
+      requestCount: 1,
+      requestAudit,
+      jsonSchemaValidated: null
+    });
+    throw error;
+  }
+  const extracted = extractChatCompletion(response.raw);
+  const result = spec.thinking
+    ? extracted
+    : { content: extracted.content, reasoning: null };
+  return {
+    ...result,
+    salvaged: false,
+    receipt: {
+      schemaVersion: 2,
+      transportAttemptCount: response.attemptCount,
+      eofVerified: true,
+      responseMode: response.responseMode,
+      finishReasonStopVerified: true,
+      acceptedEventShapes: acceptedShapeAudit(requestAudit),
+      sseDoneObserved: response.sseDoneObserved
+    }
+  };
+}
+
+/**
+ * 从抢救路径的 raw stream result 提取 reasoning 文本。
+ * chatCompletionStreamResult 产生的结构是 { choices: [{ message: { content, reasoning_content? } }] }。
+ * 抢救路径保证 content 为空、reasoning_content 非空。
+ */
+function extractSalvagedReasoning(raw: unknown): string {
+  if (typeof raw !== "object" || raw === null) {
+    throw new LlmResponseFormatError("response_shape");
+  }
+  const choices = (raw as Record<string, unknown>).choices;
+  if (!Array.isArray(choices) || choices.length === 0) {
+    throw new LlmResponseFormatError("response_shape");
+  }
+  const first = choices[0];
+  if (typeof first !== "object" || first === null) {
+    throw new LlmResponseFormatError("response_shape");
+  }
+  const message = (first as Record<string, unknown>).message;
+  if (typeof message !== "object" || message === null) {
+    throw new LlmResponseFormatError("response_shape");
+  }
+  const reasoning = (message as Record<string, unknown>).reasoning_content;
+  if (typeof reasoning !== "string" || reasoning.trim().length === 0) {
+    throw new LlmResponseFormatError("response_shape");
+  }
+  return reasoning;
+}
+
+/**
  * 配置加载不是唯一入口；实验和测试也可以直接调用 chatComplete。
  * 因此在发起任何可能计费的请求前重新检查组合，不依赖 TypeScript
  * 类型或 config/models.yaml 已经跑过。
@@ -1185,6 +1415,313 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
     completedResponses: [semantic.receipt, firstFormat.receipt, secondFormat.receipt],
     priorTransportAttemptCount:
       semantic.receipt.transportAttemptCount + firstFormat.receipt.transportAttemptCount,
+    jsonSchemaValidated: false
+  });
+  throw error;
+}
+
+/**
+ * reasoning salvage JSON 设计：分析轮使用 Pro 模型（salvage 启用），
+ * 如果 finish_reason="length" 且 reasoning 非空、content 为空，则把完整
+ * reasoning 传给独立 finalizer 阶段（finalizationSpec，通常为 Flash），
+ * 由 finalizer 提取满足 schema 的结构化 JSON。finalizer 不会重新推理，
+ * 只做信息提取和格式转换。如果分析轮正常完成（finish_reason="stop"），
+ * 则走原有两轮路径（语义→格式），salvage 不生效。
+ *
+ * 该函数返回的 receipt 是 LlmJsonCompletionReceipt（正常路径）或
+ * LlmReasoningSalvageJsonReceipt（抢救路径）的联合类型。调用方通过
+ * `"analysisSalvaged" in result.receipt` 区分两条路径。
+ *
+ * 隐私保证：原始 reasoning 仅在内存中从分析轮传递给 finalizer，
+ * 不写入 receipt、日志、错误消息或磁盘。receipt 只含安全计数。
+ */
+export async function chatCompleteReasoningSalvageJsonWithReceipt<T>(
+  provider: ProviderCredentialsLike,
+  analysisSpec: ModelCallSpec,
+  finalizationSpec: ModelCallSpec,
+  analysisMessages: ChatMessage[],
+  finalizationMessages: (text: string, reasoning: string | null) => ChatMessage[],
+  schema: z.ZodType<T>,
+  runtime: LlmRuntimeOptions,
+  options: ChatCompletionJsonOptions = {},
+  roundAudit?: TwoRoundJsonRoundAudit & {
+    readonly onSalvageFinalizationStart?: () => void;
+    readonly onSalvageFinalizationSettled?: (receipt: LlmTransportReceipt) => void;
+    readonly onSalvageFinalizationRepairStart?: () => void;
+    readonly onSalvageFinalizationRepairSettled?: (receipt: LlmTransportReceipt) => void;
+  }
+): Promise<{
+  data: T;
+  reasoning: string | null;
+  receipt: LlmJsonCompletionReceipt | LlmReasoningSalvageJsonReceipt;
+}> {
+  if (runtime.directStructuredOutput === true) {
+    return chatCompleteTwoRoundJsonWithReceipt(
+      provider,
+      analysisSpec,
+      analysisMessages,
+      finalizationMessages,
+      schema,
+      runtime,
+      options,
+      roundAudit
+    );
+  }
+  // 分析轮：启用 salvage，自由文本，不强制 JSON。
+  roundAudit?.onRoundStart("semantic");
+  const analysis = await chatCompleteSalvageableWithReceipt(
+    provider,
+    analysisSpec,
+    analysisMessages,
+    runtime,
+    {
+      requestJson: false,
+      maxOutputTokens: options.maxOutputTokens
+    }
+  );
+  if (!analysis.salvaged) {
+    // 正常路径：分析轮以 finish_reason="stop" 完成，走原有两轮格式化。
+    // 复用 chatCompleteTwoRoundJsonWithReceipt 的格式轮逻辑，但跳过语义轮。
+    // 为保持与两轮 receipt 一致，这里直接内联格式轮 + 修复轮。
+    if (analysis.receipt.finishReasonStopVerified !== true) {
+      const error = new LlmResponseFormatError("response_shape");
+      rememberLlmFailureAudit(error, {
+        requestCount: 1,
+        requestAudit: mutableAuditFromReceipt(analysis.receipt),
+        jsonSchemaValidated: false
+      });
+      throw error;
+    }
+    roundAudit?.onRoundSettled("semantic", analysis.receipt);
+    return runTwoRoundFormatPath(
+      provider,
+      analysisSpec,
+      analysis.content,
+      analysis.reasoning,
+      finalizationMessages,
+      schema,
+      runtime,
+      options,
+      analysis.receipt,
+      roundAudit
+    );
+  }
+  // 抢救路径：分析轮 finish_reason="length"，reasoning 非空，content 为空。
+  // 把完整 reasoning 传给 finalizer（Flash），由它提取结构化 JSON。
+  // 不调用 roundAudit.onRoundSettled("semantic", ...)，因为 analysis receipt
+  // 是 LlmSalvageTransportReceipt 而非 LlmTransportReceipt。
+  const finalizationInput = finalizationMessages(analysis.reasoning, null);
+  const jsonInstruction: ChatMessage = {
+    role: "system",
+    content: "只输出一个满足要求的 JSON 对象本身，不要输出任何解释、前后缀文字，也不要用 Markdown 代码块包裹。"
+  };
+  const firstFinalMessages: ChatMessage[] = [jsonInstruction, ...finalizationInput];
+  let firstFinal: ChatCompletionWithReceipt;
+  roundAudit?.onSalvageFinalizationStart?.();
+  try {
+    firstFinal = await chatCompleteWithReceipt(
+      provider,
+      finalizationSpec,
+      firstFinalMessages,
+      runtime,
+      {
+        requestJson: false,
+        maxOutputTokens: options.maxOutputTokens
+      }
+    );
+    assertStructuredCompletionTransport(firstFinal.receipt);
+  } catch (error) {
+    promoteJsonFailureAudit(
+      error,
+      2,
+      [],
+      0
+    );
+    throw error;
+  }
+  roundAudit?.onSalvageFinalizationSettled?.(firstFinal.receipt);
+  const firstAttempt = tryParseAndValidate(firstFinal.content, schema);
+  if (firstAttempt.success) {
+    return {
+      data: firstAttempt.data,
+      reasoning: null,
+      receipt: {
+        schemaVersion: 2,
+        analysisSalvaged: true,
+        requestCount: 2,
+        transportAttemptCount:
+          analysis.receipt.transportAttemptCount + firstFinal.receipt.transportAttemptCount,
+        eofVerified: true,
+        jsonSchemaValidated: true,
+        responses: [analysis.receipt, firstFinal.receipt]
+      }
+    };
+  }
+  // finalizer 修复轮
+  const repairMessages: ChatMessage[] = [
+    ...firstFinalMessages,
+    { role: "assistant", content: firstFinal.content },
+    {
+      role: "user",
+      content: `上一条回复不满足要求：${firstAttempt.error}。请只重新输出一个满足要求的 JSON 对象，不要包含任何其它文字或代码块标记。`
+    }
+  ];
+  let secondFinal: ChatCompletionWithReceipt;
+  roundAudit?.onSalvageFinalizationRepairStart?.();
+  try {
+    secondFinal = await chatCompleteWithReceipt(
+      provider,
+      finalizationSpec,
+      repairMessages,
+      runtime,
+      {
+        requestJson: false,
+        maxOutputTokens: options.maxOutputTokens
+      }
+    );
+    assertStructuredCompletionTransport(secondFinal.receipt);
+  } catch (error) {
+    promoteJsonFailureAudit(
+      error,
+      3,
+      [firstFinal.receipt],
+      firstFinal.receipt.transportAttemptCount
+    );
+    throw error;
+  }
+  roundAudit?.onSalvageFinalizationRepairSettled?.(secondFinal.receipt);
+  const secondAttempt = tryParseAndValidate(secondFinal.content, schema);
+  if (secondAttempt.success) {
+    return {
+      data: secondAttempt.data,
+      reasoning: null,
+      receipt: {
+        schemaVersion: 2,
+        analysisSalvaged: true,
+        requestCount: 3,
+        transportAttemptCount:
+          analysis.receipt.transportAttemptCount +
+          firstFinal.receipt.transportAttemptCount +
+          secondFinal.receipt.transportAttemptCount,
+        eofVerified: true,
+        jsonSchemaValidated: true,
+        responses: [analysis.receipt, firstFinal.receipt, secondFinal.receipt]
+      }
+    };
+  }
+  const error = new LlmJsonOutputError();
+  rememberLlmFailureAudit(error, {
+    requestCount: 3,
+    requestAudit: mutableAuditFromReceipt(secondFinal.receipt),
+    completedResponses: [firstFinal.receipt, secondFinal.receipt],
+    priorTransportAttemptCount: firstFinal.receipt.transportAttemptCount,
+    jsonSchemaValidated: false
+  });
+  throw error;
+}
+
+/**
+ * 正常两轮路径的格式轮 + 修复轮，从已完成的语义轮结果继续。
+ * 与 chatCompleteTwoRoundJsonWithReceipt 的格式部分逻辑一致，
+ * 但跳过语义轮（已完成），直接用 semanticOutput/semanticReasoning 构造格式轮消息。
+ */
+async function runTwoRoundFormatPath<T>(
+  provider: ProviderCredentialsLike,
+  spec: ModelCallSpec,
+  semanticOutput: string,
+  semanticReasoning: string | null,
+  formatterMessages: (semanticOutput: string, semanticReasoning: string | null) => ChatMessage[],
+  schema: z.ZodType<T>,
+  runtime: LlmRuntimeOptions,
+  options: ChatCompletionJsonOptions,
+  semanticReceipt: LlmTransportReceipt,
+  roundAudit?: TwoRoundJsonRoundAudit
+): Promise<{ data: T; reasoning: string | null; receipt: LlmJsonCompletionReceipt }> {
+  const formatMessages = formatterMessages(semanticOutput, semanticReasoning);
+  const jsonInstruction: ChatMessage = {
+    role: "system",
+    content: "只输出一个满足要求的 JSON 对象本身，不要输出任何解释、前后缀文字，也不要用 Markdown 代码块包裹。"
+  };
+  const firstFormatMessages: ChatMessage[] = [jsonInstruction, ...formatMessages];
+  let firstFormat: ChatCompletionWithReceipt;
+  roundAudit?.onRoundStart("format");
+  try {
+    firstFormat = await chatCompleteWithReceipt(provider, spec, firstFormatMessages, runtime, {
+      requestJson: false,
+      maxOutputTokens: options.maxOutputTokens
+    });
+    assertStructuredCompletionTransport(firstFormat.receipt);
+  } catch (error) {
+    promoteJsonFailureAudit(error, 2, [semanticReceipt], semanticReceipt.transportAttemptCount);
+    throw error;
+  }
+  roundAudit?.onRoundSettled("format", firstFormat.receipt);
+  const firstAttempt = tryParseAndValidate(firstFormat.content, schema);
+  if (firstAttempt.success) {
+    return {
+      data: firstAttempt.data,
+      reasoning: semanticReasoning ?? firstFormat.reasoning,
+      receipt: {
+        schemaVersion: 2,
+        requestCount: 2,
+        transportAttemptCount:
+          semanticReceipt.transportAttemptCount + firstFormat.receipt.transportAttemptCount,
+        eofVerified: true,
+        jsonSchemaValidated: true,
+        responses: [semanticReceipt, firstFormat.receipt]
+      }
+    };
+  }
+  const repairMessages: ChatMessage[] = [
+    ...firstFormatMessages,
+    { role: "assistant", content: firstFormat.content },
+    {
+      role: "user",
+      content: `上一条回复不满足要求：${firstAttempt.error}。请只重新输出一个满足要求的 JSON 对象，不要包含任何其它文字或代码块标记。`
+    }
+  ];
+  let secondFormat: ChatCompletionWithReceipt;
+  roundAudit?.onRoundStart("format_repair");
+  try {
+    secondFormat = await chatCompleteWithReceipt(provider, spec, repairMessages, runtime, {
+      requestJson: false,
+      maxOutputTokens: options.maxOutputTokens
+    });
+    assertStructuredCompletionTransport(secondFormat.receipt);
+  } catch (error) {
+    promoteJsonFailureAudit(
+      error, 3,
+      [semanticReceipt, firstFormat.receipt],
+      semanticReceipt.transportAttemptCount + firstFormat.receipt.transportAttemptCount
+    );
+    throw error;
+  }
+  roundAudit?.onRoundSettled("format_repair", secondFormat.receipt);
+  const secondAttempt = tryParseAndValidate(secondFormat.content, schema);
+  if (secondAttempt.success) {
+    return {
+      data: secondAttempt.data,
+      reasoning: semanticReasoning ?? firstFormat.reasoning ?? secondFormat.reasoning,
+      receipt: {
+        schemaVersion: 2,
+        requestCount: 3,
+        transportAttemptCount:
+          semanticReceipt.transportAttemptCount +
+          firstFormat.receipt.transportAttemptCount +
+          secondFormat.receipt.transportAttemptCount,
+        eofVerified: true,
+        jsonSchemaValidated: true,
+        responses: [semanticReceipt, firstFormat.receipt, secondFormat.receipt]
+      }
+    };
+  }
+  const error = new LlmJsonOutputError();
+  rememberLlmFailureAudit(error, {
+    requestCount: 3,
+    requestAudit: mutableAuditFromReceipt(secondFormat.receipt),
+    completedResponses: [semanticReceipt, firstFormat.receipt, secondFormat.receipt],
+    priorTransportAttemptCount:
+      semanticReceipt.transportAttemptCount + firstFormat.receipt.transportAttemptCount,
     jsonSchemaValidated: false
   });
   throw error;
@@ -1567,14 +2104,14 @@ function rememberLlmFailureAudit(
 }
 
 function mutableAuditFromReceipt(
-  receipt: LlmTransportReceipt
+  receipt: LlmTransportReceipt | LlmSalvageTransportReceipt
 ): MutableLlmRequestAudit {
   return {
     attemptCount: receipt.transportAttemptCount,
     status: 200,
     responseMode: receipt.responseMode,
     eofObserved: true,
-    finishReasonStopObserved: true,
+    finishReasonStopObserved: "finishReasonStopVerified" in receipt && receipt.finishReasonStopVerified,
     sseDoneObserved: receipt.sseDoneObserved,
     streamEventCount: 0,
     acceptedEventShapeCounts: new Map(
@@ -1650,7 +2187,8 @@ async function requestWithRetry(
   url: URL,
   init: RequestInit,
   runtime: LlmRuntimeOptions,
-  audit: MutableLlmRequestAudit
+  audit: MutableLlmRequestAudit,
+  salvageOnLengthLimit = false
 ): Promise<{
   readonly ok: boolean;
   readonly status: number;
@@ -1660,6 +2198,7 @@ async function requestWithRetry(
   readonly finishReasonStopVerified: boolean;
   readonly sseDoneObserved: boolean | null;
   readonly retryAfterMs: number | null;
+  readonly salvaged: boolean;
 }> {
   const durations = resolveLlmRequestDurations(runtime);
   const deadline = Date.now() + durations.maximumDurationMs;
@@ -1680,6 +2219,7 @@ async function requestWithRetry(
       readonly finishReasonStopVerified: boolean;
       readonly sseDoneObserved: boolean | null;
       readonly retryAfterMs: number | null;
+      readonly salvaged: boolean;
     } | null> => {
       // 排队结束后重新检查；soft-stop 期间排队的任务不能跨过调度边界发起请求。
       assertLlmRequestMayStart();
@@ -1748,29 +2288,36 @@ async function requestWithRetry(
               responseMode: null,
               finishReasonStopVerified: false,
               sseDoneObserved: null,
-              retryAfterMs
+              retryAfterMs,
+              salvaged: false
             };
           }
           return null;
         }
-        const parsed = await parseResponseBody(response, controller, {
-          onValidOutput: () => {
-            watchdog.receivedValidOutput();
-            runtime.onSafeOutputActivity?.();
-          },
-          onInvalidResponseDrainStarted: (
-            formatFailureStage,
-            formatFailureSubstage
-          ) => {
-            watchdog.invalidResponseDrainStarted(
+        const parsed = await parseResponseBody(
+          response,
+          controller,
+          {
+            onValidOutput: () => {
+              watchdog.receivedValidOutput();
+              runtime.onSafeOutputActivity?.();
+            },
+            onInvalidResponseDrainStarted: (
               formatFailureStage,
               formatFailureSubstage
-            );
+            ) => {
+              watchdog.invalidResponseDrainStarted(
+                formatFailureStage,
+                formatFailureSubstage
+              );
+            },
+            onInvalidResponseDrainActivity: () => {
+              watchdog.receivedInvalidResponseDrainActivity();
+            }
           },
-          onInvalidResponseDrainActivity: () => {
-            watchdog.receivedInvalidResponseDrainActivity();
-          }
-        }, audit);
+          audit,
+          salvageOnLengthLimit
+        );
         const timeoutError = watchdog.error();
         if (timeoutError !== undefined) {
           throw timeoutError;
@@ -1783,9 +2330,10 @@ async function requestWithRetry(
           raw: parsed.raw,
           attemptCount: audit.attemptCount,
           responseMode: parsed.responseMode,
-          finishReasonStopVerified: true,
+          finishReasonStopVerified: !parsed.salvaged,
           sseDoneObserved: parsed.sseDoneObserved,
-          retryAfterMs: null
+          retryAfterMs: null,
+          salvaged: parsed.salvaged
         };
       } catch (error) {
         const timeoutError = watchdog.error();
@@ -2154,13 +2702,15 @@ interface ParsedResponseBody {
   readonly raw: unknown;
   readonly responseMode: LlmResponseMode;
   readonly sseDoneObserved: boolean | null;
+  readonly salvaged: boolean;
 }
 
 async function parseResponseBody(
   response: Response,
   requestController: AbortController,
   observer: ResponseBodyActivityObserver,
-  audit: MutableLlmRequestAudit
+  audit: MutableLlmRequestAudit,
+  salvageOnLengthLimit = false
 ): Promise<ParsedResponseBody> {
   if (response.body === null) {
     throw new LlmResponseFormatError("missing_body");
@@ -2177,12 +2727,14 @@ async function parseResponseBody(
       response,
       requestController,
       observer,
-      audit
+      audit,
+      salvageOnLengthLimit
     );
     return {
       raw: stream.raw,
       responseMode: "sse",
-      sseDoneObserved: stream.sseDoneObserved
+      sseDoneObserved: stream.sseDoneObserved,
+      salvaged: stream.salvaged
     };
   }
   audit.responseMode = "json";
@@ -2222,7 +2774,8 @@ async function parseResponseBody(
   return {
     raw,
     responseMode: "json",
-    sseDoneObserved: null
+    sseDoneObserved: null,
+    salvaged: false
   };
 }
 
@@ -2679,6 +3232,18 @@ interface ChatCompletionStreamState {
   sawDone: boolean;
   postDoneTailShape: PostDoneTailShape | undefined;
   postDoneTailHasUnresolvedData: boolean;
+  /**
+   * 当 salvageOnLengthLimit 启用且 finish_reason="length" 到达时置为 true，
+   * 表示推理流可被抢救到独立的 finalizer 阶段。不调用 assertSafeFinishReason
+   * （该函数会抛 LLM_OUTPUT_LENGTH_LIMIT），也不置 sawStop（避免触发 post-stop
+   * 尾部校验拒绝后续 reasoning 分片）。
+   */
+  sawLengthSalvage: boolean;
+  /**
+   * 由 readChatCompletionEventStream 传入，consumeEvent 闭包读取。
+   * 只在显式启用时才接受 finish_reason="length" 作为可抢救终止。
+   */
+  salvageOnLengthLimit: boolean;
 }
 
 interface PostDonePendingDataScan {
@@ -2691,8 +3256,13 @@ async function readChatCompletionEventStream(
   response: Response,
   requestController: AbortController,
   observer: ResponseBodyActivityObserver,
-  audit: MutableLlmRequestAudit
-): Promise<{ readonly raw: unknown; readonly sseDoneObserved: boolean }> {
+  audit: MutableLlmRequestAudit,
+  salvageOnLengthLimit = false
+): Promise<{
+  readonly raw: unknown;
+  readonly sseDoneObserved: boolean;
+  readonly salvaged: boolean;
+}> {
   if (response.body === null) {
     throw new LlmResponseFormatError("missing_body");
   }
@@ -2705,7 +3275,9 @@ async function readChatCompletionEventStream(
     sawStop: false,
     sawDone: false,
     postDoneTailShape: undefined,
-    postDoneTailHasUnresolvedData: false
+    postDoneTailHasUnresolvedData: false,
+    sawLengthSalvage: false,
+    salvageOnLengthLimit
   };
   let trailingCarriageReturn = false;
   const eventBuffer = createEventStreamEventBuffer();
@@ -2809,6 +3381,21 @@ async function readChatCompletionEventStream(
             postDoneFailureSubstage(state.postDoneTailShape, true)
           );
         }
+        if (state.sawLengthSalvage && !state.sawStop) {
+          // 抢救路径：finish_reason="length" 已由 consumeChatCompletionEvent
+          // 接受为可抢救终止。必须 reasoning 非空且 content 为空——有 content
+          // 说明 content 被截断，仍然不可抢救。不调用 extractChatCompletion
+          // （它要求非空 content），直接返回原始 reasoning。
+          // 如果 sawStop 也为 true，说明流后续给出了正常终止，优先走正常路径。
+          if (state.reasoning.trim().length === 0 || state.content.trim().length !== 0) {
+            throw new LlmRequestError("LLM_OUTPUT_LENGTH_LIMIT");
+          }
+          return {
+            raw: chatCompletionStreamResult(state),
+            sseDoneObserved: state.sawDone,
+            salvaged: true
+          };
+        }
         if (!state.sawChoice || !state.sawStop) {
           throw new LlmRequestError("LLM_STREAM_INTERRUPTED");
         }
@@ -2816,7 +3403,7 @@ async function readChatCompletionEventStream(
         // 思考内容是辅助信息，不是最终回答。即使 thinking=true，
         // reasoning-only 或空白 content 也是不完整响应。
         extractChatCompletion(raw);
-        return { raw, sseDoneObserved: state.sawDone };
+        return { raw, sseDoneObserved: state.sawDone, salvaged: false };
       }
       if (
         (state.postDoneTailShape !== undefined ||
@@ -3773,7 +4360,18 @@ function consumeChatCompletionEvent(
   }
   state.sawChoice = true;
   const choiceRecord = choice as Record<string, unknown>;
-  assertSafeFinishReason(choiceRecord.finish_reason, "finish_shape");
+  if (
+    state.salvageOnLengthLimit &&
+    choiceRecord.finish_reason === "length"
+  ) {
+    // 抢救路径：接受 finish_reason="length" 作为可抢救终止。
+    // 先累积本事件的 reasoning/content，再在 EOF 校验完整性。
+    // 不调用 assertSafeFinishReason（它会对 "length" 抛 LLM_OUTPUT_LENGTH_LIMIT）。
+    // 不置 sawStop（避免触发 post-stop 尾部校验拒绝后续 reasoning 分片）。
+    state.sawLengthSalvage = true;
+  } else {
+    assertSafeFinishReason(choiceRecord.finish_reason, "finish_shape");
+  }
   const deltaOrMessage =
     typeof choiceRecord.delta === "object" && choiceRecord.delta !== null
       ? choiceRecord.delta

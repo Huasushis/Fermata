@@ -2,6 +2,8 @@ import type { PipelineModelConfig } from "../pipelines/types";
 import {
   chatCompleteTwoRoundJsonWithReceipt,
   chatCompleteWithReceipt,
+  chatCompleteSalvageableWithReceipt,
+  chatCompleteReasoningSalvageJsonWithReceipt,
   getLlmFailureAudit,
   LlmJsonOutputError,
   LlmRequestError,
@@ -10,9 +12,13 @@ import {
   serializeTargetJsonSchema,
   type ChatMessage,
   type ChatCompletionWithReceipt,
+  type ChatCompletionSalvageableResult,
   type LlmJsonCompletionReceipt,
+  type LlmReasoningSalvageJsonReceipt,
   type LlmRuntimeOptions,
   type LlmSseAcceptedShapeAudit,
+  type LlmSalvageTransportReceipt,
+  type LlmTransportReceipt,
   type LlmResponseFormatFailureStage,
   type LlmResponseFormatFailureSubstage,
   type LlmSseRejectedEventAudit
@@ -43,7 +49,7 @@ export interface FourCallRuntimeModels {
   readonly D: PipelineModelConfig;
   readonly formatter: PipelineModelConfig;
 }
-export type FourCallSafeRoundName = "semantic" | "format" | "format_repair";
+export type FourCallSafeRoundName = "semantic" | "format" | "format_repair" | "salvage_finalization" | "salvage_finalization_repair";
 
 /** 两轮（语义→格式）A 阶段中单个轮次的消毒观测；只含协议状态与计数。 */
 export interface FourCallSafeRoundReceipt {
@@ -168,6 +174,7 @@ export async function runProductionFourCallReviewDag(input: {
       return executeProductionCall(
         request,
         input.models[request.stage],
+        input.models.formatter,
         input.lifecycle
       );
     }
@@ -183,22 +190,22 @@ export function createFourCallScheduler(input: {
     twentyConcurrencyProbeAccepted: input.twentyConcurrencyProbeAccepted
   });
 }
-
 async function executeProductionCall(
   request: FourCallRequest,
   config: PipelineModelConfig,
+  formatterConfig: PipelineModelConfig,
   lifecycle?: FourCallRequestLifecycle
 ): Promise<FourCallResponse> {
   assertRequestMatchesConfig(request.model, config);
   if (request.stage === "A") {
-    return executeProductionStageATwoRound(request, config, lifecycle);
+    return executeProductionStageATwoRound(request, config, formatterConfig, lifecycle);
   }
   const startedAt = Date.now();
   let firstValidOutputMs: number | null = null;
   let validOutputEventCount = 0;
-  let completion: ChatCompletionWithReceipt;
+  let completion: ChatCompletionWithReceipt | { content: string; receipt: LlmTransportReceipt | LlmSalvageTransportReceipt; salvagedContent: true };
   try {
-    completion = await chatCompleteWithReceipt(
+    const salvageable = await chatCompleteSalvageableWithReceipt(
       config.credentials,
       config.spec,
       request.messages as ChatMessage[],
@@ -216,6 +223,29 @@ async function executeProductionCall(
             }
       }
     );
+    if (!salvageable.salvaged) {
+      completion = salvageable;
+    } else {
+      // 抢救路径：C/D 的 Pro 分析轮 finish_reason="length"，reasoning 非空。
+      // 用 formatter（Flash）做 finalizer 提取结构化 JSON。
+      const finalizerOutput = await executeSalvageFinalizer(
+        request,
+        config,
+        formatterConfig,
+        salvageable.reasoning,
+        salvageable.receipt,
+        lifecycle,
+        startedAt,
+        () => {
+          validOutputEventCount += 1;
+        }
+      );
+      completion = {
+        content: finalizerOutput.content,
+        receipt: finalizerOutput.receipt,
+        salvagedContent: true
+      };
+    }
   } catch (error) {
     const classified = classifyTransportFailure(error);
     lifecycle?.requestFailed(
@@ -232,18 +262,94 @@ async function executeProductionCall(
     );
     throw classified;
   }
+  const transportReceipt = "salvagedContent" in completion
+    ? completion.receipt
+    : completion.receipt;
   lifecycle?.requestCompleted(request, Object.freeze({
     firstValidOutputMs,
     endToEndMs: Date.now() - startedAt,
     validOutputEventCount,
     outputUtf8Bytes: Buffer.byteLength(completion.content, "utf8"),
-    acceptedEventShapes: completion.receipt.acceptedEventShapes,
-    externalTransportAttemptsUsed: completion.receipt.transportAttemptCount
+    acceptedEventShapes: transportReceipt.acceptedEventShapes,
+    externalTransportAttemptsUsed: transportReceipt.transportAttemptCount
   }));
   return {
     output: completion.content,
-    eofVerified: completion.receipt.eofVerified
+    eofVerified: transportReceipt.eofVerified
   };
+}
+
+/**
+ * C/D 抢救 finalizer：把 Pro 分析轮的 reasoning 传给 Flash，
+ * 由 Flash 提取满足 schema 的 JSON。不含原始 reasoning 的 receipt。
+ */
+async function executeSalvageFinalizer(
+  request: FourCallRequest,
+  config: PipelineModelConfig,
+  formatterConfig: PipelineModelConfig,
+  analysisReasoning: string,
+  analysisReceipt: LlmSalvageTransportReceipt,
+  lifecycle: FourCallRequestLifecycle | undefined,
+  startedAt: number,
+  onValidOutput: () => void
+): Promise<{ content: string; receipt: LlmTransportReceipt }> {
+  const schemaDescription = request.schema === null
+    ? "一个 JSON 对象"
+    : JSON.stringify(request.schema, null, 2);
+  const finalizerMessages: ChatMessage[] = [
+    {
+      role: "system",
+      content: "只输出一个满足要求的 JSON 对象本身，不要输出任何解释、前后缀文字，也不要用 Markdown 代码块包裹。"
+    },
+    {
+      role: "user",
+      content: [
+        "以下是一段分析推理文本。请从中提取最终结论，转换为符合要求的 JSON。不要重新推理，只做信息提取和格式转换：",
+        analysisReasoning
+      ].join("\n")
+    },
+    {
+      role: "user",
+      content: `目标 JSON Schema：\n${schemaDescription}`
+    }
+  ];
+  const firstFinal = await chatCompleteWithReceipt(
+    formatterConfig.credentials,
+    formatterConfig.spec,
+    finalizerMessages,
+    buildCallRuntime(request, formatterConfig, lifecycle, startedAt, onValidOutput),
+    {
+      requestJson: true,
+      maxOutputTokens: request.maxOutputTokens
+    }
+  );
+  // 验证 finalizer 输出是合法 JSON
+  try {
+    JSON.parse(firstFinal.content);
+  } catch {
+    // finalizer 输出不是合法 JSON，修复轮
+    const repairMessages: ChatMessage[] = [
+      ...finalizerMessages,
+      { role: "assistant", content: firstFinal.content },
+      {
+        role: "user",
+        content: "上一条回复不是合法 JSON。请只重新输出一个满足要求的 JSON 对象，不要包含任何其它文字或代码块标记。"
+      }
+    ];
+    const secondFinal = await chatCompleteWithReceipt(
+      formatterConfig.credentials,
+      formatterConfig.spec,
+      repairMessages,
+      buildCallRuntime(request, formatterConfig, lifecycle, startedAt, onValidOutput),
+      {
+        requestJson: true,
+        maxOutputTokens: request.maxOutputTokens
+      }
+    );
+    JSON.parse(secondFinal.content);
+    return { content: secondFinal.content, receipt: secondFinal.receipt };
+  }
+  return { content: firstFinal.content, receipt: firstFinal.receipt };
 }
 
 /**
@@ -281,10 +387,14 @@ function buildCallRuntime(
   });
 }
 
-/** A 阶段（盲解）两轮路径：语义轮自由文本 → 格式轮只做 JSON Schema 转换。 */
+/** A 阶段（盲解）两轮路径：语义轮自由文本 → 格式轮只做 JSON Schema 转换。
+ * 启用 reasoning salvage：当语义轮因 finish_reason="length" 截断且 reasoning
+ * 非空时，改由 formatter（Flash）做 finalizer 提取结构化 JSON，避免重新发起
+ * ~81 分钟的 Pro 语义轮。正常 finish_reason="stop" 路径完全不受影响。 */
 async function executeProductionStageATwoRound(
   request: FourCallRequest,
   config: PipelineModelConfig,
+  formatterConfig: PipelineModelConfig,
   lifecycle?: FourCallRequestLifecycle
 ): Promise<FourCallResponse> {
   const startedAt = Date.now();
@@ -295,12 +405,13 @@ async function executeProductionStageATwoRound(
   let result: {
     data: ReviewFlowStageAPayload;
     reasoning: string | null;
-    receipt: LlmJsonCompletionReceipt;
+    receipt: LlmJsonCompletionReceipt | LlmReasoningSalvageJsonReceipt;
   };
   try {
-    result = await chatCompleteTwoRoundJsonWithReceipt(
+    result = await chatCompleteReasoningSalvageJsonWithReceipt(
       config.credentials,
       config.spec,
+      formatterConfig.spec,
       request.messages as ChatMessage[],
       reviewFlowStageAFormatterMessages,
       reviewFlowStageAZodSchema,
@@ -318,15 +429,45 @@ async function executeProductionStageATwoRound(
       },
       {
         onRoundStart: (round) => {
+          if (round === "semantic" || round === "format" || round === "format_repair") {
+            currentRoundAcc = {
+              round,
+              startedAtMs: Date.now(),
+              firstValidOutputMs: null,
+              validOutputEventCount: 0
+            };
+          }
+        },
+        onRoundSettled: (round, transport) => {
+          if (currentRoundAcc !== null && currentRoundAcc.round === round) {
+            rounds.push(reviewFlowSafeRoundReceipt(currentRoundAcc, transport));
+          }
+          currentRoundAcc = null;
+        },
+        onSalvageFinalizationStart: () => {
           currentRoundAcc = {
-            round,
+            round: "salvage_finalization",
             startedAtMs: Date.now(),
             firstValidOutputMs: null,
             validOutputEventCount: 0
           };
         },
-        onRoundSettled: (round, transport) => {
-          if (currentRoundAcc !== null && currentRoundAcc.round === round) {
+        onSalvageFinalizationSettled: (transport) => {
+          if (currentRoundAcc !== null && currentRoundAcc.round === "salvage_finalization") {
+            rounds.push(reviewFlowSafeRoundReceipt(currentRoundAcc, transport));
+          }
+          currentRoundAcc = null;
+        },
+        onSalvageFinalizationRepairStart: () => {
+          currentRoundAcc = {
+            round: "salvage_finalization_repair",
+            startedAtMs: Date.now(),
+            firstValidOutputMs: null,
+            validOutputEventCount: 0
+          };
+        },
+        onSalvageFinalizationRepairSettled: (transport) => {
+          if (currentRoundAcc !== null && currentRoundAcc.round === "salvage_finalization_repair") {
             rounds.push(reviewFlowSafeRoundReceipt(currentRoundAcc, transport));
           }
           currentRoundAcc = null;
