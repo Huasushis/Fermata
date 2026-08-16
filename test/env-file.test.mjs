@@ -173,7 +173,7 @@ describe("run-with-env 的受控环境与同步启动异常", () => {
   it("专用公开 difficulty-smoke env 文件拒绝未登记键，manifest 键仍不可伪造父环境", () => {
     expect(() =>
       buildDifficultyEvaluationRunEnvironment(
-        "EVAL_CONCURENCY=4\n" +
+        "EVAL_CONCURRENCY=4\n" +
           `EVAL_CODE_VERSION=${"a".repeat(40)}\n` +
           "EVAL_SAMPLE_LIMIT=4\n" +
           "EVAL_SAMPLE_IDS=1862A,1989E,2065A,2068A\n" +

@@ -147,7 +147,10 @@ const allowedDifficultyEvaluationFileEnvironmentKeys = [
   "EVAL_REQUIRE_DATASET_MANIFEST",
   "EVAL_SAMPLE_LIMIT",
   "EVAL_SAMPLE_IDS",
-  "EVAL_ATTEMPT_CEILING"
+  "EVAL_ATTEMPT_CEILING",
+  "FERMATA_MANAGEMENT_TOKEN",
+  "URMOTIV_BASE_URL",
+  "URMOTIV_ROBOT_TOKEN"
 ];
 const allowedDevelopmentDiagnosticFileEnvironmentKeys = [
   "AETHER_API_KEY",
