@@ -7,6 +7,8 @@ import {
   difficultyDatasetManifestSchema,
   knownPublicDifficultyArchiveProfile,
   loadDifficultyDatasetManifest,
+  parsePublicDifficultyBoundedSelection,
+  publicDifficultySmokeSampleLimit,
   verifyDifficultyDatasetManifest,
   verifyKnownPublicDifficultyArchiveProfile,
   type DifficultyDatasetManifest,
@@ -162,5 +164,135 @@ describe("difficulty 私有 manifest 对账", () => {
       manifest: null,
       failures: [{ code: "DATASET_MANIFEST_INVALID" }]
     });
+  });
+});
+describe("公开 difficulty smoke bounded selector", () => {
+  it("未设置 env 时默认关闭，保持全量行为不变", () => {
+    expect(parsePublicDifficultyBoundedSelection({
+      rawLimit: undefined,
+      rawIds: undefined,
+      availableSamples: [{ contestId: 1, index: "A" }]
+    })).toEqual({ enabled: false, selection: null, failures: [] });
+  });
+
+  it("只在恰好 4 个唯一、格式合法且在已验证 dataset 内的公开 ID 上启用", () => {
+    const available = [
+      { contestId: 1862, index: "A" },
+      { contestId: 1866, index: "E" },
+      { contestId: 1776, index: "J" },
+      { contestId: 2065, index: "C1" }
+    ];
+    const result = parsePublicDifficultyBoundedSelection({
+      rawLimit: "4",
+      rawIds: "1862A,1866E,1776J,2065C1",
+      availableSamples: available
+    });
+    expect(result).toEqual({
+      enabled: true,
+      selection: available,
+      failures: []
+    });
+  });
+
+  it("只设置一个 env 而缺另一个时 fail closed", () => {
+    const available = [{ contestId: 1862, index: "A" }];
+    expect(parsePublicDifficultyBoundedSelection({
+      rawLimit: "4",
+      rawIds: undefined,
+      availableSamples: available
+    }).failures.map((f) => f.code)).toEqual(["PUBLIC_SAMPLE_SELECTOR_PARTIAL"]);
+    expect(parsePublicDifficultyBoundedSelection({
+      rawLimit: undefined,
+      rawIds: "1862A",
+      availableSamples: available
+    }).failures.map((f) => f.code)).toEqual(["PUBLIC_SAMPLE_SELECTOR_PARTIAL"]);
+  });
+
+  it("limit 非 4 或非整数时 fail closed", () => {
+    const available = [{ contestId: 1, index: "A" }];
+    for (const bad of ["3", "5", "abc", ""]) {
+      expect(parsePublicDifficultyBoundedSelection({
+        rawLimit: bad,
+        rawIds: "1A,2B,3C,4D",
+        availableSamples: available
+      }).failures.map((f) => f.code)).toEqual(["PUBLIC_SAMPLE_LIMIT_INVALID"]);
+    }
+  });
+
+  it("IDs 为空或纯空白时 fail closed", () => {
+    const available = [{ contestId: 1, index: "A" }];
+    for (const bad of ["", "   ", ",,,,"]) {
+      expect(parsePublicDifficultyBoundedSelection({
+        rawLimit: "4",
+        rawIds: bad,
+        availableSamples: available
+      }).failures.map((f) => f.code)).toEqual(["PUBLIC_SAMPLE_IDS_EMPTY"]);
+    }
+  });
+
+  it("ID 格式非法（含路径/特殊字符/非公开题号格式）时 fail closed", () => {
+    const available = [{ contestId: 1, index: "A" }];
+    const result = parsePublicDifficultyBoundedSelection({
+      rawLimit: "4",
+      rawIds: "1A,../etc/passwd,2B,3C",
+      availableSamples: available
+    });
+    expect(result.enabled).toBe(false);
+    expect(result.failures.map((f) => f.code)).toContain("PUBLIC_SAMPLE_ID_INVALID");
+    expect(result.failures.some((f) => f.sampleId.includes("passwd"))).toBe(true);
+  });
+
+  it("4 个 ID 中有重复时 fail closed", () => {
+    const available = [{ contestId: 1, index: "A" }, { contestId: 2, index: "B" }];
+    expect(parsePublicDifficultyBoundedSelection({
+      rawLimit: "4",
+      rawIds: "1A,1A,2B,2B",
+      availableSamples: available
+    }).failures.map((f) => f.code)).toEqual(["PUBLIC_SAMPLE_DUPLICATE"]);
+  });
+
+  it("ID 数量不等于 4 时 fail closed（过少或过多）", () => {
+    const available = [
+      { contestId: 1, index: "A" }, { contestId: 2, index: "B" },
+      { contestId: 3, index: "C" }, { contestId: 4, index: "D" }, { contestId: 5, index: "E" }
+    ];
+    expect(parsePublicDifficultyBoundedSelection({
+      rawLimit: "4",
+      rawIds: "1A,2B,3C",
+      availableSamples: available
+    }).failures.map((f) => f.code)).toEqual(["PUBLIC_SAMPLE_COUNT_MISMATCH"]);
+    expect(parsePublicDifficultyBoundedSelection({
+      rawLimit: "4",
+      rawIds: "1A,2B,3C,4D,5E",
+      availableSamples: available
+    }).failures.map((f) => f.code)).toEqual(["PUBLIC_SAMPLE_COUNT_MISMATCH"]);
+  });
+
+  it("合法 4 个 ID 但部分不在已验证 dataset 内时 fail closed", () => {
+    const available = [
+      { contestId: 1862, index: "A" }, { contestId: 1866, index: "E" }
+    ];
+    const result = parsePublicDifficultyBoundedSelection({
+      rawLimit: "4",
+      rawIds: "1862A,1866E,9999Z,8888Y",
+      availableSamples: available
+    });
+    expect(result.enabled).toBe(false);
+    expect(result.failures.map((f) => f.code)).toEqual([
+      "PUBLIC_SAMPLE_NOT_IN_VERIFIED_DATASET",
+      "PUBLIC_SAMPLE_NOT_IN_VERIFIED_DATASET"
+    ]);
+    expect(result.failures.map((f) => f.sampleId)).toEqual(["9999#Z", "8888#Y"]);
+  });
+
+  it("选择器不读取任何文件路径，只做纯字符串解析", () => {
+    const available = [{ contestId: 1, index: "A" }];
+    const result = parsePublicDifficultyBoundedSelection({
+      rawLimit: "4",
+      rawIds: "/home/ubuntu/secrets.env,1A,2B,3C",
+      availableSamples: available
+    });
+    expect(result.enabled).toBe(false);
+    expect(result.failures.some((f) => f.code === "PUBLIC_SAMPLE_ID_INVALID")).toBe(true);
   });
 });

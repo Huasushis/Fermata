@@ -235,6 +235,138 @@ export function verifyKnownPublicDifficultyArchiveProfile(
   return failures;
 }
 
+/**
+ * 公开 difficulty smoke 的选择器：只在完整 83 归档校验通过之后，把本次付费
+ * 运行限定到恰好 4 个公开样本。选择器解析是纯函数、没有 I/O；解析失败与
+ * 样本不在已验证 dataset 内一律 fail closed，默认（未设置对应 env）完全不变。
+ */
+export const publicDifficultySmokeSampleLimit = 4;
+export const publicDifficultySmokeIdPattern = /^[1-9][0-9]*[A-Z][0-9]{0,7}$/;
+
+export interface PublicDifficultyBoundedSelection {
+  readonly enabled: boolean;
+  readonly selection: readonly { readonly contestId: number; readonly index: string }[] | null;
+  readonly failures: readonly EvaluationFailure[];
+}
+
+function parsePublicDifficultySampleId(id: string): { contestId: number; index: string } | null {
+  const match = publicDifficultySmokeIdPattern.exec(id);
+  if (match === null) return null;
+  const digits = id.match(/^[0-9]+/)!;
+  return {
+    contestId: Number(digits[0]),
+    index: id.slice(digits[0].length)
+  };
+}
+
+export function parsePublicDifficultyBoundedSelection(input: {
+  readonly rawLimit: string | undefined;
+  readonly rawIds: string | undefined;
+  readonly availableSamples: readonly { readonly contestId: number; readonly index: string }[];
+}): PublicDifficultyBoundedSelection {
+  const { rawLimit, rawIds, availableSamples } = input;
+  if (rawLimit === undefined && rawIds === undefined) {
+    return { enabled: false, selection: null, failures: [] };
+  }
+  if (rawLimit === undefined || rawIds === undefined) {
+    return {
+      enabled: false,
+      selection: null,
+      failures: [{
+        sampleId: "public-sample-selector",
+        phase: "setup",
+        code: "PUBLIC_SAMPLE_SELECTOR_PARTIAL"
+      }]
+    };
+  }
+  const limit = Number.parseInt(rawLimit, 10);
+  if (!Number.isInteger(limit) || limit !== publicDifficultySmokeSampleLimit) {
+    return {
+      enabled: false,
+      selection: null,
+      failures: [{
+        sampleId: "public-sample-selector",
+        phase: "setup",
+        code: "PUBLIC_SAMPLE_LIMIT_INVALID"
+      }]
+    };
+  }
+  const tokens = rawIds.split(",").map((token) => token.trim()).filter((token) => token.length > 0);
+  if (tokens.length === 0) {
+    return {
+      enabled: false,
+      selection: null,
+      failures: [{
+        sampleId: "public-sample-selector",
+        phase: "setup",
+        code: "PUBLIC_SAMPLE_IDS_EMPTY"
+      }]
+    };
+  }
+  const parsed: { contestId: number; index: string }[] = [];
+  const invalidTokens: string[] = [];
+  for (const token of tokens) {
+    const parsedId = parsePublicDifficultySampleId(token);
+    if (parsedId === null) {
+      invalidTokens.push(token);
+      continue;
+    }
+    parsed.push(parsedId);
+  }
+  if (invalidTokens.length > 0) {
+    return {
+      enabled: false,
+      selection: null,
+      failures: invalidTokens.map((token) => ({
+        sampleId: `public-sample-${token}`,
+        phase: "setup",
+        code: "PUBLIC_SAMPLE_ID_INVALID"
+      }))
+    };
+  }
+  const uniqueKeys = new Set(parsed.map((entry) => `${entry.contestId}#${entry.index}`));
+  if (uniqueKeys.size !== parsed.length) {
+    return {
+      enabled: false,
+      selection: null,
+      failures: [{
+        sampleId: "public-sample-selector",
+        phase: "setup",
+        code: "PUBLIC_SAMPLE_DUPLICATE"
+      }]
+    };
+  }
+  if (parsed.length !== publicDifficultySmokeSampleLimit) {
+    return {
+      enabled: false,
+      selection: null,
+      failures: [{
+        sampleId: "public-sample-selector",
+        phase: "setup",
+        code: "PUBLIC_SAMPLE_COUNT_MISMATCH"
+      }]
+    };
+  }
+  const availableKeys = new Set(
+    availableSamples.map((sample) => problemKey(sample.contestId, sample.index))
+  );
+  const missing = parsed.filter(
+    (entry) => !availableKeys.has(problemKey(entry.contestId, entry.index))
+  );
+  if (missing.length > 0) {
+    return {
+      enabled: false,
+      selection: null,
+      failures: missing.map((entry) => ({
+        sampleId: problemKey(entry.contestId, entry.index),
+        phase: "setup",
+        code: "PUBLIC_SAMPLE_NOT_IN_VERIFIED_DATASET"
+      }))
+    };
+  }
+  return { enabled: true, selection: parsed, failures: [] };
+}
+
 function manifestLoadFailure(code: string): LoadedDifficultyDatasetManifest {
   return {
     manifest: null,

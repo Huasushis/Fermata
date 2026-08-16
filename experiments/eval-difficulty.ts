@@ -42,6 +42,7 @@ import {
 import {
   loadDifficultyDatasetManifest,
   knownPublicDifficultyArchiveProfile,
+  parsePublicDifficultyBoundedSelection,
   verifyDifficultyDatasetManifest,
   verifyKnownPublicDifficultyArchiveProfile
 } from "./lib/difficulty-dataset-manifest";
@@ -520,7 +521,9 @@ async function main(): Promise<void> {
       "EVAL_CODE_VERSION",
       "EVAL_CONCURRENCY",
       "EVAL_DATASET_MANIFEST_PATH",
-      "EVAL_REQUIRE_DATASET_MANIFEST"
+      "EVAL_REQUIRE_DATASET_MANIFEST",
+      "EVAL_SAMPLE_LIMIT",
+      "EVAL_SAMPLE_IDS"
     ])
   ) {
     incompleteBeforeCalls({
@@ -656,7 +659,7 @@ async function main(): Promise<void> {
   const excludedAnchorSources = preflight.sources.filter(
     (source) => anchorKeys.has(`${source.item.contestId}#${source.item.index}`)
   );
-  const dataset = preflight.sources.filter(
+  let dataset = preflight.sources.filter(
     (source) => !anchorKeys.has(`${source.item.contestId}#${source.item.index}`)
   );
   const excludedAnchors = excludedAnchorSources.length;
@@ -715,6 +718,58 @@ async function main(): Promise<void> {
       anchorsProvisional: strictAnchors.provisional
     });
     return;
+  }
+
+  // 公开 difficulty smoke 选择器：仅在完整 83 归档 + manifest + profile +
+  // 锚点 + 去重全部通过之后应用。它把本次付费运行限定到恰好 4 个公开样本；
+  // 任何解析/存在性失败都 fail closed，默认（不设置 env）保持全量行为不变。
+  const boundedSelection = parsePublicDifficultyBoundedSelection({
+    rawLimit: process.env.EVAL_SAMPLE_LIMIT,
+    rawIds: process.env.EVAL_SAMPLE_IDS,
+    availableSamples: dataset.map((source) => ({
+      contestId: source.item.contestId,
+      index: source.item.index
+    }))
+  });
+  if (boundedSelection.failures.length > 0) {
+    incompleteBeforeCalls({
+      runId,
+      label,
+      generatedAt,
+      ...codeEvidence,
+      fileCount: preflight.fileCount,
+      expectedIds: dataset.map((source) => source.sourceId),
+      failures: boundedSelection.failures,
+      manifest: manifestReport,
+      anchorsProvisional: strictAnchors.provisional
+    });
+    return;
+  }
+  if (boundedSelection.enabled && boundedSelection.selection !== null) {
+    const selectedKeys = new Set(
+      boundedSelection.selection.map((entry) => `${entry.contestId}#${entry.index}`)
+    );
+    dataset = dataset.filter((source) =>
+      selectedKeys.has(`${source.item.contestId}#${source.item.index}`)
+    );
+    if (dataset.length !== boundedSelection.selection.length) {
+      incompleteBeforeCalls({
+        runId,
+        label,
+        generatedAt,
+        ...codeEvidence,
+        fileCount: preflight.fileCount,
+        expectedIds: dataset.map((source) => source.sourceId),
+        failures: [{
+          sampleId: "public-sample-selector",
+          phase: "setup",
+          code: "PUBLIC_SAMPLE_SELECTION_FAILED"
+        }],
+        manifest: manifestReport,
+        anchorsProvisional: strictAnchors.provisional
+      });
+      return;
+    }
   }
 
   let blindContent: BlindContentDataset;
