@@ -226,6 +226,7 @@ export type DevelopmentSmokeStopReason =
   | "repeated_system_error"
   | "p90_over_three_hours"
   | "three_hour_gate"
+  | "external_stop_scheduling"
   | "manual";
 
 type SystemFailureKind = Exclude<

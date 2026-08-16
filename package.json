@@ -31,7 +31,8 @@
     "experiment:eval-review-flow": "node scripts/review-flow-evaluation-bootstrap.mjs",
     "experiment:prepare-review-flow-dataset": "tsx experiments/prepare-review-flow-dataset.ts",
     "experiment:prepare-review-flow-historical-inputs": "tsx experiments/prepare-review-flow-historical-inputs.ts",
-    "experiment:finalise-review-flow-bridge-plan": "tsx experiments/finalise-review-flow-bridge-plan.ts"
+    "experiment:finalise-review-flow-bridge-plan": "tsx experiments/finalise-review-flow-bridge-plan.ts",
+    "smoke:durable": "node scripts/durable-smoke.mjs"
   },
   "dependencies": {
     "undici": "8.9.0",

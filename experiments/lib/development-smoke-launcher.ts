@@ -2192,6 +2192,7 @@ export async function executeDevelopmentSmokePhase0(input: {
       clock: () => now().getTime()
     });
     const reusableBySlot = restoreReusableRequests(controller, ledger.state);
+    const externalStopPoller = createExternalStopSchedulingPoller(runDirectory, controller);
     const checkpoint15 = setTimeout(() => {
       ledger.mutate((state) => ({ ...state, stopReason: state.stopReason }));
     }, developmentSmokeProfile.phase0CheckpointMs);
@@ -2263,6 +2264,7 @@ export async function executeDevelopmentSmokePhase0(input: {
     } finally {
       clearTimeout(checkpoint15);
       clearTimeout(checkpoint60);
+      clearTimeout(externalStopPoller);
     }
     return Object.freeze({
       runId,
@@ -2363,6 +2365,7 @@ export async function executeDevelopmentSmokePhase1(input: {
       clock: () => now().getTime()
     });
     const reusableBySlot = restoreReusableRequests(controller, ledger.state);
+    const externalStopPoller = createExternalStopSchedulingPoller(runDirectory, controller);
     const checkpoint15 = setTimeout(() => {
       ledger.mutate((state) => ({
         ...state,
@@ -2440,6 +2443,7 @@ export async function executeDevelopmentSmokePhase1(input: {
     } finally {
       clearTimeout(checkpoint15);
       clearTimeout(checkpoint60);
+      clearTimeout(externalStopPoller);
     }
     const metrics = buildRunMetrics(ledger.state, now());
     return Object.freeze({
@@ -3368,6 +3372,26 @@ function acquireRunLock(runDirectory: string, runId: string): () => void {
   return () => rmSync(lockPath, { force: false });
 }
 
+
+/**
+ * 外部停止调度标志文件轮询：在运行目录中检测 stop-scheduling.private.json
+ * 存在时调用 controller.softStop("external_stop_scheduling")。不取消已在流式的
+ * 请求；仅阻止新请求被调度。返回定时器句柄，调用方负责在 finally 中清理。
+ */
+function createExternalStopSchedulingPoller(
+  runDirectory: string,
+  controller: DevelopmentSmokeRunController,
+  intervalMs = 5_000
+): NodeJS.Timeout {
+  const flagPath = resolve(runDirectory, "stop-scheduling.private.json");
+  const timer = setInterval(() => {
+    if (existsSync(flagPath)) {
+      controller.softStop("external_stop_scheduling");
+    }
+  }, intervalMs);
+  timer.unref();
+  return timer;
+}
 function writeNewPrivateFile(path: string, bytes: Buffer): void {
   const directory = resolve(path, "..");
   assertUserOnlyPath(directory, true);
