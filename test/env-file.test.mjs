@@ -8,6 +8,7 @@ import {
 import {
   buildReviewFlowEvaluationRunEnvironment,
   buildDevelopmentSmokeRunEnvironment,
+  buildDifficultyEvaluationRunEnvironment,
   assertDevelopmentSmokeArguments,
   buildRunEnvironment,
   createRunWithEnvSignalController,
@@ -137,6 +138,60 @@ describe("run-with-env 的受控环境与同步启动异常", () => {
         PATH: "/bin",
         LEVELS_LLM_MAX_DURATON_MS: "14400000"
       })
+    ).toThrow("UNKNOWN_PROTECTED_ENVIRONMENT_KEY");
+  });
+
+  it("专用公开 difficulty-smoke env 文件可携带私有 manifest 路径并选中 4 个样本", () => {
+    const environment = buildDifficultyEvaluationRunEnvironment(
+      "AETHER_BASE_URL=https://model.example/v1\n" +
+        "AETHER_API_KEY=private-value\n" +
+        `EVAL_CODE_VERSION=${"a".repeat(40)}\n` +
+        "EVAL_CONCURRENCY=4\n" +
+        "EVAL_DATASET_MANIFEST_PATH=/project/private/manifest.json\n" +
+        "EVAL_REQUIRE_DATASET_MANIFEST=1\n" +
+        "EVAL_SAMPLE_LIMIT=4\n" +
+        "EVAL_SAMPLE_IDS=1862A,1989E,2065A,2068A\n" +
+        "EVAL_ATTEMPT_CEILING=8\n",
+      { PATH: "/safe/bin" }
+    );
+    expect(environment).toMatchObject({
+      PATH: "/safe/bin",
+      AETHER_BASE_URL: "https://model.example/v1",
+      AETHER_API_KEY: "private-value",
+      EVAL_CODE_VERSION: "a".repeat(40),
+      EVAL_CONCURRENCY: "4",
+      EVAL_DATASET_MANIFEST_PATH: "/project/private/manifest.json",
+      EVAL_REQUIRE_DATASET_MANIFEST: "1",
+      EVAL_SAMPLE_LIMIT: "4",
+      EVAL_SAMPLE_IDS: "1862A,1989E,2065A,2068A",
+      EVAL_ATTEMPT_CEILING: "8",
+      FERMATA_RUN_WITH_ENV: "1"
+    });
+    expect(environment.PATH).toBe("/safe/bin");
+  });
+
+  it("专用公开 difficulty-smoke env 文件拒绝未登记键，manifest 键仍不可伪造父环境", () => {
+    expect(() =>
+      buildDifficultyEvaluationRunEnvironment(
+        "EVAL_CONCURENCY=4\n" +
+          `EVAL_CODE_VERSION=${"a".repeat(40)}\n` +
+          "EVAL_SAMPLE_LIMIT=4\n" +
+          "EVAL_SAMPLE_IDS=1862A,1989E,2065A,2068A\n" +
+          "EVAL_ATTEMPT_CEILING=8\n",
+        { PATH: "/bin" }
+      )
+    ).toThrow("DIFFICULTY_EVALUATION_ENV_FILE_INCOMPLETE");
+    expect(() =>
+      buildDifficultyEvaluationRunEnvironment(
+        "AETHER_API_KEY=x\nAETHER_BASE_URL=http://y\n" +
+          `EVAL_CODE_VERSION=${"a".repeat(40)}\n` +
+          "EVAL_CONCURRENCY=4\n" +
+          "EVAL_SAMPLE_LIMIT=4\n" +
+          "EVAL_SAMPLE_IDS=1862A,1989E,2065A,2068A\n" +
+          "EVAL_ATTEMPT_CEILING=8\n" +
+          "EVAL_MANIFEST_PATH=/tmp/unknown\n",
+        { PATH: "/bin" }
+      )
     ).toThrow("UNKNOWN_PROTECTED_ENVIRONMENT_KEY");
   });
 

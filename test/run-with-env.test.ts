@@ -134,6 +134,54 @@ describe("run-with-env：命令行边界", () => {
     );
   });
 
+  it("专用公开 difficulty-smoke 模式固定 Node、tsx 与入口路径并透传 manifest", async () => {
+    const secret = "WRAPPER_PRIVATE_SECRET_SENTINEL";
+    let spawned:
+      | {
+          readonly command: string;
+          readonly arguments_: readonly string[];
+          readonly environment: NodeJS.ProcessEnv | undefined;
+        }
+      | undefined;
+    const runWithEnv = await loadRunWithEnv();
+    runWithEnv(
+      [
+        "--difficulty-evaluation",
+        "/private/difficulty.env",
+        "--public-difficulty-smoke"
+      ],
+      {
+        parentEnvironment: { PATH: "/safe/bin" },
+        readEnvFile: () =>
+          "AETHER_BASE_URL=https://model.example/v1\n" +
+          `AETHER_API_KEY=${secret}\n` +
+          `EVAL_CODE_VERSION=${"a".repeat(40)}\n` +
+          "EVAL_CONCURRENCY=4\n" +
+          "EVAL_DATASET_MANIFEST_PATH=/private/manifest.json\n" +
+          "EVAL_REQUIRE_DATASET_MANIFEST=1\n" +
+          "EVAL_SAMPLE_LIMIT=4\n" +
+          "EVAL_SAMPLE_IDS=1862A,1989E,2065A,2068A\n" +
+          "EVAL_ATTEMPT_CEILING=8\n",
+        spawnProcess: (command, arguments_, options) => {
+          spawned = { command, arguments_, environment: options.env };
+          return {};
+        }
+      }
+    );
+    expect(spawned).toBeDefined();
+    expect(spawned?.command).toBe(process.execPath);
+    expect(spawned?.arguments_[0]).toMatch(/\/node_modules\/tsx\/dist\/cli\.mjs$/u);
+    expect(spawned?.arguments_[1]).toMatch(
+      /\/experiments\/eval-difficulty\.ts$/u
+    );
+    expect(spawned?.arguments_.slice(2)).toEqual(["--public-difficulty-smoke"]);
+    expect(spawned?.environment?.AETHER_API_KEY).toBe(secret);
+    expect(spawned?.environment?.EVAL_DATASET_MANIFEST_PATH).toBe(
+      "/private/manifest.json"
+    );
+    expect(spawned?.environment?.EVAL_REQUIRE_DATASET_MANIFEST).toBe("1");
+  });
+
   it.each([
     { arguments_: [] },
     { arguments_: ["--unknown", "value"] },
