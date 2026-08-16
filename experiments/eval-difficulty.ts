@@ -43,6 +43,8 @@ import {
   loadDifficultyDatasetManifest,
   knownPublicDifficultyArchiveProfile,
   parsePublicDifficultyBoundedSelection,
+  parsePublicDifficultySmokeRuntimePolicy,
+  type PublicDifficultySmokeRuntimePolicy,
   verifyDifficultyDatasetManifest,
   verifyKnownPublicDifficultyArchiveProfile
 } from "./lib/difficulty-dataset-manifest";
@@ -139,6 +141,8 @@ interface DifficultyReport {
   readonly configurationFingerprint: string | null;
   /** 只保存 provider/baseUrl/apiKey 的不可逆摘要，不保存任何原值。 */
   readonly providerIdentityFingerprint: string | null;
+  /** 公开 difficulty smoke 运行时约束；默认全量运行为 null。 */
+  readonly smokePolicy: PublicDifficultySmokeRuntimePolicy | null;
   readonly executionComplete: boolean;
   readonly accuracyPassed: boolean;
   readonly anchorsProvisional: boolean | null;
@@ -369,6 +373,7 @@ function incompleteBeforeCalls(input: {
   readonly manifest?: DifficultyReport["dataset"]["manifest"];
   readonly configurationFingerprint?: string | null;
   readonly providerIdentityFingerprint?: string | null;
+  readonly smokePolicy?: PublicDifficultySmokeRuntimePolicy | null;
   readonly anchorsProvisional?: boolean;
   readonly excludedAnchors?: number;
   readonly persistedRows?: readonly PersistedEvalRow[];
@@ -414,6 +419,7 @@ function incompleteBeforeCalls(input: {
     modelsConfigSha256: input.modelsConfigSha256 ?? null,
     configurationFingerprint: input.configurationFingerprint ?? null,
     providerIdentityFingerprint: input.providerIdentityFingerprint ?? null,
+    smokePolicy: input.smokePolicy ?? null,
     anchorsProvisional: input.anchorsProvisional ?? null,
     ...eligibility,
     chain: input.chain ?? {
@@ -523,7 +529,8 @@ async function main(): Promise<void> {
       "EVAL_DATASET_MANIFEST_PATH",
       "EVAL_REQUIRE_DATASET_MANIFEST",
       "EVAL_SAMPLE_LIMIT",
-      "EVAL_SAMPLE_IDS"
+      "EVAL_SAMPLE_IDS",
+      "EVAL_ATTEMPT_CEILING"
     ])
   ) {
     incompleteBeforeCalls({
@@ -772,6 +779,31 @@ async function main(): Promise<void> {
     }
   }
 
+  // 公开 difficulty smoke：选择器激活（恰好 4 个已核验样本）后，立即把本次
+  // 运行锁定为并发 4 + 总外部尝试上限 8。缺失或非法值 fail closed；默认全量
+  // 路径未启用时返回 null，与既有行为完全一致。
+  const smokeRuntime = parsePublicDifficultySmokeRuntimePolicy({
+    enabled: boundedSelection.enabled,
+    rawConcurrency: process.env.EVAL_CONCURRENCY,
+    rawAttemptCeiling: process.env.EVAL_ATTEMPT_CEILING,
+    sampleCount: dataset.length
+  });
+  if (smokeRuntime.failures.length > 0) {
+    incompleteBeforeCalls({
+      runId,
+      label,
+      generatedAt,
+      ...codeEvidence,
+      fileCount: preflight.fileCount,
+      expectedIds: dataset.map((source) => source.sourceId),
+      failures: smokeRuntime.failures,
+      manifest: manifestReport,
+      anchorsProvisional: strictAnchors.provisional,
+      smokePolicy: smokeRuntime.policy,
+    });
+    return;
+  }
+
   let blindContent: BlindContentDataset;
   let blindGold: BlindGoldDataset<DifficultyBlindGold>;
   try {
@@ -826,12 +858,15 @@ async function main(): Promise<void> {
 
   let concurrency: number;
   try {
-    concurrency = parseBoundedPositiveInteger(
-      process.env.EVAL_CONCURRENCY,
-      6,
-      32,
-      "EVAL_CONCURRENCY"
-    );
+    // smoke 策略把并发锁定为恰好 4；默认全量路径保持原有 6..32 边界。
+    concurrency = smokeRuntime.policy !== null
+      ? smokeRuntime.policy.concurrency
+      : parseBoundedPositiveInteger(
+          process.env.EVAL_CONCURRENCY,
+          6,
+          32,
+          "EVAL_CONCURRENCY"
+        );
   } catch {
     incompleteBeforeCalls({
       runId,
@@ -956,7 +991,7 @@ async function main(): Promise<void> {
       firstOutputTimeoutMs: config.models.timeouts.llmFirstOutputMs,
       outputIdleTimeoutMs: config.models.timeouts.llmOutputIdleMs,
       maximumDurationMs: config.models.timeouts.llmMaximumDurationMs,
-      maxAttempts: config.models.retry.maxAttempts,
+      maxAttempts: smokeRuntime.policy?.attemptsPerSample ?? config.models.retry.maxAttempts,
       baseDelayMs: config.models.retry.baseDelayMs
     }
   };
@@ -1160,6 +1195,7 @@ async function main(): Promise<void> {
       modelsConfigSha256,
       configurationFingerprint,
       providerIdentityFingerprint,
+      smokePolicy: smokeRuntime.policy,
       anchorsProvisional: strictAnchors.provisional,
       ...eligibility,
       chain,

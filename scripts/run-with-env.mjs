@@ -22,11 +22,13 @@ const usage =
   "用法：node scripts/run-with-env.mjs <env文件> <命令> [参数...]\n" +
   "      node scripts/run-with-env.mjs --review-flow-evaluation <env文件> [评测参数...]\n" +
   "      node scripts/run-with-env.mjs --development-smoke <env文件> [--preflight|--preflight-phase1 --resume=<runId>|--network-phase0 [--resume=<runId>]|--network-phase1 --resume=<runId> --release-phase1]\n" +
+  "      node scripts/run-with-env.mjs --difficulty-evaluation <env文件> --public-difficulty-smoke\n" +
   "      node scripts/run-with-env.mjs --development-diagnostic <env文件> --state-dir <绝对目录> [--authorize-plan <fingerprint>]\n";
 
 export const reviewFlowEvaluationModeFlag = "--review-flow-evaluation";
 export const developmentSmokeModeFlag = "--development-smoke";
 export const developmentDiagnosticModeFlag = "--development-diagnostic";
+export const difficultyEvaluationModeFlag = "--difficulty-evaluation";
 export const reviewFlowEvaluationBootstrapPath = fileURLToPath(
   new URL("./review-flow-evaluation-bootstrap.mjs", import.meta.url)
 );
@@ -41,6 +43,9 @@ export const developmentDiagnosticEntrypointPath = fileURLToPath(
 );
 export const developmentDiagnosticTsxPath = fileURLToPath(
   new URL("../node_modules/tsx/dist/cli.mjs", import.meta.url)
+);
+export const difficultyEvaluationEntrypointPath = fileURLToPath(
+  new URL("../experiments/eval-difficulty.ts", import.meta.url)
 );
 const forwardedSignals = Object.freeze(["SIGINT", "SIGTERM", "SIGHUP"]);
 
@@ -59,6 +64,7 @@ const allowedFermataEnvironmentKeys = [
   "EVAL_REQUIRE_DATASET_MANIFEST",
   "EVAL_SAMPLE_LIMIT",
   "EVAL_SAMPLE_IDS",
+  "EVAL_ATTEMPT_CEILING",
   "FERMATA_MANAGEMENT_TOKEN",
   "FERMATA_PORT",
   "FERMATA_SETTINGS_PATH",
@@ -129,6 +135,17 @@ const allowedReviewFlowEvaluationFileEnvironmentKeys = [
 const allowedDevelopmentSmokeFileEnvironmentKeys = [
   "AETHER_API_KEY",
   "AETHER_BASE_URL"
+];
+const allowedDifficultyEvaluationFileEnvironmentKeys = [
+  "AETHER_API_KEY",
+  "AETHER_BASE_URL",
+  "DASHSCOPE_API_KEY",
+  "DASHSCOPE_BASE_URL",
+  "EVAL_CODE_VERSION",
+  "EVAL_CONCURRENCY",
+  "EVAL_SAMPLE_LIMIT",
+  "EVAL_SAMPLE_IDS",
+  "EVAL_ATTEMPT_CEILING"
 ];
 const allowedDevelopmentDiagnosticFileEnvironmentKeys = [
   "AETHER_API_KEY",
@@ -305,6 +322,93 @@ export function buildDevelopmentSmokeRunEnvironment(
   };
 }
 
+export function buildDifficultyEvaluationRunEnvironment(
+  envFileContent,
+  parentEnvironment
+) {
+  assertSafeNodeEnvironment(parentEnvironment);
+  const fileEnvironment = parseEnvFile(envFileContent);
+  assertSafeNodeEnvironment(fileEnvironment);
+  assertNoUnknownPrefixedEnvironmentKeys(
+    parentEnvironment,
+    [
+      ...allowedDifficultyEvaluationFileEnvironmentKeys,
+      ...allowedProxyEnvironmentKeys,
+      ...allowedBasicEnvironmentKeys
+    ],
+    protectedRunEnvironmentPrefixes
+  );
+  assertNoUnknownPrefixedEnvironmentKeys(
+    fileEnvironment,
+    allowedDifficultyEvaluationFileEnvironmentKeys,
+    [""]
+  );
+  for (const requiredKey of [
+    "EVAL_CODE_VERSION",
+    "EVAL_CONCURRENCY",
+    "EVAL_SAMPLE_LIMIT",
+    "EVAL_SAMPLE_IDS",
+    "EVAL_ATTEMPT_CEILING"
+  ]) {
+    if (!Object.hasOwn(fileEnvironment, requiredKey)) {
+      throw new Error("DIFFICULTY_EVALUATION_ENV_FILE_INCOMPLETE");
+    }
+  }
+  if (!/^(?!0{40}$)[0-9a-f]{40}$/u.test(fileEnvironment.EVAL_CODE_VERSION)) {
+    throw new Error("DIFFICULTY_EVALUATION_ENV_FILE_INCOMPLETE");
+  }
+  if (
+    fileEnvironment.EVAL_CONCURRENCY.trim() !== "4" ||
+    fileEnvironment.EVAL_SAMPLE_LIMIT.trim() !== "4" ||
+    fileEnvironment.EVAL_ATTEMPT_CEILING.trim() !== "8"
+  ) {
+    throw new Error("DIFFICULTY_EVALUATION_ENV_FILE_INCOMPLETE");
+  }
+  const sampleIds = fileEnvironment.EVAL_SAMPLE_IDS.split(",")
+    .map((token) => token.trim())
+    .filter((token) => token.length > 0);
+  if (
+    sampleIds.length !== 4 ||
+    new Set(sampleIds).size !== sampleIds.length ||
+    sampleIds.some((id) => !/^[1-9][0-9]*[A-Z][0-9]{0,7}$/u.test(id))
+  ) {
+    throw new Error("DIFFICULTY_EVALUATION_ENV_FILE_INCOMPLETE");
+  }
+  let configuredProviderCount = 0;
+  for (const [baseUrlKey, apiKeyKey] of [
+    ["AETHER_BASE_URL", "AETHER_API_KEY"],
+    ["DASHSCOPE_BASE_URL", "DASHSCOPE_API_KEY"]
+  ]) {
+    const hasBaseUrl = Object.hasOwn(fileEnvironment, baseUrlKey);
+    const hasApiKey = Object.hasOwn(fileEnvironment, apiKeyKey);
+    if (hasBaseUrl !== hasApiKey) {
+      throw new Error("DIFFICULTY_EVALUATION_ENV_FILE_INCOMPLETE");
+    }
+    if (hasBaseUrl) configuredProviderCount += 1;
+  }
+  if (configuredProviderCount === 0) {
+    throw new Error("DIFFICULTY_EVALUATION_ENV_FILE_INCOMPLETE");
+  }
+  return {
+    ...selectEnvironment(parentEnvironment, [
+      ...allowedProxyEnvironmentKeys,
+      ...allowedBasicEnvironmentKeys
+    ]),
+    ...selectEnvironment(
+      fileEnvironment,
+      allowedDifficultyEvaluationFileEnvironmentKeys
+    ),
+    FERMATA_RUN_WITH_ENV: "1",
+    NODE_DEBUG: "",
+    NODE_DEBUG_NATIVE: "",
+    NODE_DISABLE_COMPILE_CACHE: "1",
+    NODE_OPTIONS: "",
+    NODE_PATH: "",
+    NODE_REDIRECT_WARNINGS: "",
+    NODE_V8_COVERAGE: ""
+  };
+}
+
 export function buildDevelopmentDiagnosticRunEnvironment(
   envFileContent,
   parentEnvironment
@@ -455,6 +559,12 @@ export function assertDevelopmentSmokeArguments(args) {
   }
 }
 
+export function assertDifficultyEvaluationArguments(args) {
+  if (args.length !== 1 || args[0] !== "--public-difficulty-smoke") {
+    throw new Error("RUN_WITH_ENV_INVALID_ARGUMENTS");
+  }
+}
+
 export function assertDevelopmentDiagnosticArguments(args) {
   const seen = new Set();
   let hasStateDirectory = false;
@@ -511,10 +621,13 @@ export function runWithEnv(
     argv[0] === developmentSmokeModeFlag;
   const dedicatedDevelopmentDiagnostic =
     argv[0] === developmentDiagnosticModeFlag;
+  const dedicatedDifficultyEvaluation =
+    argv[0] === difficultyEvaluationModeFlag;
   const effectiveArguments =
     dedicatedReviewFlowEvaluation ||
     dedicatedDevelopmentSmoke ||
-    dedicatedDevelopmentDiagnostic
+    dedicatedDevelopmentDiagnostic ||
+    dedicatedDifficultyEvaluation
       ? argv.slice(1)
       : argv;
   const [envPath, ...remainingArguments] = effectiveArguments;
@@ -523,6 +636,7 @@ export function runWithEnv(
     (!dedicatedReviewFlowEvaluation &&
       !dedicatedDevelopmentSmoke &&
       !dedicatedDevelopmentDiagnostic &&
+      !dedicatedDifficultyEvaluation &&
       remainingArguments.length === 0) ||
     !isAbsolute(envPath)
   ) {
@@ -530,6 +644,9 @@ export function runWithEnv(
   }
   if (dedicatedDevelopmentSmoke) {
     assertDevelopmentSmokeArguments(remainingArguments);
+  }
+  if (dedicatedDifficultyEvaluation) {
+    assertDifficultyEvaluationArguments(remainingArguments);
   }
   if (dedicatedDevelopmentDiagnostic) {
     assertDevelopmentDiagnosticArguments(remainingArguments);
@@ -564,8 +681,13 @@ export function runWithEnv(
             envFileContent,
             parentEnvironment
           )
-        : buildRunEnvironment(envFileContent, parentEnvironment);
-  // 付费 review-flow/development-smoke 模式不能经 PATH 解析 npm/tsx 或接受任意命令。
+        : dedicatedDifficultyEvaluation
+          ? buildDifficultyEvaluationRunEnvironment(
+              envFileContent,
+              parentEnvironment
+            )
+          : buildRunEnvironment(envFileContent, parentEnvironment);
+  // 付费 review-flow/development-smoke/difficulty-evaluation 模式不能经 PATH 解析 npm/tsx 或接受任意命令。
   // 包装器固定使用当前 Node 和仓库内绝对入口；其余参数只能是对应入口的参数。
   const command = dedicatedReviewFlowEvaluation
     ? [process.execPath, reviewFlowEvaluationBootstrapPath, ...remainingArguments]
@@ -583,7 +705,14 @@ export function runWithEnv(
             developmentDiagnosticEntrypointPath,
             ...remainingArguments
           ]
-        : remainingArguments;
+        : dedicatedDifficultyEvaluation
+          ? [
+              process.execPath,
+              developmentSmokeTsxPath,
+              difficultyEvaluationEntrypointPath,
+              ...remainingArguments
+            ]
+          : remainingArguments;
   if (signalController?.closed === true) return undefined;
   const child = spawnRunCommand(command, childEnvironment, spawnProcess);
   signalController?.attach(child);

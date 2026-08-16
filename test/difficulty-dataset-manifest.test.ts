@@ -15,6 +15,11 @@ import {
   type DifficultyDatasetItemForManifest
 } from "../experiments/lib/difficulty-dataset-manifest";
 import type { DatasetSource } from "../experiments/lib/evaluation-integrity";
+import {
+  parsePublicDifficultySmokeRuntimePolicy,
+  publicDifficultySmokeAttemptCeiling,
+  publicDifficultySmokeConcurrency
+} from "../experiments/lib/difficulty-dataset-manifest";
 
 const temporaryDirectories: string[] = [];
 
@@ -294,5 +299,105 @@ describe("公开 difficulty smoke bounded selector", () => {
     });
     expect(result.enabled).toBe(false);
     expect(result.failures.some((f) => f.code === "PUBLIC_SAMPLE_ID_INVALID")).toBe(true);
+  });
+});
+
+describe("公开 difficulty smoke runtime policy", () => {
+  it("未启用时返回 null policy 且无失败", () => {
+    const result = parsePublicDifficultySmokeRuntimePolicy({
+      enabled: false,
+      rawConcurrency: "4",
+      rawAttemptCeiling: "8",
+      sampleCount: 4
+    });
+    expect(result.policy).toBeNull();
+    expect(result.failures).toEqual([]);
+  });
+
+  it("精确 4/8 且 sampleCount=4 时返回 policy 且 attemptsPerSample=2", () => {
+    const expected = {
+      concurrency: publicDifficultySmokeConcurrency,
+      attemptCeiling: publicDifficultySmokeAttemptCeiling,
+      attemptsPerSample: 2,
+      sampleCount: 4
+    };
+    expect(parsePublicDifficultySmokeRuntimePolicy({
+      enabled: true,
+      rawConcurrency: "4",
+      rawAttemptCeiling: "8",
+      sampleCount: 4
+    })).toEqual({ policy: expected, failures: [] });
+    // 精确匹配在 trim 后比较，容忍 env 文件里常见的空白
+    expect(parsePublicDifficultySmokeRuntimePolicy({
+      enabled: true,
+      rawConcurrency: " 4 ",
+      rawAttemptCeiling: " 8 ",
+      sampleCount: 4
+    })).toEqual({ policy: expected, failures: [] });
+  });
+
+  it("并发缺失或非精确 4 时 fail closed", () => {
+    for (const rawConcurrency of [undefined, "5", "04"]) {
+      const result = parsePublicDifficultySmokeRuntimePolicy({
+        enabled: true,
+        rawConcurrency,
+        rawAttemptCeiling: "8",
+        sampleCount: 4
+      });
+      expect(result.policy).toBeNull();
+      expect(result.failures.map((f) => f.code)).toEqual([
+        "PUBLIC_SMOKE_CONCURRENCY_INVALID"
+      ]);
+    }
+  });
+
+  it("尝试上限缺失或非精确 8（含前导零）时 fail closed", () => {
+    for (const rawAttemptCeiling of [undefined, "7", "08", "8.0"]) {
+      const result = parsePublicDifficultySmokeRuntimePolicy({
+        enabled: true,
+        rawConcurrency: "4",
+        rawAttemptCeiling,
+        sampleCount: 4
+      });
+      expect(result.policy).toBeNull();
+      expect(result.failures.map((f) => f.code)).toEqual([
+        "PUBLIC_SMOKE_ATTEMPT_CEILING_INVALID"
+      ]);
+    }
+  });
+
+  it("sampleCount 不等于 4 时 fail closed", () => {
+    for (const sampleCount of [0, 3, 5, 4.5]) {
+      const result = parsePublicDifficultySmokeRuntimePolicy({
+        enabled: true,
+        rawConcurrency: "4",
+        rawAttemptCeiling: "8",
+        sampleCount
+      });
+      expect(result.policy).toBeNull();
+      expect(result.failures.map((f) => f.code)).toEqual([
+        "PUBLIC_SMOKE_SAMPLE_COUNT_INVALID"
+      ]);
+    }
+  });
+
+  it("多项非法输入按聚合失败 fail closed", () => {
+    const result = parsePublicDifficultySmokeRuntimePolicy({
+      enabled: true,
+      rawConcurrency: "5",
+      rawAttemptCeiling: "7",
+      sampleCount: 5
+    });
+    expect(result.policy).toBeNull();
+    expect(result.failures.map((f) => f.code)).toEqual([
+      "PUBLIC_SMOKE_CONCURRENCY_INVALID",
+      "PUBLIC_SMOKE_ATTEMPT_CEILING_INVALID",
+      "PUBLIC_SMOKE_SAMPLE_COUNT_INVALID"
+    ]);
+    expect(result.failures.map((f) => f.sampleId)).toEqual([
+      "public-smoke-runtime",
+      "public-smoke-runtime",
+      "public-smoke-runtime"
+    ]);
   });
 });

@@ -4,12 +4,12 @@
  *
  * 用法：
  *   node scripts/durable-smoke.mjs launch <env文件> --network-phase0 [--resume=<runId>]
+ *   node scripts/durable-smoke.mjs launch <env文件> --public-difficulty-smoke
  *   node scripts/durable-smoke.mjs launch <env文件> --network-phase1 --resume=<runId> --release-phase1
  *   node scripts/durable-smoke.mjs status <run目录或runId>
  *   node scripts/durable-smoke.mjs stop-scheduling <run目录或runId>
  *   node scripts/durable-smoke.mjs recover <run目录或runId>
- *
- * 通过 run-with-env.mjs --development-smoke 启动子进程；子进程以 detached
+ * 通过 run-with-env.mjs --development-smoke / --difficulty-evaluation 启动子进程；子进程以 detached
  * 方式运行，调用方退出后继续。秘密仅在 env 文件中，不进 argv 或日志。
  * stop-scheduling 写入标志文件；运行进程轮询后调用 softStop，不取消已在
  * 流式的请求。status/recover 只读检查点和锁，不重放或重新启动。
@@ -38,7 +38,10 @@ import {
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { selectEnvironment } from "./env-file.mjs";
-import { allowedRunEnvironmentKeys } from "./run-with-env.mjs";
+import {
+  allowedRunEnvironmentKeys,
+  difficultyEvaluationModeFlag
+} from "./run-with-env.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
@@ -142,26 +145,44 @@ function redactEnvPath(envPath) {
 
 function commandLaunch(args) {
   if (args.length < 2) {
-    throw new Error("DURABLE_SMOKE_LAUNCH_ARGS: <envFile> --network-phase0|--network-phase1 ...");
+    throw new Error("DURABLE_SMOKE_LAUNCH_ARGS: <envFile> --network-phase0|--network-phase1|--public-difficulty-smoke ...");
   }
   const envPath = redactEnvPath(args[0]);
   const smokeArgs = args.slice(1);
 
-  // 验证参数是合法的 development-smoke 参数
-  const validModes = ["--preflight", "--preflight-phase1", "--network-phase0", "--network-phase1"];
+  // 验证参数是合法的 development-smoke 或公开 difficulty-smoke 参数
+  const validModes = [
+    "--preflight",
+    "--preflight-phase1",
+    "--network-phase0",
+    "--network-phase1",
+    "--public-difficulty-smoke"
+  ];
   const hasMode = smokeArgs.some((a) => validModes.includes(a));
   if (!hasMode) {
     throw new Error("DURABLE_SMOKE_LAUNCH_MODE_REQUIRED");
   }
-  // 不允许 preflight（不启动网络请求的模式无需 detached）
-  if (smokeArgs.includes("--preflight") || smokeArgs.includes("--preflight-phase1")) {
-    throw new Error("DURABLE_SMOKE_PREFLIGHT_NOT_DETACHED");
+  const isPublicDifficulty = smokeArgs.includes("--public-difficulty-smoke");
+  if (isPublicDifficulty) {
+    // 公开 difficulty smoke 的样本选择/并发/尝试上限全部由 env 文件传入并在
+    // eval-difficulty 内强制；这里只接受单模式参数，拒绝与 6×4 模式混用。
+    if (smokeArgs.length !== 1) {
+      throw new Error("DURABLE_SMOKE_PUBLIC_DIFFICULTY_ARGS");
+    }
+  } else {
+    // 不允许 preflight（不启动网络请求的模式无需 detached）
+    if (smokeArgs.includes("--preflight") || smokeArgs.includes("--preflight-phase1")) {
+      throw new Error("DURABLE_SMOKE_PREFLIGHT_NOT_DETACHED");
+    }
   }
 
   // 构造 run-with-env.mjs 参数
-  const childArgv = ["--development-smoke", envPath, ...smokeArgs];
+  const childArgv = isPublicDifficulty
+    ? [difficultyEvaluationModeFlag, envPath, ...smokeArgs]
+    : ["--development-smoke", envPath, ...smokeArgs];
 
-  // 提取 resume runId 用于确定运行目录
+  // 提取 resume runId 用于确定运行目录（difficulty smoke 由 eval-difficulty
+  // 自身检查点恢复，不传 durable resume）
   const resumeMatch = smokeArgs.find((a) => /^--resume=[a-f0-9]{64}$/.test(a));
   const runId = resumeMatch ? resumeMatch.split("=")[1] : null;
 
@@ -215,7 +236,9 @@ function commandLaunch(args) {
         pid,
         ppid: process.pid,
         cwd: repoRoot,
-        commandRedacted: "run-with-env.mjs --development-smoke [REDACTED]",
+        commandRedacted: isPublicDifficulty
+          ? "run-with-env.mjs --difficulty-evaluation [REDACTED]"
+          : "run-with-env.mjs --development-smoke [REDACTED]",
         smokeArgs: smokeArgs.filter((a) => !/^--resume=/.test(a)),
         startedAt,
         runId,

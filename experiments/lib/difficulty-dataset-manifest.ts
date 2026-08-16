@@ -367,6 +367,98 @@ export function parsePublicDifficultyBoundedSelection(input: {
   return { enabled: true, selection: parsed, failures: [] };
 }
 
+/**
+ * 公开 difficulty smoke 的运行时策略：仅在 bounded 选择器激活（恰好 4 个已核验
+ * 公开样本）后启用。并发必须恰好 4；总外部尝试（初次 + 429 重试）上限必须恰好
+ * 8，每样本 attemptsPerSample = 8/4 = 2，保证任何样本分布下都不会发出第 9 次
+ * 外部尝试。缺失、非整数、带多余空白或前导零、除不尽一律 fail closed；未启用
+ * （默认全量 83 路径）返回 null，行为完全不变。
+ */
+export const publicDifficultySmokeConcurrency = 4;
+export const publicDifficultySmokeAttemptCeiling = 8;
+
+export interface PublicDifficultySmokeRuntimePolicy {
+  readonly concurrency: number;
+  readonly attemptCeiling: number;
+  readonly attemptsPerSample: number;
+  readonly sampleCount: number;
+}
+
+export function parsePublicDifficultySmokeRuntimePolicy(input: {
+  readonly enabled: boolean;
+  readonly rawConcurrency: string | undefined;
+  readonly rawAttemptCeiling: string | undefined;
+  readonly sampleCount: number;
+}): {
+  readonly policy: PublicDifficultySmokeRuntimePolicy | null;
+  readonly failures: readonly EvaluationFailure[];
+} {
+  if (!input.enabled) {
+    return { policy: null, failures: [] };
+  }
+  const failures: EvaluationFailure[] = [];
+  const concurrencyToken = input.rawConcurrency?.trim();
+  const concurrency = Number.parseInt(concurrencyToken ?? "", 10);
+  if (
+    concurrencyToken === undefined ||
+    concurrencyToken === "" ||
+    !Number.isInteger(concurrency) ||
+    String(concurrency) !== concurrencyToken ||
+    concurrency !== publicDifficultySmokeConcurrency
+  ) {
+    failures.push({
+      sampleId: "public-smoke-runtime",
+      phase: "setup",
+      code: "PUBLIC_SMOKE_CONCURRENCY_INVALID"
+    });
+  }
+  const ceilingToken = input.rawAttemptCeiling?.trim();
+  const ceiling = Number.parseInt(ceilingToken ?? "", 10);
+  if (
+    ceilingToken === undefined ||
+    ceilingToken === "" ||
+    !Number.isInteger(ceiling) ||
+    String(ceiling) !== ceilingToken ||
+    ceiling !== publicDifficultySmokeAttemptCeiling
+  ) {
+    failures.push({
+      sampleId: "public-smoke-runtime",
+      phase: "setup",
+      code: "PUBLIC_SMOKE_ATTEMPT_CEILING_INVALID"
+    });
+  }
+  if (!Number.isInteger(input.sampleCount) || input.sampleCount !== publicDifficultySmokeSampleLimit) {
+    failures.push({
+      sampleId: "public-smoke-runtime",
+      phase: "setup",
+      code: "PUBLIC_SMOKE_SAMPLE_COUNT_INVALID"
+    });
+  }
+  if (
+    failures.length === 0 &&
+    (publicDifficultySmokeAttemptCeiling % input.sampleCount !== 0 ||
+      Math.floor(publicDifficultySmokeAttemptCeiling / input.sampleCount) < 1)
+  ) {
+    failures.push({
+      sampleId: "public-smoke-runtime",
+      phase: "setup",
+      code: "PUBLIC_SMOKE_ATTEMPT_BUDGET_INVALID"
+    });
+  }
+  if (failures.length > 0) {
+    return { policy: null, failures };
+  }
+  return {
+    policy: {
+      concurrency: publicDifficultySmokeConcurrency,
+      attemptCeiling: publicDifficultySmokeAttemptCeiling,
+      attemptsPerSample: publicDifficultySmokeAttemptCeiling / input.sampleCount,
+      sampleCount: input.sampleCount
+    },
+    failures: []
+  };
+}
+
 function manifestLoadFailure(code: string): LoadedDifficultyDatasetManifest {
   return {
     manifest: null,

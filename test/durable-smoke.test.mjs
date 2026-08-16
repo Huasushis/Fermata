@@ -316,6 +316,73 @@ tests.push(async () => {
   }
 });
 
+// 15. launch 接受 --public-difficulty-smoke 单模式参数并写 difficulty 专用脱敏 receipt
+tests.push(async () => {
+  const parent = makeTempDir();
+  const runtimeRoot = resolve(parent, "runtime-root");
+  mkdirSync(runtimeRoot, { recursive: true, mode: 0o700 });
+  const envPath = resolve(parent, "test.env");
+  writeFileSync(envPath, "# fake\n", { mode: 0o600 });
+  // 合成 live-wrapper：无限存活，验证宽限期后仍被判定为成功
+  const wrapperPath = resolve(parent, "live-wrapper.mjs");
+  writeFileSync(wrapperPath, "setInterval(() => {}, 1000);\n", { mode: 0o700 });
+  let livePid = null;
+  try {
+    const result = await runDurable(
+      ["launch", envPath, "--public-difficulty-smoke"],
+      {
+        env: {
+          DURABLE_SMOKE_WRAPPER_PATH: wrapperPath,
+          DURABLE_SMOKE_RUNTIME_ROOT: runtimeRoot,
+        },
+      }
+    );
+    let output = null;
+    try {
+      output = JSON.parse(result.stdout.trim());
+    } catch { /* 保留 null，失败断言会给出明确信息 */ }
+    if (output !== null && Number.isInteger(output.pid)) {
+      livePid = output.pid;
+    }
+    assert.equal(result.code, 0);
+    assert.equal(output?.ok, true);
+    assert.deepEqual(output?.smokeArgs, ["--public-difficulty-smoke"]);
+    assert.ok(!result.stdout.includes("test.env"));
+    const receipts = readdirSync(runtimeRoot).filter((f) => f.startsWith("durable-pid-"));
+    assert.equal(receipts.length, 1);
+    assert.equal(receipts[0], `durable-pid-${livePid}.private.json`);
+    const receipt = JSON.parse(
+      readFileSync(resolve(runtimeRoot, receipts[0]), "utf8")
+    );
+    assert.equal(
+      receipt.commandRedacted,
+      "run-with-env.mjs --difficulty-evaluation [REDACTED]"
+    );
+  } finally {
+    // 清理本测试创建的 live-wrapper 子进程（测试自有工件）
+    if (livePid !== null) {
+      try { process.kill(livePid, "SIGKILL"); } catch { /* 已退出 */ }
+    }
+  }
+});
+
+// 16. launch 拒绝 difficulty 模式与其他参数混用，未知模式也 fail closed
+tests.push(async () => {
+  const parent = makeTempDir();
+  const envPath = resolve(parent, "test.env");
+  writeFileSync(envPath, "# fake\n", { mode: 0o600 });
+  for (const extra of ["--network-phase0", "--preflight"]) {
+    const result = await runDurable(
+      ["launch", envPath, "--public-difficulty-smoke", extra]
+    );
+    assert.notEqual(result.code, 0);
+    assert.ok(result.stderr.includes("PUBLIC_DIFFICULTY_ARGS"));
+  }
+  const unknown = await runDurable(["launch", envPath, "--public-difficulty-smok"]);
+  assert.notEqual(unknown.code, 0);
+  assert.ok(unknown.stderr.includes("LAUNCH_MODE_REQUIRED"));
+});
+
 // ── 运行测试 ──
 
 let passed = 0;

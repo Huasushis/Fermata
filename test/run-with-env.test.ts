@@ -50,6 +50,7 @@ describe("run-with-env：命令行边界", () => {
       "用法：node scripts/run-with-env.mjs <env文件> <命令> [参数...]\n" +
       "      node scripts/run-with-env.mjs --review-flow-evaluation <env文件> [评测参数...]\n" +
       "      node scripts/run-with-env.mjs --development-smoke <env文件> [--preflight|--preflight-phase1 --resume=<runId>|--network-phase0 [--resume=<runId>]|--network-phase1 --resume=<runId> --release-phase1]\n" +
+      "      node scripts/run-with-env.mjs --difficulty-evaluation <env文件> --public-difficulty-smoke\n" +
       "      node scripts/run-with-env.mjs --development-diagnostic <env文件> --state-dir <绝对目录> [--authorize-plan <fingerprint>]\n"
     );
   });
