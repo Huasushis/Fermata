@@ -85,8 +85,8 @@ const thinkingRequestBodySchema = z
     stream: z.literal(true),
     messages: z.array(z.unknown()).min(1),
     thinking: z.object({ type: z.literal("enabled") }).strict(),
-    reasoning_effort: z.literal("max"),
-    max_tokens: z.literal(maximumExplicitLlmOutputTokens)
+    reasoning_effort: z.literal("max")
+    // 难度路径不发送任何数值型输出上限字段；携带 max_tokens 也会被 strict 拒绝。
   })
   .strict();
 

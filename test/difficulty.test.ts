@@ -51,8 +51,9 @@ describe("runDifficultyPipeline：整体接线", () => {
   it("把 LLM 的原始 rating 夹到整百范围内再返回", async () => {
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      // 难度路径不发送任何数值型输出上限字段；thinking/reasoning 保留。
+      expect(body).not.toHaveProperty("max_tokens");
       expect(body).toMatchObject({
-        max_tokens: 384_000,
         thinking: { type: "enabled" },
         reasoning_effort: "max"
       });
@@ -87,7 +88,6 @@ describe("runDifficultyPipeline：整体接线", () => {
     };
     let requestBody:
       | {
-          max_tokens?: number;
           thinking?: unknown;
           reasoning_effort?: unknown;
           response_format?: unknown;
@@ -121,7 +121,7 @@ describe("runDifficultyPipeline：整体接线", () => {
     expect(result.rating).toBe(3_300);
     expect(result.confidence).toBe(0.4);
     expect(requestBody).toBeDefined();
-    expect(requestBody?.max_tokens).toBe(384_000);
+    expect(requestBody).not.toHaveProperty("max_tokens");
     expect(requestBody?.thinking).toEqual({ type: "enabled" });
     expect(requestBody?.reasoning_effort).toBe("max");
     expect(requestBody).not.toHaveProperty("response_format");
@@ -152,7 +152,7 @@ describe("runDifficultyPipeline：整体接线", () => {
   it("没有锚点时也能正常工作（只是提示词里不带锚点）", async () => {
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body));
-      expect(body.max_tokens).toBe(384_000);
+      expect(body).not.toHaveProperty("max_tokens");
       const joined = body.messages.map((m: { content: string }) => m.content).join("\n");
       expect(joined).not.toContain("参考锚点");
       return completionResponse('{"rating": 900, "confidence": 0.5, "rationale": "简单"}');
@@ -176,7 +176,7 @@ describe("runDifficultyPipeline：整体接线", () => {
     expect(result.rating).toBe(900);
   });
 
-  it("JSON 首轮失败后的修复轮仍使用同一个 difficulty 输出上限", async () => {
+  it("JSON 首轮失败后的修复轮同样不发送 difficulty 输出上限", async () => {
     const requestBodies: Record<string, unknown>[] = [];
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
@@ -206,12 +206,11 @@ describe("runDifficultyPipeline：整体接线", () => {
 
     expect(result.rating).toBe(2_100);
     expect(requestBodies).toHaveLength(2);
-    expect(requestBodies.map((body) => body.max_tokens)).toEqual([384_000, 384_000]);
-    expect(requestBodies.map((body) => body.thinking)).toEqual([
-      { type: "enabled" },
-      { type: "enabled" }
-    ]);
-    expect(requestBodies.map((body) => body.reasoning_effort)).toEqual(["max", "max"]);
-    expect(requestBodies.every((body) => !("response_format" in body))).toBe(true);
+    for (const body of requestBodies) {
+      expect(body).not.toHaveProperty("max_tokens");
+      expect(body.thinking).toEqual({ type: "enabled" });
+      expect(body.reasoning_effort).toBe("max");
+      expect(body).not.toHaveProperty("response_format");
+    }
   });
 });

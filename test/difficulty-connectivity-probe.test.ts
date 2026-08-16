@@ -93,8 +93,7 @@ const validRequestBody = {
   stream: true,
   messages: [{ role: "user", content: "synthetic" }],
   thinking: { type: "enabled" },
-  reasoning_effort: "max",
-  max_tokens: 384_000
+  reasoning_effort: "max"
 };
 
 function validResult(): DifficultyConnectivityProbeResult {
@@ -342,9 +341,9 @@ describe("Candidate C 单请求与真实 EOF", () => {
     expect(requestBody).toMatchObject({
       model: "deepseek-v4-flash",
       thinking: { type: "enabled" },
-      reasoning_effort: "max",
-      max_tokens: 384_000
+      reasoning_effort: "max"
     });
+    expect(requestBody).not.toHaveProperty("max_tokens");
 
     streamController.close();
     await expect(pending).resolves.toEqual(validResult());

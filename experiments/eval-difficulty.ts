@@ -40,6 +40,14 @@ import {
   difficultyProviderIdentityFingerprint
 } from "./lib/difficulty-evaluation-eligibility";
 import {
+  aggregateDifficultyTransport,
+  attachDifficultyTransportObservability,
+  DifficultyTransportObserver,
+  eofObservedFromFailure,
+  isDifficultyTransportComplete,
+  type DifficultyTransportAggregate
+} from "./lib/difficulty-transport-observability";
+import {
   loadDifficultyDatasetManifest,
   knownPublicDifficultyArchiveProfile,
   parsePublicDifficultyBoundedSelection,
@@ -168,6 +176,8 @@ interface DifficultyReport {
   readonly integrity: EvaluationCompleteness;
   readonly summary: ReturnType<typeof summarize>;
   readonly rows: readonly EvalRow[];
+  /** 每样本传输可观测性聚合；仅含脱敏计数与时间戳。no-call 预检报告为 null。 */
+  readonly transport: DifficultyTransportAggregate | null;
 }
 
 function parseLabelArg(): string {
@@ -299,6 +309,21 @@ function renderMarkdown(report: DifficultyReport): string {
     `- eligible：${report.eligible ? "true" : "false"}`,
     `- 配置指纹：${report.configurationFingerprint ?? "未能建立"}`,
     `- 模型服务身份指纹：${report.providerIdentityFingerprint ?? "未能建立"}`,
+    `- 传输观测：${
+      report.transport === null
+        ? "无（未发起任何调用）"
+        : [
+            `attempted=${report.transport.attempted}`,
+            `completed=${report.transport.completed}`,
+            `failed=${report.transport.failed}`,
+            `cancelled=${report.transport.cancelled}`,
+            `missing=${report.transport.missing}`,
+            `in-flight=${report.transport.inFlight}`,
+            `totalAttempts=${report.transport.totalAttempts}`,
+            `totalRetries=${report.transport.totalRetries}`,
+            `complete=${isDifficultyTransportComplete(report.transport) ? "true" : "false"}`
+          ].join(" ")
+    }`,
     `- 数据集用途：${report.dataset.purpose}（public83 已参与调参，不是最终盲测集）`,
     `- MAE（平均绝对误差）：${report.summary.meanAbsoluteError.toFixed(1)}`,
     `- ±200 命中率：${(report.summary.hitRateWithin200 * 100).toFixed(1)}%`,
@@ -441,7 +466,8 @@ function incompleteBeforeCalls(input: {
     },
     integrity,
     summary,
-    rows
+    rows,
+    transport: null
   };
   writeReports(report, input.persistedRows ?? []);
   process.exitCode = 1;
@@ -997,6 +1023,8 @@ async function main(): Promise<void> {
   };
 
   const expectedSampleIds = dataset.map((source) => source.sourceId);
+  /** continueClean 内登记的每样本观测器；写入 report 前聚合。 */
+  let activeTransportObservers = new Map<string, DifficultyTransportObserver>();
   let checkpoint: DifficultyEvaluationCheckpoint;
   try {
     checkpoint = new DifficultyEvaluationCheckpoint({
@@ -1090,18 +1118,31 @@ async function main(): Promise<void> {
           pendingIds
         );
         let done = dataset.length - pendingContent.samples.length;
+        const observerBySampleId = new Map<string, DifficultyTransportObserver>();
         try {
           await runBlindInference({
             content: pendingContent,
             concurrency,
             // 这是付费调用的提交点。只有 active 已经 fsync 并原子替换成功后，
-            // 才允许进入 inferDifficultyBlindSample。
+            // 才允许进入 inferDifficultyBlindSample。同一轮里先建观测器再标记 active。
             beforeInference: (sample) => {
+              const observer = new DifficultyTransportObserver(sample.safeId);
+              observerBySampleId.set(sample.safeId, observer);
               checkpoint.markActive(sample.safeId);
             },
-            infer: (sample) => inferDifficultyBlindSample({ sample, anchors, model }),
+            infer: (sample) => inferDifficultyBlindSample({
+              sample,
+              anchors,
+              model: attachDifficultyTransportObservability(
+                model,
+                // beforeInference 先于 infer 执行，同一样本必然已登记。
+                observerBySampleId.get(sample.safeId) as DifficultyTransportObserver
+              )
+            }),
             // 这里只冻结预测；整批在途请求全部收束后，外层才允许连接 gold。
             afterInference: (prediction) => {
+              // 成功路径的 EOF 由 chatCompleteJsonWithReceipt 保证。
+              observerBySampleId.get(prediction.safeId)?.settle("succeeded", true);
               const checkpointPrediction: DifficultyCheckpointPrediction = {
                 contentHash: prediction.contentHash,
                 predictedRating: prediction.prediction.predictedRating,
@@ -1118,6 +1159,7 @@ async function main(): Promise<void> {
               });
             },
             onInferenceError: (sample, error) => {
+              observerBySampleId.get(sample.safeId)?.failed(error);
               done += 1;
               const failure = executionFailure(sample.safeId, error);
               checkpoint.markFailed(sample.safeId, failure);
@@ -1136,6 +1178,9 @@ async function main(): Promise<void> {
             phase: "setup",
             code: "DIFFICULTY_EVALUATION_STOPPED"
           };
+        } finally {
+          // continueClean 收束后由主流程聚合；重建以隔离污染链路径。
+          activeTransportObservers = observerBySampleId;
         }
       }
     });
@@ -1174,6 +1219,10 @@ async function main(): Promise<void> {
     }
     const rows: EvalRow[] = persistedRows.map(({ sampleId: _sampleId, ...row }) => row);
     const summary = summarize(rows);
+    const transport = aggregateDifficultyTransport({
+      expectedSampleIds,
+      observers: activeTransportObservers
+    });
     const eligibility = assessDifficultyEvaluationEligibility({
       integrityComplete: integrity.complete,
       expected: integrity.expected,
@@ -1207,7 +1256,8 @@ async function main(): Promise<void> {
       },
       integrity,
       summary,
-      rows
+      rows,
+      transport
     };
     const artifacts = writeReports(report, persistedRows);
     if (report.executionComplete) {
@@ -1222,6 +1272,15 @@ async function main(): Promise<void> {
       succeeded: integrity.succeeded,
       failed: integrity.failed,
       complete: integrity.complete,
+      transportComplete: isDifficultyTransportComplete(transport),
+      transportAttempted: transport.attempted,
+      transportCompleted: transport.completed,
+      transportFailed: transport.failed,
+      transportCancelled: transport.cancelled,
+      transportMissing: transport.missing,
+      transportInFlight: transport.inFlight,
+      totalAttempts: transport.totalAttempts,
+      totalRetries: transport.totalRetries,
       accuracyPassed: report.accuracyPassed,
       eligible: report.eligible,
       meanAbsoluteError: report.summary.meanAbsoluteError,

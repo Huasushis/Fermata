@@ -104,10 +104,10 @@ export const difficultyConnectivityProbeRequestBodySchema = z
     model: z.literal("deepseek-v4-flash"),
     temperature: z.literal(0.2),
     stream: z.literal(true),
+    // 难度路径不发送任何数值型输出上限字段；携带 max_tokens 也会被 strict 拒绝。
     messages: z.array(z.unknown()).min(1),
     thinking: z.object({ type: z.literal("enabled") }).strict(),
-    reasoning_effort: z.literal("max"),
-    max_tokens: z.literal(difficultyConnectivityProbeMaxOutputTokens)
+    reasoning_effort: z.literal("max")
   })
   .strict();
 
