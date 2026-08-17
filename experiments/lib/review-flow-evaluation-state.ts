@@ -506,7 +506,7 @@ export const reviewFlowEvaluationCheckpointSchema = z
     if (
       state.representative3Timing !== undefined &&
       (
-        state.identity.caseSelection?.selector !== "representative3-v1" ||
+        state.identity.caseSelection === undefined ||
         state.entries.some((entry) => entry.status !== "completed")
       )
     ) {
@@ -922,7 +922,7 @@ export class ReviewFlowEvaluationCheckpoint {
     const parsed =
       reviewFlowEvaluationRepresentative3TimingSchema.parse(receipt);
     if (
-      this.#state.identity.caseSelection?.selector !== "representative3-v1" ||
+      this.#state.identity.caseSelection === undefined ||
       this.#state.entries.some((entry) => entry.status !== "completed") ||
       this.#state.executionSeal !== null ||
       this.#state.representative3Timing !== undefined

@@ -48,8 +48,10 @@ import {
   reviewFlowEvaluationDevelopmentPredictionBindingSha256,
   reviewFlowEvaluationHoldoutPredictionBindingSha256,
   reviewFlowEvaluationOrderedSelectionSha256,
+  reviewFlowEvaluationRepresentative3V2AuditedStrataCounts,
   reviewFlowEvaluationRevealDescriptorSchema,
   reviewFlowEvaluationSourceLineageSetSha256,
+  selectReviewFlowEvaluationRepresentative3V2,
   type ReviewFlowEvaluationDatasetBundle,
   type ReviewFlowEvaluationGold
 } from "../experiments/lib/review-flow-evaluation-dataset";
@@ -199,6 +201,146 @@ describe("review-flow dataset v2 与真实 Gold 边界", () => {
         : 0
     ).toBeGreaterThan(0);
     registry.close();
+  });
+
+  it("representative3-v2 绑定已审计三层、稳定顺序与全局 claim", () => {
+    const fixture = createDatasetFixture("representative3-v2");
+    const registry = newRegistry(
+      fixture,
+      join(fixture.privateRoot, "representative3-v2-registry")
+    );
+    const full = loadDataset(fixture, "development_scored");
+    const first = loadDevelopmentDatasetAfterUsageRegistration({
+      manifestPath: fixture.manifestPath,
+      revealDescriptorPath: fixture.developmentRevealDescriptorPath,
+      datasetPrivateRoot: fixture.privateRoot,
+      containingWorkspace: fixture.workspace,
+      registry,
+      caseSelector: "representative3-v2"
+    });
+    const second = loadDevelopmentDatasetAfterUsageRegistration({
+      manifestPath: fixture.manifestPath,
+      revealDescriptorPath: fixture.developmentRevealDescriptorPath,
+      datasetPrivateRoot: fixture.privateRoot,
+      containingWorkspace: fixture.workspace,
+      registry,
+      caseSelector: "representative3-v2"
+    });
+    if (first.caseSelection?.selector !== "representative3-v2") {
+      throw new Error("TEST_REPRESENTATIVE3_V2_SELECTION_MISSING");
+    }
+
+    expect(first.cases.map((entry) => entry.safeId)).toEqual(
+      second.cases.map((entry) => entry.safeId)
+    );
+    expect(first.caseSelection).toMatchObject({
+      schemaVersion: 2,
+      selector: "representative3-v2",
+      selectorIdentity: "review-flow-evaluation-representative3-v2",
+      tieBreakProtocol: "review-flow-representative3-v2-tiebreak",
+      parentDatasetFingerprint: full.datasetFingerprint,
+      parentManifestSha256: full.manifestSha256,
+      parentBridgeCompletionSha256: full.bridgeCompletionSha256,
+      auditedStrataCounts:
+        reviewFlowEvaluationRepresentative3V2AuditedStrataCounts,
+      orderedSelectionSha256:
+        reviewFlowEvaluationOrderedSelectionSha256(first.cases)
+    });
+    const [accepted, rejectedTaste, rejectedNoReasons] = first.cases;
+    expect(accepted).toMatchObject({
+      task: { problem: { type: "interactive" } },
+      gold: { historicalOutcome: "accepted" }
+    });
+    expect(rejectedTaste).toMatchObject({
+      task: { problem: { type: "submit_answer" } },
+      gold: {
+        historicalOutcome: "rejected",
+        observedHistoricalTechnicalReasons: []
+      }
+    });
+    expect(
+      rejectedTaste?.gold?.evaluationScope === "verdict_and_taste"
+        ? rejectedTaste.gold.observedHistoricalTasteReasons.some(
+            (reason) => reason.direction === "concern"
+          )
+        : false
+    ).toBe(true);
+    expect(rejectedNoReasons).toMatchObject({
+      task: { problem: { type: "traditional" } },
+      gold: {
+        historicalOutcome: "rejected",
+        observedHistoricalTechnicalReasons: [],
+        observedHistoricalTasteReasons: []
+      }
+    });
+
+    const identity: ReviewFlowEvaluationIdentity = {
+      ...identityFixture("development"),
+      datasetFingerprint: first.datasetFingerprint,
+      manifestSha256: first.manifestSha256,
+      configurationSummary: {
+        ...identityFixture("development").configurationSummary,
+        caseAttempts: 3
+      },
+      caseSelection: first.caseSelection
+    };
+    const chain = createDatasetCheckpoint(
+      fixture,
+      first,
+      "baseline",
+      "representative3-v2-smoke",
+      null,
+      "representative3-v2-state",
+      { identity }
+    );
+    const claim = registry.claimLabel({
+      genesis: chain.checkpoint.genesisBinding(),
+      datasetFingerprint: first.datasetFingerprint,
+      holdoutIdentity: null,
+      thresholdPolicySha256: null,
+      caseSelection: first.caseSelection,
+      resume: false
+    });
+    expect(claim.claim.caseSelection).toEqual(first.caseSelection);
+    chain.checkpoint.close();
+    registry.close();
+  });
+
+  it("representative3-v2 对审计计数变化与 tie digest 碰撞失败关闭", () => {
+    const changed = loadDataset(
+      createDatasetFixture("representative3-v2-count-mismatch"),
+      "development_scored"
+    );
+    expect(() =>
+      selectReviewFlowEvaluationRepresentative3V2(changed)
+    ).toThrow(
+      "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_V2_AUDITED_COUNTS_CHANGED"
+    );
+
+    const full = loadDataset(
+      createDatasetFixture("representative3-v2-tie"),
+      "development_scored"
+    );
+    const candidates = full.cases.filter(
+      (entry) =>
+        entry.task.problem.type === "submit_answer" &&
+        entry.gold?.evaluationScope === "verdict_and_taste" &&
+        entry.gold.historicalOutcome === "rejected"
+    );
+    const source = candidates[0];
+    const replaced = candidates[1];
+    if (source === undefined || replaced === undefined) {
+      throw new Error("TEST_REPRESENTATIVE3_V2_CANDIDATES_MISSING");
+    }
+    const collided: ReviewFlowEvaluationDatasetBundle = {
+      ...full,
+      cases: full.cases.map((entry) => entry === replaced ? source : entry)
+    };
+    expect(() =>
+      selectReviewFlowEvaluationRepresentative3V2(collided)
+    ).toThrow(
+      "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_V2_TIE_DIGEST_COLLISION"
+    );
   });
 
   it("holdout_prediction 不打开 Gold；reveal 才读取并严格失败", () => {
@@ -927,61 +1069,69 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
 
   );
 
-  it("representative3 先独占执行首题 pilot，落盘单调时延收据后才并发剩余两题", async () => {
-    const fixture = createRepresentative3StateFixture();
-    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
-    const calls: string[] = [];
-    const monotonicValues = [0, 1_000, 1_000, 2_000];
-    const state = await runReviewFlowEvaluationCases({
-      checkpoint,
-      cases: preparedStateCases(fixture),
-      executor: {
-        async execute(safeId) {
-          calls.push(safeId);
-          return {
-            status: "complete" as const,
-            projection: projection("approve"),
-            timing: {
-              schemaVersion: 1 as const,
-              firstByteMs: 100,
-              endToEndMs: 500
-            }
-          };
-        }
-      },
-      concurrency: 20,
-      maxCaseAttempts: 3,
-      monotonicNow: () => monotonicValues.shift() ?? 1_000
-    });
-    expect(calls[0]).toBe(fixture.expectedCases[0]?.safeId);
-    expect(calls.slice(1).sort()).toEqual(
-      fixture.expectedCases.slice(1).map((entry) => entry.safeId).sort()
-    );
-    expect(state.entries.map((entry) => entry.status)).toEqual([
-      "completed",
-      "completed",
-      "completed"
-    ]);
-    const pilot = state.entries[0];
-    expect(pilot?.status === "completed" ? pilot.pilotTiming : null).toMatchObject({
-      monotonicLatencyMs: 1_000,
-      projectedWithinLimit: true,
-      remainingCasesAdmitted: true,
-      maximumTotalDurationMs: representative3MaximumTotalDurationMs
-    });
-    expect(state.representative3Timing).toEqual({
-      schemaVersion: 1,
-      firstByteMs: 100,
-      stage2LatencyMs: 1_000,
-      endToEndMs: 2_000
-    });
-    expect(state.entries.slice(1).every(
-      (entry) => !("pilotTiming" in entry)
-    )).toBe(true);
-    // 三题 smoke 不得冒充 frozen32 完整标定。
-    expect(state.executionSeal?.complete).toBe(false);
-    checkpoint.close();
-  });
+  it.each([
+    "representative3-v1",
+    "representative3-v2"
+  ] as const)(
+    "%s 先独占执行首题 pilot，落盘单调时延收据后才并发剩余两题",
+    async (selector) => {
+      const fixture = createRepresentative3StateFixture({}, selector);
+      const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+      const calls: string[] = [];
+      const monotonicValues = [0, 1_000, 1_000, 2_000];
+      const state = await runReviewFlowEvaluationCases({
+        checkpoint,
+        cases: preparedStateCases(fixture),
+        executor: {
+          async execute(safeId) {
+            calls.push(safeId);
+            return {
+              status: "complete" as const,
+              projection: projection("approve"),
+              timing: {
+                schemaVersion: 1 as const,
+                firstByteMs: 100,
+                endToEndMs: 500
+              }
+            };
+          }
+        },
+        concurrency: 20,
+        maxCaseAttempts: 3,
+        monotonicNow: () => monotonicValues.shift() ?? 1_000
+      });
+      expect(calls[0]).toBe(fixture.expectedCases[0]?.safeId);
+      expect(calls.slice(1).sort()).toEqual(
+        fixture.expectedCases.slice(1).map((entry) => entry.safeId).sort()
+      );
+      expect(state.entries.map((entry) => entry.status)).toEqual([
+        "completed",
+        "completed",
+        "completed"
+      ]);
+      const pilot = state.entries[0];
+      expect(
+        pilot?.status === "completed" ? pilot.pilotTiming : null
+      ).toMatchObject({
+        monotonicLatencyMs: 1_000,
+        projectedWithinLimit: true,
+        remainingCasesAdmitted: true,
+        maximumTotalDurationMs: representative3MaximumTotalDurationMs
+      });
+      expect(state.representative3Timing).toEqual({
+        schemaVersion: 1,
+        firstByteMs: 100,
+        stage2LatencyMs: 1_000,
+        endToEndMs: 2_000
+      });
+      expect(state.entries.slice(1).every(
+        (entry) => !("pilotTiming" in entry)
+      )).toBe(true);
+      // 三题 smoke 不得冒充 frozen32 完整标定。
+      expect(state.executionSeal?.complete).toBe(false);
+      checkpoint.close();
+    }
+  );
 
   it("representative3 的 retry/backoff/watchdog 保守 ETA 超过 90 分钟时不调度剩余两题", async () => {
     const fixture = createRepresentative3StateFixture({
@@ -2364,6 +2514,23 @@ describe("adapter、CLI 与窄环境", () => {
       maxCaseAttempts: 3,
       resume: false
     });
+    const representative3V2Args = representative3Args.map((entry) =>
+      entry === "--case-selector=representative3-v1"
+        ? "--case-selector=representative3-v2"
+        : entry
+    );
+    expect(resolveReviewFlowEvaluationCliOptions(
+      representative3V2Args
+    )).toMatchObject({
+      purpose: "development",
+      caseSelector: "representative3-v2",
+      maxCaseAttempts: 3,
+      resume: false
+    });
+    expect(() => resolveReviewFlowEvaluationCliOptions([
+      ...representative3V2Args,
+      "--resume"
+    ])).toThrow("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
     for (const invalidArgs of [
       representative3Args.map((entry) =>
         entry === "--case-selector=representative3-v1"
@@ -2504,89 +2671,143 @@ function createDatasetFixture(seed = "default"): DatasetFixture {
   };
   const catalogBytes = jsonBytes(catalog);
   writePrivateFile(join(suiteDirectory, "tag-catalog.private.json"), catalogBytes);
-  const developmentMaterials = [
-    writeDatasetCase({
-      directory: suiteDirectory,
-      goldDirectory: developmentRevealDirectory,
-      partition: "development",
-      safeId: "case-0001",
-      subjectId: `subject-${safeToken(seed)}-dev-0001`,
-      numericId: numericSeed(seed, 1),
-      catalog,
-      gold: (common) => ({
-        ...common,
-        evaluationScope: "verdict_and_taste",
-        historicalOutcome: "accepted",
-        contestUse: "used",
-        observedHistoricalTasteReasons: [{
-          dimension: "novelty",
-          direction: "strength"
-        }],
-        observedHistoricalTechnicalReasons: [],
-        independentVerdict: {
-          annotation: "independent_human_three_way",
-          verdict: "approve"
-        },
-        independentTaste: {
-          annotation: "exhaustive_independent_human",
-          reasons: [{ dimension: "novelty", direction: "strength" }]
-        },
-        independentOriginality: {
-          annotation: "independent_human_originality",
-          confirmedDuplicate: false
-        },
-        expectedTagIds: ["tag-basic"],
-        independentDifficulty: {
-          annotation: "independent_human_without_submitter_metadata",
-          codeforcesDifficulty: 1800,
-          thinkingLevel: 3,
-          codingLevel: 2
-        }
-      })
-    }),
-    writeDatasetCase({
-      directory: suiteDirectory,
-      goldDirectory: developmentRevealDirectory,
-      partition: "development",
-      safeId: "case-0002",
-      subjectId: `subject-${safeToken(seed)}-dev-0002`,
-      numericId: numericSeed(seed, 2),
-      catalog,
-      gold: (common) => ({
-        ...common,
-        evaluationScope: "verdict_and_taste",
-        historicalOutcome: "rejected",
-        contestUse: "not_used",
-        observedHistoricalTasteReasons: [{
-          dimension: "icpc_fit",
-          direction: "concern"
-        }],
-        observedHistoricalTechnicalReasons: ["judgeability_concern"]
-      })
-    })
-  ];
-  for (let extraIndex = 3; extraIndex <= 32; extraIndex++) {
-    const padded = String(extraIndex).padStart(4, "0");
-    developmentMaterials.push(
-      writeDatasetCase({
+  const developmentMaterials: RevealCaseMaterial[] = [];
+  if (seed.startsWith("representative3-v2")) {
+    const countMismatch = seed.includes("count-mismatch");
+    for (let index = 1; index <= 32; index++) {
+      const padded = String(index).padStart(4, "0");
+      const rejectedSubmitAnswer = index >= 2 && index <= 9;
+      const rejectedNoReasons = index >= 10 && index <= 12;
+      const rejectedTraditionalTaste = index === 13;
+      const rejected = rejectedSubmitAnswer ||
+        rejectedNoReasons ||
+        rejectedTraditionalTaste;
+      const hasTaste = index === 1 ||
+        rejectedSubmitAnswer ||
+        rejectedTraditionalTaste ||
+        (index >= 14 && index <= 28);
+      const problemType: RobotReviewTask["problem"]["type"] =
+        index === 1
+          ? "interactive"
+          : rejectedSubmitAnswer
+            ? countMismatch && index === 9
+              ? "traditional"
+              : "submit_answer"
+            : index <= 18
+              ? "traditional"
+              : "submit_answer";
+      developmentMaterials.push(writeDatasetCase({
         directory: suiteDirectory,
         goldDirectory: developmentRevealDirectory,
         partition: "development",
         safeId: `case-${padded}`,
         subjectId: `subject-${safeToken(seed)}-dev-${padded}`,
-        numericId: numericSeed(seed, extraIndex),
+        numericId: numericSeed(seed, index),
+        problemType,
         catalog,
         gold: (common) => ({
           ...common,
           evaluationScope: "verdict_and_taste",
-          historicalOutcome: extraIndex === 3 ? "rejected" : "accepted",
+          historicalOutcome: rejected ? "rejected" : "accepted",
+          contestUse:
+            !rejected && (index === 1 || index <= 29)
+              ? "used"
+              : "unknown",
+          observedHistoricalTasteReasons: hasTaste
+            ? [{
+                dimension: rejected ? "icpc_fit" : "novelty",
+                direction: rejected ? "concern" : "strength"
+              }]
+            : [],
+          observedHistoricalTechnicalReasons: []
+        })
+      }));
+    }
+  } else {
+    developmentMaterials.push(
+      writeDatasetCase({
+        directory: suiteDirectory,
+        goldDirectory: developmentRevealDirectory,
+        partition: "development",
+        safeId: "case-0001",
+        subjectId: `subject-${safeToken(seed)}-dev-0001`,
+        numericId: numericSeed(seed, 1),
+        catalog,
+        gold: (common) => ({
+          ...common,
+          evaluationScope: "verdict_and_taste",
+          historicalOutcome: "accepted",
+          contestUse: "used",
+          observedHistoricalTasteReasons: [{
+            dimension: "novelty",
+            direction: "strength"
+          }],
+          observedHistoricalTechnicalReasons: [],
+          independentVerdict: {
+            annotation: "independent_human_three_way",
+            verdict: "approve"
+          },
+          independentTaste: {
+            annotation: "exhaustive_independent_human",
+            reasons: [{ dimension: "novelty", direction: "strength" }]
+          },
+          independentOriginality: {
+            annotation: "independent_human_originality",
+            confirmedDuplicate: false
+          },
+          expectedTagIds: ["tag-basic"],
+          independentDifficulty: {
+            annotation: "independent_human_without_submitter_metadata",
+            codeforcesDifficulty: 1800,
+            thinkingLevel: 3,
+            codingLevel: 2
+          }
+        })
+      }),
+      writeDatasetCase({
+        directory: suiteDirectory,
+        goldDirectory: developmentRevealDirectory,
+        partition: "development",
+        safeId: "case-0002",
+        subjectId: `subject-${safeToken(seed)}-dev-0002`,
+        numericId: numericSeed(seed, 2),
+        catalog,
+        gold: (common) => ({
+          ...common,
+          evaluationScope: "verdict_and_taste",
+          historicalOutcome: "rejected",
           contestUse: "not_used",
-          observedHistoricalTasteReasons: [],
-          observedHistoricalTechnicalReasons:
-            extraIndex === 3 ? ["judgeability_concern"] : []
+          observedHistoricalTasteReasons: [{
+            dimension: "icpc_fit",
+            direction: "concern"
+          }],
+          observedHistoricalTechnicalReasons: ["judgeability_concern"]
         })
       })
     );
+    for (let extraIndex = 3; extraIndex <= 32; extraIndex++) {
+      const padded = String(extraIndex).padStart(4, "0");
+      developmentMaterials.push(
+        writeDatasetCase({
+          directory: suiteDirectory,
+          goldDirectory: developmentRevealDirectory,
+          partition: "development",
+          safeId: `case-${padded}`,
+          subjectId: `subject-${safeToken(seed)}-dev-${padded}`,
+          numericId: numericSeed(seed, extraIndex),
+          catalog,
+          gold: (common) => ({
+            ...common,
+            evaluationScope: "verdict_and_taste",
+            historicalOutcome: extraIndex === 3 ? "rejected" : "accepted",
+            contestUse: "not_used",
+            observedHistoricalTasteReasons: [],
+            observedHistoricalTechnicalReasons:
+              extraIndex === 3 ? ["judgeability_concern"] : []
+          })
+        })
+      );
+    }
   }
   const development = developmentMaterials.map(toPredictionDescriptor);
   const holdoutMaterials = [
@@ -2735,6 +2956,7 @@ function writeDatasetCase(input: {
   readonly safeId: string;
   readonly subjectId: string;
   readonly numericId: number;
+  readonly problemType?: RobotReviewTask["problem"]["type"];
   readonly catalog: {
     readonly version: number;
     readonly tags: RobotReviewTask["tagCatalog"]["tags"];
@@ -2757,7 +2979,11 @@ function writeDatasetCase(input: {
     }
   ) => ReviewFlowEvaluationGold;
 }): RevealCaseMaterial {
-  const task = taskFixture(input.numericId, input.catalog);
+  const task = taskFixture(
+    input.numericId,
+    input.catalog,
+    input.problemType ?? "traditional"
+  );
   const contentBytes = jsonBytes(task);
   const contentSha256 = sha256(contentBytes);
   const sourceLineageSha256 = sha256(`lineage-${input.subjectId}`);
@@ -2854,7 +3080,8 @@ function taskFixture(
   catalog: {
     readonly version: number;
     readonly tags: RobotReviewTask["tagCatalog"]["tags"];
-  }
+  },
+  problemType: RobotReviewTask["problem"]["type"] = "traditional"
 ): RobotReviewTask {
   const suffix = String(numericId).padStart(12, "0").slice(-12);
   const contentHash = sha256(`problem-${numericId}`);
@@ -2867,7 +3094,7 @@ function taskFixture(
       reviewRound: 1,
       contentHash,
       title: `PRIVATE_TITLE_SENTINEL_${numericId}`,
-      type: "traditional",
+      type: problemType,
       tagIds: ["tag-basic"],
       content: {
         basicStatement: `PRIVATE_STATEMENT_SENTINEL_${numericId}`,
@@ -3008,7 +3235,9 @@ function createStateFixtureIn(
 function createRepresentative3StateFixture(
   configurationOverrides: Partial<
     ReviewFlowEvaluationIdentity["configurationSummary"]
-  > = {}
+  > = {},
+  selector: "representative3-v1" | "representative3-v2" =
+    "representative3-v1"
 ): StateFixture {
   const fixture = createStateFixture(3);
   const configurationSummary = {
@@ -3025,17 +3254,33 @@ function createRepresentative3StateFixture(
   const identity: ReviewFlowEvaluationIdentity = {
     ...fixture.identity,
     configurationSummary,
-    caseSelection: {
-      schemaVersion: 1,
-      selector: "representative3-v1",
-      parentDatasetFingerprint: fixture.identity.datasetFingerprint,
-      parentManifestSha256: fixture.identity.manifestSha256,
-      parentBridgeCompletionSha256: "3".repeat(64),
-      parentCaseCount: 32,
-      orderedSelectionSha256:
-        reviewFlowEvaluationOrderedSelectionSha256(fixture.expectedCases),
-      selectedCaseCount: 3
-    }
+    caseSelection: selector === "representative3-v1"
+      ? {
+          schemaVersion: 1,
+          selector,
+          parentDatasetFingerprint: fixture.identity.datasetFingerprint,
+          parentManifestSha256: fixture.identity.manifestSha256,
+          parentBridgeCompletionSha256: "3".repeat(64),
+          parentCaseCount: 32,
+          orderedSelectionSha256:
+            reviewFlowEvaluationOrderedSelectionSha256(fixture.expectedCases),
+          selectedCaseCount: 3
+        }
+      : {
+          schemaVersion: 2,
+          selector,
+          selectorIdentity: "review-flow-evaluation-representative3-v2",
+          tieBreakProtocol: "review-flow-representative3-v2-tiebreak",
+          parentDatasetFingerprint: fixture.identity.datasetFingerprint,
+          parentManifestSha256: fixture.identity.manifestSha256,
+          parentBridgeCompletionSha256: "3".repeat(64),
+          parentCaseCount: 32,
+          auditedStrataCounts:
+            reviewFlowEvaluationRepresentative3V2AuditedStrataCounts,
+          orderedSelectionSha256:
+            reviewFlowEvaluationOrderedSelectionSha256(fixture.expectedCases),
+          selectedCaseCount: 3
+        }
   };
   return { ...fixture, identity };
 }

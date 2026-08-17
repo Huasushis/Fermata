@@ -70,17 +70,18 @@ export type ReviewFlowEvaluationPurpose = z.infer<
   typeof reviewFlowEvaluationPurposeSchema
 >;
 
-export const reviewFlowEvaluationCaseSelectorSchema = z.literal(
-  "representative3-v1"
-);
+export const reviewFlowEvaluationCaseSelectorSchema = z.enum([
+  "representative3-v1",
+  "representative3-v2"
+]);
 export type ReviewFlowEvaluationCaseSelector = z.infer<
   typeof reviewFlowEvaluationCaseSelectorSchema
 >;
 
-export const reviewFlowEvaluationCaseSelectionSchema = z
+const reviewFlowEvaluationCaseSelectionV1Schema = z
   .object({
     schemaVersion: z.literal(1),
-    selector: reviewFlowEvaluationCaseSelectorSchema,
+    selector: z.literal("representative3-v1"),
     parentDatasetFingerprint: reviewFlowEvaluationDigestSchema,
     parentManifestSha256: reviewFlowEvaluationDigestSchema,
     parentBridgeCompletionSha256: reviewFlowEvaluationDigestSchema,
@@ -89,6 +90,44 @@ export const reviewFlowEvaluationCaseSelectionSchema = z
     selectedCaseCount: z.literal(3)
   })
   .strict();
+
+export const reviewFlowEvaluationRepresentative3V2AuditedStrataCounts = {
+  acceptedInteractive: 1,
+  rejectedSubmitAnswerTasteConcernNoTechnical: 8,
+  rejectedTraditionalNoObservedReasons: 3
+} as const;
+
+const reviewFlowEvaluationCaseSelectionV2Schema = z
+  .object({
+    schemaVersion: z.literal(2),
+    selector: z.literal("representative3-v2"),
+    selectorIdentity: z.literal(
+      "review-flow-evaluation-representative3-v2"
+    ),
+    tieBreakProtocol: z.literal(
+      "review-flow-representative3-v2-tiebreak"
+    ),
+    parentDatasetFingerprint: reviewFlowEvaluationDigestSchema,
+    parentManifestSha256: reviewFlowEvaluationDigestSchema,
+    parentBridgeCompletionSha256: reviewFlowEvaluationDigestSchema,
+    parentCaseCount: z.literal(32),
+    auditedStrataCounts: z
+      .object({
+        acceptedInteractive: z.literal(1),
+        rejectedSubmitAnswerTasteConcernNoTechnical: z.literal(8),
+        rejectedTraditionalNoObservedReasons: z.literal(3)
+      })
+      .strict(),
+    orderedSelectionSha256: reviewFlowEvaluationDigestSchema,
+    selectedCaseCount: z.literal(3)
+  })
+  .strict();
+
+export const reviewFlowEvaluationCaseSelectionSchema =
+  z.discriminatedUnion("selector", [
+    reviewFlowEvaluationCaseSelectionV1Schema,
+    reviewFlowEvaluationCaseSelectionV2Schema
+  ]);
 export type ReviewFlowEvaluationCaseSelection = z.infer<
   typeof reviewFlowEvaluationCaseSelectionSchema
 >;
@@ -697,6 +736,154 @@ export function selectReviewFlowEvaluationRepresentative3(
     parentManifestSha256: dataset.manifestSha256,
     parentBridgeCompletionSha256: dataset.bridgeCompletionSha256,
     parentCaseCount: 32,
+    orderedSelectionSha256:
+      reviewFlowEvaluationOrderedSelectionSha256(selected),
+    selectedCaseCount: 3
+  });
+  return deepFreezePhysicalBlind({
+    ...dataset,
+    caseSelection,
+    cases: selected
+  });
+}
+
+/**
+ * frozen32 当前已审计形状的 successor smoke。三层规则与计数都是 selector
+ * 身份的一部分；任何 Gold/类型分布变化都失败，不回退为“看起来相近”的样本。
+ */
+export function selectReviewFlowEvaluationRepresentative3V2(
+  dataset: ReviewFlowEvaluationDatasetBundle
+): ReviewFlowEvaluationSelectedDatasetBundle {
+  if (
+    dataset.purpose !== "development" ||
+    dataset.loadMode !== "development_scored" ||
+    dataset.summary?.caseCount !== 32 ||
+    dataset.cases.length !== 32 ||
+    dataset.cases.some(
+      (entry) =>
+        entry.gold === null ||
+        entry.gold.evaluationScope !== "verdict_and_taste"
+    )
+  ) {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_V2_PARENT_INVALID"
+    );
+  }
+  const strata = [
+    {
+      name: "accepted_interactive",
+      expectedCount:
+        reviewFlowEvaluationRepresentative3V2AuditedStrataCounts
+          .acceptedInteractive,
+      accepts: (entry: ReviewFlowEvaluationDatasetCase) =>
+        entry.task.problem.type === "interactive" &&
+        entry.gold?.evaluationScope === "verdict_and_taste" &&
+        entry.gold.historicalOutcome === "accepted"
+    },
+    {
+      name: "rejected_submit_answer_taste_concern_no_technical",
+      expectedCount:
+        reviewFlowEvaluationRepresentative3V2AuditedStrataCounts
+          .rejectedSubmitAnswerTasteConcernNoTechnical,
+      accepts: (entry: ReviewFlowEvaluationDatasetCase) =>
+        entry.task.problem.type === "submit_answer" &&
+        entry.gold?.evaluationScope === "verdict_and_taste" &&
+        entry.gold.historicalOutcome === "rejected" &&
+        entry.gold.observedHistoricalTechnicalReasons.length === 0 &&
+        entry.gold.observedHistoricalTasteReasons.some(
+          (reason) => reason.direction === "concern"
+        )
+    },
+    {
+      name: "rejected_traditional_no_observed_reasons",
+      expectedCount:
+        reviewFlowEvaluationRepresentative3V2AuditedStrataCounts
+          .rejectedTraditionalNoObservedReasons,
+      accepts: (entry: ReviewFlowEvaluationDatasetCase) =>
+        entry.task.problem.type === "traditional" &&
+        entry.gold?.evaluationScope === "verdict_and_taste" &&
+        entry.gold.historicalOutcome === "rejected" &&
+        entry.gold.observedHistoricalTechnicalReasons.length === 0 &&
+        entry.gold.observedHistoricalTasteReasons.length === 0
+    }
+  ] as const;
+  if (
+    dataset.cases.some(
+      (entry) =>
+        strata.filter((stratum) => stratum.accepts(entry)).length > 1
+    )
+  ) {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_V2_STRATA_OVERLAP"
+    );
+  }
+  const rankedStrata = strata.map((stratum) => {
+    const ranked = dataset.cases
+      .filter(stratum.accepts)
+      .map((entry) => ({
+        entry,
+        rank: hashCanonicalValue({
+          selectorIdentity:
+            "review-flow-evaluation-representative3-v2",
+          stratum: stratum.name,
+          parentDatasetFingerprint: dataset.datasetFingerprint,
+          committedCaseSha256: hashCanonicalValue({
+            safeId: entry.safeId,
+            subjectId: entry.subjectId,
+            originalAnklangResponseSha256:
+              entry.originalAnklangResponseSha256
+          }),
+          committedSourceSha256: entry.sourceLineageSha256,
+          committedContentSha256: entry.contentSha256
+        })
+      }))
+      .sort((left, right) => left.rank.localeCompare(right.rank));
+    if (ranked.length !== stratum.expectedCount) {
+      throw new ReviewFlowEvaluationDatasetError(
+        "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_V2_AUDITED_COUNTS_CHANGED"
+      );
+    }
+    return ranked;
+  });
+  const allTieDigests = rankedStrata.flatMap((ranked) =>
+    ranked.map((candidate) => candidate.rank)
+  );
+  if (new Set(allTieDigests).size !== allTieDigests.length) {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_V2_TIE_DIGEST_COLLISION"
+    );
+  }
+  const selected = rankedStrata.map((ranked) => ranked[0]!.entry);
+  const selectedOutcomes = selected.map((entry) =>
+    entry.gold?.evaluationScope === "verdict_and_taste"
+      ? entry.gold.historicalOutcome
+      : null
+  );
+  if (
+    new Set(selected.map((entry) => entry.safeId)).size !== 3 ||
+    new Set(selected.map((entry) => entry.task.problem.type)).size !== 3 ||
+    selected[0]?.task.problem.type !== "interactive" ||
+    selected[1]?.task.problem.type !== "submit_answer" ||
+    selected[2]?.task.problem.type !== "traditional" ||
+    selectedOutcomes[0] !== "accepted" ||
+    selectedOutcomes[1] !== "rejected" ||
+    selectedOutcomes[2] !== "rejected"
+  ) {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_V2_SELECTION_INVALID"
+    );
+  }
+  const caseSelection = reviewFlowEvaluationCaseSelectionSchema.parse({
+    schemaVersion: 2,
+    selector: "representative3-v2",
+    selectorIdentity: "review-flow-evaluation-representative3-v2",
+    tieBreakProtocol: "review-flow-representative3-v2-tiebreak",
+    parentDatasetFingerprint: dataset.datasetFingerprint,
+    parentManifestSha256: dataset.manifestSha256,
+    parentBridgeCompletionSha256: dataset.bridgeCompletionSha256,
+    parentCaseCount: 32,
+    auditedStrataCounts:
+      reviewFlowEvaluationRepresentative3V2AuditedStrataCounts,
     orderedSelectionSha256:
       reviewFlowEvaluationOrderedSelectionSha256(selected),
     selectedCaseCount: 3
