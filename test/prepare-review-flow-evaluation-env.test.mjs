@@ -118,8 +118,10 @@ describe("review-flow 专用环境准备", () => {
       "AETHER_BASE_URL=https://example.invalid/v1\nAETHER_API_KEY=secret\n";
     expect(() => buildReviewFlowEvaluationEnvFile(source, "0".repeat(40)))
       .toThrow("REVIEW_FLOW_EVALUATION_ENV_PREPARATION_FAILED");
-    expect(() => buildReviewFlowEvaluationEnvFile(source, commit, 33))
+    expect(() => buildReviewFlowEvaluationEnvFile(source, commit, 21))
       .toThrow("REVIEW_FLOW_EVALUATION_ENV_PREPARATION_FAILED");
+    expect(() => buildReviewFlowEvaluationEnvFile(source, commit, 20))
+      .not.toThrow();
   });
 
   it("以 0600/nlink=1 独占发布最小配置，既有目标绝不覆盖", () => {
@@ -132,7 +134,7 @@ describe("review-flow 专用环境准备", () => {
       AETHER_BASE_URL: "https://example.invalid/v1",
       AETHER_API_KEY: "test-secret",
       EVAL_CODE_VERSION: commit,
-      EVAL_CONCURRENCY: "2"
+      EVAL_CONCURRENCY: "16"
     });
     const firstBytes = readFileSync(fixture.target);
     expect(() => prepareReviewFlowEvaluationEnv(
@@ -140,6 +142,23 @@ describe("review-flow 专用环境准备", () => {
       fixture.options
     )).toThrow("REVIEW_FLOW_EVALUATION_ENV_PREPARATION_FAILED");
     expect(readFileSync(fixture.target)).toEqual(firstBytes);
+  });
+
+  it("CLI 可显式准备 concurrency20，并拒绝 21+", () => {
+    const accepted = createPrivateFixture("concurrency-20");
+    prepareReviewFlowEvaluationEnv(
+      [...accepted.argv, "--concurrency=20"],
+      accepted.options
+    );
+    expect(parseEnvFile(readFileSync(accepted.target, "utf8")))
+      .toMatchObject({ EVAL_CONCURRENCY: "20" });
+
+    const rejected = createPrivateFixture("concurrency-21");
+    expect(() => prepareReviewFlowEvaluationEnv(
+      [...rejected.argv, "--concurrency=21"],
+      rejected.options
+    )).toThrow("REVIEW_FLOW_EVALUATION_ENV_PREPARATION_FAILED");
+    expect(existsSync(rejected.target)).toBe(false);
   });
 
   it.each(["mode", "hardlink", "symlink"])(

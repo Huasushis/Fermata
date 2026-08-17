@@ -6,6 +6,8 @@
  * createReviewFlowLlmBundle(productionGrant:null) 创建，最后只读取编排器提供的
  * calibration projection。测试在更外层注入假 executor，不会伪造此 adapter。
  */
+import { AsyncLocalStorage } from "node:async_hooks";
+import { performance } from "node:perf_hooks";
 import runtimeManifestDocument from "../../config/review-flow-runtime.json" with { type: "json" };
 import type { ModelSpec } from "../../src/config";
 import type { LlmRequestStartGate } from "../../src/llm";
@@ -37,6 +39,7 @@ import {
   type ReviewFlowEvaluationConfig
 } from "./review-flow-evaluation-config";
 import type {
+  ReviewFlowEvaluationCaseTiming,
   ReviewFlowEvaluationFailure,
   ReviewFlowEvaluationIdentity
 } from "./review-flow-evaluation-state";
@@ -66,14 +69,17 @@ export interface PreparedReviewFlowEvaluationCase {
   readonly taskSource: ReviewFlowTaskSourceResult;
 }
 
+
 export type ReviewFlowEvaluationExecutionOutcome =
   | {
       readonly status: "complete";
       readonly projection: ReviewFlowCalibrationProjection;
+      readonly timing?: ReviewFlowEvaluationCaseTiming;
     }
   | {
       readonly status: "incomplete";
       readonly failure: ReviewFlowEvaluationFailure;
+      readonly timing?: ReviewFlowEvaluationCaseTiming;
     };
 
 export interface ReviewFlowEvaluationAdapter {
@@ -88,6 +94,13 @@ export interface ReviewFlowEvaluationAdapter {
     requestStartGate: LlmRequestStartGate
   ): Promise<ReviewFlowEvaluationExecutionOutcome>;
 }
+
+interface MutableCaseTiming {
+  readonly startedAt: number;
+  firstByteAt: number | null;
+}
+
+const caseTimingStorage = new AsyncLocalStorage<MutableCaseTiming>();
 
 /** 构造本次实验唯一 runner；不会在本函数中发送模型请求。 */
 export function createReviewFlowEvaluationAdapter(input: {
@@ -230,25 +243,37 @@ export function createReviewFlowEvaluationAdapter(input: {
       if (!preparedCases.has(prepared)) {
         throw new Error("REVIEW_FLOW_EVALUATION_PREPARED_CASE_INVALID");
       }
-      const outcome = await runReviewEvidenceFlowCalibrationOutcome({
-        taskSource: prepared.taskSource,
-        trustedRunner: bundle,
-        executionContext: {
-          schemaVersion: 1,
-          runId,
-          assignmentId: prepared.taskSource.taskBinding.assignmentId,
-          expectedRound: prepared.taskSource.taskBinding.expectedRound
-        },
-        requestStartGate
-      });
-      if (outcome.status === "complete") {
-        return { status: "complete" as const, projection: outcome.projection };
-      }
-      requestStartGate.close();
-      return {
-        status: "incomplete" as const,
-        failure: normalizeIncompleteFailure(outcome.failure)
+      const timing: MutableCaseTiming = {
+        startedAt: performance.now(),
+        firstByteAt: null
       };
+      return caseTimingStorage.run(timing, async () => {
+        const outcome = await runReviewEvidenceFlowCalibrationOutcome({
+          taskSource: prepared.taskSource,
+          trustedRunner: bundle,
+          executionContext: {
+            schemaVersion: 1,
+            runId,
+            assignmentId: prepared.taskSource.taskBinding.assignmentId,
+            expectedRound: prepared.taskSource.taskBinding.expectedRound
+          },
+          requestStartGate
+        });
+        const timingReceipt = caseTimingReceipt(timing, performance.now());
+        if (outcome.status === "complete") {
+          return {
+            status: "complete" as const,
+            projection: outcome.projection,
+            timing: timingReceipt
+          };
+        }
+        requestStartGate.close();
+        return {
+          status: "incomplete" as const,
+          failure: normalizeIncompleteFailure(outcome.failure),
+          timing: timingReceipt
+        };
+      });
     }
   } satisfies ReviewFlowEvaluationAdapter);
 }
@@ -291,7 +316,8 @@ function modelConfig(
       outputIdleTimeoutMs: config.models.timeouts.llmOutputIdleMs,
       maximumDurationMs: config.models.timeouts.llmMaximumDurationMs,
       maxAttempts: config.models.retry.maxAttempts,
-      baseDelayMs: config.models.retry.baseDelayMs
+      baseDelayMs: config.models.retry.baseDelayMs,
+      onResponseBodyByte: observeResponseBodyByte
     }
   };
 }
@@ -310,6 +336,36 @@ export function summarizeReviewFlowEvaluationProxyEnvironment(
       variables: entries
     })
   });
+}
+
+function observeResponseBodyByte(): void {
+  const timing = caseTimingStorage.getStore();
+  if (timing !== undefined && timing.firstByteAt === null) {
+    timing.firstByteAt = performance.now();
+  }
+}
+
+function caseTimingReceipt(
+  timing: MutableCaseTiming,
+  endedAt: number
+): ReviewFlowEvaluationCaseTiming | undefined {
+  if (timing.firstByteAt === null) return undefined;
+  const endToEndMs = monotonicDuration(timing.startedAt, endedAt);
+  return Object.freeze({
+    schemaVersion: 1,
+    firstByteMs: monotonicDuration(timing.startedAt, timing.firstByteAt),
+    endToEndMs
+  });
+}
+function monotonicDuration(startedAt: number, endedAt: number): number {
+  if (
+    !Number.isFinite(startedAt) ||
+    !Number.isFinite(endedAt) ||
+    endedAt < startedAt
+  ) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.ceil(endedAt - startedAt));
 }
 
 function normalizeIncompleteFailure(

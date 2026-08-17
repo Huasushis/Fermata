@@ -9,6 +9,7 @@ import type {
   ReviewFlowEvaluationExecutionOutcome
 } from "./review-flow-evaluation-adapter";
 import type {
+  ReviewFlowEvaluationCaseTiming,
   ReviewFlowEvaluationCheckpoint,
   ReviewFlowEvaluationCheckpointState,
   ReviewFlowEvaluationFailure,
@@ -206,6 +207,8 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
     throw new Error("REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_RUN_INVALID");
   }
   const monotonicNow = input.monotonicNow ?? (() => performance.now());
+  const representative3StartedAt =
+    selection === undefined ? null : monotonicNow();
 
   const runBatch = async (
     pending: readonly string[],
@@ -227,7 +230,7 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
           if (evaluationCase === undefined) {
             throw new Error("REVIEW_FLOW_EVALUATION_CASE_SET_MISMATCH");
           }
-          const pilotStartedAt = pilot ? monotonicNow() : null;
+          const pilotStartedAt = pilot ? representative3StartedAt : null;
 
           // active 必须在任何模型调用前同步、原子地落盘。
           try {
@@ -242,12 +245,21 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
             }
             throw error;
           }
-          const pilotReceipt = (succeeded: boolean) =>
-            pilot && pilotStartedAt !== null
+          const pilotReceipt = (
+            succeeded: boolean,
+            timing: ReviewFlowEvaluationCaseTiming | undefined
+          ) =>
+            pilot &&
+            pilotStartedAt !== null &&
+            validCaseTiming(timing)
               ? buildRepresentative3PilotTimingReceipt({
-                  monotonicLatencyMs: conservativeMonotonicElapsed(
-                    pilotStartedAt,
-                    monotonicNow()
+                  firstByteMs: timing.firstByteMs,
+                  monotonicLatencyMs: Math.max(
+                    timing.endToEndMs,
+                    conservativeMonotonicElapsed(
+                      pilotStartedAt,
+                      monotonicNow()
+                    )
                   ),
                   succeeded,
                   concurrency: input.concurrency,
@@ -272,7 +284,7 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
                   input.checkpoint.markFailed(
                     safeId,
                     failure,
-                    pilotReceipt(false)
+                    pilotReceipt(false, undefined)
                   );
                 } catch {
                   localFatal = true;
@@ -309,7 +321,19 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
                 input.checkpoint.markFailed(
                   safeId,
                   { ...latestIncomplete, caseAttempts },
-                  pilotReceipt(false)
+                  pilotReceipt(false, outcome.timing)
+                );
+              } catch {
+                localFatal = true;
+              }
+              finalized = true;
+              continue;
+            }
+            if (selection !== undefined && !validCaseTiming(outcome.timing)) {
+              try {
+                input.checkpoint.markFailed(
+                  safeId,
+                  timingReceiptMissingFailure(caseAttempts)
                 );
               } catch {
                 localFatal = true;
@@ -322,7 +346,8 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
                 input.checkpoint,
                 safeId,
                 outcome.projection,
-                pilotReceipt(true)
+                pilotReceipt(true, outcome.timing),
+                outcome.timing
               );
             } catch {
               throw new Error("REVIEW_FLOW_EVALUATION_LOCAL_STATE_FAILURE");
@@ -356,7 +381,31 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
       return input.checkpoint.sealExecution();
     }
     // pilot 收据落盘且通过 90 分钟准入后，才同时放行剩余两题。
+    const stage2StartedAt = monotonicNow();
     await runBatch(input.checkpoint.pendingSafeIds(), input.concurrency, false);
+    const stage2EndedAt = monotonicNow();
+    const completed = input.checkpoint.snapshot();
+    const pilotCaseTiming = completed.entries[0]?.status === "completed"
+      ? completed.entries[0].caseTiming
+      : undefined;
+    if (
+      completed.entries.every((entry) => entry.status === "completed") &&
+      pilotCaseTiming !== undefined &&
+      representative3StartedAt !== null
+    ) {
+      input.checkpoint.bindRepresentative3Timing({
+        schemaVersion: 1,
+        firstByteMs: pilotCaseTiming.firstByteMs,
+        stage2LatencyMs: conservativeMonotonicElapsed(
+          stage2StartedAt,
+          stage2EndedAt
+        ),
+        endToEndMs: conservativeMonotonicElapsed(
+          representative3StartedAt,
+          stage2EndedAt
+        )
+      });
+    }
   } else {
     await runBatch(pending, input.concurrency, false);
   }
@@ -366,6 +415,7 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
 export const representative3MaximumTotalDurationMs = 90 * 60 * 1_000;
 
 export function buildRepresentative3PilotTimingReceipt(input: {
+  readonly firstByteMs: number;
   readonly monotonicLatencyMs: number;
   readonly succeeded: boolean;
   readonly concurrency: number;
@@ -397,7 +447,9 @@ export function buildRepresentative3PilotTimingReceipt(input: {
   const projectedWithinLimit =
     projectedTotalDurationMs <= representative3MaximumTotalDurationMs;
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    firstByteMs: Math.min(latencyMs, boundedDuration(input.firstByteMs)),
+    endToEndMs: latencyMs,
     monotonicLatencyMs: latencyMs,
     remainingTwoBoundMs,
     projectedTotalDurationMs,
@@ -441,14 +493,41 @@ function markCompleted(
   checkpoint: ReviewFlowEvaluationCheckpoint,
   safeId: string,
   projection: ReviewFlowCalibrationProjection,
-  pilotTiming?: ReviewFlowEvaluationPilotTimingReceipt
+  pilotTiming?: ReviewFlowEvaluationPilotTimingReceipt,
+  caseTiming?: ReviewFlowEvaluationCaseTiming
 ): void {
   try {
-    checkpoint.markCompleted(safeId, projection, pilotTiming);
+    checkpoint.markCompleted(safeId, projection, pilotTiming, caseTiming);
   } catch (error) {
     // 检查点 I/O 失败时不能猜测磁盘终态，更不能把同一请求重发成另一条链。
     throw error;
   }
+}
+
+function validCaseTiming(
+  timing: ReviewFlowEvaluationCaseTiming | undefined
+): timing is ReviewFlowEvaluationCaseTiming {
+  return (
+    timing?.schemaVersion === 1 &&
+    Number.isSafeInteger(timing.firstByteMs) &&
+    timing.firstByteMs >= 0 &&
+    Number.isSafeInteger(timing.endToEndMs) &&
+    timing.endToEndMs >= timing.firstByteMs
+  );
+}
+
+function timingReceiptMissingFailure(
+  caseAttempts: number
+): ReviewFlowEvaluationFailure {
+  return {
+    code: "REVIEW_FLOW_EVALUATION_TIMING_RECEIPT_MISSING",
+    failureKind: null,
+    httpStatus: null,
+    completedRoleCount: 11,
+    failedRoleCount: 0,
+    failedRoles: [],
+    caseAttempts
+  };
 }
 
 function unexpectedFailure(): ReviewFlowEvaluationFailure {

@@ -2880,13 +2880,15 @@ describe("chatComplete：按输出活动判断是否停住", () => {
           headers: { "Content-Type": "text/event-stream" }
         });
       });
+      const onResponseBodyByte = vi.fn();
       const resultPromise = chatComplete(provider, spec, [], {
         outputIdleTimeoutMs: 1_000,
         firstOutputTimeoutMs: 1_000,
         maximumDurationMs: 5_000,
         maxAttempts: 3,
         baseDelayMs: 1,
-        fetch: fetchMock
+        fetch: fetchMock,
+        onResponseBodyByte
       });
       await vi.advanceTimersByTimeAsync(0);
       streamController.enqueue(
@@ -2901,6 +2903,7 @@ describe("chatComplete：按输出活动判断是否停住", () => {
       expect((error as Error).message).not.toContain("部分");
       expect((error as Error).message).not.toContain("不应泄露的部分输出");
       expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(onResponseBodyByte).toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }

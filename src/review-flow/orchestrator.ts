@@ -127,6 +127,7 @@ export const reviewFlowFailureKindAllowlist = Object.freeze([
   "validation",
   "service_http",
   "transport",
+  "stream_interrupted",
   "timeout",
   "cancelled",
   "output_limit",
@@ -1622,15 +1623,21 @@ function classifyRoleFailure(error: unknown): ReviewFlowFailureKind {
     ? (error as { readonly code?: unknown }).code
     : undefined;
   if (code === "LLM_HTTP_ERROR") return "service_http";
-  if (["LLM_NETWORK_FAILED", "LLM_STREAM_INTERRUPTED"].includes(String(code))) {
-    return "transport";
+  const audit = getLlmFailureAudit(error);
+  const receivedResponseBytes =
+    audit !== null && audit.stream.utf8Bytes > 0;
+  if (code === "LLM_NETWORK_FAILED") return "transport";
+  if (code === "LLM_STREAM_INTERRUPTED") {
+    return receivedResponseBytes || audit === null
+      ? "stream_interrupted"
+      : "transport";
   }
   if ([
     "LLM_FIRST_OUTPUT_TIMEOUT",
     "LLM_OUTPUT_IDLE_TIMEOUT",
     "LLM_TOTAL_TIMEOUT"
   ].includes(String(code))) {
-    return "timeout";
+    return receivedResponseBytes ? "stream_interrupted" : "timeout";
   }
   if (["LLM_CANCELLED", "LLM_REQUEST_START_BLOCKED"].includes(String(code))) {
     return "cancelled";

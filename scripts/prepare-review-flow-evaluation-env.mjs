@@ -90,7 +90,7 @@ function rawEnvironmentLines(content) {
 export function buildReviewFlowEvaluationEnvFile(
   sourceContent,
   codeVersion,
-  concurrency = 2
+  concurrency = 16
 ) {
   try {
     if (
@@ -197,16 +197,32 @@ function writeExclusivePrivateFile(directory, content, validateBeforePublish) {
 
 function parseArguments(argv) {
   if (
-    argv.length !== 2 ||
+    (argv.length !== 2 && argv.length !== 3) ||
     !argv[0].startsWith("--source-environment-file=") ||
-    !argv[1].startsWith("--target-directory=")
+    !argv[1].startsWith("--target-directory=") ||
+    (argv[2] !== undefined && !argv[2].startsWith("--concurrency="))
   ) {
     failPreparation();
   }
   const source = argv[0].slice("--source-environment-file=".length);
   const targetDirectory = argv[1].slice("--target-directory=".length);
-  if (!isAbsolute(source) || !isAbsolute(targetDirectory)) failPreparation();
-  return { source: resolve(source), targetDirectory: resolve(targetDirectory) };
+  const concurrency = argv[2] === undefined
+    ? 16
+    : Number(argv[2].slice("--concurrency=".length));
+  if (
+    !isAbsolute(source) ||
+    !isAbsolute(targetDirectory) ||
+    !Number.isSafeInteger(concurrency) ||
+    concurrency < 1 ||
+    concurrency > 20
+  ) {
+    failPreparation();
+  }
+  return {
+    source: resolve(source),
+    targetDirectory: resolve(targetDirectory),
+    concurrency
+  };
 }
 
 export function prepareReviewFlowEvaluationEnv(
@@ -228,14 +244,15 @@ export function prepareReviewFlowEvaluationEnv(
     temporaryRoot,
     containingWorkspace
   );
-  const { source, targetDirectory } = parseArguments(argv);
+  const { source, targetDirectory, concurrency } = parseArguments(argv);
   const gitOptions = { temporaryRoot: trustedTemporaryRoot };
   const codeVersion = readRepositoryHead(undefined, gitOptions);
   const runtimeOptions = { privateRoot, containingWorkspace };
   const sourceContent = readEnvFile(source, runtimeOptions);
   const content = buildReviewFlowEvaluationEnvFile(
     sourceContent,
-    codeVersion
+    codeVersion,
+    concurrency
   );
   const directory = prepareDirectory(targetDirectory, runtimeOptions);
   try {

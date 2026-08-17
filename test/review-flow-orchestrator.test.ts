@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { LlmRequestStartGate } from "../src/llm";
+import { LlmRequestError, LlmRequestStartGate } from "../src/llm";
 import {
   assertEvidenceArtifact,
   hashCanonicalValue,
@@ -1098,6 +1098,7 @@ describe("冻结证据多角色审题编排", () => {
       const outcome = await runReviewEvidenceFlowOutcome({
         source: source(),
         identities: identities(),
+
         roles: defaultRoles({
           solver: async () => { throw forgedError; }
         })
@@ -1116,6 +1117,24 @@ describe("冻结证据多角色审题编排", () => {
       expect(serialized).not.toContain(privateCode);
       expect(serialized).not.toContain(privateKind);
     }
+  });
+
+  it("把已收字节后的流中断保留为 durable non-retryable 类别", async () => {
+    const outcome = await runReviewEvidenceFlowOutcome({
+      source: source(),
+      identities: identities(),
+      roles: defaultRoles({
+        solver: async () => {
+          throw new LlmRequestError("LLM_STREAM_INTERRUPTED");
+        }
+      })
+    });
+    expect(outcome.status).toBe("incomplete");
+    if (outcome.status !== "incomplete") throw new Error("expected incomplete");
+    expect(outcome.failure.failureKind).toBe("stream_interrupted");
+    expect(outcome.failure.failedRoles[0]?.failureKind).toBe(
+      "stream_interrupted"
+    );
   });
 
   it("可信上下文缺 receipt 或轮次不匹配都在付费工作流边界 fail-closed", async () => {

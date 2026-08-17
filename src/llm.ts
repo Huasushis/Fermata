@@ -389,6 +389,8 @@ export interface LlmRuntimeOptions {
    * development smoke 在进程内测首个有效输出与事件速率。
    */
   readonly onSafeOutputActivity?: () => void;
+  /** 首个非空 HTTP 正文字节的安全通知；不接收、不保留正文。 */
+  readonly onResponseBodyByte?: () => void;
   /**
    * 在每次实际外部传输（fetch）前同步调用。如果回调抛出异常，
    * fetch 不会发生，失败按确定性 fail-closed 处理。
@@ -2302,6 +2304,9 @@ async function requestWithRetry(
               watchdog.receivedValidOutput();
               runtime.onSafeOutputActivity?.();
             },
+            onResponseByte: () => {
+              runtime.onResponseBodyByte?.();
+            },
             onInvalidResponseDrainStarted: (
               formatFailureStage,
               formatFailureSubstage
@@ -2706,6 +2711,7 @@ async function delayBeforeRetry(
 
 interface ResponseBodyActivityObserver {
   readonly onValidOutput: () => void;
+  readonly onResponseByte: () => void;
   readonly onInvalidResponseDrainStarted: (
     formatFailureStage?: LlmResponseFormatFailureStage,
     formatFailureSubstage?: LlmResponseFormatFailureSubstage
@@ -2826,6 +2832,7 @@ async function readResponseTextWithLimit(
           throw new LlmResponseFormatError("json_utf8");
         }
       }
+      if (chunk.value.byteLength > 0) observer.onResponseByte();
       if (firstProtocolError !== undefined) {
         if (chunk.value.byteLength > 0) {
           observer.onInvalidResponseDrainActivity();
@@ -2887,6 +2894,7 @@ async function drainResponseAfterProtocolError(
         audit.eofObserved = true;
         throw firstProtocolError;
       }
+      if (chunk.value.byteLength > 0) observer.onResponseByte();
       // 排空阶段不解码、不拼接、不解析，也不保留任何响应字节。
       if (chunk.value.byteLength > 0) {
         observer.onInvalidResponseDrainActivity();
@@ -3428,6 +3436,7 @@ async function readChatCompletionEventStream(
         observer.onInvalidResponseDrainActivity();
       }
       totalBytes = addResponseChunkSize(totalBytes, chunk.value.byteLength);
+      if (chunk.value.byteLength > 0) observer.onResponseByte();
       audit.streamUtf8Bytes = totalBytes;
       if (chunk.value.byteLength > 0) {
         responseChunkCount += 1;

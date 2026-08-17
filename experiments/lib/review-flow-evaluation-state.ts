@@ -271,9 +271,30 @@ const failureSchema = z
   .strict();
 export type ReviewFlowEvaluationFailure = z.infer<typeof failureSchema>;
 
-export const reviewFlowEvaluationPilotTimingReceiptSchema = z
+export const reviewFlowEvaluationCaseTimingSchema = z
   .object({
     schemaVersion: z.literal(1),
+    firstByteMs: z.number().int().nonnegative(),
+    endToEndMs: z.number().int().nonnegative()
+  })
+  .strict()
+  .superRefine((receipt, context) => {
+    if (receipt.firstByteMs > receipt.endToEndMs) {
+      context.addIssue({
+        code: "custom",
+        message: "案例首字节时延不得晚于案例结束。"
+      });
+    }
+  });
+export type ReviewFlowEvaluationCaseTiming = z.infer<
+  typeof reviewFlowEvaluationCaseTimingSchema
+>;
+
+export const reviewFlowEvaluationPilotTimingReceiptSchema = z
+  .object({
+    schemaVersion: z.literal(2),
+    firstByteMs: z.number().int().nonnegative(),
+    endToEndMs: z.number().int().nonnegative(),
     monotonicLatencyMs: z.number().int().nonnegative(),
     remainingTwoBoundMs: z.number().int().nonnegative(),
     projectedTotalDurationMs: z.number().int().nonnegative(),
@@ -284,18 +305,43 @@ export const reviewFlowEvaluationPilotTimingReceiptSchema = z
   .strict()
   .superRefine((receipt, context) => {
     if (
+      receipt.endToEndMs !== receipt.monotonicLatencyMs ||
+      receipt.firstByteMs > receipt.endToEndMs ||
       receipt.projectedWithinLimit !==
         (receipt.projectedTotalDurationMs <= receipt.maximumTotalDurationMs) ||
       (receipt.remainingCasesAdmitted && !receipt.projectedWithinLimit)
     ) {
       context.addIssue({
         code: "custom",
-        message: "pilot 时延收据与 90 分钟准入决定不一致。"
+        message: "pilot 时延收据与真实时序或 90 分钟准入决定不一致。"
       });
     }
   });
 export type ReviewFlowEvaluationPilotTimingReceipt = z.infer<
   typeof reviewFlowEvaluationPilotTimingReceiptSchema
+>;
+
+export const reviewFlowEvaluationRepresentative3TimingSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    firstByteMs: z.number().int().nonnegative(),
+    stage2LatencyMs: z.number().int().nonnegative(),
+    endToEndMs: z.number().int().nonnegative()
+  })
+  .strict()
+  .superRefine((receipt, context) => {
+    if (
+      receipt.firstByteMs > receipt.endToEndMs ||
+      receipt.stage2LatencyMs > receipt.endToEndMs
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "representative3 时延收据顺序无效。"
+      });
+    }
+  });
+export type ReviewFlowEvaluationRepresentative3Timing = z.infer<
+  typeof reviewFlowEvaluationRepresentative3TimingSchema
 >;
 
 const pendingEntrySchema = z
@@ -314,7 +360,8 @@ const completedEntrySchema = z
     status: z.literal("completed"),
     completedAt: timestampSchema,
     projection: reviewFlowCalibrationProjectionSchema,
-    pilotTiming: reviewFlowEvaluationPilotTimingReceiptSchema.optional()
+    pilotTiming: reviewFlowEvaluationPilotTimingReceiptSchema.optional(),
+    caseTiming: reviewFlowEvaluationCaseTimingSchema.optional()
   })
   .strict();
 const failedEntrySchema = z
@@ -382,6 +429,8 @@ export const reviewFlowEvaluationCheckpointSchema = z
     termination: terminationSchema.nullable(),
     executionSeal: executionSealSchema.nullable(),
     publication: reviewFlowEvaluationPublicationBindingSchema.nullable(),
+    representative3Timing:
+      reviewFlowEvaluationRepresentative3TimingSchema.optional(),
     revision: z.number().int().positive(),
     createdAt: timestampSchema,
     updatedAt: timestampSchema
@@ -452,6 +501,32 @@ export const reviewFlowEvaluationCheckpointSchema = z
         code: "custom",
         path: ["expectedCases"],
         message: "representative3 检查点未绑定固定三题有序集合。"
+      });
+    }
+    if (
+      state.representative3Timing !== undefined &&
+      (
+        state.identity.caseSelection?.selector !== "representative3-v1" ||
+        state.entries.some((entry) => entry.status !== "completed")
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["representative3Timing"],
+        message: "representative3 总时延只能绑定三题完成终态。"
+      });
+    }
+    if (
+      state.identity.caseSelection !== undefined &&
+      state.entries.some(
+        (entry) =>
+          entry.status === "completed" && entry.caseTiming === undefined
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["entries"],
+        message: "representative3 完成案例缺少真实请求时延收据。"
       });
     }
     if (state.executionSeal !== null) {
@@ -782,7 +857,8 @@ export class ReviewFlowEvaluationCheckpoint {
   public markCompleted(
     safeId: string,
     projection: z.infer<typeof reviewFlowCalibrationProjectionSchema>,
-    pilotTiming?: ReviewFlowEvaluationPilotTimingReceipt
+    pilotTiming?: ReviewFlowEvaluationPilotTimingReceipt,
+    caseTiming?: ReviewFlowEvaluationCaseTiming
   ): void {
     const parsed = reviewFlowCalibrationProjectionSchema.parse(projection);
     const parsedPilotTiming = pilotTiming === undefined
@@ -801,7 +877,13 @@ export class ReviewFlowEvaluationCheckpoint {
         projection: parsed,
         ...(parsedPilotTiming === undefined
           ? {}
-          : { pilotTiming: parsedPilotTiming })
+          : { pilotTiming: parsedPilotTiming }),
+        ...(caseTiming === undefined
+          ? {}
+          : {
+              caseTiming:
+                reviewFlowEvaluationCaseTimingSchema.parse(caseTiming)
+            })
       };
     });
   }
@@ -831,6 +913,25 @@ export class ReviewFlowEvaluationCheckpoint {
           : { pilotTiming: parsedPilotTiming })
       };
     });
+  }
+
+  public bindRepresentative3Timing(
+    receipt: ReviewFlowEvaluationRepresentative3Timing
+  ): void {
+    this.assertOpen();
+    const parsed =
+      reviewFlowEvaluationRepresentative3TimingSchema.parse(receipt);
+    if (
+      this.#state.identity.caseSelection?.selector !== "representative3-v1" ||
+      this.#state.entries.some((entry) => entry.status !== "completed") ||
+      this.#state.executionSeal !== null ||
+      this.#state.representative3Timing !== undefined
+    ) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_TIMING_INVALID"
+      );
+    }
+    this.update({ representative3Timing: parsed });
   }
 
   public sealExecution(): ReviewFlowEvaluationCheckpointState {
@@ -1079,6 +1180,7 @@ function executionCompletionFingerprint(
     | "entries"
     | "globalClaimSha256"
     | "termination"
+    | "representative3Timing"
   >
 ): string {
   const receiptSeal = buildExecutionReceiptSeal(state.entries);
@@ -1090,7 +1192,10 @@ function executionCompletionFingerprint(
     entries: state.entries,
     receiptSeal,
     globalClaimSha256: state.globalClaimSha256,
-    termination: state.termination
+    termination: state.termination,
+    ...(state.representative3Timing === undefined
+      ? {}
+      : { representative3Timing: state.representative3Timing })
   });
 }
 

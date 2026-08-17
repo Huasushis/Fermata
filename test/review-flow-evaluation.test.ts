@@ -693,6 +693,60 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
     checkpoint.close();
   });
 
+  it("partial-byte 流中断不重放案例，zero-byte transport 仍按上限安全重试", async () => {
+    const partialFixture = createStateFixture(1);
+    const partialCheckpoint = openCheckpoint(partialFixture, {
+      bindClaim: true
+    });
+    const partialExecute = vi.fn(async () => ({
+      status: "incomplete" as const,
+      failure: {
+        ...fixedFailure("REVIEW_FLOW_ROLE_FAILED", null),
+        failureKind: "stream_interrupted" as const
+      }
+    }));
+    const partialState = await runReviewFlowEvaluationCases({
+      checkpoint: partialCheckpoint,
+      cases: preparedStateCases(partialFixture),
+      executor: { execute: partialExecute },
+      concurrency: 1,
+      maxCaseAttempts: 3
+    });
+    expect(partialExecute).toHaveBeenCalledTimes(1);
+    expect(partialState.entries[0]).toMatchObject({
+      status: "failed",
+      failure: { failureKind: "stream_interrupted", caseAttempts: 1 }
+    });
+    partialCheckpoint.close();
+
+    const zeroByteFixture = createStateFixture(1);
+    const zeroByteCheckpoint = openCheckpoint(zeroByteFixture, {
+      bindClaim: true
+    });
+    const zeroByteExecute = vi.fn()
+      .mockResolvedValueOnce({
+        status: "incomplete" as const,
+        failure: {
+          ...fixedFailure("REVIEW_FLOW_NETWORK_FAILED", null),
+          failureKind: "transport" as const
+        }
+      })
+      .mockResolvedValueOnce({
+        status: "complete" as const,
+        projection: projection("approve")
+      });
+    const zeroByteState = await runReviewFlowEvaluationCases({
+      checkpoint: zeroByteCheckpoint,
+      cases: preparedStateCases(zeroByteFixture),
+      executor: { execute: zeroByteExecute },
+      concurrency: 1,
+      maxCaseAttempts: 3
+    });
+    expect(zeroByteExecute).toHaveBeenCalledTimes(2);
+    expect(zeroByteState.entries[0]?.status).toBe("completed");
+    zeroByteCheckpoint.close();
+  });
+
   it("maxCaseAttempts 超界或非整数被拒绝", async () => {
     const fixture = createStateFixture(1);
     const checkpoint = openCheckpoint(fixture, { bindClaim: true });
@@ -877,7 +931,7 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
     const fixture = createRepresentative3StateFixture();
     const checkpoint = openCheckpoint(fixture, { bindClaim: true });
     const calls: string[] = [];
-    const monotonicValues = [0, 1_000];
+    const monotonicValues = [0, 1_000, 1_000, 2_000];
     const state = await runReviewFlowEvaluationCases({
       checkpoint,
       cases: preparedStateCases(fixture),
@@ -886,11 +940,16 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
           calls.push(safeId);
           return {
             status: "complete" as const,
-            projection: projection("approve")
+            projection: projection("approve"),
+            timing: {
+              schemaVersion: 1 as const,
+              firstByteMs: 100,
+              endToEndMs: 500
+            }
           };
         }
       },
-      concurrency: 2,
+      concurrency: 20,
       maxCaseAttempts: 3,
       monotonicNow: () => monotonicValues.shift() ?? 1_000
     });
@@ -910,6 +969,12 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
       remainingCasesAdmitted: true,
       maximumTotalDurationMs: representative3MaximumTotalDurationMs
     });
+    expect(state.representative3Timing).toEqual({
+      schemaVersion: 1,
+      firstByteMs: 100,
+      stage2LatencyMs: 1_000,
+      endToEndMs: 2_000
+    });
     expect(state.entries.slice(1).every(
       (entry) => !("pilotTiming" in entry)
     )).toBe(true);
@@ -925,14 +990,19 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
     const checkpoint = openCheckpoint(fixture, { bindClaim: true });
     const execute = vi.fn(async () => ({
       status: "complete" as const,
-      projection: projection("approve")
+      projection: projection("approve"),
+      timing: {
+        schemaVersion: 1 as const,
+        firstByteMs: 1_000,
+        endToEndMs: 60_000
+      }
     }));
     const monotonicValues = [0, 60_000];
     const state = await runReviewFlowEvaluationCases({
       checkpoint,
       cases: preparedStateCases(fixture),
       executor: { execute },
-      concurrency: 2,
+      concurrency: 20,
       maxCaseAttempts: 3,
       monotonicNow: () => monotonicValues.shift() ?? 60_000
     });
@@ -955,6 +1025,38 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
         : 0
     ).toBeGreaterThan(representative3MaximumTotalDurationMs);
     expect(state.termination).toBeNull();
+    expect(state.executionSeal?.complete).toBe(false);
+    checkpoint.close();
+  });
+
+  it("representative3 缺少真实请求时延收据时持久失败并封存 INCOMPLETE", async () => {
+    const fixture = createRepresentative3StateFixture();
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const execute = vi.fn(async () => ({
+      status: "complete" as const,
+      projection: projection("approve")
+    }));
+    const state = await runReviewFlowEvaluationCases({
+      checkpoint,
+      cases: preparedStateCases(fixture),
+      executor: { execute },
+      concurrency: 20,
+      maxCaseAttempts: 3
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(state.entries.map((entry) => entry.status)).toEqual([
+      "failed",
+      "pending",
+      "pending"
+    ]);
+    expect(state.entries[0]).toMatchObject({
+      status: "failed",
+      failure: {
+        code: "REVIEW_FLOW_EVALUATION_TIMING_RECEIPT_MISSING",
+        caseAttempts: 1
+      }
+    });
+    expect(state.representative3Timing).toBeUndefined();
     expect(state.executionSeal?.complete).toBe(false);
     checkpoint.close();
   });
@@ -987,6 +1089,7 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
     const fixture = createRepresentative3StateFixture();
     const configuration = fixture.identity.configurationSummary;
     const base = buildRepresentative3PilotTimingReceipt({
+      firstByteMs: 100,
       monotonicLatencyMs: 1_000,
       succeeded: true,
       concurrency: 2,
@@ -994,6 +1097,7 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
       configuration
     });
     const moreBackoff = buildRepresentative3PilotTimingReceipt({
+      firstByteMs: 100,
       monotonicLatencyMs: 1_000,
       succeeded: true,
       concurrency: 2,
@@ -1001,6 +1105,7 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
       configuration: { ...configuration, baseDelayMs: configuration.baseDelayMs + 1 }
     });
     const longerWatchdog = buildRepresentative3PilotTimingReceipt({
+      firstByteMs: 100,
       monotonicLatencyMs: 1_000,
       succeeded: true,
       concurrency: 2,
@@ -1011,6 +1116,7 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
       }
     });
     const serial = buildRepresentative3PilotTimingReceipt({
+      firstByteMs: 100,
       monotonicLatencyMs: 1_000,
       succeeded: true,
       concurrency: 1,
@@ -2912,7 +3018,7 @@ function createRepresentative3StateFixture(
     llmMaximumDurationMs: 1_000,
     maxAttempts: 3,
     baseDelayMs: 100,
-    concurrency: 2,
+    concurrency: 20,
     caseAttempts: 3,
     ...configurationOverrides
   };
