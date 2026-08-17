@@ -4,7 +4,6 @@ import {
   chatCompleteStagedSolverJsonWithReceipt,
   chatCompleteTwoRoundJsonWithReceipt,
   llmTransportProtocolVersion,
-  maximumExplicitLlmOutputTokens,
   type ChatMessage,
   type LlmJsonCompletionReceipt
 } from "../llm";
@@ -169,8 +168,7 @@ export function createReviewFlowLlmBundle(input: {
         buildSolverSynthesisMessages,
         buildSolverFormatterMessages,
         solverPayloadSchema,
-        models.solver.runtime,
-        { maxOutputTokens: maximumExplicitLlmOutputTokens }
+        models.solver.runtime
       );
       const narrative = mergeNarrative(reasoning, data.narrative);
       return trustedRoleExecution({ ...data, narrative }, receipt);
@@ -178,15 +176,13 @@ export function createReviewFlowLlmBundle(input: {
     solutionAnalyst: async (view) => runJsonRole(
       models.solution_analyst,
       buildSolutionAnalystMessages(view),
-      solutionAnalystPayloadSchema,
-      maximumExplicitLlmOutputTokens
+      solutionAnalystPayloadSchema
     ),
     technicalAuditor: async (view) => {
       const { data, receipt } = await runJson(
         models.technical_auditor,
         buildTechnicalAuditorMessages(view),
-        technicalModelPayloadSchema,
-        maximumExplicitLlmOutputTokens
+        technicalModelPayloadSchema
       );
       const provided = view.referenceImplementation.provided;
       return trustedRoleExecution({
@@ -223,14 +219,12 @@ export function createReviewFlowLlmBundle(input: {
     difficulty: async (view) => runJsonRole(
       models.difficulty,
       buildDifficultyMessages(view, anchors),
-      difficultyPayloadSchema,
-      maximumExplicitLlmOutputTokens
+      difficultyPayloadSchema
     ),
     editorialJudge: async (view) => runJsonRole(
       models.editorial_judge,
       buildEditorialJudgeMessages(view),
-      editorialPayloadSchema,
-      maximumExplicitLlmOutputTokens
+      editorialPayloadSchema
     ),
     contestFit: async (view) => {
       const { data, receipt } = await chatCompleteTwoRoundJsonWithReceipt(
@@ -239,8 +233,7 @@ export function createReviewFlowLlmBundle(input: {
         buildContestFitSemanticMessages(view),
         buildContestFitFormatterMessages,
         contestFitPayloadSchema,
-        models.contest_fit.runtime,
-        { maxOutputTokens: maximumExplicitLlmOutputTokens }
+        models.contest_fit.runtime
       );
       return trustedRoleExecution(data, receipt);
     },
@@ -251,8 +244,7 @@ export function createReviewFlowLlmBundle(input: {
         buildOriginalitySemanticMessages(view),
         buildOriginalityFormatterMessages,
         originalityPayloadSchema,
-        models.originality.runtime,
-        { maxOutputTokens: maximumExplicitLlmOutputTokens }
+        models.originality.runtime
       );
       return trustedRoleExecution(data, receipt);
     },
@@ -263,28 +255,24 @@ export function createReviewFlowLlmBundle(input: {
         buildTagsSemanticMessages(view),
         buildTagsFormatterMessages,
         tagsPayloadSchema,
-        models.tags.runtime,
-        { maxOutputTokens: maximumExplicitLlmOutputTokens }
+        models.tags.runtime
       );
       return trustedRoleExecution(data, receipt);
     },
     critic: async (view) => runJsonRole(
       models.critic,
       buildCriticMessages(view),
-      criticPayloadSchema,
-      maximumExplicitLlmOutputTokens
+      criticPayloadSchema
     ),
     adversary: async (view) => runJsonRole(
       models.adversary,
       buildAdversaryMessages(view),
-      adversaryPayloadSchema,
-      maximumExplicitLlmOutputTokens
+      adversaryPayloadSchema
     ),
     adjudicator: async (view) => runJsonRole(
       models.adjudicator,
       buildAdjudicatorMessages(view),
-      adjudicatorPayloadSchema,
-      maximumExplicitLlmOutputTokens
+      adjudicatorPayloadSchema
     )
   };
 
@@ -817,18 +805,16 @@ export function buildAdjudicatorMessages(
 async function runJsonRole<T>(
   model: PipelineModelConfig,
   messages: readonly ChatMessage[],
-  schema: z.ZodType<T>,
-  maxOutputTokens: number
+  schema: z.ZodType<T>
 ): Promise<unknown> {
-  const result = await runJson(model, messages, schema, maxOutputTokens);
+  const result = await runJson(model, messages, schema);
   return trustedRoleExecution(result.data, result.receipt);
 }
 
 async function runJson<T>(
   model: PipelineModelConfig,
   messages: readonly ChatMessage[],
-  schema: z.ZodType<T>,
-  maxOutputTokens: number
+  schema: z.ZodType<T>
 ): Promise<{
   readonly data: T;
   readonly reasoning: string | null;
@@ -839,8 +825,7 @@ async function runJson<T>(
     model.spec,
     [...messages],
     schema,
-    model.runtime,
-    { maxOutputTokens }
+    model.runtime
   );
 }
 

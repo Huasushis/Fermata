@@ -725,20 +725,18 @@ describe("历史人工标准驱动的多角色提示词", () => {
     )).toThrow("REVIEW_FLOW_PRODUCTION_GRANT_INVALID");
   });
 
-  it("legacy 11-role adapter also requests the provider hard max for every role (no project output cap remains)", async () => {
+  it("legacy 11-role adapter omits outbound cap fields for every default request", async () => {
     const roleByModel = new Map<string, ReviewFlowRole>(
       reviewFlowRoleSchema.options.map((role) => [`cap-test-${role}`, role] as const)
     );
-    const observedMaxTokens: Record<string, number> = {};
+    const observedBodies: Array<Record<string, unknown>> = [];
     const fetchImpl = vi.fn(async (
       _url: string | URL | Request,
       init?: RequestInit
     ) => {
-      const body = JSON.parse(String(init?.body)) as { readonly model?: unknown; readonly max_tokens?: unknown };
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       const model = typeof body.model === "string" ? body.model : "unknown";
-      if (typeof body.max_tokens === "number") {
-        observedMaxTokens[model] = body.max_tokens;
-      }
+      observedBodies.push(body);
       const role = roleByModel.get(model);
       const payload = role !== undefined ? wireRolePayloads[role] : wireRolePayloads.solver;
       return new Response(JSON.stringify({
@@ -795,21 +793,11 @@ describe("历史人工标准驱动的多角色提示词", () => {
       await invocations[role]();
     }
     expect(fetchImpl).toHaveBeenCalledTimes(reviewFlowRoleSchema.options.length + 5);
-    const expectedBudgets: Readonly<Record<ReviewFlowRole, number>> = {
-      solver: 384_000,
-      solution_analyst: 384_000,
-      technical_auditor: 384_000,
-      difficulty: 384_000,
-      editorial_judge: 384_000,
-      contest_fit: 384_000,
-      originality: 384_000,
-      tags: 384_000,
-      critic: 384_000,
-      adversary: 384_000,
-      adjudicator: 384_000
-    };
-    for (const role of reviewFlowRoleSchema.options) {
-      expect(observedMaxTokens[`cap-test-${role}`]).toBe(expectedBudgets[role]);
+    expect(observedBodies).toHaveLength(reviewFlowRoleSchema.options.length + 5);
+    for (const body of observedBodies) {
+      expect(body).not.toHaveProperty("max_tokens");
+      expect(body).not.toHaveProperty("max_completion_tokens");
+      expect(body).not.toHaveProperty("maxOutputTokens");
     }
   });
 });

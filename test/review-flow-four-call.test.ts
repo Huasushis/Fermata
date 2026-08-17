@@ -1,7 +1,6 @@
 import { describe, expect, it, vi, type Mock } from "vitest";
 import {
   parseReviewFlowUnifiedResult,
-  reviewFlowStageOutputBudgets,
   reviewFlowUnifiedJsonSchema,
   reviewFlowUnifiedSchemaFingerprint,
   runFourCallReviewDag,
@@ -82,11 +81,10 @@ function stageOutput(stage: "A" | "B" | "C" | "D" | "formatter"): string {
 
 /**
  * 识别合成请求体中的四阶段：B/C/D 通过 response_format 名称；两轮 A 阶段
- * 两轮都不带 response_format，靠 max_tokens=32000 与末条用户消息是否含
- * "目标 JSON Schema"区分语义轮与格式轮。
+ * 都不带 response_format，靠末条用户消息是否含"目标 JSON Schema"区分
+ * 语义轮与格式轮。
  */
 function syntheticFourCallStage(body: {
-  readonly max_tokens?: number;
   readonly response_format?: {
     readonly json_schema?: { readonly name?: string };
   };
@@ -100,17 +98,13 @@ function syntheticFourCallStage(body: {
   if (stage === "A" || stage === "B" || stage === "C" || stage === "D") {
     return stage;
   }
-  if (body.max_tokens === 384_000) {
-    // 语义轮不含"目标 JSON Schema"指令；格式轮与修复轮都包含该指令
-    // （修复轮在格式消息后会追加 assistant/修复提示）。
-    const containsSchemaInstruction = (body.messages ?? []).some(
-      (message) =>
-        typeof message.content === "string" &&
-        message.content.includes("目标 JSON Schema")
-    );
-    return containsSchemaInstruction ? "A_FORMAT" : "A";
-  }
-  return undefined;
+  if (responseFormat !== undefined) return undefined;
+  const containsSchemaInstruction = (body.messages ?? []).some(
+    (message) =>
+      typeof message.content === "string" &&
+      message.content.includes("目标 JSON Schema")
+  );
+  return containsSchemaInstruction ? "A_FORMAT" : "A";
 }
 
 function syntheticJsonCompletion(content: string): Response {
@@ -380,7 +374,7 @@ describe("四语义请求 DAG 冻结接口", () => {
       }
     })).resolves.toMatchObject({ reusedStages: ["B"] });
   });
-  it("production adapter emits two-round A plus single-round B/C/D with stage budgets", async () => {
+  it("production adapter emits two-round A plus single-round B/C/D without outbound caps", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -448,16 +442,17 @@ describe("四语义请求 DAG 冻结接口", () => {
     expect(result.formatterRequestCount).toBe(0);
     // A 语义轮 + A 格式轮 + B/C/D 各一次
     expect(fetchImpl).toHaveBeenCalledTimes(5);
-    expect(bodies.map((body) => body.max_tokens).sort((left, right) =>
-      Number(left) - Number(right)
-    )).toEqual([384_000, 384_000, 384_000, 384_000, 384_000]);
+    expect(bodies).toHaveLength(5);
     for (const body of bodies) {
+      expect(body).not.toHaveProperty("max_tokens");
+      expect(body).not.toHaveProperty("max_completion_tokens");
+      expect(body).not.toHaveProperty("maxOutputTokens");
       expect(body).toMatchObject({
         thinking: { type: "enabled" },
         reasoning_effort: "max"
       });
     }
-    expect(bodies.filter((body) => body.max_tokens === 384_000 && body.response_format === undefined))
+    expect(bodies.filter((body) => body.response_format === undefined))
       .toHaveLength(2);
     const formatBody = bodies.find((body) =>
       String((body.messages as readonly { content: string }[]).at(-1)?.content).includes(
@@ -465,12 +460,12 @@ describe("四语义请求 DAG 冻结接口", () => {
       )
     );
     expect(formatBody).toBeDefined();
-    expect(formatBody?.max_tokens).toBe(384_000);
+    expect(formatBody).not.toHaveProperty("max_tokens");
   });
 });
 
 describe("两轮 A 阶段（语义→格式）", () => {
-  it("routes A through reasoning-then-format rounds with per-round provider-max budget and reasoning=max", async () => {
+  it("routes A through reasoning-then-format rounds without outbound caps and with reasoning=max", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -504,10 +499,12 @@ describe("两轮 A 阶段（语义→格式）", () => {
     expect(formatCalls).toHaveLength(1);
     for (const call of [...semanticCalls, ...formatCalls]) {
       expect(call).toMatchObject({
-        max_tokens: 384_000,
         thinking: { type: "enabled" },
         reasoning_effort: "max"
       });
+      expect(call).not.toHaveProperty("max_tokens");
+      expect(call).not.toHaveProperty("max_completion_tokens");
+      expect(call).not.toHaveProperty("maxOutputTokens");
       expect(call.response_format).toBeUndefined();
     }
   });
@@ -614,9 +611,9 @@ describe("两轮 A 阶段（语义→格式）", () => {
     for (const stage of ["B", "C", "D"] as const) {
       const calls = bodies.filter((body) => syntheticFourCallStage(body) === stage);
       expect(calls).toHaveLength(1);
-      expect(calls[0]?.max_tokens).toBe(
-        reviewFlowStageOutputBudgets[stage]
-      );
+      expect(calls[0]).not.toHaveProperty("max_tokens");
+      expect(calls[0]).not.toHaveProperty("max_completion_tokens");
+      expect(calls[0]).not.toHaveProperty("maxOutputTokens");
     }
     expect(fetchImpl).toHaveBeenCalledTimes(5);
   });
@@ -635,15 +632,6 @@ describe("统一机器 schema", () => {
     expect(parseReviewFlowUnifiedResult(unifiedOutput())).toEqual(unifiedOutput());
   });
 
-  it("freezes stage budgets at provider hard max (no project output cap remains)", () => {
-    expect(reviewFlowStageOutputBudgets).toEqual({
-      A: 384_000,
-      B: 384_000,
-      C: 384_000,
-      D: 384_000,
-      formatter: 384_000
-    });
-  });
 });
 
 describe("全局公平调度与逐阶段重试", () => {

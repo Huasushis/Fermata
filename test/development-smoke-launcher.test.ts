@@ -195,7 +195,11 @@ function validOfflineTransport(
   entered?: (stage: "A" | "B" | "C" | "D") => void
 ) {
   return vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-    const stage = stageOfBody(JSON.parse(String(init?.body)));
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("max_tokens");
+    expect(body).not.toHaveProperty("max_completion_tokens");
+    expect(body).not.toHaveProperty("maxOutputTokens");
+    const stage = stageOfBody(body);
     if (stage === undefined) {
       throw new Error("SYNTHETIC_STAGE_INVALID");
     }
@@ -214,7 +218,11 @@ function validOfflineTransport(
 
 function validOfflineSseTransport() {
   return vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-    const stage = stageOfBody(JSON.parse(String(init?.body)));
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("max_tokens");
+    expect(body).not.toHaveProperty("max_completion_tokens");
+    expect(body).not.toHaveProperty("maxOutputTokens");
+    const stage = stageOfBody(body);
     if (stage === undefined) {
       throw new Error("SYNTHETIC_STAGE_INVALID");
     }
@@ -245,12 +253,10 @@ function validOfflineSseTransport() {
 type SyntheticStage = "A" | "A_FORMAT" | "B" | "C" | "D";
 
 /**
- * 从请求体识别合成阶段：B/C/D 通过 response_format 名称；
- * 两轮 A 阶段两轮都不带 response_format，靠 max_tokens=32000 加最后一轮
- * 用户消息是否含"目标 JSON Schema"区分语义轮与格式轮。
+ * 从请求体识别合成阶段：B/C/D 通过 response_format 名称；两轮 A 阶段都不带
+ * response_format，靠最后一轮用户消息是否含"目标 JSON Schema"区分语义轮与格式轮。
  */
 function stageOfBody(body: {
-  readonly max_tokens?: number;
   readonly response_format?: {
     readonly json_schema?: { readonly name?: string };
   };
@@ -266,17 +272,13 @@ function stageOfBody(body: {
   ) {
     return formatStage;
   }
-  if (body.max_tokens === 384_000) {
-    // 语义轮不含"目标 JSON Schema"指令；格式轮与修复轮都包含该指令
-    // （修复轮在格式消息后会追加 assistant/修复提示）。
-    const containsSchemaInstruction = (body.messages ?? []).some(
-      (message) =>
-        typeof message.content === "string" &&
-        message.content.includes("目标 JSON Schema")
-    );
-    return containsSchemaInstruction ? "A_FORMAT" : "A";
-  }
-  return undefined;
+  if (body.response_format !== undefined) return undefined;
+  const containsSchemaInstruction = (body.messages ?? []).some(
+    (message) =>
+      typeof message.content === "string" &&
+      message.content.includes("目标 JSON Schema")
+  );
+  return containsSchemaInstruction ? "A_FORMAT" : "A";
 }
 
 function syntheticContentFor(stage: SyntheticStage): string {

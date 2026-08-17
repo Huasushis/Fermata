@@ -116,13 +116,16 @@ function sseResponse(body: string): Response {
  * 识别合成请求中的阶段（nativeSchemaCompatible=true）。
  * - B/C/D：response_format={json_schema:{name:fermata_..._X_v1}}
  * - formatter：response_format={json_schema:{name:fermata_..._formatter_v1}}
- * - A 语义轮：无 response_format，max_tokens=384000，无"目标 JSON Schema"
- * - A 格式/finalizer 轮：无 response_format，max_tokens=384000，含"目标 JSON Schema"
+ * - A 语义轮：无 response_format，无"目标 JSON Schema"
+ * - A 格式/finalizer 轮：无 response_format，含"目标 JSON Schema"
  * - C/D salvage finalizer：response_format={type:json_object}
  */
 type SyntheticStage = "A" | "A_FORMAT" | "B" | "C" | "D" | "FORMATTER" | "FINALIZER" | "FINALIZER_REPAIR";
 
 function syntheticStage(body: Record<string, unknown>): SyntheticStage | undefined {
+  expect(body).not.toHaveProperty("max_tokens");
+  expect(body).not.toHaveProperty("max_completion_tokens");
+  expect(body).not.toHaveProperty("maxOutputTokens");
   const responseFormat = body.response_format as
     | { type?: string; json_schema?: { name?: string } }
     | undefined;
@@ -133,27 +136,20 @@ function syntheticStage(body: Record<string, unknown>): SyntheticStage | undefin
   const hasRepairHint = messages.some(
     (m) => typeof m.content === "string" && m.content.includes("上一条回复")
   );
-  const maxTokens = body.max_tokens as number | undefined;
 
   const schemaName = responseFormat?.json_schema?.name ?? "";
-  // B/C/D with json_schema
   const schemaStage = schemaName.match(/_([abcd])_v1$/u)?.[1]?.toUpperCase();
   if (schemaStage === "B" || schemaStage === "C" || schemaStage === "D") {
     return schemaStage;
   }
-  // formatter with json_schema
   if (schemaName.endsWith("_formatter_v1") || schemaName.includes("formatter")) {
     return "FORMATTER";
   }
-  // json_object response_format → salvage finalizer (C/D)
   if (responseFormat?.type === "json_object") {
     return hasRepairHint ? "FINALIZER_REPAIR" : "FINALIZER";
   }
-  // No response_format: A semantic or A format
-  if (maxTokens === 384_000) {
-    return hasSchemaInstruction ? "A_FORMAT" : "A";
-  }
-  return undefined;
+  if (responseFormat !== undefined) return undefined;
+  return hasSchemaInstruction ? "A_FORMAT" : "A";
 }
 
 function proConfig(fetchImpl: NonNullable<PipelineModelConfig["runtime"]["fetch"]>): PipelineModelConfig {

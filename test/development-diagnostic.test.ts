@@ -329,7 +329,7 @@ type ObservedRoleRequest = {
   readonly targetSchema: unknown | null;
   readonly responseFormatPresent: boolean;
   readonly model: unknown;
-  readonly maxTokens: unknown;
+  readonly outputCapFieldsPresent: boolean;
   readonly thinkingRequest: unknown;
   readonly reasoningEffort: unknown;
 };
@@ -496,6 +496,8 @@ function completeElevenRoleFetch(invalidAdjudicatorEvidence = false): {
       readonly response_format?: unknown;
       readonly model?: unknown;
       readonly max_tokens?: unknown;
+      readonly max_completion_tokens?: unknown;
+      readonly maxOutputTokens?: unknown;
       readonly thinking?: unknown;
       readonly reasoning_effort?: unknown;
     };
@@ -508,7 +510,10 @@ function completeElevenRoleFetch(invalidAdjudicatorEvidence = false): {
       targetSchema: targetSchemaFromPrompt(prompt),
       responseFormatPresent: "response_format" in request,
       model: request.model,
-      maxTokens: request.max_tokens,
+      outputCapFieldsPresent:
+        "max_tokens" in request ||
+        "max_completion_tokens" in request ||
+        "maxOutputTokens" in request,
       thinkingRequest: request.thinking,
       reasoningEffort: request.reasoning_effort
     });
@@ -4194,11 +4199,7 @@ describe("createRealDevelopmentSmokeFixture — public preflight", () => {
       expect(request.model).toMatch(/^deepseek-/u);
       expect(request.thinkingRequest).toEqual({ type: "enabled" });
       expect(request.reasoningEffort).toBe("max");
-      expect(typeof request.maxTokens).toBe("number");
-      if (typeof request.maxTokens !== "number") {
-        throw new Error("EXPECTED_NUMERIC_MAX_TOKENS");
-      }
-      expect(request.maxTokens).toBeLessThanOrEqual(384_000);
+      expect(request.outputCapFieldsPresent).toBe(false);
     }
     const structuredRequests = mock.requests.filter(
       (request) => request.targetSchema !== null

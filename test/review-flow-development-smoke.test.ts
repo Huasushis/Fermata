@@ -27,7 +27,6 @@ import {
 } from "../src/review-flow/development-smoke";
 import {
   reviewFlowStageJsonSchemas,
-  reviewFlowStageOutputBudgets,
   type FourCallRequest,
   type ReviewFlowDagStage
 } from "../src/review-flow/four-call";
@@ -127,7 +126,6 @@ function request(
     input: "not logged",
     model,
     messages: [{ role: "user", content: "not logged" }],
-    maxOutputTokens: reviewFlowStageOutputBudgets[stage],
     thinkingRequest: "enabled",
     reasoningEffort: "max",
     schema,
@@ -286,12 +284,10 @@ describe("development smoke profile", () => {
       cases: []
     })).rejects.toThrow("DEVELOPMENT_SMOKE_PHASE_BATCH_INVALID");
   });
-  it("emits exact per-request token/model/schema receipts and no request content", () => {
+  it("emits exact per-request model/schema receipts without request content or output caps", () => {
     const receipts: DevelopmentSmokeSafeRequestReceipt[] = [];
     const run = controller((receipt) => receipts.push(receipt));
     for (const stage of stages) run.authorizeRequest(request("slot-01", stage));
-    expect(receipts.map((receipt) => receipt.maxOutputTokens))
-      .toEqual([384_000, 384_000, 384_000, 384_000, 384_000]);
     for (const receipt of receipts) {
       expect(receipt).toMatchObject({
         provider: "aether",
@@ -301,11 +297,9 @@ describe("development smoke profile", () => {
         logicalRequestCeiling: 30,
         externalAttemptCeiling: 52
       });
+      expect(receipt.maxOutputTokens).toBe(384_000);
       expect(JSON.stringify(receipt)).not.toContain("not logged");
     }
-    expect(() => controller().authorizeRequest(request("slot-01", "A", {
-      maxOutputTokens: 384_001
-    }))).toThrow("DEVELOPMENT_SMOKE_REQUEST_RECEIPT_INVALID");
     expect(() => controller().authorizeRequest(request("slot-01", "A", {
       model: { ...request("slot-01", "A").model, reasoningEffort: "low" as never }
     }))).toThrow("DEVELOPMENT_SMOKE_REQUEST_RECEIPT_INVALID");

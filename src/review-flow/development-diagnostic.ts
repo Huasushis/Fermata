@@ -9,7 +9,6 @@ import {
 import { hashCanonicalValue } from "./evidence";
 import {
   reviewFlowStageJsonSchemas,
-  reviewFlowStageOutputBudgets,
   type FourCallRequest,
   type ReviewFlowCompletedStage,
   type ReviewFlowCompletedStages,
@@ -638,7 +637,7 @@ export class DevelopmentDiagnosticRunController {
       model: expectedDiagnosticModels[request.stage],
       modelFingerprint: request.model.fingerprint,
       schemaFingerprint,
-      maxOutputTokens: request.maxOutputTokens as DevelopmentDiagnosticSafeRequestReceipt["maxOutputTokens"],
+      maxOutputTokens: 384_000 as const,
       thinkingRequest: "enabled" as const,
       reasoningEffort: "max" as const,
       logicalAttempt: 1 as const,
@@ -814,7 +813,7 @@ export class DevelopmentDiagnosticRunController {
       receipt.provider !== "aether" ||
       receipt.model !== expectedDiagnosticModels[receipt.stage] ||
       receipt.schemaFingerprint !== expectedSchemaFingerprint ||
-      receipt.maxOutputTokens !== reviewFlowStageOutputBudgets[receipt.stage] ||
+      receipt.maxOutputTokens !== 384_000 ||
       receipt.thinkingRequest !== "enabled" ||
       receipt.reasoningEffort !== "max" ||
       receipt.logicalAttempt !== 1 ||
@@ -1183,7 +1182,6 @@ export class DevelopmentDiagnosticRunController {
       !digestSchema.safeParse(request.model.fingerprint).success ||
       request.thinkingRequest !== "enabled" ||
       request.reasoningEffort !== "max" ||
-      request.maxOutputTokens !== reviewFlowStageOutputBudgets[request.stage] ||
       request.schema === null ||
       request.schemaFingerprint !== expectedSchemaFingerprint
     ) {
