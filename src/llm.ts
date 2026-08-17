@@ -2355,14 +2355,29 @@ async function requestWithRetry(
         ) {
           throw error;
         }
-        // fetch 无法证明请求是否已经到达模型服务。自动重发可能让同一题重复计费，
-        // 因此只有服务端明确返回“请求过多”(429)时才自动重试。
-        throw new LlmRequestError(
-          responseReceived ? "LLM_STREAM_INTERRUPTED" : "LLM_NETWORK_FAILED",
-          undefined,
-          watchdog.formatFailureStage(),
-          watchdog.formatFailureSubstage()
-        );
+        // 这里只处理没有任何已收模型字节的纯传输失败。重试判定：
+        // - 服务端明确返回“请求过多”(429)时自动重试（上面非 2xx 分支已处理）；
+        // - 连接/流失败且零响应字节（fetch 未得到响应，或 2xx 流在收到任何字节
+        //   前中断）也允许重试，但上限受 maxAttempts 约束；
+        // - 一旦收到任何响应字节（audit.streamUtf8Bytes > 0），请求已经到达服务端，
+        //   绝不能把局部/不确定输出重放成新的付费请求。
+        if (audit.streamUtf8Bytes > 0) {
+          throw new LlmRequestError(
+            "LLM_STREAM_INTERRUPTED",
+            undefined,
+            watchdog.formatFailureStage(),
+            watchdog.formatFailureSubstage()
+          );
+        }
+        if (attempt >= runtime.maxAttempts) {
+          throw new LlmRequestError(
+            "LLM_NETWORK_FAILED",
+            undefined,
+            watchdog.formatFailureStage(),
+            watchdog.formatFailureSubstage()
+          );
+        }
+        return null;
       } finally {
         runtime.signal?.removeEventListener("abort", cancelForTaskState);
         watchdog.close();

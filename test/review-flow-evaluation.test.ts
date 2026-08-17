@@ -643,6 +643,40 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
     checkpoint.close();
   });
 
+  it("并发 20 被接受且 worker 数不越过挂起案例数；未开始的案例不启动", async () => {
+    const fixture = createStateFixture(3);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const thirdStarted = deferred<void>();
+    const started: string[] = [];
+    const run = runReviewFlowEvaluationCases({
+      checkpoint,
+      cases: preparedStateCases(fixture),
+      executor: {
+        async execute(safeId) {
+          if (safeId === "case-0003") {
+            thirdStarted.resolve();
+            return { status: "complete" as const, projection: projection("approve") };
+          }
+          await thirdStarted.promise;
+          started.push(safeId);
+          return { status: "complete" as const, projection: projection("approve") };
+        }
+      },
+      // 20 必须通过 runner 校验（旧代码上限 4）；worker 数取 min(concurrency, pending)，
+      // 不会因为配置 20 就同时发起超过挂起案例数的请求，未开始的案例也不占槽位。
+      concurrency: 20
+    });
+    const state = await run;
+    expect(started.length).toBeLessThanOrEqual(3);
+    expect(started.sort()).toEqual(["case-0001", "case-0002"]);
+    expect(state.entries.map((entry) => entry.status)).toEqual([
+      "completed",
+      "completed",
+      "completed"
+    ]);
+    checkpoint.close();
+  });
+
   it("终止后闸门关闭，剩余重试不再启动", async () => {
     const fixture = createStateFixture(1);
     const checkpoint = openCheckpoint(fixture, { bindClaim: true });
@@ -1906,6 +1940,42 @@ describe("adapter、CLI 与窄环境", () => {
       safeId: dataset.cases[0]!.safeId,
       task: dataset.cases[0]!.task
     })).toThrow("REVIEW_FLOW_EVALUATION_PLACEHOLDER_TAGS_MISMATCH");
+  });
+
+  it("adapter 接受并发 16/20 并写入配置，拒绝超过硬上限 20", () => {
+    const fixture = createDatasetFixture();
+    const dataset = loadDataset(fixture, "development_scored");
+    const config = loadReviewFlowEvaluationConfig({ env: narrowEnvironment() });
+    const baseOverrides = {
+      config,
+      codeIdentity: codeIdentityFixture(),
+      runtimeIdentity: runtimeIdentityFixture(),
+      difficultyAnchors: {
+        anchors: [],
+        provisional: true,
+        fingerprint: "4".repeat(64)
+      },
+      datasetFingerprint: dataset.datasetFingerprint,
+      manifestSha256: dataset.manifestSha256,
+      anklangInputPolicy: dataset.anklangInputPolicy,
+      placeholderTagIds: dataset.placeholderTagIds,
+      purpose: dataset.purpose,
+      maxCaseAttempts: 2,
+      proxyEnvironment: { HTTP_PROXY: "http://127.0.0.1:10808" }
+    };
+    // 16（CLI 默认起始）与 20（硬上限）都必须通过 adapter 校验并进入配置摘要。
+    for (const concurrency of [16, 20]) {
+      const adapter = createReviewFlowEvaluationAdapter({
+        ...baseOverrides,
+        concurrency
+      });
+      expect(adapter.identity.configurationSummary.concurrency).toBe(concurrency);
+    }
+    // 超过 20 必须在 adapter 层被拒绝，而不是等到运行时。
+    expect(() => createReviewFlowEvaluationAdapter({
+      ...baseOverrides,
+      concurrency: 21
+    })).toThrow("REVIEW_FLOW_EVALUATION_CONCURRENCY_INVALID");
   });
 
   it("CLI 分离 run/reveal 参数，标记不能绕过危险/无关凭据检查", async () => {

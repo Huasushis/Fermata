@@ -119,7 +119,7 @@ export const reviewFlowEvaluationIdentitySchema = z
         llmMaximumDurationMs: z.number().int().positive(),
         maxAttempts: z.number().int().min(1).max(10),
         baseDelayMs: z.number().int().positive(),
-        concurrency: z.number().int().min(1).max(4),
+        concurrency: z.number().int().min(1).max(20),
         caseAttempts: z.number().int().min(1).max(8),
         proxyEnvironmentFingerprint: digestSchema,
         proxyEnvironmentKeys: z

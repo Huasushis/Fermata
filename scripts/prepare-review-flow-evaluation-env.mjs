@@ -98,7 +98,7 @@ export function buildReviewFlowEvaluationEnvFile(
       !codeVersionPattern.test(codeVersion) ||
       !Number.isSafeInteger(concurrency) ||
       concurrency < 1 ||
-      concurrency > 32
+      concurrency > 20
     ) {
       failPreparation();
     }

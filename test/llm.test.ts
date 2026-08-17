@@ -3316,14 +3316,38 @@ describe("chatComplete：只在服务端明确拒绝接单时重试", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("网络异常不自动重发，因为无法证明模型服务没有开始生成", async () => {
+  it("零字节连接失败重试到 maxAttempts 上限后以网络失败封存", async () => {
     const fetchMock = vi.fn(async () => {
       throw new Error("ECONNRESET");
     });
     await expect(
-      chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock })
+      chatComplete(provider, spec, [], {
+        ...runtime,
+        maxAttempts: 3,
+        baseDelayMs: 1,
+        fetch: fetchMock
+      })
     ).rejects.toMatchObject({ code: "LLM_NETWORK_FAILED" });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("零字节连接失败后首次重试成功，且不重复计费", async () => {
+    let calls = 0;
+    const fetchMock = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw new Error("ECONNRESET");
+      }
+      return completionResponse("成功");
+    });
+    const result = await chatComplete(provider, spec, [], {
+      ...runtime,
+      maxAttempts: 3,
+      baseDelayMs: 1,
+      fetch: fetchMock
+    });
+    expect(result.content).toBe("成功");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("上层确认任务已丢失时停止当前模型请求，且不自动重发", async () => {

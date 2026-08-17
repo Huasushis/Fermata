@@ -165,10 +165,11 @@ describe("reconcileEvaluation", () => {
 
 describe("实验身份与配置指纹", () => {
   it("整数环境变量不接受小数、后缀或越界值", () => {
-    expect(parseBoundedPositiveInteger(undefined, 6, 32, "EVAL_CONCURRENCY")).toBe(6);
-    expect(parseBoundedPositiveInteger("32", 6, 32, "EVAL_CONCURRENCY")).toBe(32);
-    for (const invalid of ["0", "-1", "1.5", "6junk", "33"]) {
-      expect(() => parseBoundedPositiveInteger(invalid, 6, 32, "EVAL_CONCURRENCY")).toThrow();
+    expect(parseBoundedPositiveInteger(undefined, 16, 20, "EVAL_CONCURRENCY")).toBe(16);
+    expect(parseBoundedPositiveInteger("16", 16, 20, "EVAL_CONCURRENCY")).toBe(16);
+    expect(parseBoundedPositiveInteger("20", 16, 20, "EVAL_CONCURRENCY")).toBe(20);
+    for (const invalid of ["0", "-1", "1.5", "6junk", "21", "33"]) {
+      expect(() => parseBoundedPositiveInteger(invalid, 16, 20, "EVAL_CONCURRENCY")).toThrow();
     }
   });
 

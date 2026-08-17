@@ -329,29 +329,29 @@ describe("run-with-env 的受控环境与同步启动异常", () => {
     )).toThrow("REVIEW_FLOW_EVALUATION_ENV_FILE_INCOMPLETE");
   });
 
-  it("review-flow 并发上限与内部 CLI 一致：接受 1..4，拒绝 5 和 32", () => {
+  it("review-flow 并发上限与内部 CLI 一致：接受 1..20，拒绝 21 和 32", () => {
     const parent = {
       PATH: "/safe/bin",
       AETHER_BASE_URL: "https://parent.example/v1",
       AETHER_API_KEY: "parent-key",
       EVAL_CODE_VERSION: "2".repeat(40),
-      EVAL_CONCURRENCY: "2"
+      EVAL_CONCURRENCY: "16"
     };
     const baseFile =
       "AETHER_BASE_URL=https://file.example/v1\n" +
       "AETHER_API_KEY=file-key\n" +
       `EVAL_CODE_VERSION=${"1".repeat(40)}\n`;
-    // 1..4 all accepted
-    for (const c of ["1", "2", "3", "4"]) {
+    // 1..20 all accepted (16 is the CLI default start)
+    for (const c of ["1", "2", "4", "16", "20"]) {
       const env = buildReviewFlowEvaluationRunEnvironment(
         baseFile + `EVAL_CONCURRENCY=${c}\n`,
         parent
       );
       expect(env.EVAL_CONCURRENCY).toBe(c);
     }
-    // 5 rejected
+    // 21 rejected
     expect(() => buildReviewFlowEvaluationRunEnvironment(
-      baseFile + "EVAL_CONCURRENCY=5\n",
+      baseFile + "EVAL_CONCURRENCY=21\n",
       parent
     )).toThrow("REVIEW_FLOW_EVALUATION_ENV_FILE_INCOMPLETE");
     // 32 rejected

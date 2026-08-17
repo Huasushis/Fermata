@@ -104,7 +104,7 @@ export function createReviewFlowEvaluationAdapter(input: {
   readonly maxCaseAttempts: number;
   readonly proxyEnvironment: NodeJS.ProcessEnv;
 }): ReviewFlowEvaluationAdapter {
-  if (!Number.isSafeInteger(input.concurrency) || input.concurrency < 1 || input.concurrency > 4) {
+  if (!Number.isSafeInteger(input.concurrency) || input.concurrency < 1 || input.concurrency > 20) {
     throw new Error("REVIEW_FLOW_EVALUATION_CONCURRENCY_INVALID");
   }
   const proxyEnvironmentSummary = summarizeReviewFlowEvaluationProxyEnvironment(

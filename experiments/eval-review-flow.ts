@@ -346,8 +346,8 @@ async function runPredictionOrDevelopment(input: {
   const options = input.options;
   const concurrency = parseBoundedPositiveInteger(
     input.env.EVAL_CONCURRENCY,
-    4,
-    4,
+    16,
+    20,
     "EVAL_CONCURRENCY"
   );
   // CLI 永远使用固定的项目私有全局 registry；没有可覆盖目录的命令行或 API
