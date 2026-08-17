@@ -47,6 +47,7 @@ import {
   reviewFlowEvaluationBridgeCompletionFileName,
   reviewFlowEvaluationDevelopmentPredictionBindingSha256,
   reviewFlowEvaluationHoldoutPredictionBindingSha256,
+  reviewFlowEvaluationOrderedSelectionSha256,
   reviewFlowEvaluationRevealDescriptorSchema,
   reviewFlowEvaluationSourceLineageSetSha256,
   type ReviewFlowEvaluationDatasetBundle,
@@ -66,7 +67,9 @@ import {
   parseReviewFlowEvaluationReportSummary
 } from "../experiments/lib/review-flow-evaluation-report";
 import {
+  buildRepresentative3PilotTimingReceipt,
   installReviewFlowEvaluationSignalHandlers,
+  representative3MaximumTotalDurationMs,
   ReviewFlowEvaluationStartGate,
   runReviewFlowEvaluationCases,
   type ReviewFlowEvaluationTerminationSignal
@@ -122,7 +125,7 @@ describe("review-flow dataset v2 与真实 Gold 边界", () => {
 
     expect(dataset.summary).toMatchObject({
       caseCount: 32,
-      historicalOutcomeCounts: { accepted: 31, rejected: 1 },
+      historicalOutcomeCounts: { accepted: 30, rejected: 2 },
       contestUseCounts: { used: 1, not_used: 31, unknown: 0 },
       independentVerdictLabeledCaseCount: 1,
       independentTasteLabeledCaseCount: 1,
@@ -136,6 +139,66 @@ describe("review-flow dataset v2 与真实 Gold 边界", () => {
     expect(dataset.cases[1]?.gold).not.toHaveProperty("independentVerdict");
     expect(dataset.cases[1]?.gold).not.toHaveProperty("independentTaste");
     expect(dataset.cases[1]?.gold).not.toHaveProperty("independentOriginality");
+  });
+
+  it("representative3 只在 frozen32 全量登记与 Gold 验真后按三层摘要确定选三题", () => {
+    const fixture = createDatasetFixture("representative3");
+    const registry = newRegistry(
+      fixture,
+      join(fixture.privateRoot, "representative3-registry")
+    );
+    const full = loadDataset(fixture, "development_scored");
+    const first = loadDevelopmentDatasetAfterUsageRegistration({
+      manifestPath: fixture.manifestPath,
+      revealDescriptorPath: fixture.developmentRevealDescriptorPath,
+      datasetPrivateRoot: fixture.privateRoot,
+      containingWorkspace: fixture.workspace,
+      registry,
+      caseSelector: "representative3-v1"
+    });
+    const second = loadDevelopmentDatasetAfterUsageRegistration({
+      manifestPath: fixture.manifestPath,
+      revealDescriptorPath: fixture.developmentRevealDescriptorPath,
+      datasetPrivateRoot: fixture.privateRoot,
+      containingWorkspace: fixture.workspace,
+      registry,
+      caseSelector: "representative3-v1"
+    });
+
+    expect(full.cases).toHaveLength(32);
+    expect(full).not.toHaveProperty("caseSelection");
+    expect(first.cases).toHaveLength(3);
+    expect(first.cases.map((entry) => entry.safeId)).toEqual(
+      second.cases.map((entry) => entry.safeId)
+    );
+    expect(first.caseSelection).toMatchObject({
+      selector: "representative3-v1",
+      parentDatasetFingerprint: full.datasetFingerprint,
+      parentManifestSha256: full.manifestSha256,
+      parentBridgeCompletionSha256: full.bridgeCompletionSha256,
+      parentCaseCount: 32,
+      selectedCaseCount: 3,
+      orderedSelectionSha256:
+        reviewFlowEvaluationOrderedSelectionSha256(first.cases)
+    });
+    const [accepted, technical, tasteOrMixed] = first.cases;
+    expect(accepted?.gold).toMatchObject({ historicalOutcome: "accepted" });
+    expect(
+      technical?.gold?.evaluationScope === "verdict_and_taste"
+        ? technical.gold.observedHistoricalTechnicalReasons.length
+        : 0
+    ).toBeGreaterThan(0);
+    expect(
+      technical?.gold?.evaluationScope === "verdict_and_taste"
+        ? technical.gold.observedHistoricalTasteReasons
+        : []
+    ).toHaveLength(0);
+    expect(
+      tasteOrMixed?.gold?.evaluationScope === "verdict_and_taste"
+        ? tasteOrMixed.gold.observedHistoricalTasteReasons.length
+        : 0
+    ).toBeGreaterThan(0);
+    registry.close();
   });
 
   it("holdout_prediction 不打开 Gold；reveal 才读取并严格失败", () => {
@@ -807,7 +870,161 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
       expect(state.executionSeal?.complete).toBe(false);
       checkpoint.close();
     }
+
   );
+
+  it("representative3 先独占执行首题 pilot，落盘单调时延收据后才并发剩余两题", async () => {
+    const fixture = createRepresentative3StateFixture();
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const calls: string[] = [];
+    const monotonicValues = [0, 1_000];
+    const state = await runReviewFlowEvaluationCases({
+      checkpoint,
+      cases: preparedStateCases(fixture),
+      executor: {
+        async execute(safeId) {
+          calls.push(safeId);
+          return {
+            status: "complete" as const,
+            projection: projection("approve")
+          };
+        }
+      },
+      concurrency: 2,
+      maxCaseAttempts: 3,
+      monotonicNow: () => monotonicValues.shift() ?? 1_000
+    });
+    expect(calls[0]).toBe(fixture.expectedCases[0]?.safeId);
+    expect(calls.slice(1).sort()).toEqual(
+      fixture.expectedCases.slice(1).map((entry) => entry.safeId).sort()
+    );
+    expect(state.entries.map((entry) => entry.status)).toEqual([
+      "completed",
+      "completed",
+      "completed"
+    ]);
+    const pilot = state.entries[0];
+    expect(pilot?.status === "completed" ? pilot.pilotTiming : null).toMatchObject({
+      monotonicLatencyMs: 1_000,
+      projectedWithinLimit: true,
+      remainingCasesAdmitted: true,
+      maximumTotalDurationMs: representative3MaximumTotalDurationMs
+    });
+    expect(state.entries.slice(1).every(
+      (entry) => !("pilotTiming" in entry)
+    )).toBe(true);
+    // 三题 smoke 不得冒充 frozen32 完整标定。
+    expect(state.executionSeal?.complete).toBe(false);
+    checkpoint.close();
+  });
+
+  it("representative3 的 retry/backoff/watchdog 保守 ETA 超过 90 分钟时不调度剩余两题", async () => {
+    const fixture = createRepresentative3StateFixture({
+      llmMaximumDurationMs: 3_000_000
+    });
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const execute = vi.fn(async () => ({
+      status: "complete" as const,
+      projection: projection("approve")
+    }));
+    const monotonicValues = [0, 60_000];
+    const state = await runReviewFlowEvaluationCases({
+      checkpoint,
+      cases: preparedStateCases(fixture),
+      executor: { execute },
+      concurrency: 2,
+      maxCaseAttempts: 3,
+      monotonicNow: () => monotonicValues.shift() ?? 60_000
+    });
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(state.entries.map((entry) => entry.status)).toEqual([
+      "completed",
+      "pending",
+      "pending"
+    ]);
+    const pilot = state.entries[0];
+    expect(pilot?.status === "completed" ? pilot.pilotTiming : null).toMatchObject({
+      monotonicLatencyMs: 60_000,
+      projectedWithinLimit: false,
+      remainingCasesAdmitted: false
+    });
+    expect(
+      pilot?.status === "completed"
+        ? pilot.pilotTiming?.projectedTotalDurationMs
+        : 0
+    ).toBeGreaterThan(representative3MaximumTotalDurationMs);
+    expect(state.termination).toBeNull();
+    expect(state.executionSeal?.complete).toBe(false);
+    checkpoint.close();
+  });
+
+  it("representative3 checkpoint/registry 绑定 parent、顺序与数量，且完全禁止 resume", () => {
+    const fixture = createRepresentative3StateFixture();
+    const checkpoint = openCheckpoint(fixture);
+    const registry = newRegistry(
+      fixture,
+      join(fixture.privateRoot, "representative3-registry")
+    );
+    const claim = registry.claimLabel({
+      genesis: checkpoint.genesisBinding(),
+      datasetFingerprint: fixture.identity.datasetFingerprint,
+      holdoutIdentity: null,
+      thresholdPolicySha256: null,
+      caseSelection: fixture.identity.caseSelection,
+      resume: false
+    });
+    expect(claim.claim.caseSelection).toEqual(fixture.identity.caseSelection);
+    checkpoint.bindGlobalClaim(claim.sha256);
+    checkpoint.close();
+    expect(() => openCheckpoint(fixture, { resume: true })).toThrow(
+      "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_FRESH_ONLY"
+    );
+    registry.close();
+  });
+
+  it("representative3 ETA 对 case retry、transport backoff 与请求 watchdog 均单调保守", () => {
+    const fixture = createRepresentative3StateFixture();
+    const configuration = fixture.identity.configurationSummary;
+    const base = buildRepresentative3PilotTimingReceipt({
+      monotonicLatencyMs: 1_000,
+      succeeded: true,
+      concurrency: 2,
+      maxCaseAttempts: 3,
+      configuration
+    });
+    const moreBackoff = buildRepresentative3PilotTimingReceipt({
+      monotonicLatencyMs: 1_000,
+      succeeded: true,
+      concurrency: 2,
+      maxCaseAttempts: 3,
+      configuration: { ...configuration, baseDelayMs: configuration.baseDelayMs + 1 }
+    });
+    const longerWatchdog = buildRepresentative3PilotTimingReceipt({
+      monotonicLatencyMs: 1_000,
+      succeeded: true,
+      concurrency: 2,
+      maxCaseAttempts: 3,
+      configuration: {
+        ...configuration,
+        llmMaximumDurationMs: configuration.llmMaximumDurationMs + 1
+      }
+    });
+    const serial = buildRepresentative3PilotTimingReceipt({
+      monotonicLatencyMs: 1_000,
+      succeeded: true,
+      concurrency: 1,
+      maxCaseAttempts: 3,
+      configuration
+    });
+    expect(moreBackoff.remainingTwoBoundMs).toBeGreaterThan(
+      base.remainingTwoBoundMs
+    );
+    expect(longerWatchdog.remainingTwoBoundMs).toBeGreaterThan(
+      base.remainingTwoBoundMs
+    );
+    expect(serial.remainingTwoBoundMs).toBe(base.remainingTwoBoundMs * 2);
+  });
 });
 
 describe("32 案例 × 11 角色 = 352 收据封存契约", () => {
@@ -1531,6 +1748,7 @@ describe("严格私有报告、恢复与计分", () => {
     completeAll(chain.checkpoint, dataset.cases.map((entry) => entry.safeId), (safeId) => {
       if (safeId === "case-0001") return projection("approve");
       if (safeId === "case-0002") return projection("reject", { judgeabilityConcern: true, contestUse: "not_used" });
+      if (safeId === "case-0003") return projection("reject", { judgeabilityConcern: true, contestUse: "not_used" });
       return projection("approve", { contestUse: "not_used" });
     });
     const state = chain.checkpoint.sealExecution();
@@ -1551,8 +1769,8 @@ describe("严格私有报告、恢复与计分", () => {
     expect(report.summary.scoring.contestUse.coverage).toMatchObject({
       used: 1,
       not_used: 31,
-      historicalAccepted: 31,
-      historicalRejected: 1
+      historicalAccepted: 30,
+      historicalRejected: 2
     });
     expect(report.summary.scoring.contestUse.knownUseBinary.accuracy).toBe(1);
     expect(report.summary.receiptCoverage.completeElevenRoleReceiptCaseCount).toBe(32);
@@ -2020,6 +2238,55 @@ describe("adapter、CLI 与窄环境", () => {
       "--label=dev-a",
       "--variant=baseline"
     ])).toThrow("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+    const representative3Args = [
+      "--action=run",
+      "--manifest=/private/manifest.json",
+      "--reveal-descriptor=/private/reveal/development.private.json",
+      "--dataset-private-root=/private",
+      "--private-dir=/private/runs",
+      "--partition=development",
+      "--label=dev-smoke",
+      "--variant=baseline",
+      "--case-selector=representative3-v1",
+      "--max-case-attempts=3"
+    ] as const;
+    expect(resolveReviewFlowEvaluationCliOptions(
+      representative3Args
+    )).toMatchObject({
+      purpose: "development",
+      caseSelector: "representative3-v1",
+      maxCaseAttempts: 3,
+      resume: false
+    });
+    for (const invalidArgs of [
+      representative3Args.map((entry) =>
+        entry === "--case-selector=representative3-v1"
+          ? "--case-selector=case-0001"
+          : entry
+      ),
+      [...representative3Args, "--resume"],
+      representative3Args.map((entry) =>
+        entry === "--max-case-attempts=3"
+          ? "--max-case-attempts=2"
+          : entry
+      ),
+      [
+        "--action=run",
+        "--manifest=/private/manifest.json",
+        "--dataset-private-root=/private",
+        "--private-dir=/private/runs",
+        "--partition=holdout",
+        "--label=before-a",
+        "--variant=baseline",
+        "--development-baseline-label=dev-before-a",
+        "--development-candidate-label=dev-after-a",
+        "--case-selector=representative3-v1"
+      ]
+    ]) {
+      expect(() => resolveReviewFlowEvaluationCliOptions(invalidArgs)).toThrow(
+        "REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID"
+      );
+    }
     await expect(runReviewFlowEvaluationCli({ argv: [], env: {} })).rejects.toThrow(
       "REVIEW_FLOW_EVALUATION_SAFE_LAUNCH_REQUIRED"
     );
@@ -2206,10 +2473,11 @@ function createDatasetFixture(seed = "default"): DatasetFixture {
         gold: (common) => ({
           ...common,
           evaluationScope: "verdict_and_taste",
-          historicalOutcome: "accepted",
+          historicalOutcome: extraIndex === 3 ? "rejected" : "accepted",
           contestUse: "not_used",
           observedHistoricalTasteReasons: [],
-          observedHistoricalTechnicalReasons: []
+          observedHistoricalTechnicalReasons:
+            extraIndex === 3 ? ["judgeability_concern"] : []
         })
       })
     );
@@ -2570,6 +2838,7 @@ function chmodPartitionFiles(
         partition === "development"
           ? fixture.developmentRevealDirectory
           : fixture.revealDirectory,
+
         gold.fileName
       ),
       mode
@@ -2628,6 +2897,41 @@ function createStateFixtureIn(
     holdoutIdentity: purpose === "holdout" ? "8".repeat(64) : null,
     thresholdPolicySha256: purpose === "holdout" ? "9".repeat(64) : null
   };
+}
+
+function createRepresentative3StateFixture(
+  configurationOverrides: Partial<
+    ReviewFlowEvaluationIdentity["configurationSummary"]
+  > = {}
+): StateFixture {
+  const fixture = createStateFixture(3);
+  const configurationSummary = {
+    ...fixture.identity.configurationSummary,
+    llmFirstOutputMs: 100,
+    llmOutputIdleMs: 100,
+    llmMaximumDurationMs: 1_000,
+    maxAttempts: 3,
+    baseDelayMs: 100,
+    concurrency: 2,
+    caseAttempts: 3,
+    ...configurationOverrides
+  };
+  const identity: ReviewFlowEvaluationIdentity = {
+    ...fixture.identity,
+    configurationSummary,
+    caseSelection: {
+      schemaVersion: 1,
+      selector: "representative3-v1",
+      parentDatasetFingerprint: fixture.identity.datasetFingerprint,
+      parentManifestSha256: fixture.identity.manifestSha256,
+      parentBridgeCompletionSha256: "3".repeat(64),
+      parentCaseCount: 32,
+      orderedSelectionSha256:
+        reviewFlowEvaluationOrderedSelectionSha256(fixture.expectedCases),
+      selectedCaseCount: 3
+    }
+  };
+  return { ...fixture, identity };
 }
 
 function openCheckpoint(

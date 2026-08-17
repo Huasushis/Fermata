@@ -31,8 +31,11 @@ import {
 } from "./lib/review-flow-evaluation-config";
 import {
   loadReviewFlowEvaluationDataset,
+  reviewFlowEvaluationCaseSelectorSchema,
   reviewFlowEvaluationLabelSchema,
   reviewFlowEvaluationPurposeSchema,
+  selectReviewFlowEvaluationRepresentative3,
+  type ReviewFlowEvaluationCaseSelector,
   type ReviewFlowEvaluationPurpose
 } from "./lib/review-flow-evaluation-dataset";
 import {
@@ -86,6 +89,7 @@ export interface ReviewFlowEvaluationRunCliOptions {
   readonly developmentBaselineLabel: string | null;
   readonly developmentCandidateLabel: string | null;
   readonly resume: boolean;
+  readonly caseSelector: ReviewFlowEvaluationCaseSelector | null;
   readonly maxCaseAttempts: number;
 }
 
@@ -174,6 +178,7 @@ export function resolveReviewFlowEvaluationCliOptions(
     "baseline-label",
     "development-baseline-label",
     "development-candidate-label",
+    "case-selector",
     "max-case-attempts"
   ]);
   if ([...values.keys()].some((key) => !allowed.has(key))) {
@@ -212,6 +217,13 @@ export function resolveReviewFlowEvaluationCliOptions(
   const maxCaseAttempts = maxCaseAttemptsRaw === undefined
     ? 3
     : Number(maxCaseAttemptsRaw);
+  const caseSelectorRaw = values.get("case-selector");
+  const caseSelector = caseSelectorRaw === undefined
+    ? null
+    : reviewFlowEvaluationCaseSelectorSchema.safeParse(caseSelectorRaw);
+  if (caseSelector !== null && !caseSelector.success) {
+    throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+  }
   if (
     !Number.isSafeInteger(maxCaseAttempts) ||
     maxCaseAttempts < 1 ||
@@ -238,7 +250,13 @@ export function resolveReviewFlowEvaluationCliOptions(
         developmentCandidateLabel === null ||
         developmentBaselineLabel === developmentCandidateLabel ||
         !reviewFlowEvaluationLabelSchema.safeParse(developmentBaselineLabel).success ||
-        !reviewFlowEvaluationLabelSchema.safeParse(developmentCandidateLabel).success))
+        !reviewFlowEvaluationLabelSchema.safeParse(developmentCandidateLabel).success)) ||
+    (caseSelector !== null &&
+      (
+        purpose.data !== "development" ||
+        resume ||
+        maxCaseAttempts !== 3
+      ))
   ) {
     throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
   }
@@ -255,7 +273,8 @@ export function resolveReviewFlowEvaluationCliOptions(
     developmentBaselineLabel,
     developmentCandidateLabel,
     resume,
-    maxCaseAttempts
+    maxCaseAttempts,
+    caseSelector: caseSelector === null ? null : caseSelector.data
   };
 }
 
@@ -300,6 +319,7 @@ export function loadDevelopmentDatasetAfterUsageRegistration(input: {
   readonly datasetPrivateRoot: string;
   readonly containingWorkspace?: string;
   readonly registry: ReviewFlowEvaluationGlobalRegistry;
+  readonly caseSelector?: ReviewFlowEvaluationCaseSelector | null;
 }) {
   const identityDataset = loadReviewFlowEvaluationDataset({
     manifestPath: input.manifestPath,
@@ -307,6 +327,13 @@ export function loadDevelopmentDatasetAfterUsageRegistration(input: {
     containingWorkspace: input.containingWorkspace,
     mode: "development_identity"
   });
+  if (
+    input.caseSelector !== undefined &&
+    input.caseSelector !== null &&
+    identityDataset.cases.length !== 32
+  ) {
+    throw new Error("REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_PARENT_INVALID");
+  }
   input.registry.registerDevelopmentUse(identityDataset);
   const scoredDataset = loadReviewFlowEvaluationDataset({
     manifestPath: input.manifestPath,
@@ -333,7 +360,9 @@ export function loadDevelopmentDatasetAfterUsageRegistration(input: {
   ) {
     throw new Error("REVIEW_FLOW_EVALUATION_DEVELOPMENT_DATASET_CHANGED");
   }
-  return scoredDataset;
+  return input.caseSelector === "representative3-v1"
+    ? selectReviewFlowEvaluationRepresentative3(scoredDataset)
+    : scoredDataset;
 }
 
 async function runPredictionOrDevelopment(input: {
@@ -366,7 +395,8 @@ async function runPredictionOrDevelopment(input: {
           revealDescriptorPath: options.revealDescriptorPath!,
           datasetPrivateRoot: options.datasetPrivateRoot,
           containingWorkspace: input.runtimeAttestation.originWorkspaceRoot,
-          registry
+          registry,
+          caseSelector: options.caseSelector
         })
       : loadReviewFlowEvaluationDataset({
           manifestPath: options.manifestPath,
@@ -404,6 +434,10 @@ async function runPredictionOrDevelopment(input: {
       maxCaseAttempts: options.maxCaseAttempts,
       proxyEnvironment: input.env
     });
+    const caseSelection = dataset.caseSelection;
+    const checkpointIdentity = caseSelection === undefined
+      ? adapter.identity
+      : { ...adapter.identity, caseSelection };
     // 全量 taskSource 预检发生在 checkpoint/claim 与任何模型调用之前。
     const preparedCases = dataset.cases.map((evaluationCase) => ({
       safeId: evaluationCase.safeId,
@@ -430,7 +464,7 @@ async function runPredictionOrDevelopment(input: {
       variant: options.variant,
       baselineLabel: options.baselineLabel,
       baselineBinding,
-      identity: adapter.identity,
+      identity: checkpointIdentity,
       holdoutIdentity:
         holdout?.identity ?? null,
       thresholdPolicySha256:
@@ -454,6 +488,7 @@ async function runPredictionOrDevelopment(input: {
         holdout?.identity ?? null,
       thresholdPolicySha256:
         holdout?.registration.thresholdPolicySha256 ?? null,
+      ...(caseSelection === undefined ? {} : { caseSelection }),
       resume: options.resume
     });
     checkpoint.bindGlobalClaim(labelClaim.sha256);
@@ -464,6 +499,7 @@ async function runPredictionOrDevelopment(input: {
         holdout?.identity ?? null,
       thresholdPolicySha256:
         holdout?.registration.thresholdPolicySha256 ?? null,
+      ...(caseSelection === undefined ? {} : { caseSelection }),
       expectedSha256: labelClaim.sha256
     });
     const holdoutSlot = holdoutPlan === null

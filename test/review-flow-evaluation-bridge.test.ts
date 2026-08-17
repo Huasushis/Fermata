@@ -143,6 +143,9 @@ describe("review-flow trusted dataset bridge", () => {
       holdoutRevealCommitmentSha256: null
     });
     expect(manifest.partitions.holdout.cases).toHaveLength(0);
+    // smoke 选择发生在 frozen32 登记与揭示验真之后；桥接产物永远保持全量。
+    expect(manifest).not.toHaveProperty("caseSelector");
+    expect(manifest).not.toHaveProperty("caseSelection");
     expect(developmentIdentity.placeholderTagIds).toEqual(["tag-basic"]);
     for (const descriptor of manifest.partitions.development.cases) {
       expect(descriptor).not.toHaveProperty("anklangInputPolicy");
@@ -185,6 +188,8 @@ describe("review-flow trusted dataset bridge", () => {
       developmentCount: 32,
       holdoutCount: 0
     });
+    expect(completion).not.toHaveProperty("caseSelector");
+    expect(completion).not.toHaveProperty("caseSelection");
     const bridgePlan = readJson(fixture.input.bridgePlanPath);
     const planCase = bridgePlan.cases[0];
     const sourceBindings = readJson(

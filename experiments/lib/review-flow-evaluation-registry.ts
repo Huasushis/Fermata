@@ -18,6 +18,7 @@ import {
   writePrivateArtifactExclusive
 } from "./private-artifact-io";
 import {
+  reviewFlowEvaluationCaseSelectionSchema,
   reviewFlowEvaluationDigestSchema,
   reviewFlowEvaluationHoldoutRegistrationSchema,
   reviewFlowEvaluationLabelSchema,
@@ -148,6 +149,7 @@ export const reviewFlowEvaluationLabelClaimSchema = z
       .strict(),
     holdoutIdentity: digestSchema.nullable(),
     thresholdPolicySha256: digestSchema.nullable(),
+    caseSelection: reviewFlowEvaluationCaseSelectionSchema.optional(),
     claimedAt: timestampSchema
   })
   .strict();
@@ -406,6 +408,9 @@ export class ReviewFlowEvaluationGlobalRegistry {
     readonly datasetFingerprint: string;
     readonly holdoutIdentity: string | null;
     readonly thresholdPolicySha256: string | null;
+    readonly caseSelection?: z.infer<
+      typeof reviewFlowEvaluationCaseSelectionSchema
+    >;
     readonly resume: boolean;
   }): { readonly claim: ReviewFlowEvaluationLabelClaim; readonly sha256: string } {
     this.assertOpen();
@@ -454,6 +459,9 @@ export class ReviewFlowEvaluationGlobalRegistry {
       stateDirectory: input.genesis.stateDirectory,
       holdoutIdentity: input.holdoutIdentity,
       thresholdPolicySha256: input.thresholdPolicySha256,
+      ...(input.caseSelection === undefined
+        ? {}
+        : { caseSelection: input.caseSelection }),
       claimedAt: this.#now().toISOString()
     });
     this.claimRunIdentity(input.genesis, input.resume);
@@ -526,6 +534,9 @@ export class ReviewFlowEvaluationGlobalRegistry {
     readonly datasetFingerprint: string;
     readonly holdoutIdentity: string | null;
     readonly thresholdPolicySha256: string | null;
+    readonly caseSelection?: z.infer<
+      typeof reviewFlowEvaluationCaseSelectionSchema
+    >;
     readonly expectedSha256: string;
   }): ReviewFlowEvaluationLabelClaim {
     const bytes = readPrivateArtifactBytes(
@@ -1644,6 +1655,9 @@ function assertLabelClaimMatches(
     readonly datasetFingerprint: string;
     readonly holdoutIdentity: string | null;
     readonly thresholdPolicySha256: string | null;
+    readonly caseSelection?: z.infer<
+      typeof reviewFlowEvaluationCaseSelectionSchema
+    >;
   }
 ): void {
   const genesis = input.genesis;
@@ -1659,7 +1673,9 @@ function assertLabelClaimMatches(
     claim.stateDirectory.device !== genesis.stateDirectory.device ||
     claim.stateDirectory.inode !== genesis.stateDirectory.inode ||
     claim.holdoutIdentity !== input.holdoutIdentity ||
-    claim.thresholdPolicySha256 !== input.thresholdPolicySha256
+    claim.thresholdPolicySha256 !== input.thresholdPolicySha256 ||
+    hashCanonicalValue(claim.caseSelection ?? null) !==
+      hashCanonicalValue(input.caseSelection ?? null)
   ) {
     throw new ReviewFlowEvaluationRegistryError(
       "REVIEW_FLOW_EVALUATION_LABEL_CLAIM_MISMATCH"
@@ -1823,7 +1839,9 @@ function assertRegistryLabelClaimForState(
       claim.datasetFingerprint !== state.identity.datasetFingerprint ||
       claim.expectedCasesFingerprint !== hashCanonicalValue(state.expectedCases) ||
       claim.holdoutIdentity !== state.holdoutIdentity ||
-      claim.thresholdPolicySha256 !== state.thresholdPolicySha256
+      claim.thresholdPolicySha256 !== state.thresholdPolicySha256 ||
+      hashCanonicalValue(claim.caseSelection ?? null) !==
+        hashCanonicalValue(state.identity.caseSelection ?? null)
     ) {
       throw new Error("invalid");
     }

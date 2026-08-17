@@ -42,8 +42,10 @@ import {
   readPrivateArtifactBytes
 } from "./private-artifact-io";
 import {
+  reviewFlowEvaluationCaseSelectionSchema,
   reviewFlowEvaluationDigestSchema,
   reviewFlowEvaluationLabelSchema,
+  reviewFlowEvaluationOrderedSelectionSha256,
   reviewFlowEvaluationPurposeSchema,
   reviewFlowEvaluationSafeIdSchema,
   reviewFlowEvaluationSubjectIdSchema
@@ -143,7 +145,8 @@ export const reviewFlowEvaluationIdentitySchema = z
     profileName: z.string().trim().min(1).max(120),
     runnerIdentity: digestSchema,
     transportMode: z.literal("production_undici"),
-    providerSummary: z.array(roleProviderSummarySchema).length(11)
+    providerSummary: z.array(roleProviderSummarySchema).length(11),
+    caseSelection: reviewFlowEvaluationCaseSelectionSchema.optional()
   })
   .strict()
   .superRefine((identity, context) => {
@@ -158,6 +161,22 @@ export const reviewFlowEvaluationIdentitySchema = z
         code: "custom",
         path: ["providerSummary"],
         message: "必须按固定顺序绑定全部 11 个角色。"
+      });
+    }
+    if (
+      identity.caseSelection !== undefined &&
+      (
+        identity.purpose !== "development" ||
+        identity.caseSelection.parentDatasetFingerprint !==
+          identity.datasetFingerprint ||
+        identity.caseSelection.parentManifestSha256 !== identity.manifestSha256 ||
+        identity.configurationSummary.caseAttempts !== 3
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["caseSelection"],
+        message: "representative3 只能绑定 development frozen32 与三次案例上限。"
       });
     }
   });
@@ -252,6 +271,33 @@ const failureSchema = z
   .strict();
 export type ReviewFlowEvaluationFailure = z.infer<typeof failureSchema>;
 
+export const reviewFlowEvaluationPilotTimingReceiptSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    monotonicLatencyMs: z.number().int().nonnegative(),
+    remainingTwoBoundMs: z.number().int().nonnegative(),
+    projectedTotalDurationMs: z.number().int().nonnegative(),
+    maximumTotalDurationMs: z.literal(90 * 60 * 1_000),
+    projectedWithinLimit: z.boolean(),
+    remainingCasesAdmitted: z.boolean()
+  })
+  .strict()
+  .superRefine((receipt, context) => {
+    if (
+      receipt.projectedWithinLimit !==
+        (receipt.projectedTotalDurationMs <= receipt.maximumTotalDurationMs) ||
+      (receipt.remainingCasesAdmitted && !receipt.projectedWithinLimit)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "pilot 时延收据与 90 分钟准入决定不一致。"
+      });
+    }
+  });
+export type ReviewFlowEvaluationPilotTimingReceipt = z.infer<
+  typeof reviewFlowEvaluationPilotTimingReceiptSchema
+>;
+
 const pendingEntrySchema = z
   .object({ safeId: reviewFlowEvaluationSafeIdSchema, status: z.literal("pending") })
   .strict();
@@ -267,7 +313,8 @@ const completedEntrySchema = z
     safeId: reviewFlowEvaluationSafeIdSchema,
     status: z.literal("completed"),
     completedAt: timestampSchema,
-    projection: reviewFlowCalibrationProjectionSchema
+    projection: reviewFlowCalibrationProjectionSchema,
+    pilotTiming: reviewFlowEvaluationPilotTimingReceiptSchema.optional()
   })
   .strict();
 const failedEntrySchema = z
@@ -275,7 +322,8 @@ const failedEntrySchema = z
     safeId: reviewFlowEvaluationSafeIdSchema,
     status: z.literal("failed"),
     failedAt: timestampSchema,
-    failure: failureSchema
+    failure: failureSchema,
+    pilotTiming: reviewFlowEvaluationPilotTimingReceiptSchema.optional()
   })
   .strict();
 export const reviewFlowEvaluationEntrySchema = z.discriminatedUnion("status", [
@@ -390,6 +438,20 @@ export const reviewFlowEvaluationCheckpointSchema = z
         code: "custom",
         path: ["entries"],
         message: "检查点身份或样本集合不一致。"
+      });
+    }
+    if (
+      state.identity.caseSelection !== undefined &&
+      (
+        state.expectedCases.length !== 3 ||
+        state.identity.caseSelection.orderedSelectionSha256 !==
+          reviewFlowEvaluationOrderedSelectionSha256(state.expectedCases)
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["expectedCases"],
+        message: "representative3 检查点未绑定固定三题有序集合。"
       });
     }
     if (state.executionSeal !== null) {
@@ -538,6 +600,22 @@ export class ReviewFlowEvaluationCheckpoint {
       .min(1)
       .max(1_000)
       .parse(options.expectedCases);
+    if (identity.caseSelection !== undefined) {
+      if (options.resume) {
+        throw new ReviewFlowEvaluationCheckpointError(
+          "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_FRESH_ONLY"
+        );
+      }
+      if (
+        expectedCases.length !== 3 ||
+        identity.caseSelection.orderedSelectionSha256 !==
+          reviewFlowEvaluationOrderedSelectionSha256(expectedCases)
+      ) {
+        throw new ReviewFlowEvaluationCheckpointError(
+          "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_CASE_SET_MISMATCH"
+        );
+      }
+    }
     const holdoutIdentity = options.holdoutIdentity ?? null;
     const thresholdPolicySha256 = options.thresholdPolicySha256 ?? null;
     const privateRoot = options.privateRoot ?? projectPrivateRoot;
@@ -703,9 +781,13 @@ export class ReviewFlowEvaluationCheckpoint {
 
   public markCompleted(
     safeId: string,
-    projection: z.infer<typeof reviewFlowCalibrationProjectionSchema>
+    projection: z.infer<typeof reviewFlowCalibrationProjectionSchema>,
+    pilotTiming?: ReviewFlowEvaluationPilotTimingReceipt
   ): void {
     const parsed = reviewFlowCalibrationProjectionSchema.parse(projection);
+    const parsedPilotTiming = pilotTiming === undefined
+      ? undefined
+      : reviewFlowEvaluationPilotTimingReceiptSchema.parse(pilotTiming);
     this.replaceEntry(safeId, (entry) => {
       if (entry.status !== "active") {
         throw new ReviewFlowEvaluationCheckpointError(
@@ -716,16 +798,23 @@ export class ReviewFlowEvaluationCheckpoint {
         safeId,
         status: "completed",
         completedAt: this.#now().toISOString(),
-        projection: parsed
+        projection: parsed,
+        ...(parsedPilotTiming === undefined
+          ? {}
+          : { pilotTiming: parsedPilotTiming })
       };
     });
   }
 
   public markFailed(
     safeId: string,
-    failure: ReviewFlowEvaluationFailure
+    failure: ReviewFlowEvaluationFailure,
+    pilotTiming?: ReviewFlowEvaluationPilotTimingReceipt
   ): void {
     const parsed = failureSchema.parse(failure);
+    const parsedPilotTiming = pilotTiming === undefined
+      ? undefined
+      : reviewFlowEvaluationPilotTimingReceiptSchema.parse(pilotTiming);
     this.replaceEntry(safeId, (entry) => {
       if (entry.status !== "active") {
         throw new ReviewFlowEvaluationCheckpointError(
@@ -736,7 +825,10 @@ export class ReviewFlowEvaluationCheckpoint {
         safeId,
         status: "failed",
         failedAt: this.#now().toISOString(),
-        failure: parsed
+        failure: parsed,
+        ...(parsedPilotTiming === undefined
+          ? {}
+          : { pilotTiming: parsedPilotTiming })
       };
     });
   }

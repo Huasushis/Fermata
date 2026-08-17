@@ -70,6 +70,29 @@ export type ReviewFlowEvaluationPurpose = z.infer<
   typeof reviewFlowEvaluationPurposeSchema
 >;
 
+export const reviewFlowEvaluationCaseSelectorSchema = z.literal(
+  "representative3-v1"
+);
+export type ReviewFlowEvaluationCaseSelector = z.infer<
+  typeof reviewFlowEvaluationCaseSelectorSchema
+>;
+
+export const reviewFlowEvaluationCaseSelectionSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    selector: reviewFlowEvaluationCaseSelectorSchema,
+    parentDatasetFingerprint: reviewFlowEvaluationDigestSchema,
+    parentManifestSha256: reviewFlowEvaluationDigestSchema,
+    parentBridgeCompletionSha256: reviewFlowEvaluationDigestSchema,
+    parentCaseCount: z.literal(32),
+    orderedSelectionSha256: reviewFlowEvaluationDigestSchema,
+    selectedCaseCount: z.literal(3)
+  })
+  .strict();
+export type ReviewFlowEvaluationCaseSelection = z.infer<
+  typeof reviewFlowEvaluationCaseSelectionSchema
+>;
+
 /**
  * 历史通过/否决结果发生在题目进入当前 Anklang 语料之前。校准时必须统一排除
  * 当前语料，避免赛后同题自匹配把历史结果泄漏给 originality/裁决角色。
@@ -578,6 +601,125 @@ export interface ReviewFlowEvaluationDatasetBundle {
   readonly tagCatalogVersion: number;
   readonly summary: ReviewFlowEvaluationDatasetSummary | null;
   readonly cases: readonly ReviewFlowEvaluationDatasetCase[];
+  readonly caseSelection?: ReviewFlowEvaluationCaseSelection;
+}
+
+export interface ReviewFlowEvaluationSelectedDatasetBundle
+  extends ReviewFlowEvaluationDatasetBundle {
+  readonly caseSelection: ReviewFlowEvaluationCaseSelection;
+}
+
+/**
+ * frozen32 已完整验真并登记 development 用途后，才可基于已揭示 Gold 选取
+ * 固定三层 smoke。排序只使用绑定摘要；不接受调用方提供的 ID、路径或顺序。
+ */
+export function selectReviewFlowEvaluationRepresentative3(
+  dataset: ReviewFlowEvaluationDatasetBundle
+): ReviewFlowEvaluationSelectedDatasetBundle {
+  if (
+    dataset.purpose !== "development" ||
+    dataset.loadMode !== "development_scored" ||
+    dataset.summary?.caseCount !== 32 ||
+    dataset.cases.length !== 32 ||
+    dataset.cases.some(
+      (entry) =>
+        entry.gold === null ||
+        entry.gold.evaluationScope !== "verdict_and_taste"
+    )
+  ) {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_PARENT_INVALID"
+    );
+  }
+  const strata = [
+    {
+      name: "accepted",
+      accepts: (entry: ReviewFlowEvaluationDatasetCase) =>
+        entry.gold?.evaluationScope === "verdict_and_taste" &&
+        entry.gold.historicalOutcome === "accepted"
+    },
+    {
+      name: "rejected_technical",
+      accepts: (entry: ReviewFlowEvaluationDatasetCase) =>
+        entry.gold?.evaluationScope === "verdict_and_taste" &&
+        entry.gold.historicalOutcome === "rejected" &&
+        entry.gold.observedHistoricalTechnicalReasons.length > 0 &&
+        entry.gold.observedHistoricalTasteReasons.length === 0
+    },
+    {
+      name: "rejected_taste_or_mixed",
+      accepts: (entry: ReviewFlowEvaluationDatasetCase) =>
+        entry.gold?.evaluationScope === "verdict_and_taste" &&
+        entry.gold.historicalOutcome === "rejected" &&
+        entry.gold.observedHistoricalTasteReasons.length > 0
+    }
+  ] as const;
+  const selected = strata.map((stratum) => {
+    const ranked = dataset.cases
+      .filter(stratum.accepts)
+      .map((entry) => ({
+        entry,
+        rank: hashCanonicalValue({
+          protocol: "review-flow-representative3-v1-tiebreak",
+          stratum: stratum.name,
+          parentDatasetFingerprint: dataset.datasetFingerprint,
+          parentManifestSha256: dataset.manifestSha256,
+          parentBridgeCompletionSha256: dataset.bridgeCompletionSha256,
+          sourceLineageSha256: entry.sourceLineageSha256,
+          contentSha256: entry.contentSha256,
+          originalAnklangResponseSha256:
+            entry.originalAnklangResponseSha256
+        })
+      }))
+      .sort((left, right) =>
+        left.rank.localeCompare(right.rank) ||
+        left.entry.sourceLineageSha256.localeCompare(
+          right.entry.sourceLineageSha256
+        )
+      );
+    const winner = ranked[0]?.entry;
+    if (winner === undefined) {
+      throw new ReviewFlowEvaluationDatasetError(
+        "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_STRATUM_EMPTY"
+      );
+    }
+    return winner;
+  });
+  if (new Set(selected.map((entry) => entry.safeId)).size !== 3) {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_NOT_DISTINCT"
+    );
+  }
+  const caseSelection = reviewFlowEvaluationCaseSelectionSchema.parse({
+    schemaVersion: 1,
+    selector: "representative3-v1",
+    parentDatasetFingerprint: dataset.datasetFingerprint,
+    parentManifestSha256: dataset.manifestSha256,
+    parentBridgeCompletionSha256: dataset.bridgeCompletionSha256,
+    parentCaseCount: 32,
+    orderedSelectionSha256:
+      reviewFlowEvaluationOrderedSelectionSha256(selected),
+    selectedCaseCount: 3
+  });
+  return deepFreezePhysicalBlind({
+    ...dataset,
+    caseSelection,
+    cases: selected
+  });
+}
+
+export function reviewFlowEvaluationOrderedSelectionSha256(
+  cases: readonly Pick<
+    ReviewFlowEvaluationDatasetCase,
+    "safeId" | "subjectId" | "sourceLineageSha256" | "contentSha256"
+  >[]
+): string {
+  return hashCanonicalValue(cases.map((entry) => ({
+    safeId: entry.safeId,
+    subjectId: entry.subjectId,
+    sourceLineageSha256: entry.sourceLineageSha256,
+    contentSha256: entry.contentSha256
+  })));
 }
 
 export class ReviewFlowEvaluationDatasetError extends Error {
