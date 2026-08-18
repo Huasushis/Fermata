@@ -170,13 +170,13 @@ export const reviewFlowEvaluationIdentitySchema = z
         identity.caseSelection.parentDatasetFingerprint !==
           identity.datasetFingerprint ||
         identity.caseSelection.parentManifestSha256 !== identity.manifestSha256 ||
-        identity.configurationSummary.caseAttempts !== 3
+        identity.configurationSummary.caseAttempts !== 1
       )
     ) {
       context.addIssue({
         code: "custom",
         path: ["caseSelection"],
-        message: "representative3 只能绑定 development frozen32 与三次案例上限。"
+        message: "representative3 只能绑定 development frozen32 与单次案例尝试。"
       });
     }
   });

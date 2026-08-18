@@ -78,6 +78,7 @@ import {
 } from "../experiments/lib/review-flow-evaluation-runner";
 import {
   loadReviewFlowEvaluationCheckpointForReveal,
+  reviewFlowEvaluationIdentitySchema,
   reviewFlowEvaluationPredictionIdentityFingerprint,
   ReviewFlowEvaluationCheckpoint,
   type ReviewFlowEvaluationCheckpointState,
@@ -280,7 +281,7 @@ describe("review-flow dataset v2 与真实 Gold 边界", () => {
       manifestSha256: first.manifestSha256,
       configurationSummary: {
         ...identityFixture("development").configurationSummary,
-        caseAttempts: 3
+        caseAttempts: 1
       },
       caseSelection: first.caseSelection
     };
@@ -654,6 +655,37 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
       containingWorkspace: root.workspace
     })).toThrow();
     expect(existsSync(missingDirectory)).toBe(false);
+  });
+  it("checkpoint identity 只允许 representative3 单次案例尝试，full 保持三次", () => {
+    for (const selector of ["representative3-v1", "representative3-v2"] as const) {
+      const singleAttempt = createRepresentative3StateFixture(
+        { caseAttempts: 1 },
+        selector
+      );
+      expect(
+        reviewFlowEvaluationIdentitySchema.safeParse(singleAttempt.identity).success
+      ).toBe(true);
+
+      for (const caseAttempts of [0, 2, 3, 8, 9]) {
+        const invalid = createRepresentative3StateFixture(
+          { caseAttempts },
+          selector
+        );
+        expect(
+          reviewFlowEvaluationIdentitySchema.safeParse(invalid.identity).success
+        ).toBe(false);
+      }
+    }
+
+    const full = createStateFixture(3).identity;
+    const fullDefault = {
+      ...full,
+      configurationSummary: {
+        ...full.configurationSummary,
+        caseAttempts: 3
+      }
+    };
+    expect(reviewFlowEvaluationIdentitySchema.safeParse(fullDefault).success).toBe(true);
   });
 
   it("checkpoint resume 从 dirfd 严格要求 0600/current owner/nlink=1", () => {
@@ -3269,7 +3301,7 @@ function createRepresentative3StateFixture(
     maxAttempts: 3,
     baseDelayMs: 100,
     concurrency: 20,
-    caseAttempts: 3,
+    caseAttempts: 1,
     ...configurationOverrides
   };
   const identity: ReviewFlowEvaluationIdentity = {
