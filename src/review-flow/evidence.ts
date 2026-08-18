@@ -171,8 +171,22 @@ function canonicalJson(value: unknown): string {
 }
 
 export function deepFreeze<T>(value: T): T {
-  if (typeof value !== "object" || value === null || Object.isFrozen(value)) {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Object.isFrozen(value)
+  ) {
     return value;
+  }
+  // 平台 host 对象（AbortSignal、AbortController 等）不是普通可深度冻结的
+  // plain config：递归冻结会破坏其内部状态（如后续 abort() 抛“只读属性”错误）。
+  // 它们必须保持 opaque——不递归、也不调用 Object.freeze。普通 plain 对象与
+  // 数组（Object.prototype/null 原型）仍按原语义整体深冻结，不放松不可变性。
+  if (!Array.isArray(value)) {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return value;
+    }
   }
   for (const child of Object.values(value as Record<string, unknown>)) {
     deepFreeze(child);
