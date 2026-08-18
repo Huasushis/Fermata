@@ -87,6 +87,7 @@ import {
   type ReviewFlowEvaluationIdentity
 } from "../experiments/lib/review-flow-evaluation-state";
 import { serializePhysicalBlindArtifact } from "../experiments/lib/physical-blind-common";
+import { LlmRequestStartGate } from "../src/llm";
 
 const temporaryRoots: string[] = [];
 const fixedNow = () => new Date("2026-08-02T12:00:00.000Z");
@@ -1332,6 +1333,147 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
       base.remainingTwoBoundMs
     );
     expect(serial.remainingTwoBoundMs).toBe(base.remainingTwoBoundMs * 2);
+  });
+});
+
+describe("NO_SAFE_CONTROL 每案例请求闸门注册表", () => {
+  it("终止时关闭所有已登记的每案例请求闸门", () => {
+    const fixture = createStateFixture(1);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const gate = new ReviewFlowEvaluationStartGate(checkpoint);
+    const caseGateA = gate.createCaseRequestStartGate();
+    const caseGateB = gate.createCaseRequestStartGate();
+    const caseGateC = gate.createCaseRequestStartGate();
+    expect(caseGateA.canStartRequest()).toBe(true);
+    expect(caseGateB.canStartRequest()).toBe(true);
+    expect(caseGateC.canStartRequest()).toBe(true);
+    gate.closeForTermination();
+    expect(caseGateA.canStartRequest()).toBe(false);
+    expect(caseGateB.canStartRequest()).toBe(false);
+    expect(caseGateC.canStartRequest()).toBe(false);
+    expect(gate.canStart()).toBe(false);
+    checkpoint.close();
+  });
+
+  it("终止不取消已发出的流，in-flight 案例跑到自然 EOF", async () => {
+    const fixture = createStateFixture(3);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const source = new EventEmitter();
+    const gate = new ReviewFlowEvaluationStartGate(checkpoint);
+    const remove = installReviewFlowEvaluationSignalHandlers({ gate, source });
+    const first = deferred<ReviewFlowCalibrationProjection>();
+    const second = deferred<ReviewFlowCalibrationProjection>();
+    const started: string[] = [];
+    const settled: string[] = [];
+    const run = runReviewFlowEvaluationCases({
+      checkpoint,
+      cases: preparedStateCases(fixture),
+      executor: {
+        async execute(safeId, _runId, requestStartGate) {
+          started.push(safeId);
+          // 模拟已发出的流：闸门此时已登记，但请求已开始，不应被取消。
+          expect(requestStartGate.canStartRequest()).toBe(true);
+          const value = await (safeId === "case-0001"
+            ? first.promise
+            : second.promise);
+          // 终止后该闸门应已关闭；但本次已开始的流仍跑完到 EOF。
+          settled.push(safeId);
+          return { status: "complete" as const, projection: value };
+        }
+      },
+      concurrency: 2,
+      startGate: gate
+    });
+    await vi.waitFor(() => expect(started).toHaveLength(2));
+    source.emit("SIGTERM");
+    let finished = false;
+    void run.finally(() => { finished = true; });
+    await Promise.resolve();
+    // 两条 in-flight 流在终止后仍未结束——证明未被取消。
+    expect(finished).toBe(false);
+    expect(settled).toHaveLength(0);
+    first.resolve(projection("approve"));
+    second.resolve(projection("reject", { judgeabilityConcern: true }));
+    const state = await run;
+    remove();
+    // 两条已开始的流都跑到自然 EOF 并完成。
+    expect(settled).toHaveLength(2);
+    expect(state.entries.map((entry) => entry.status)).toEqual([
+      "completed",
+      "completed",
+      "pending"
+    ]);
+    expect(state.termination?.signal).toBe("SIGTERM");
+    checkpoint.close();
+  });
+
+  it("终止后已登记案例闸门拒绝后续角色/修复/重试启动", async () => {
+    const fixture = createStateFixture(2);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const source = new EventEmitter();
+    const gate = new ReviewFlowEvaluationStartGate(checkpoint);
+    const remove = installReviewFlowEvaluationSignalHandlers({ gate, source });
+    const secondEntered = deferred<void>();
+    const terminated = deferred<void>();
+    const secondRoleChecked = deferred<boolean>();
+    const run = runReviewFlowEvaluationCases({
+      checkpoint,
+      cases: preparedStateCases(fixture),
+      executor: {
+        async execute(safeId, _runId, requestStartGate) {
+          if (safeId === "case-0001") {
+            // 等待 case-0002 已进入执行（通过 markActive）后再触发终止，
+            // 避免终止使 case-0002 的 markActive 被拒绝而提前退出。
+            await secondEntered.promise;
+            source.emit("SIGTERM");
+            // 此时两个案例的闸门都已被终止批量关闭。
+            expect(requestStartGate.canStartRequest()).toBe(false);
+            terminated.resolve();
+            return {
+              status: "incomplete" as const,
+              failure: fixedFailure("REVIEW_FLOW_HTTP_499", 499)
+            };
+          }
+          // case-0002 在终止前已登记闸门；终止后该闸门被批量关闭。
+          secondEntered.resolve();
+          await terminated.promise;
+          const canSecondRoleStart = requestStartGate.canStartRequest();
+          secondRoleChecked.resolve(canSecondRoleStart);
+          return {
+            status: "incomplete" as const,
+            failure: fixedFailure("REVIEW_FLOW_HTTP_499", 499)
+          };
+        }
+      },
+      concurrency: 2,
+      startGate: gate,
+      maxCaseAttempts: 3
+    });
+    const checked = await secondRoleChecked.promise;
+    const state = await run;
+    remove();
+    // 终止后任何已登记案例的后续角色/修复/重试都无法启动新请求。
+    expect(checked).toBe(false);
+    expect(state.entries.map((entry) => entry.status)).toEqual([
+      "failed",
+      "failed"
+    ]);
+    checkpoint.close();
+  });
+
+  it("案例清理后从注册表移除其请求闸门，后续终止不再关闭已释放闸门", () => {
+    const fixture = createStateFixture(1);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const gate = new ReviewFlowEvaluationStartGate(checkpoint);
+    const released = gate.createCaseRequestStartGate();
+    gate.releaseCaseRequestStartGate(released);
+    // 释放后再终止：已释放的闸门保持打开，证明已从注册表移除。
+    gate.closeForTermination();
+    expect(released.canStartRequest()).toBe(true);
+    // 幂等：重复释放无副作用。
+    gate.releaseCaseRequestStartGate(released);
+    expect(released.canStartRequest()).toBe(true);
+    checkpoint.close();
   });
 });
 

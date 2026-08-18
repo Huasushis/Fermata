@@ -80,6 +80,12 @@ export class ReviewFlowEvaluationStartGate {
   readonly #checkpoint: ReviewFlowEvaluationCheckpoint;
   #closed = false;
   #persistenceFailed = false;
+  /**
+   * 已创建但尚未在案例清理时释放的每案例请求闸门登记表。终止时逐一关闭，
+   * 使任何尚未开始的角色/修复/重试请求被拒绝；已发出的流不受影响，跑到
+   * 自然 EOF。登记表仅在案例生命周期内持有引用，案例清理时移除，避免泄漏。
+   */
+  readonly #caseGates = new Set<LlmRequestStartGate>();
 
   public constructor(
     checkpoint: ReviewFlowEvaluationCheckpoint
@@ -93,19 +99,44 @@ export class ReviewFlowEvaluationStartGate {
   }
 
   /**
-   * 为单个案例创建独立的请求闸门。一个案例内某角色失败时只会关闭该案例
-   * 自己的闸门，阻止同案例后续角色启动；不会影响其它并发案例。
+   * 为单个案例创建独立的请求闸门，并登记到注册表。一个案例内某角色失败时
+   * 只会关闭该案例自己的闸门，阻止同案例后续角色启动；不会影响其它并发
+   * 案例。若终止已发生，新创建的闸门立即关闭，确保终止后新案例也无法
+   * 启动任何请求。案例执行结束后必须调用 releaseCaseRequestStartGate
+   * 释放登记，避免注册表无限增长。
    */
   public createCaseRequestStartGate(): LlmRequestStartGate {
-    return new LlmRequestStartGate();
+    const gate = new LlmRequestStartGate();
+    if (this.#closed) {
+      gate.close();
+    }
+    this.#caseGates.add(gate);
+    return gate;
   }
 
+  /**
+   * 案例清理时从注册表移除其请求闸门。幂等：重复释放或释放未登记闸门无副作用。
+   * 已关闭的闸门移除后不再被后续终止批量关闭，但 canStartRequest() 行为不变。
+   */
+  public releaseCaseRequestStartGate(gate: LlmRequestStartGate): void {
+    this.#caseGates.delete(gate);
+  }
+
+  /**
+   * 关闭外层闸门并同步关闭所有已登记的每案例闸门。已发出的 HTTP 流不会被
+   * 取消；只阻止尚未发起的角色/修复/重试请求。关闭后清空注册表，因为所有
+   * 已登记闸门均已关闭，无需再保留引用。
+   */
   public closeForTermination(): void {
     this.#closed = true;
+    for (const gate of this.#caseGates) {
+      gate.close();
+    }
+    this.#caseGates.clear();
   }
 
   public requestTermination(signal: ReviewFlowEvaluationTerminationSignal): void {
-    this.#closed = true;
+    this.closeForTermination();
     try {
       this.#checkpoint.markTerminationRequested(signal);
     } catch {
@@ -119,7 +150,6 @@ export class ReviewFlowEvaluationStartGate {
     }
   }
 }
-
 export interface ReviewFlowEvaluationSignalSource {
   on(
     signal: ReviewFlowEvaluationTerminationSignal,
@@ -298,18 +328,21 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
             }
             caseAttempts += 1;
             let outcome: ReviewFlowEvaluationExecutionOutcome;
+            const caseRequestStartGate = startGate.createCaseRequestStartGate();
             try {
               latestThrown = false;
               latestIncomplete = null;
               outcome = await input.executor.execute(
                 evaluationCase.prepared,
                 initial.runId,
-                startGate.createCaseRequestStartGate()
+                caseRequestStartGate
               );
             } catch {
+              startGate.releaseCaseRequestStartGate(caseRequestStartGate);
               latestThrown = true;
               continue;
             }
+            startGate.releaseCaseRequestStartGate(caseRequestStartGate);
 
             if (outcome.status === "incomplete") {
               latestIncomplete = outcome.failure;
