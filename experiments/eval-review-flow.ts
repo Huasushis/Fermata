@@ -256,7 +256,7 @@ export function resolveReviewFlowEvaluationCliOptions(
       (
         purpose.data !== "development" ||
         resume ||
-        maxCaseAttempts !== 3
+        maxCaseAttempts !== 1
       ))
   ) {
     throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");

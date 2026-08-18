@@ -1097,7 +1097,7 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
           }
         },
         concurrency: 20,
-        maxCaseAttempts: 3,
+        maxCaseAttempts: 1,
         monotonicNow: () => monotonicValues.shift() ?? 1_000
       });
       expect(calls[0]).toBe(fixture.expectedCases[0]?.safeId);
@@ -1133,9 +1133,29 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
     }
   );
 
+  it.each([
+    "representative3-v1",
+    "representative3-v2"
+  ] as const)("%s runner 拒绝多次 case 尝试", async (selector) => {
+    const fixture = createRepresentative3StateFixture({}, selector);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    await expect(runReviewFlowEvaluationCases({
+      checkpoint,
+      cases: preparedStateCases(fixture),
+      executor: {
+        async execute() {
+          throw new Error("must not execute");
+        }
+      },
+      concurrency: 20,
+      maxCaseAttempts: 3
+    })).rejects.toThrow("REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_RUN_INVALID");
+    checkpoint.close();
+  });
+
   it("representative3 的 retry/backoff/watchdog 保守 ETA 超过 90 分钟时不调度剩余两题", async () => {
     const fixture = createRepresentative3StateFixture({
-      llmMaximumDurationMs: 3_000_000
+      baseDelayMs: 100_000_000
     });
     const checkpoint = openCheckpoint(fixture, { bindClaim: true });
     const execute = vi.fn(async () => ({
@@ -1153,7 +1173,7 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
       cases: preparedStateCases(fixture),
       executor: { execute },
       concurrency: 20,
-      maxCaseAttempts: 3,
+      maxCaseAttempts: 1,
       monotonicNow: () => monotonicValues.shift() ?? 60_000
     });
 
@@ -1191,7 +1211,7 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
       cases: preparedStateCases(fixture),
       executor: { execute },
       concurrency: 20,
-      maxCaseAttempts: 3
+      maxCaseAttempts: 1
     });
     expect(execute).toHaveBeenCalledTimes(1);
     expect(state.entries.map((entry) => entry.status)).toEqual([
@@ -2469,6 +2489,7 @@ describe("adapter、CLI 与窄环境", () => {
       variant: "baseline",
       developmentBaselineLabel: "dev-before-a",
       developmentCandidateLabel: "dev-after-a",
+      maxCaseAttempts: 3,
       resume: false
     });
     expect(resolveReviewFlowEvaluationCliOptions([
@@ -2504,14 +2525,14 @@ describe("adapter、CLI 与窄环境", () => {
       "--label=dev-smoke",
       "--variant=baseline",
       "--case-selector=representative3-v1",
-      "--max-case-attempts=3"
+      "--max-case-attempts=1"
     ] as const;
     expect(resolveReviewFlowEvaluationCliOptions(
       representative3Args
     )).toMatchObject({
       purpose: "development",
       caseSelector: "representative3-v1",
-      maxCaseAttempts: 3,
+      maxCaseAttempts: 1,
       resume: false
     });
     const representative3V2Args = representative3Args.map((entry) =>
@@ -2524,7 +2545,7 @@ describe("adapter、CLI 与窄环境", () => {
     )).toMatchObject({
       purpose: "development",
       caseSelector: "representative3-v2",
-      maxCaseAttempts: 3,
+      maxCaseAttempts: 1,
       resume: false
     });
     expect(() => resolveReviewFlowEvaluationCliOptions([
@@ -2539,8 +2560,8 @@ describe("adapter、CLI 与窄环境", () => {
       ),
       [...representative3Args, "--resume"],
       representative3Args.map((entry) =>
-        entry === "--max-case-attempts=3"
-          ? "--max-case-attempts=2"
+        entry === "--max-case-attempts=1"
+          ? "--max-case-attempts=3"
           : entry
       ),
       [

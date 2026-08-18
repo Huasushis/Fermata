@@ -199,7 +199,7 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
         selection.selector !== "representative3-v1" &&
         selection.selector !== "representative3-v2"
       ) ||
-      maxCaseAttempts !== 3 ||
+      maxCaseAttempts !== 1 ||
       initial.entries.length !== 3 ||
       initial.entries.some((entry) => entry.status !== "pending") ||
       initial.expectedCases.some(
