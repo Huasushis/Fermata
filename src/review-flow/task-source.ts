@@ -97,6 +97,73 @@ const safeCandidateUrlSchema = z
     }
   }, "候选地址必须是不含认证信息的 HTTP(S) URL。");
 
+/**
+ * candidate.metadata 的可选镜像契约，与 Anklang anklang/metadata.py 的
+ * canonicalize_metadata 按同一套边界独立实现：键必须是 ASCII 小写字母/
+ * 数字/下划线且以字母开头（^[a-z][a-z0-9_]{0,63}$），最多 16 个键，值只
+ * 允许字符串、有限数字、布尔或 null（不允许嵌套对象/数组）；字符串值
+ * 必须非空、已经是去掉两端空白的形式并按 UTF-8 字节数不超过 512；整包
+ * 按规范 JSON（ASCII 升序键、紧凑分隔符、不转义非 ASCII）编码后不超过
+ * 2048 个 UTF-8 字节。元数据是展示性、非检索性的题面外信息，不参与
+ * contentHash/resultHash/相似度或任何裁决输入。
+ */
+const metadataKeySchema = z.string().regex(
+  /^[a-z][a-z0-9_]{0,63}$/u,
+  "元数据键必须是小写字母开头的字母/数字/下划线。"
+);
+const metadataStringValueSchema = z
+  .string()
+  .min(1)
+  .refine((value) => value === value.trim(), "元数据字符串值必须已是去空白形式。")
+  .refine(
+    (value) => new TextEncoder().encode(value).byteLength <= 512,
+    "元数据字符串值不能超过 512 字节。"
+  );
+const metadataValueSchema = z.union([
+  metadataStringValueSchema,
+  z.number().finite(),
+  z.boolean(),
+  z.null()
+]);
+const MAX_CANDIDATE_METADATA_KEYS = 16;
+const MAX_CANDIDATE_METADATA_BYTES = 2_048;
+const anklangCandidateMetadataSchema = z
+  .record(metadataKeySchema, metadataValueSchema)
+  .superRefine((metadata, context) => {
+    const keys = Object.keys(metadata);
+    if (keys.length > MAX_CANDIDATE_METADATA_KEYS) {
+      context.addIssue({
+        code: "custom",
+        path: [],
+        message: `candidate.metadata 最多允许 ${MAX_CANDIDATE_METADATA_KEYS} 个键。`
+      });
+      return;
+    }
+    const canonical = canonicalMetadataJson(metadata);
+    const byteLength = new TextEncoder().encode(canonical).byteLength;
+    if (byteLength > MAX_CANDIDATE_METADATA_BYTES) {
+      context.addIssue({
+        code: "custom",
+        path: [],
+        message: "candidate.metadata 整包不能超过 2048 字节。"
+      });
+    }
+  });
+export type AnklangCandidateMetadata = z.infer<
+  typeof anklangCandidateMetadataSchema
+>;
+
+/** ASCII 升序键、紧凑分隔符、不转义非 ASCII 的规范 JSON 序列化。 */
+function canonicalMetadataJson(metadata: Record<string, unknown>): string {
+  const keys = Object.keys(metadata).sort();
+  const parts = keys.map((key) => {
+    const serializedKey = JSON.stringify(key);
+    const serializedValue = JSON.stringify(metadata[key]);
+    return `${serializedKey}:${serializedValue}`;
+  });
+  return `{${parts.join(",")}}`;
+}
+
 const anklangCandidateSchema = z
   .object({
     source: boundedCanonicalText(80),
@@ -105,7 +172,8 @@ const anklangCandidateSchema = z
     url: safeCandidateUrlSchema.optional(),
     similarity: z.number().finite().min(0).max(1),
     sameProblemSuggestion: z.boolean().optional(),
-    explanation: boundedCanonicalText(2_000).optional()
+    explanation: boundedCanonicalText(2_000).optional(),
+    metadata: anklangCandidateMetadataSchema.optional()
   })
   .strict();
 
@@ -261,6 +329,7 @@ const anklangEvidenceProvenanceSchema = z
     candidateIndex: z.number().int().nonnegative().max(49),
     similarity: z.number().finite().min(0).max(1),
     serviceReviewSuggestion: z.boolean().optional(),
+    metadata: anklangCandidateMetadataSchema.optional(),
     authenticationStatus: z.literal("authenticated_builtin_anklang_plugin"),
     deterministicConfirmationAllowed: z.literal(true)
   })
@@ -365,7 +434,17 @@ export function buildReviewFlowTaskSource(
   assertCoreMaterials(task.problem);
   assertProblemTagsExist(task);
   const anklang = parseCompleteAnklangItem(task, readNowMs(options.now));
-  const anklangResultHash = hashCanonicalValue(anklang.result);
+  // candidate.metadata 是不参与内容身份的展示性字段，与 Anklang 侧的
+  // contentHash/去重逻辑一致：结果身份哈希必须在有/无 metadata 时逐字节
+  // 相同，因此从哈希输入中剔除 metadata，裁决与证据 id 也随之不变。
+  const anklangResultHash = hashCanonicalValue({
+    ...anklang.result,
+    candidates: anklang.result.candidates.map((candidate) => {
+      // 只去 metadata，保留所有实际参与内容身份与裁决的字段字节。
+      const { metadata: _metadataForIdentity, ...rest } = candidate;
+      return rest;
+    })
+  });
   const duplicateEvidence = anklang.result.candidates.map((candidate, index) => {
     const evidenceId = `anklang-${hashCanonicalValue({
       reviewItemId: anklang.item.id,
@@ -394,6 +473,10 @@ export function buildReviewFlowTaskSource(
         ...(candidate.sameProblemSuggestion === undefined
           ? {}
           : { serviceReviewSuggestion: candidate.sameProblemSuggestion }),
+        ...(candidate.metadata === undefined ||
+          Object.keys(candidate.metadata).length === 0
+          ? {}
+          : { metadata: candidate.metadata }),
         authenticationStatus: "authenticated_builtin_anklang_plugin" as const,
         deterministicConfirmationAllowed: true as const
       }

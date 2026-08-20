@@ -6,7 +6,8 @@ import {
   isBuiltReviewFlowTaskSourceResult,
   isHistoricalCalibrationReviewFlowTaskSourceResult,
   ReviewFlowTaskSourceError,
-  type ReviewFlowTaskSourceErrorCode
+  type ReviewFlowTaskSourceErrorCode,
+  type ReviewFlowTaskSourceResult
 } from "../src/review-flow/task-source";
 import type { RobotReviewTask } from "../src/urmotiv-schemas";
 
@@ -453,6 +454,167 @@ describe("robot review task 到可信审题 source 的严格适配", () => {
     expect(caught).toMatchObject({
       code: "REVIEW_FLOW_TASK_SOURCE_INVALID",
       message: "REVIEW_FLOW_TASK_SOURCE_INVALID"
+    });
+  });
+});
+
+describe("candidate.metadata 镜像契约", () => {
+  function taskWithCandidateMetadata(metadata: unknown): RobotReviewTask {
+    const task = completeTask();
+    const data = completeAnklangV2Data();
+    const candidates = data.candidates as unknown[];
+    (candidates[0] as Record<string, unknown>).metadata = metadata;
+    task.reviewItems[0]!.data = data;
+    return task;
+  }
+
+  it("合法标量 metadata 原样保留进认证 provenance，决策输入保持不变", () => {
+    const metadata = {
+      origin: "CF 1000A",
+      rounds: 3,
+      pinned: true,
+      archived: null,
+      score: 0.75,
+      display_order: 2
+    } as const;
+    const withMetadata = build(taskWithCandidateMetadata(metadata));
+    const withoutMetadata = build(completeTask());
+
+    // metadata 只进入 provenance evidence，不进 duplicateEvidence/裁决。
+    expect(withMetadata.provenance.anklang.evidence[0]).toMatchObject({
+      metadata
+    });
+    expect(Object.keys(withMetadata.source.duplicateEvidence[0]!).sort()).toEqual(
+      ["evidenceId", "sameProblemSuggestion", "similarity", "source", "summary", "externalId"]
+        .sort()
+    );
+    // 有无 metadata 时 duplicateEvidence 逐字节/语义等价。
+    expect(withMetadata.source.duplicateEvidence).toEqual(
+      withoutMetadata.source.duplicateEvidence
+    );
+    expect(withMetadata.source).toEqual(withoutMetadata.source);
+    expect(withMetadata.taskBinding).toEqual(withoutMetadata.taskBinding);
+  });
+
+  function authenticatedAnklang(result: ReviewFlowTaskSourceResult) {
+    const provenance = result.provenance.anklang;
+    if ("resultHash" in provenance) return provenance;
+    throw new Error("expected authenticated provenance");
+  }
+
+  it("结果身份哈希与证据 id 在有/无 metadata 时逐字节相同", () => {
+    const metadata = { origin: "CF 1000A", rounds: 3 };
+    const withResult = build(taskWithCandidateMetadata(metadata));
+    const withMetadata = authenticatedAnklang(withResult);
+    const withoutResult = build(completeTask());
+    const withoutMetadata = authenticatedAnklang(withoutResult);
+    expect(withMetadata.resultHash).toBe(withoutMetadata.resultHash);
+    expect(withMetadata.evidence[0]?.evidenceId).toBe(
+      withoutMetadata.evidence[0]?.evidenceId
+    );
+    const [withId, withoutId] = [
+      withResult.source.duplicateEvidence[0]!.evidenceId,
+      withoutResult.source.duplicateEvidence[0]!.evidenceId
+    ];
+    expect(withId).toBe(withoutId);
+  });
+
+  it("空对象与缺失同样视为没有 metadata，provenance 省略该字段", () => {
+    const withEmpty = authenticatedAnklang(
+      build(taskWithCandidateMetadata({}))
+    );
+    const withoutMetadata = authenticatedAnklang(build(completeTask()));
+    expect("metadata" in withEmpty.evidence[0]!).toBe(false);
+    expect(withEmpty.evidence[0]).toEqual(withoutMetadata.evidence[0]);
+    expect(withEmpty.resultHash).toBe(withoutMetadata.resultHash);
+  });
+
+  it("键名、键数量、值类型与整包字节的每个边界都 fail closed", () => {
+    const invalidKeyBadChar = taskWithCandidateMetadata({ "BadKey": "x" });
+    expectFailure(invalidKeyBadChar, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
+
+    const invalidKeyDigitStart = taskWithCandidateMetadata({ "1abc": "x" });
+    expectFailure(invalidKeyDigitStart, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
+
+    const invalidKeyHyphen = taskWithCandidateMetadata({ "a-b": "x" });
+    expectFailure(invalidKeyHyphen, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
+
+    const invalidKeyDot = taskWithCandidateMetadata({ "a.b": "x" });
+    expectFailure(invalidKeyDot, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
+
+    const tooLongKey = taskWithCandidateMetadata({
+      [`a${"a".repeat(64)}`]: "x"
+    });
+    expectFailure(tooLongKey, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
+
+    const emptyKey = taskWithCandidateMetadata({ "": "x" });
+    expectFailure(emptyKey, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
+
+    const tooManyKeys = taskWithCandidateMetadata(
+      Object.fromEntries(
+        Array.from({ length: 17 }, (_, i) => [`k${i}`, "x"])
+      )
+    );
+    expectFailure(tooManyKeys, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
+
+    const nestedObjectButValidScalar = taskWithCandidateMetadata({
+      nested: { value: 1 }
+    });
+    expectFailure(
+      nestedObjectButValidScalar,
+      "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID"
+    );
+
+    const nestedArray = taskWithCandidateMetadata({
+      children: [1, 2, 3]
+    });
+    expectFailure(nestedArray, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
+
+    const emptyStringValue = taskWithCandidateMetadata({ empty: "" });
+    expectFailure(emptyStringValue, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
+
+    const untrimmed = taskWithCandidateMetadata({ untrimmed: "  x " });
+    expectFailure(untrimmed, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
+
+    const tooLongString = taskWithCandidateMetadata({
+      long: "中".repeat(171) // 每字 3 字节 => 513 字节 > 512
+    });
+    expectFailure(tooLongString, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
+
+    const nonFinite = taskWithCandidateMetadata({
+      infinity: Number.POSITIVE_INFINITY,
+      negativeInfinity: Number.NEGATIVE_INFINITY,
+      nan: Number.NaN
+    });
+    expectFailure(nonFinite, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
+
+    // 16 个键每个 500 字节 → 总量远超 2048 字节上限；但单值仍 ≤512。
+    const overBudget = taskWithCandidateMetadata(
+      Object.fromEntries(
+        Array.from({ length: 16 }, (_, i) => [`k${i}`, "x".repeat(500)])
+      )
+    );
+    expectFailure(overBudget, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
+  });
+
+  it("candidate 未知字段仍拒绝未声明字段，metadata 必须声明为可用字段", () => {
+    const unknownCandidateField = completeTask();
+    const data = completeAnklangV2Data();
+    const candidates = data.candidates as unknown[];
+    const candidate = candidates[0] as Record<string, unknown>;
+    candidate.unexpected = true;
+    data.candidates = candidates;
+    unknownCandidateField.reviewItems[0]!.data = data;
+    expectFailure(
+      unknownCandidateField,
+      "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID"
+    );
+
+    // 合法 metadata 被完整保留，未引入任何新错误码或字段泄漏。
+    const valid = taskWithCandidateMetadata({ origin: "CF", tags: "demo" });
+    const result = build(valid);
+    expect(result.provenance.anklang.evidence[0]).toMatchObject({
+      metadata: { origin: "CF", tags: "demo" }
     });
   });
 });
