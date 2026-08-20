@@ -24,7 +24,7 @@ defaults:
 # profiles 下每个 key 是一个"模型档位"的名字，供 modelProfileName 引用。
 # 每个档位同时保留旧流水线与旧 11 角色槽，供历史 checkpoint 验证；新的 A/B/C/D runtime
 # 从对应槽位组装四个语义请求和一个可选 formatter。`thinking` 只决定是否保留返回的推理过程。
-# Aether deepseek-v4-flash / deepseek-v4-pro 必须配置 `thinkingRequest: enabled` 与
+# Aether deepseek-v4-flash 必须配置 `thinkingRequest: enabled` 与
 # `reasoningEffort: max`，传输固定发送 `thinking: {type: "enabled"}` 和
 # `reasoning_effort: "max"`；缺失、disabled 或非 max 都在网络前失败关闭。
 #
@@ -42,7 +42,7 @@ profiles:
     thinking:
       solver:
         provider: aether
-        model: deepseek-v4-pro
+        model: deepseek-v4-flash
         temperature: 0.4
         thinking: true
         thinkingRequest: enabled
@@ -63,7 +63,7 @@ profiles:
       reasoningEffort: max
     verdict:
       provider: aether
-      model: deepseek-v4-pro
+      model: deepseek-v4-flash
       temperature: 0.1
       thinking: false
       thinkingRequest: enabled
@@ -71,21 +71,21 @@ profiles:
     reviewFlow:
       solver:
         provider: aether
-        model: deepseek-v4-pro
+        model: deepseek-v4-flash
         temperature: 0.4
         thinking: true
         thinkingRequest: enabled
         reasoningEffort: max
       solutionAnalyst:
         provider: aether
-        model: deepseek-v4-pro
+        model: deepseek-v4-flash
         temperature: 0.2
         thinking: true
         thinkingRequest: enabled
         reasoningEffort: max
       technicalAuditor:
         provider: aether
-        model: deepseek-v4-pro
+        model: deepseek-v4-flash
         temperature: 0.1
         thinking: true
         thinkingRequest: enabled
@@ -99,14 +99,14 @@ profiles:
         reasoningEffort: max
       editorialJudge:
         provider: aether
-        model: deepseek-v4-pro
+        model: deepseek-v4-flash
         temperature: 0.1
         thinking: true
         thinkingRequest: enabled
         reasoningEffort: max
       contestFit:
         provider: aether
-        model: deepseek-v4-pro
+        model: deepseek-v4-flash
         temperature: 0.1
         thinking: true
         thinkingRequest: enabled
@@ -127,21 +127,21 @@ profiles:
         reasoningEffort: max
       critic:
         provider: aether
-        model: deepseek-v4-pro
+        model: deepseek-v4-flash
         temperature: 0.2
         thinking: true
         thinkingRequest: enabled
         reasoningEffort: max
       adversary:
         provider: aether
-        model: deepseek-v4-pro
+        model: deepseek-v4-flash
         temperature: 0.2
         thinking: true
         thinkingRequest: enabled
         reasoningEffort: max
       adjudicator:
         provider: aether
-        model: deepseek-v4-pro
+        model: deepseek-v4-flash
         temperature: 0.1
         thinking: true
         thinkingRequest: enabled
