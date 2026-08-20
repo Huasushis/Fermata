@@ -474,8 +474,8 @@ describe("candidate.metadata 镜像契约", () => {
       rounds: 3,
       pinned: true,
       archived: null,
-      score: 0.75,
-      display_order: 2
+      score: 2,
+      display_order: 0
     } as const;
     const withMetadata = build(taskWithCandidateMetadata(metadata));
     const withoutMetadata = build(completeTask());
@@ -587,6 +587,18 @@ describe("candidate.metadata 镜像契约", () => {
       nan: Number.NaN
     });
     expectFailure(nonFinite, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
+
+    const fractional = taskWithCandidateMetadata({ score: 0.5 });
+    expectFailure(fractional, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
+
+    // 2^53 是不可安全表示的整数，格式化会跨语言不一致。
+    const unsafeInteger = taskWithCandidateMetadata({
+      big: 2 ** 53
+    });
+    expectFailure(unsafeInteger, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
+
+    const negativeZero = taskWithCandidateMetadata({ value: -0 as number });
+    expectFailure(negativeZero, "REVIEW_FLOW_TASK_ANKLANG_RESULT_INVALID");
 
     // 16 个键每个 500 字节 → 总量远超 2048 字节上限；但单值仍 ≤512。
     const overBudget = taskWithCandidateMetadata(

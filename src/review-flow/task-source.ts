@@ -101,7 +101,7 @@ const safeCandidateUrlSchema = z
  * candidate.metadata 的可选镜像契约，与 Anklang anklang/metadata.py 的
  * canonicalize_metadata 按同一套边界独立实现：键必须是 ASCII 小写字母/
  * 数字/下划线且以字母开头（^[a-z][a-z0-9_]{0,63}$），最多 16 个键，值只
- * 允许字符串、有限数字、布尔或 null（不允许嵌套对象/数组）；字符串值
+ * 允许字符串、安全整数数字、布尔或 null（不允许嵌套对象/数组）；字符串值
  * 必须非空、已经是去掉两端空白的形式并按 UTF-8 字节数不超过 512；整包
  * 按规范 JSON（ASCII 升序键、紧凑分隔符、不转义非 ASCII）编码后不超过
  * 2048 个 UTF-8 字节。元数据是展示性、非检索性的题面外信息，不参与
@@ -119,9 +119,19 @@ const metadataStringValueSchema = z
     (value) => new TextEncoder().encode(value).byteLength <= 512,
     "元数据字符串值不能超过 512 字节。"
   );
+// 数字必须是 64 位浮点可精确保真的整数（安全整数）才行：JS 与 Python 对
+// 整数的规范 JSON 序列化一致，但对其它有限浮点（分数、大数、负零）的
+// 格式化与精度不同，会破坏 2048 字节上限的跨语言一致性。相似度仍是顶层
+// 浮点，不受此限制。
+const metadataSafeIntegerSchema = z
+  .number()
+  .refine(
+    (value) => Number.isSafeInteger(value) && !Object.is(value, -0),
+    "元数据数字必须是安全整数（±(2^53−1) 内），不允许分数、非有限或负零。"
+  );
 const metadataValueSchema = z.union([
   metadataStringValueSchema,
-  z.number().finite(),
+  metadataSafeIntegerSchema,
   z.boolean(),
   z.null()
 ]);
