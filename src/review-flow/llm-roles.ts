@@ -874,11 +874,31 @@ function trustedRoleExecution(
   });
 }
 
-function mergeNarrative(reasoning: string | null, narrative: string): string {
-  const reasoningText = reasoning?.trim() ?? "";
+/**
+ * 把探索轮的推理过程与结构化轮的 narrative 合并，但绝不超出 schema 的
+ * 200_000 字符上限。模型自身的 narrative 完整保留；只有被拼接进去的
+ * 推理前缀会在逼近上限时被截断。这样格式轮已通过 solverPayloadSchema
+ * 校验的 payload，不会因合并而再次失效（见 case-0001 的 schema_output）。
+ */
+const solverNarrativeMaxBytes = 200_000;
+
+export function mergeNarrative(reasoning: string | null, narrative: string): string {
   const narrativeText = narrative.trim();
+  const reasoningText = (reasoning?.trim() ?? "");
   if (reasoningText.length === 0) return narrativeText;
-  return `模型思考过程：\n${reasoningText}\n\n模型结构化解题记录：\n${narrativeText}`;
+  const header = "模型思考过程：\n";
+  const separator = "\n\n模型结构化解题记录：\n";
+  const overhead = header.length + separator.length + narrativeText.length;
+  if (overhead >= solverNarrativeMaxBytes) {
+    return narrativeText.length > 0 ? narrativeText.slice(0, solverNarrativeMaxBytes) : "";
+  }
+  const reasoningBudget = Math.max(0, solverNarrativeMaxBytes - overhead);
+  const truncatedReasoning = reasoningText.length > reasoningBudget
+    ? reasoningBudget >= 3
+      ? `${reasoningText.slice(0, reasoningBudget - 3)}……`
+      : ""
+    : reasoningText;
+  return `${header}${truncatedReasoning}${separator}${narrativeText}`;
 }
 
 function guardedSystemPrompt(role: ReviewFlowRole, roleInstructions: string): string {

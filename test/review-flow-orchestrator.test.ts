@@ -20,6 +20,7 @@ import {
 } from "../src/review-flow/orchestrator";
 import {
   createReviewFlowLlmBundle,
+  mergeNarrative,
   type ReviewFlowModelConfigs
 } from "../src/review-flow/llm-roles";
 import { buildReviewFlowTaskSource } from "../src/review-flow/task-source";
@@ -752,7 +753,7 @@ describe("冻结证据多角色审题编排", () => {
     expect(JSON.stringify(outcome)).not.toContain("projection");
   });
 
-  it("并行角色首错同步关门，等待已发的兄弟请求 EOF 且不启动下游角色", async () => {
+  it("并行角色首错不再关闭共享案例闸门，已发出的兄弟角色完整收束", async () => {
     const baseFetch = syntheticRoleFetch()!;
     const pendingResponses: Array<{
       readonly url: string | URL | Request;
@@ -789,8 +790,10 @@ describe("冻结证据多角色审题编排", () => {
     await vi.waitFor(() => {
       expect(fetchImpl).toHaveBeenCalledTimes(10);
       expect(pendingResponses).toHaveLength(4);
-      expect(gate.canStartRequest()).toBe(false);
     });
+    // difficulty 首错后不再关闭共享案例闸门：兄弟角色（含两轮角色的
+    // 格式化轮）继续完整收束，而非被 LLM_REQUEST_START_BLOCKED 拒绝。
+    expect(gate.canStartRequest()).toBe(true);
     expect(settled).toBe(false);
     for (const response of pendingResponses) {
       response.resolve(await baseFetch(response.url, response.init));
@@ -798,16 +801,46 @@ describe("冻结证据多角色审题编排", () => {
     const outcome = await pending;
     expect(outcome.status).toBe("incomplete");
     if (outcome.status !== "incomplete") throw new Error("expected incomplete");
+    // 闸门保持打开：只有 difficulty 失败，其余兄弟角色（含两轮角色的
+    // 格式化轮）全部完整收束，不再被 LLM_REQUEST_START_BLOCKED 取消。
     expect(outcome.failure.failedRoles.map((entry) => entry.role)).toEqual([
-      "difficulty",
-      "contest_fit",
-      "originality",
-      "tags"
+      "difficulty"
     ]);
-    // difficulty 首错后闸门关闭：已发出的兄弟请求仍收束，但两轮角色
-    // （contest_fit/originality/tags）的格式化轮是闸门关闭后的新逻辑请求，
-    // 被 LLM_REQUEST_START_BLOCKED 拒绝并归类为 cancelled；单轮兄弟角色则完整收束。
-    expect(fetchImpl).toHaveBeenCalledTimes(10);
+    expect(outcome.failure.completedRoles.map((entry) => entry.role)).toEqual(
+      expect.arrayContaining(["editorial_judge", "contest_fit", "originality", "tags"])
+    );
+    // 兄弟角色完整收束：两轮角色的格式化轮请求成功发出，总调用数多于关门路径。
+    expect(fetchImpl.mock.calls.length).toBeGreaterThan(10);
+  });
+
+  it("RED→GREEN: solver 推理合并后 narrative 不超过 schema 200k 上限", () => {
+    // 复现 rep3-v4 case-0001：3 轮传输都返回字节（格式轮 JSON 已通过
+    // solverPayloadSchema 校验），但 mergeNarrative 把巨大 reasoning 拼接进
+    // narrative 后超出 200_000 上限，sealEvidenceArtifact 二次校验时被
+    // ZodError 拒绝（分类 schema_output）。
+    const hugeReasoning = "思".repeat(250_000);
+    const modelNarrative = "完整解题记录。";
+    const merged = mergeNarrative(hugeReasoning, modelNarrative);
+    // fix 后：合并结果 ≤ 200_000，满足 solverPayloadSchema
+    expect(merged.length).toBeLessThanOrEqual(200_000);
+    expect(solverPayloadSchema.safeParse({
+      solved: true,
+      narrative: merged,
+      approach: "直接处理。",
+      claimedComplexity: "O(1)",
+      uncertainties: []
+    }).success).toBe(true);
+    // 模型自身的 narrative 完整保留
+    expect(merged).toContain(modelNarrative);
+  });
+
+  it("RED→GREEN: 正常长度推理合并不受影响", () => {
+    const normalReasoning = "先推导性质，再验证边界。";
+    const merged = mergeNarrative(normalReasoning, "完整解法");
+    expect(merged).toContain("模型思考过程：");
+    expect(merged).toContain(normalReasoning);
+    expect(merged).toContain("模型结构化解题记录：");
+    expect(merged).toContain("完整解法");
   });
 
   it("solver 运行时只收到题面视图，题解、标签、查重和自报答案均不可见", async () => {

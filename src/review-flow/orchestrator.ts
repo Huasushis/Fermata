@@ -1393,7 +1393,11 @@ async function runAndSeal<TPayload>(input: {
     }));
     return artifact;
   } catch (error) {
-    input.requestStartGate?.close();
+    // 不在单个角色失败时关闭共享案例请求闸门。关闭它会拒绝同批已发出
+    // 语义轮的兄弟角色的格式轮（LLM_REQUEST_START_BLOCKED），把它们
+    // 错误地归类为 cancelled 而非让已付费的请求自然收束（见 rep3-v4
+    // 终态账本中 5 个 cancelled 角色）。案例终态由 runIndependentRoles
+    // 抛出的第一个错误决定；这里只记录失败，不阻止其它在途请求。
     const failureKind = classifyRoleFailure(error);
     input.tracker.onTerminalRoleFailure?.(input.spec.role, failureKind, error);
     input.tracker.completions.delete(input.spec.role);
@@ -1403,10 +1407,10 @@ async function runAndSeal<TPayload>(input: {
       llmAudit !== null
         ? summarizeRoleFailure(input.spec.role, failureKind, llmAudit)
         : summarizeCompletedReceiptFailure(
-            input.spec.role,
-            failureKind,
-            completedReceipt
-          )
+          input.spec.role,
+          failureKind,
+          completedReceipt
+        )
     );
     if (error instanceof ReviewFlowError) throw error;
     throw new ReviewFlowError("REVIEW_FLOW_ROLE_FAILED", input.spec.role, failureKind);
