@@ -298,7 +298,7 @@ export const reviewFlowEvaluationPilotTimingReceiptSchema = z
     monotonicLatencyMs: z.number().int().nonnegative(),
     remainingTwoBoundMs: z.number().int().nonnegative(),
     projectedTotalDurationMs: z.number().int().nonnegative(),
-    maximumTotalDurationMs: z.literal(90 * 60 * 1_000),
+    maximumTotalDurationMs: z.literal(180 * 60 * 1_000),
     projectedWithinLimit: z.boolean(),
     remainingCasesAdmitted: z.boolean()
   })

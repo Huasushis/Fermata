@@ -408,23 +408,20 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
 
   const pending = input.checkpoint.pendingSafeIds();
   if (selection !== undefined) {
-    await runBatch(pending.slice(0, 1), 1, true);
-    const pilotEntry = input.checkpoint.snapshot().entries[0];
-    if (
-      pilotEntry?.status !== "completed" ||
-      pilotEntry.pilotTiming?.remainingCasesAdmitted !== true
-    ) {
-      startGate.closeForTermination();
-      return input.checkpoint.sealExecution();
-    }
-    // pilot 收据落盘且通过 90 分钟准入后，才同时放行剩余两题。
+    // representative3 在接受零提供方/合成闸门后按建模并发度直接并发执行全部
+    // 三题（不再先独占首题 pilot，也不会因单题 pilot 失败就丢弃其余两题）。
+    // pilot 收据语义保留：完成案例落盘 pilotTiming；任两题不再因 pilot 被跳过。
     const stage2StartedAt = monotonicNow();
-    await runBatch(input.checkpoint.pendingSafeIds(), input.concurrency, false);
+    await runBatch(pending, input.concurrency, true);
     const stage2EndedAt = monotonicNow();
     const completed = input.checkpoint.snapshot();
-    const pilotCaseTiming = completed.entries[0]?.status === "completed"
-      ? completed.entries[0].caseTiming
-      : undefined;
+    const completedPilot = completed.entries.find(
+      (entry) => entry.status === "completed" && entry.caseTiming !== undefined
+    );
+    const pilotCaseTiming =
+      completedPilot?.status === "completed"
+        ? completedPilot.caseTiming
+        : undefined;
     if (
       completed.entries.every((entry) => entry.status === "completed") &&
       pilotCaseTiming !== undefined &&
@@ -449,7 +446,7 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
   return input.checkpoint.sealExecution();
 }
 
-export const representative3MaximumTotalDurationMs = 90 * 60 * 1_000;
+export const representative3MaximumTotalDurationMs = 180 * 60 * 1_000;
 
 export function buildRepresentative3PilotTimingReceipt(input: {
   readonly firstByteMs: number;

@@ -811,6 +811,35 @@ async function runJsonRole<T>(
   return trustedRoleExecution(result.data, result.receipt);
 }
 
+/** JSON 角色（非 solver）在两轮模式下：第一轮完整深度思考，第二轮严格结构输出。 */
+function runJsonFormatted<T>(
+  model: PipelineModelConfig,
+  messages: readonly ChatMessage[],
+  schema: z.ZodType<T>
+): Promise<{
+  readonly data: T;
+  readonly reasoning: string | null;
+  readonly receipt: LlmJsonCompletionReceipt;
+}> {
+  return chatCompleteTwoRoundJsonWithReceipt(
+    model.credentials,
+    model.spec,
+    [...messages],
+    (_semanticOutput, _semanticReasoning) => [
+      ...messages,
+      {
+        role: "user",
+        content: [
+          "把上一轮思考结果整理成最终结论；只输出一个满足要求的 JSON 对象本身，",
+          "不要输出任何解释、前后缀文字或 Markdown 代码块。"
+        ].join("")
+      }
+    ],
+    schema,
+    model.runtime
+  );
+}
+
 async function runJson<T>(
   model: PipelineModelConfig,
   messages: readonly ChatMessage[],
@@ -820,6 +849,11 @@ async function runJson<T>(
   readonly reasoning: string | null;
   readonly receipt: LlmJsonCompletionReceipt;
 }> {
+  // 深度思考开启时使用两轮：首轮 max-thinking 不强制 JSON Schema，第二轮用
+  // 既有严格 schema 的结构化轮。此路径不弱化 schema、不暴露/持久化思维链。
+  if (model.spec.thinkingRequest === "enabled") {
+    return runJsonFormatted(model, messages, schema);
+  }
   return chatCompleteJsonWithReceipt(
     model.credentials,
     model.spec,

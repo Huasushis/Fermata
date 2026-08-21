@@ -47,9 +47,9 @@ import {
   reviewFlowEvaluationBridgeCompletionFileName,
   reviewFlowEvaluationDevelopmentPredictionBindingSha256,
   reviewFlowEvaluationHoldoutPredictionBindingSha256,
-  reviewFlowEvaluationOrderedSelectionSha256,
-  reviewFlowEvaluationRepresentative3V2AuditedStrataCounts,
   reviewFlowEvaluationRevealDescriptorSchema,
+  reviewFlowEvaluationRepresentative3V2AuditedStrataCounts,
+  reviewFlowEvaluationOrderedSelectionSha256,
   reviewFlowEvaluationSourceLineageSetSha256,
   selectReviewFlowEvaluationRepresentative3V2,
   selectReviewFlowEvaluationRepresentative3V3,
@@ -85,10 +85,11 @@ import {
   type ReviewFlowEvaluationCheckpointState,
   type ReviewFlowEvaluationBaselineBinding,
   type ReviewFlowEvaluationExpectedCase,
-  type ReviewFlowEvaluationIdentity
+  type ReviewFlowEvaluationIdentity,
+  reviewFlowEvaluationPilotTimingReceiptSchema,
 } from "../experiments/lib/review-flow-evaluation-state";
 import { serializePhysicalBlindArtifact } from "../experiments/lib/physical-blind-common";
-import { LlmRequestStartGate } from "../src/llm";
+import { LlmRequestStartGate, maximumExplicitLlmOutputTokens } from "../src/llm";
 
 const temporaryRoots: string[] = [];
 const fixedNow = () => new Date("2026-08-02T12:00:00.000Z");
@@ -3500,7 +3501,7 @@ function createRepresentative3StateFixture(
   configurationOverrides: Partial<
     ReviewFlowEvaluationIdentity["configurationSummary"]
   > = {},
-  selector: "representative3-v1" | "representative3-v2" =
+  selector: "representative3-v1" | "representative3-v2" | "representative3-v3" =
     "representative3-v1"
 ): StateFixture {
   const fixture = createStateFixture(3);
@@ -3530,21 +3531,36 @@ function createRepresentative3StateFixture(
             reviewFlowEvaluationOrderedSelectionSha256(fixture.expectedCases),
           selectedCaseCount: 3
         }
-      : {
-          schemaVersion: 2,
-          selector,
-          selectorIdentity: "review-flow-evaluation-representative3-v2",
-          tieBreakProtocol: "review-flow-representative3-v2-tiebreak",
-          parentDatasetFingerprint: fixture.identity.datasetFingerprint,
-          parentManifestSha256: fixture.identity.manifestSha256,
-          parentBridgeCompletionSha256: "3".repeat(64),
-          parentCaseCount: 32,
-          auditedStrataCounts:
-            reviewFlowEvaluationRepresentative3V2AuditedStrataCounts,
-          orderedSelectionSha256:
-            reviewFlowEvaluationOrderedSelectionSha256(fixture.expectedCases),
-          selectedCaseCount: 3
-        }
+      : selector === "representative3-v3"
+        ? {
+            schemaVersion: 3,
+            selector,
+            selectorIdentity: "review-flow-evaluation-representative3-v3",
+            tieBreakProtocol: "review-flow-representative3-v3-tiebreak",
+            parentDatasetFingerprint: fixture.identity.datasetFingerprint,
+            parentManifestSha256: fixture.identity.manifestSha256,
+            parentBridgeCompletionSha256: "3".repeat(64),
+            parentCaseCount: 32,
+            categoryPattern: "accepted_any_first_rejected_two_distinct",
+            orderedSelectionSha256:
+              reviewFlowEvaluationOrderedSelectionSha256(fixture.expectedCases),
+            selectedCaseCount: 3
+          }
+        : {
+            schemaVersion: 2,
+            selector,
+            selectorIdentity: "review-flow-evaluation-representative3-v2",
+            tieBreakProtocol: "review-flow-representative3-v2-tiebreak",
+            parentDatasetFingerprint: fixture.identity.datasetFingerprint,
+            parentManifestSha256: fixture.identity.manifestSha256,
+            parentBridgeCompletionSha256: "3".repeat(64),
+            parentCaseCount: 32,
+            auditedStrataCounts:
+              reviewFlowEvaluationRepresentative3V2AuditedStrataCounts,
+            orderedSelectionSha256:
+              reviewFlowEvaluationOrderedSelectionSha256(fixture.expectedCases),
+            selectedCaseCount: 3
+          }
   };
   return { ...fixture, identity };
 }
@@ -4412,5 +4428,86 @@ describe("T0145-RED 终端摘要账本完整性", () => {
     expect(summary.failures.some((row) => row.code === "REVIEW_FLOW_ROLE_FAILED")).toBe(true);
     expect(summary.failures.some((row) => row.code === "REVIEW_FLOW_EVALUATION_NOT_STARTED_AFTER_FAILURE")).toBe(true);
     chain.checkpoint.close();
+  });
+});
+
+describe("rep3-v3 minimal acceptance-causal gates", () => {
+  it("C: effective representative3 max duration = 180m (exact 10800000 ms) matches descriptor parity", () => {
+    // 180 分钟 = 180*60*1000 = 10,800,000 ms；这是唯一允许的值，5,400,000 必须被拒。
+    expect(representative3MaximumTotalDurationMs).toBe(10_800_000);
+    expect(
+      reviewFlowEvaluationPilotTimingReceiptSchema.shape.maximumTotalDurationMs
+        .safeParse(10_800_000).success
+    ).toBe(true);
+    expect(
+      reviewFlowEvaluationPilotTimingReceiptSchema.shape.maximumTotalDurationMs
+        .safeParse(5_400_000).success
+    ).toBe(false);
+  });
+
+  it("E: all review-flow slots preserve thinkingRequest=enabled + reasoningEffort=max and no artificial output cap", () => {
+    const source = readFileSync(new URL("../config/models.yaml", import.meta.url), "utf8");
+    const slots = source.split(/model: deepseek-v4-flash/).length - 1;
+    expect(slots).toBeGreaterThanOrEqual(1);
+    expect((source.match(/thinkingRequest: enabled/g) ?? []).length).toBe((source.match(/reasoningEffort: max/g) ?? []).length);
+    expect(source).not.toMatch(/maxOutputTokens|max_tokens/);
+    expect(maximumExplicitLlmOutputTokens).toBe(384_000);
+  });
+
+  it("D: representative3 三题按建模并发度并发 admit（不再 pilot 串行丢弃两题）", async () => {
+    const fixture = createRepresentative3StateFixture({}, "representative3-v3");
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const maxInFlight = { value: 0 };
+    let admitted = 0;
+    const entered = new Set<string>();
+    const leave = deferred<void>();
+    const state = await runReviewFlowEvaluationCases({
+      checkpoint,
+      cases: preparedStateCases(fixture),
+      executor: {
+        async execute(safeId) {
+          entered.add(safeId);
+          admitted += 1;
+          maxInFlight.value = Math.max(maxInFlight.value, admitted);
+          if (maxInFlight.value === 3) leave.resolve();
+          await leave.promise;
+          admitted -= 1;
+          return {
+            status: "complete" as const,
+            projection: projection("approve"),
+            timing: { schemaVersion: 1 as const, firstByteMs: 10, endToEndMs: 20 }
+          };
+        }
+      },
+      concurrency: 3,
+      maxCaseAttempts: 1
+    });
+    expect(entered.size).toBe(3);
+    // 三题同期并发（hidden pilot 串行被移除后最大在飞=3）。
+    expect(maxInFlight.value).toBe(3);
+    expect(state.entries.every((entry) => entry.status === "completed")).toBe(true);
+    checkpoint.close();
+  });
+
+  it("B: representative3 并发失败时逐案例失败/未启动账本 bounded 且不可复用", async () => {
+    const fixture = createRepresentative3StateFixture({}, "representative3-v3");
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const state = await runReviewFlowEvaluationCases({
+      checkpoint,
+      cases: preparedStateCases(fixture),
+      executor: {
+        async execute() {
+          throw Object.assign(new Error("boom"), { code: "REVIEW_FLOW_ROLE_FAILED" });
+        }
+      },
+      concurrency: 3,
+      maxCaseAttempts: 1
+    });
+    // 三题各自有确定终态（failed 或 not_started 都不可能是可复用 completed）。
+    const statuses = state.entries.map((entry) => entry.status);
+    expect(statuses).toEqual(["failed", "failed", "failed"]);
+    expect(statuses.every((status) => status !== "completed")).toBe(true);
+    expect(state.executionSeal?.complete).toBe(false);
+    checkpoint.close();
   });
 });
