@@ -227,7 +227,8 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
     (
       (
         selection.selector !== "representative3-v1" &&
-        selection.selector !== "representative3-v2"
+        selection.selector !== "representative3-v2" &&
+        selection.selector !== "representative3-v3"
       ) ||
       maxCaseAttempts !== 1 ||
       initial.entries.length !== 3 ||

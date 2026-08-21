@@ -72,7 +72,8 @@ export type ReviewFlowEvaluationPurpose = z.infer<
 
 export const reviewFlowEvaluationCaseSelectorSchema = z.enum([
   "representative3-v1",
-  "representative3-v2"
+  "representative3-v2",
+  "representative3-v3"
 ]);
 export type ReviewFlowEvaluationCaseSelector = z.infer<
   typeof reviewFlowEvaluationCaseSelectorSchema
@@ -123,10 +124,31 @@ const reviewFlowEvaluationCaseSelectionV2Schema = z
   })
   .strict();
 
+const reviewFlowEvaluationCaseSelectionV3Schema = z
+  .object({
+    schemaVersion: z.literal(3),
+    selector: z.literal("representative3-v3"),
+    selectorIdentity: z.literal(
+      "review-flow-evaluation-representative3-v3"
+    ),
+    tieBreakProtocol: z.literal(
+      "review-flow-representative3-v3-tiebreak"
+    ),
+    parentDatasetFingerprint: reviewFlowEvaluationDigestSchema,
+    parentManifestSha256: reviewFlowEvaluationDigestSchema,
+    parentBridgeCompletionSha256: reviewFlowEvaluationDigestSchema,
+    parentCaseCount: z.literal(32),
+    categoryPattern: z.literal("accepted_any_first_rejected_two_distinct"),
+    orderedSelectionSha256: reviewFlowEvaluationDigestSchema,
+    selectedCaseCount: z.literal(3)
+  })
+  .strict();
+
 export const reviewFlowEvaluationCaseSelectionSchema =
   z.discriminatedUnion("selector", [
     reviewFlowEvaluationCaseSelectionV1Schema,
-    reviewFlowEvaluationCaseSelectionV2Schema
+    reviewFlowEvaluationCaseSelectionV2Schema,
+    reviewFlowEvaluationCaseSelectionV3Schema
   ]);
 export type ReviewFlowEvaluationCaseSelection = z.infer<
   typeof reviewFlowEvaluationCaseSelectionSchema
@@ -907,6 +929,144 @@ export function reviewFlowEvaluationOrderedSelectionSha256(
     sourceLineageSha256: entry.sourceLineageSha256,
     contentSha256: entry.contentSha256
   })));
+}
+
+/**
+ * representative3-v3：与 v1/v2 完全不相交的 successor 冒烟选择。
+ * 只在 frozen32 development_scored 上运行，并先由同一数据集确定性重算旧 v1+v2
+ * 全集（不引用任何私有题号），再做三槽选择：1 个任意类型的 accepted 控制 +
+ * 2 个 rejected（submit_answer 品味关切无技术理由、traditional 无观察理由）。
+ * 任一槽不足、重叠、平局碰撞或类别/数量不符都 fail closed；不保存、不输出
+ * 候选题面或私有标识。
+ */
+export function selectReviewFlowEvaluationRepresentative3V3(
+  dataset: ReviewFlowEvaluationDatasetBundle
+): ReviewFlowEvaluationSelectedDatasetBundle {
+  const oldUnionV2 = selectReviewFlowEvaluationRepresentative3V2(dataset);
+  const excluded = new Set(
+    oldUnionV2.cases.map((entry) => entry.safeId)
+  );
+  const strata = [
+    {
+      name: "accepted_any",
+      expectedCount: 1,
+      accepts: (entry: ReviewFlowEvaluationDatasetCase) =>
+        entry.gold?.evaluationScope === "verdict_and_taste" &&
+        entry.gold.historicalOutcome === "accepted"
+    },
+    {
+      name: "rejected_submit_answer_taste_no_technical",
+      expectedCount: 1,
+      accepts: (entry: ReviewFlowEvaluationDatasetCase) =>
+        entry.task.problem.type === "submit_answer" &&
+        entry.gold?.evaluationScope === "verdict_and_taste" &&
+        entry.gold.historicalOutcome === "rejected" &&
+        entry.gold.observedHistoricalTechnicalReasons.length === 0 &&
+        entry.gold.observedHistoricalTasteReasons.some(
+          (reason) => reason.direction === "concern"
+        )
+    },
+    {
+      name: "rejected_traditional_no_observed_reasons",
+      expectedCount: 1,
+      accepts: (entry: ReviewFlowEvaluationDatasetCase) =>
+        entry.task.problem.type === "traditional" &&
+        entry.gold?.evaluationScope === "verdict_and_taste" &&
+        entry.gold.historicalOutcome === "rejected" &&
+        entry.gold.observedHistoricalTechnicalReasons.length === 0 &&
+        entry.gold.observedHistoricalTasteReasons.length === 0
+    }
+  ] as const;
+  if (
+    dataset.cases.some(
+      (entry) =>
+        strata.filter((stratum) => stratum.accepts(entry) && !excluded.has(entry.safeId)).length > 1
+    )
+  ) {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_V3_STRATA_OVERLAP"
+    );
+  }
+  const rankedStrata = strata.map((stratum) => {
+    const ranked = dataset.cases
+      .filter((entry) => !excluded.has(entry.safeId) && stratum.accepts(entry))
+      .map((entry) => ({
+        entry,
+        rank: hashCanonicalValue({
+          selectorIdentity: "review-flow-evaluation-representative3-v3",
+          stratum: stratum.name,
+          parentDatasetFingerprint: dataset.datasetFingerprint,
+          committedCaseSha256: hashCanonicalValue({
+            safeId: entry.safeId,
+            subjectId: entry.subjectId,
+            originalAnklangResponseSha256:
+              entry.originalAnklangResponseSha256
+          }),
+          committedSourceSha256: entry.sourceLineageSha256,
+          committedContentSha256: entry.contentSha256
+        })
+      }))
+      .sort((left, right) => left.rank.localeCompare(right.rank));
+    if (ranked.length < stratum.expectedCount) {
+      throw new ReviewFlowEvaluationDatasetError(
+        "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_V3_AUDITED_COUNTS_CHANGED"
+      );
+    }
+    return ranked;
+  });
+  const allTieDigests = rankedStrata.flatMap((ranked) =>
+    ranked.map((candidate) => candidate.rank)
+  );
+  if (new Set(allTieDigests).size !== allTieDigests.length) {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_V3_TIE_DIGEST_COLLISION"
+    );
+  }
+  const selectedFromEach = rankedStrata.map((ranked) => ranked[0]!.entry);
+  const selected = [...selectedFromEach]
+    .map((entry) => entry)
+    .sort((left, right) => left.safeId.localeCompare(right.safeId));
+  const outcomes = selected.map((entry) =>
+    entry.gold?.evaluationScope === "verdict_and_taste"
+      ? entry.gold.historicalOutcome
+      : null
+  );
+  if (
+    new Set(selected.map((entry) => entry.safeId)).size !== 3 ||
+    new Set(selected.map((entry) => entry.task.problem.type)).size < 2 ||
+    outcomes.filter((value) => value === "accepted").length !== 1 ||
+    outcomes.filter((value) => value === "rejected").length !== 2
+  ) {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_V3_SELECTION_INVALID"
+    );
+  }
+  for (const entry of oldUnionV2.cases) {
+    if (selected.some((candidate) => candidate.safeId === entry.safeId)) {
+      throw new ReviewFlowEvaluationDatasetError(
+        "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_V3_OLD_INTERSECTION"
+      );
+    }
+  }
+  const caseSelection = reviewFlowEvaluationCaseSelectionSchema.parse({
+    schemaVersion: 3,
+    selector: "representative3-v3",
+    selectorIdentity: "review-flow-evaluation-representative3-v3",
+    tieBreakProtocol: "review-flow-representative3-v3-tiebreak",
+    parentDatasetFingerprint: dataset.datasetFingerprint,
+    parentManifestSha256: dataset.manifestSha256,
+    parentBridgeCompletionSha256: dataset.bridgeCompletionSha256,
+    parentCaseCount: 32,
+    categoryPattern: "accepted_any_first_rejected_two_distinct",
+    orderedSelectionSha256:
+      reviewFlowEvaluationOrderedSelectionSha256(selected),
+    selectedCaseCount: 3
+  });
+  return deepFreezePhysicalBlind({
+    ...dataset,
+    caseSelection,
+    cases: selected
+  });
 }
 
 export class ReviewFlowEvaluationDatasetError extends Error {

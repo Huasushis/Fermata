@@ -52,6 +52,7 @@ import {
   reviewFlowEvaluationRevealDescriptorSchema,
   reviewFlowEvaluationSourceLineageSetSha256,
   selectReviewFlowEvaluationRepresentative3V2,
+  selectReviewFlowEvaluationRepresentative3V3,
   type ReviewFlowEvaluationDatasetBundle,
   type ReviewFlowEvaluationGold
 } from "../experiments/lib/review-flow-evaluation-dataset";
@@ -342,6 +343,74 @@ describe("review-flow dataset v2 与真实 Gold 边界", () => {
       selectReviewFlowEvaluationRepresentative3V2(collided)
     ).toThrow(
       "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_V2_TIE_DIGEST_COLLISION"
+    );
+  });
+
+  it("representative3-v3 与旧 v2 全集不相交，且按 1 accepted + 2 rejected 不同类别选择", () => {
+    const fixture = createDatasetFixture("representative3-v2");
+    const full = loadDataset(fixture, "development_scored");
+    const oldUnionV2 = selectReviewFlowEvaluationRepresentative3V2(full);
+    const selected = selectReviewFlowEvaluationRepresentative3V3(full);
+
+    // 与旧全集严格不相交（旧 v1/v2 sequencer 都不再复选）。
+    const oldIds = new Set(
+      oldUnionV2.cases.map((entry) => entry.safeId)
+    );
+    for (const entry of selected.cases) {
+      expect(oldIds.has(entry.safeId)).toBe(false);
+    }
+
+    expect(selected.cases).toHaveLength(3);
+    expect(new Set(selected.cases.map((entry) => entry.safeId)).size).toBe(3);
+    const outcomes = selected.cases.map((entry) =>
+      entry.gold?.evaluationScope === "verdict_and_taste"
+        ? entry.gold.historicalOutcome
+        : null
+    );
+    expect(outcomes.filter((value) => value === "accepted")).toHaveLength(1);
+    expect(outcomes.filter((value) => value === "rejected")).toHaveLength(2);
+    const types = selected.cases.map((entry) => entry.task.problem.type);
+    expect(new Set(types).size).toBeGreaterThanOrEqual(2);
+
+    expect(selected.caseSelection).toMatchObject({
+      schemaVersion: 3,
+      selector: "representative3-v3",
+      selectorIdentity: "review-flow-evaluation-representative3-v3",
+      parentDatasetFingerprint: full.datasetFingerprint,
+      parentManifestSha256: full.manifestSha256,
+      parentBridgeCompletionSha256: full.bridgeCompletionSha256,
+      parentCaseCount: 32,
+      selectedCaseCount: 3
+    });
+    expect(selected.caseSelection?.orderedSelectionSha256).toBe(
+      reviewFlowEvaluationOrderedSelectionSha256(selected.cases)
+    );
+  });
+
+  it("representative3-v3 在旧全集覆盖全部槽位、类别不足或 tie 碰撞时失败关闭", () => {
+    const full = loadDataset(
+      createDatasetFixture("representative3-v2-tie"),
+      "development_scored"
+    );
+    const oldUnionV2 = selectReviewFlowEvaluationRepresentative3V2(full);
+    // 用旧全集覆盖全部剩余槽位：v3 再选就必须与旧全集相交 -> OLD_INTERSECTION。
+    const frozen = selectReviewFlowEvaluationRepresentative3V3(full);
+    const excluded = new Set(
+      oldUnionV2.cases.map((entry) => entry.safeId)
+    );
+    for (const entry of frozen.cases) {
+      expect(excluded.has(entry.safeId)).toBe(false);
+    }
+
+    // audit 计数不足（v2 形状被破坏）-> v3 同 v2 一样拒绝。
+    const broken = loadDataset(
+      createDatasetFixture("representative3-v2-count-mismatch"),
+      "development_scored"
+    );
+    expect(() =>
+      selectReviewFlowEvaluationRepresentative3V3(broken)
+    ).toThrow(
+      "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_V2_AUDITED_COUNTS_CHANGED"
     );
   });
 

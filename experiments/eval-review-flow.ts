@@ -36,6 +36,7 @@ import {
   reviewFlowEvaluationPurposeSchema,
   selectReviewFlowEvaluationRepresentative3,
   selectReviewFlowEvaluationRepresentative3V2,
+  selectReviewFlowEvaluationRepresentative3V3,
   type ReviewFlowEvaluationCaseSelector,
   type ReviewFlowEvaluationPurpose
 } from "./lib/review-flow-evaluation-dataset";
@@ -364,9 +365,13 @@ export function loadDevelopmentDatasetAfterUsageRegistration(input: {
   if (input.caseSelector === "representative3-v1") {
     return selectReviewFlowEvaluationRepresentative3(scoredDataset);
   }
-  return input.caseSelector === "representative3-v2"
-    ? selectReviewFlowEvaluationRepresentative3V2(scoredDataset)
-    : scoredDataset;
+  if (input.caseSelector === "representative3-v2") {
+    return selectReviewFlowEvaluationRepresentative3V2(scoredDataset);
+  }
+  if (input.caseSelector === "representative3-v3") {
+    return selectReviewFlowEvaluationRepresentative3V3(scoredDataset);
+  }
+  return scoredDataset;
 }
 
 async function runPredictionOrDevelopment(input: {
