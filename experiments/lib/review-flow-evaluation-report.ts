@@ -202,7 +202,26 @@ const caseCountsSchema = z
     pending: z.number().int().nonnegative(),
     active: z.number().int().nonnegative(),
     completed: z.number().int().nonnegative(),
-    failed: z.number().int().nonnegative()
+    failed: z.number().int().nonnegative(),
+    notStarted: z.number().int().nonnegative(),
+    skipped: z.number().int().nonnegative(),
+    cancelled: z.number().int().nonnegative(),
+    http499: z.number().int().nonnegative(),
+    unaccounted: z.number().int().nonnegative(),
+    expectedEqualsTerminal: z.boolean()
+  })
+  .strict();
+
+/** 全部案例/角色/尝试的耐久账本；任一字段缺失都必须让摘要不完整。 */
+const accountingSchema = z
+  .object({
+    logicalRequests: z.number().int().nonnegative(),
+    transportAttempts: z.number().int().nonnegative(),
+    receivedByteResponses: z.number().int().nonnegative(),
+    retries: z.number().int().nonnegative(),
+    schemaErrors: z.number().int().nonnegative(),
+    formatterCorrections: z.number().int().nonnegative(),
+    repairCount: z.number().int().nonnegative()
   })
   .strict();
 
@@ -257,6 +276,7 @@ export const reviewFlowEvaluationReportSummarySchema = z
     executionIdentity: reviewFlowEvaluationIdentitySchema,
     executionCompletionFingerprint: digestSchema,
     caseCounts: caseCountsSchema,
+    accounting: accountingSchema,
     terminationSignal: z.enum(["SIGINT", "SIGTERM", "SIGHUP"]).nullable(),
     receiptCoverage: z
       .object({
@@ -299,6 +319,12 @@ export const reviewFlowEvaluationReportSummarySchema = z
           : "evaluation_incomplete") ||
       summary.receiptCoverage.completedCaseCount !== summary.caseCounts.completed ||
       summary.caseResults.length !== summary.caseCounts.expected ||
+      summary.caseCounts.expectedEqualsTerminal !== true ||
+      summary.caseCounts.unaccounted !== 0 ||
+      summary.accounting.logicalRequests <
+        summary.accounting.receivedByteResponses ||
+      summary.accounting.transportAttempts <
+        summary.accounting.receivedByteResponses ||
       (summary.dataset.purpose === "development" &&
         summary.dataset.holdoutIdentity !== null) ||
       (summary.dataset.purpose === "holdout" &&
@@ -402,12 +428,81 @@ export function buildReviewFlowEvaluationReport(input: {
       entries.get(evaluationCase.safeId)!
     )
   );
+  const terminalStatusCounts = {
+    pending: 0,
+    active: 0,
+    completed: 0,
+    failed: 0,
+    cancelled: 0,
+    http499: 0
+  };
+  const accounting = {
+    logicalRequests: 0,
+    transportAttempts: 0,
+    receivedByteResponses: 0,
+    retries: 0,
+    schemaErrors: 0,
+    formatterCorrections: 0,
+    repairCount: 0
+  };
+  for (const entry of input.checkpoint.entries) {
+    if (entry.status === "completed") {
+      terminalStatusCounts.completed += 1;
+      for (const receipt of entry.projection.roleReceipts) {
+        accounting.logicalRequests += receipt.requestCount;
+        accounting.transportAttempts += receipt.transportAttemptCount;
+        accounting.receivedByteResponses += receipt.responses.length;
+      }
+      continue;
+    }
+    if (entry.status === "failed") {
+      terminalStatusCounts.failed += 1;
+      const httpStatus = entry.failure.httpStatus;
+      if (httpStatus === 499) terminalStatusCounts.http499 += 1;
+      if (entry.failure.failureKind === "cancelled") {
+        terminalStatusCounts.cancelled += 1;
+      }
+      for (const roleFailure of entry.failure.failedRoles) {
+        accounting.logicalRequests += roleFailure.requestCount;
+        accounting.transportAttempts += roleFailure.transportAttemptCount;
+        accounting.receivedByteResponses += roleFailure.completedResponseCount;
+        accounting.retries += Math.max(
+          0,
+          roleFailure.transportAttemptCount - roleFailure.requestCount
+        );
+        if (roleFailure.failureKind === "schema_output") {
+          accounting.schemaErrors += 1;
+        }
+      }
+      continue;
+    }
+    if (entry.status === "active") terminalStatusCounts.active += 1;
+    if (entry.status === "pending") terminalStatusCounts.pending += 1;
+  }
   const counts = {
     expected: input.checkpoint.entries.length,
-    pending: input.checkpoint.entries.filter((entry) => entry.status === "pending").length,
-    active: input.checkpoint.entries.filter((entry) => entry.status === "active").length,
-    completed: input.checkpoint.entries.filter((entry) => entry.status === "completed").length,
-    failed: input.checkpoint.entries.filter((entry) => entry.status === "failed").length
+    pending: terminalStatusCounts.pending,
+    active: terminalStatusCounts.active,
+    completed: terminalStatusCounts.completed,
+    failed: terminalStatusCounts.failed,
+    notStarted: terminalStatusCounts.pending,
+    skipped: 0,
+    cancelled: terminalStatusCounts.cancelled,
+    http499: terminalStatusCounts.http499,
+    unaccounted: Math.max(
+      0,
+      input.checkpoint.entries.length -
+        (terminalStatusCounts.pending +
+          terminalStatusCounts.active +
+          terminalStatusCounts.completed +
+          terminalStatusCounts.failed)
+    ),
+    expectedEqualsTerminal:
+      terminalStatusCounts.pending +
+        terminalStatusCounts.active +
+        terminalStatusCounts.completed +
+        terminalStatusCounts.failed ===
+      input.checkpoint.entries.length
   };
   const complete = input.checkpoint.executionSeal!.complete;
   const completed = completedProjectionMap(input.checkpoint.entries);
@@ -434,6 +529,7 @@ export function buildReviewFlowEvaluationReport(input: {
     executionCompletionFingerprint:
       input.checkpoint.executionSeal!.completionFingerprint,
     caseCounts: counts,
+    accounting,
     terminationSignal: input.checkpoint.termination?.signal ?? null,
     receiptCoverage: {
       completedCaseCount: counts.completed,

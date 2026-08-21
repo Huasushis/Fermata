@@ -4276,3 +4276,72 @@ function narrowEnvironment(): Record<string, string> {
     AETHER_API_KEY: "aether-secret-key"
   };
 }
+
+describe("T0145-RED 终端摘要账本完整性", () => {
+  it("部分角色失败+未启动案例必须暴露逐案例/逐角色/逐尝试账本，缺失字段 completeness=false", () => {
+    const fixture = createDatasetFixture("red-accounting");
+    const dataset = loadDataset(fixture, "development_scored");
+    const chain = createDatasetCheckpoint(
+      fixture,
+      dataset,
+      "baseline",
+      "dev-red-accounting",
+      null,
+      "dev-red-accounting"
+    );
+    chain.checkpoint.bindGlobalClaim("c".repeat(64));
+    // 单例部分角色失败：failedRoles 持久化 requestCount=2 / transportAttemptCount=2 / completedResponseCount=1
+    chain.checkpoint.markActive("case-0001");
+    chain.checkpoint.markFailed("case-0001", {
+      ...fixedFailure("REVIEW_FLOW_ROLE_FAILED", 200),
+      completedRoleCount: 2,
+      failedRoleCount: 1,
+      failedRoles: [{
+        role: "critic",
+        failureKind: "protocol",
+        requestCount: 2,
+        transportAttemptCount: 2,
+        completedResponseCount: 1
+      }]
+    });
+    const state = chain.checkpoint.sealExecution();
+    const report = buildReviewFlowEvaluationReport({ dataset, checkpoint: state });
+    const summary = report.summary as unknown as {
+      caseCounts: Record<string, number>;
+      accounting: {
+        logicalRequests: number;
+        transportAttempts: number;
+        receivedByteResponses: number;
+        retries: number;
+        schemaErrors: number;
+        formatterCorrections: number;
+        repairCount: number;
+      };
+      complete: boolean;
+      failures: Array<{ code: string; count: number }>;
+    };
+    // 逐案例状态账本必须一分不差
+    expect(summary.caseCounts.completed).toBe(0);
+    expect(summary.caseCounts.failed).toBe(1);
+    expect(summary.caseCounts.notStarted).toBe(31);
+    expect(summary.caseCounts.skipped).toBe(0);
+    expect(summary.caseCounts.cancelled).toBe(0);
+    expect(summary.caseCounts.http499).toBe(0);
+    expect(summary.caseCounts.unaccounted).toBe(0);
+    // 逐角色/逐尝试账本：一次部分角色失败精确暴露 2 次逻辑请求 / 2 次传输 / 1 次收到字节响应 / 重试 / schema / formatter / repair
+    expect(summary.accounting).toEqual({
+      logicalRequests: 2,
+      transportAttempts: 2,
+      receivedByteResponses: 1,
+      retries: 0,
+      schemaErrors: 0,
+      formatterCorrections: 0,
+      repairCount: 0
+    });
+    // 任一账本字段缺失 => completeness=false，且 failures 必须逐项列出
+    expect(summary.complete).toBe(false);
+    expect(summary.failures.some((row) => row.code === "REVIEW_FLOW_ROLE_FAILED")).toBe(true);
+    expect(summary.failures.some((row) => row.code === "REVIEW_FLOW_EVALUATION_NOT_STARTED_AFTER_FAILURE")).toBe(true);
+    chain.checkpoint.close();
+  });
+});

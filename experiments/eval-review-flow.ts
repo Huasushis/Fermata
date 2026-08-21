@@ -545,6 +545,10 @@ async function runPredictionOrDevelopment(input: {
       process.stdout.write(
         `11 角色 development 实验已私有封存：标签 ${options.label}，完成 ${report.summary.caseCounts.completed}/${report.summary.caseCounts.expected}，完整=${report.summary.complete ? "是" : "否"}，可用资格=否。\n`
       );
+      if (!report.summary.complete) {
+        // 不完整链永久封存不等于成功：账本缺失/失败/未启动都必须让 CLI 以非零退出。
+        process.exitCode = 1;
+      }
     } else if (state.executionSeal?.complete === true && holdoutSlot !== null) {
       const completion = registry.completeHoldoutPrediction({
         state,
@@ -563,6 +567,9 @@ async function runPredictionOrDevelopment(input: {
       process.stdout.write(
         `11 角色 holdout 预测链不完整并已永久封存：标签 ${options.label}；未读取 Gold、不可 reveal、可用资格=否。\n`
       );
+      // 不完整 holdout 链同样必须以非零退出，避免 CLI"干净成功"掩盖不完整
+      // （与 development 分支一致，fail-closed 退出契约）。
+      process.exitCode = 1;
     }
     if (state.termination !== null) {
       throw new Error("REVIEW_FLOW_EVALUATION_TERMINATED_AFTER_SEAL");
