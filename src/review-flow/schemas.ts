@@ -518,17 +518,41 @@ export const originalityPayloadSchema = z
   .strict();
 export type OriginalityPayload = z.infer<typeof originalityPayloadSchema>;
 
+function rejectDuplicateTagIds(
+  payload: { readonly tagIds: readonly string[] },
+  context: z.RefinementCtx
+): void {
+  if (new Set(payload.tagIds).size !== payload.tagIds.length) {
+    context.addIssue({ code: "custom", path: ["tagIds"], message: "标签不能重复。" });
+  }
+}
+
 export const tagsPayloadSchema = z
   .object({
     tagIds: z.array(z.string().min(1).max(120)).min(1).max(30),
     rationale: shortTextSchema
   })
   .strict()
-  .superRefine((payload, context) => {
-    if (new Set(payload.tagIds).size !== payload.tagIds.length) {
-      context.addIssue({ code: "custom", path: ["tagIds"], message: "标签不能重复。" });
-    }
-  });
+  .superRefine(rejectDuplicateTagIds);
+
+export function createTagsPayloadSchema(
+  activeTagIds: readonly string[]
+): z.ZodType<TagsPayload> {
+  const canonicalTagIds = [...new Set(activeTagIds)];
+  if (canonicalTagIds.length === 0) {
+    throw new Error("REVIEW_FLOW_TAG_CATALOG_EMPTY");
+  }
+  return z
+    .object({
+      tagIds: z
+        .array(z.enum(canonicalTagIds as [string, ...string[]]))
+        .min(1)
+        .max(Math.min(30, canonicalTagIds.length)),
+      rationale: shortTextSchema
+    })
+    .strict()
+    .superRefine(rejectDuplicateTagIds);
+}
 export type TagsPayload = z.infer<typeof tagsPayloadSchema>;
 
 export const criticPayloadSchema = z

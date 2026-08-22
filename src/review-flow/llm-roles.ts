@@ -5,6 +5,7 @@ import {
   chatCompleteTwoRoundJsonWithReceipt,
   llmTransportProtocolVersion,
   maximumExplicitLlmOutputTokens,
+  serializeTargetJsonSchema,
   type ChatMessage,
   type LlmJsonCompletionReceipt
 } from "../llm";
@@ -35,6 +36,7 @@ import {
   solutionAnalystPayloadSchema,
   solverPayloadSchema,
   tagsPayloadSchema,
+  createTagsPayloadSchema,
   technicalCheckStatusSchema,
   trustedRoleExecutionResultSchema,
   type ReviewFlowRole,
@@ -250,12 +252,25 @@ export function createReviewFlowLlmBundle(input: {
       return trustedRoleExecution(data, receipt);
     },
     tags: async (view) => {
+      const activeTagIds = [
+        ...new Set(
+          view.tagCatalog
+            .filter((tag) => tag.active === true)
+            .map((tag) => tag.id)
+        )
+      ];
+      const schema = createTagsPayloadSchema(activeTagIds);
+      const serializedSchema = serializeTargetJsonSchema(schema);
       const { data, receipt } = await chatCompleteTwoRoundJsonWithReceipt(
         models.tags.credentials,
         models.tags.spec,
         buildTagsSemanticMessages(view),
-        buildTagsFormatterMessages,
-        tagsPayloadSchema,
+        (semanticOutput, semanticReasoning) => buildTagsFormatterMessages(
+          semanticOutput,
+          semanticReasoning,
+          serializedSchema
+        ),
+        schema,
         models.tags.runtime
       );
       return trustedRoleExecution(data, receipt);
@@ -538,7 +553,8 @@ export function buildTagsSemanticMessages(
  */
 export function buildTagsFormatterMessages(
   semanticOutput: string,
-  _semanticReasoning: string | null
+  _semanticReasoning: string | null,
+  serializedSchema: string
 ): ChatMessage[] {
   return [
     {
@@ -547,7 +563,13 @@ export function buildTagsFormatterMessages(
     },
     {
       role: "user",
-      content: `以下是标签整理结果，请转换为严格 JSON 对象：tagIds（字符串数组，至少一项、去重，只能是整理结果里明确选定的目录 id）、rationale（字符串，选择理由）。不要改变任何语义判断，只做格式转换。\n\n${semanticOutput}`
+      content: [
+        "以下是标签整理结果，请转换为严格 JSON 对象：tagIds（字符串数组，至少一项、去重，只能是整理结果里明确选定的目录 id）、rationale（字符串，选择理由）。",
+        "目标 JSON Schema 的 tagIds.items.enum 是本题当前启用目录 ID；只能原样使用其中的 ID，不得输出标签名称或分类名称：",
+        serializedSchema,
+        "不要改变任何语义判断，只做格式转换。",
+        semanticOutput
+      ].join("\n\n")
     }
   ];
 }

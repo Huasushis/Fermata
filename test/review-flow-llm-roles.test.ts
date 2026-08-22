@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ZodType } from "zod";
-import { maximumExplicitLlmOutputTokens } from "../src/llm";
+import {
+  maximumExplicitLlmOutputTokens,
+  serializeTargetJsonSchema
+} from "../src/llm";
 import type { PipelineModelConfig } from "../src/pipelines/types";
 import type { ProductionReviewGrant } from "../src/production-eligibility";
 import {
@@ -42,6 +45,7 @@ import {
   solutionAnalystPayloadSchema,
   solverPayloadSchema,
   tagsPayloadSchema,
+  createTagsPayloadSchema,
   trustedRoleExecutionResultSchema,
   technicalAuditPayloadSchema,
   type ReviewFlowRole
@@ -533,6 +537,38 @@ describe("历史人工标准驱动的多角色提示词", () => {
       }
     }
   });
+  it("标签 schema 只接受当前目录 id 并生成去重 enum", () => {
+    expect(() => createTagsPayloadSchema([])).toThrow("REVIEW_FLOW_TAG_CATALOG_EMPTY");
+    const schema = createTagsPayloadSchema([
+      "active.alpha",
+      "active.beta",
+      "active.alpha"
+    ]);
+    const schemaJson = JSON.parse(serializeTargetJsonSchema(schema)) as {
+      properties: {
+        tagIds: {
+          minItems: number;
+          maxItems: number;
+          items: { enum: string[] };
+        };
+      };
+    };
+    expect(schemaJson.properties.tagIds.items.enum).toEqual([
+      "active.alpha",
+      "active.beta"
+    ]);
+    expect(schemaJson.properties.tagIds.minItems).toBe(1);
+    expect(schemaJson.properties.tagIds.maxItems).toBe(2);
+    expect(schema.safeParse({
+      tagIds: ["outside.catalog"],
+      rationale: "synthetic"
+    }).success).toBe(false);
+    expect(schema.safeParse({
+      tagIds: ["active.beta"],
+      rationale: "synthetic"
+    }).success).toBe(true);
+  });
+
 
 
   it("所有角色都经过同一提示注入边界，待审材料中的伪指令只能留在 user JSON", () => {
