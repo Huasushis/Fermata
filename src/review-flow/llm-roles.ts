@@ -749,8 +749,9 @@ export function buildOriginalityFormatterMessages(
       role: "system",
       content: guardedSystemPrompt("originality", [
         "上一条消息是原创性分析者用自然语言给出的结论。你只把该结论转换为严格 JSON，不添加、不修改任何",
-        "判断，不引入语义输出中没有的事实。JSON 字段：originalityLevel、sameProblemAsExisting、",
-        "highestSimilarity、evidenceIds、rationale。evidenceIds 只包含语义结论中真正引用过的证据。",
+        "判断，不引入语义输出中没有的事实。originalityLevel 必须直接输出为 JSON 整数 1、2、3、4 或 5，不得输出中文词语或字符串。",
+        "JSON 字段：originalityLevel、sameProblemAsExisting、highestSimilarity、",
+        "evidenceIds、rationale。evidenceIds 只包含语义结论中真正引用过的证据。",
         "先输出序列化后的 JSON 对象本身，不要先写分析、复述或解释；序列化结果控制在 3000 字符以内。"
       ].join(""))
     },

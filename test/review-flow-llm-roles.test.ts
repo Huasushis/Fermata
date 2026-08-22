@@ -537,6 +537,52 @@ describe("历史人工标准驱动的多角色提示词", () => {
       }
     }
   });
+  it("原创性格式轮明确要求 1 到 5 的 JSON 整数，且保留严格 schema", () => {
+    const valid = {
+      originalityLevel: 4,
+      sameProblemAsExisting: false,
+      highestSimilarity: 0,
+      evidenceIds: [],
+      rationale: "合成原创性判断。"
+    };
+    const formatterSystem = buildOriginalityFormatterMessages(
+      "SYNTHETIC_SEMANTIC_CONCLUSION",
+      null
+    )[0]!.content;
+    expect(formatterSystem).toContain(
+      "originalityLevel 必须直接输出为 JSON 整数 1、2、3、4 或 5"
+    );
+    expect(originalityPayloadSchema.safeParse(valid).success).toBe(true);
+    for (const originalityLevel of ["四", 0, 1.5, 6]) {
+      expect(
+        originalityPayloadSchema.safeParse({ ...valid, originalityLevel }).success
+      ).toBe(false);
+    }
+    expect(
+      originalityPayloadSchema.safeParse({
+        ...valid,
+        sameProblemAsExisting: "否"
+      }).success
+    ).toBe(false);
+    expect(
+      originalityPayloadSchema.safeParse({
+        ...valid,
+        highestSimilarity: 1.1
+      }).success
+    ).toBe(false);
+    expect(
+      originalityPayloadSchema.safeParse({
+        ...valid,
+        evidenceIds: [""]
+      }).success
+    ).toBe(false);
+    expect(
+      originalityPayloadSchema.safeParse({
+        ...valid,
+        rationale: ""
+      }).success
+    ).toBe(false);
+  });
   it("标签 schema 只接受当前目录 id 并生成去重 enum", () => {
     expect(() => createTagsPayloadSchema([])).toThrow("REVIEW_FLOW_TAG_CATALOG_EMPTY");
     const schema = createTagsPayloadSchema([
