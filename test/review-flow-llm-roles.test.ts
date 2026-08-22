@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ZodType } from "zod";
+import { maximumExplicitLlmOutputTokens } from "../src/llm";
 import type { PipelineModelConfig } from "../src/pipelines/types";
 import type { ProductionReviewGrant } from "../src/production-eligibility";
 import {
@@ -441,6 +442,57 @@ describe("历史人工标准驱动的多角色提示词", () => {
     );
     expect(bodies).toHaveLength(2);
   });
+  it("技术核验与题解分析的 DeepSeek max 轮显式发送提供商输出上限", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const fetchImpl = vi.fn(async (
+      _url: string | URL | Request,
+      init?: RequestInit
+    ) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      const payload = bodies.length <= 2
+        ? wireRolePayloads.technical_auditor
+        : wireRolePayloads.solution_analyst;
+      return new Response(JSON.stringify({
+        choices: [{
+          message: { content: JSON.stringify(payload) },
+          finish_reason: "stop"
+        }]
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    const baseModels = modelConfigs();
+    const maxModel = (model: PipelineModelConfig): PipelineModelConfig => ({
+      ...model,
+      spec: {
+        ...model.spec,
+        model: "deepseek-v4-flash",
+        thinkingRequest: "enabled",
+        reasoningEffort: "max"
+      },
+      runtime: { ...model.runtime, fetch: fetchImpl }
+    });
+    const models = {
+      ...baseModels,
+      technical_auditor: maxModel(baseModels.technical_auditor),
+      solution_analyst: maxModel(baseModels.solution_analyst)
+    } as ReviewFlowModelConfigs;
+    const bundle = createReviewFlowLlmBundle({
+      models,
+      difficultyAnchors: [],
+      profileName: "synthetic-profile",
+      experimentVersion: "synthetic-experiment",
+      engineBuildFingerprint: "c".repeat(64),
+      productionGrant: null
+    });
+
+    const views = flowViews();
+    await bundle.roles.technicalAuditor(views.technical);
+    await bundle.roles.solutionAnalyst(views.solutionAnalyst);
+    expect(bodies).toHaveLength(4);
+    expect(bodies.every((body) => body.max_tokens === maximumExplicitLlmOutputTokens)).toBe(true);
+    expect(bodies.filter((body) => body.thinking !== undefined)).toHaveLength(2);
+  });
+
 
 
   it("命题品味与 ICPC 适配分别覆盖历史通过/否决的实际区分轴", () => {
@@ -810,7 +862,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
     )).toThrow("REVIEW_FLOW_PRODUCTION_GRANT_INVALID");
   });
 
-  it("legacy 11-role adapter omits outbound cap fields for every default request", async () => {
+  it("legacy 11-role adapter sends the provider cap for JSON roles without alias fields", async () => {
     const roleByModel = new Map<string, ReviewFlowRole>(
       reviewFlowRoleSchema.options.map((role) => [`cap-test-${role}`, role] as const)
     );
@@ -879,8 +931,10 @@ describe("历史人工标准驱动的多角色提示词", () => {
     }
     expect(fetchImpl).toHaveBeenCalledTimes(reviewFlowRoleSchema.options.length + 5);
     expect(observedBodies).toHaveLength(reviewFlowRoleSchema.options.length + 5);
+    expect(observedBodies.filter(
+      (body) => body.max_tokens === maximumExplicitLlmOutputTokens
+    )).toHaveLength(7);
     for (const body of observedBodies) {
-      expect(body).not.toHaveProperty("max_tokens");
       expect(body).not.toHaveProperty("max_completion_tokens");
       expect(body).not.toHaveProperty("maxOutputTokens");
     }

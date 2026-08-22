@@ -4,6 +4,7 @@ import {
   chatCompleteStagedSolverJsonWithReceipt,
   chatCompleteTwoRoundJsonWithReceipt,
   llmTransportProtocolVersion,
+  maximumExplicitLlmOutputTokens,
   type ChatMessage,
   type LlmJsonCompletionReceipt
 } from "../llm";
@@ -840,7 +841,8 @@ function runJsonFormatted<T>(
       }
     ],
     schema,
-    model.runtime
+    model.runtime,
+    { maxOutputTokens: maximumExplicitLlmOutputTokens }
   );
 }
 
@@ -863,7 +865,8 @@ async function runJson<T>(
     model.spec,
     [...messages],
     schema,
-    model.runtime
+    model.runtime,
+    { maxOutputTokens: maximumExplicitLlmOutputTokens }
   );
 }
 
