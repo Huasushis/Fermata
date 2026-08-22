@@ -358,6 +358,27 @@ describe("历史人工标准驱动的多角色提示词", () => {
     expect(messages[0]!.content).toContain("不能声称静态核对、编译、运行");
   });
 
+  it("技术核验提示词逐字给出严格 JSON 的字段名，模型不能靠猜键名", () => {
+    // repop v6 first cause：technicalModelPayloadSchema 是 .strict() 精确键名，
+    // 但提示词只写“四项 check 使用 verified/concern/not_assessed”，从不给出
+    // statementSolutionConsistency/judgeability/sampleConsistency/
+    // constraintSufficiency 这些字段名，模型自造键名必然被 .strict() 拒绝，
+    // 表现为 HTTP200 + 三次完整响应却全部 schema_output。其余角色（editorial、
+    // originality、contest_fit、tags）的提示词都逐字枚举了字段名。
+    const { technical } = flowViews();
+    const system = buildTechnicalAuditorMessages(technical)[0]!.content;
+    for (const key of [
+      "statementSolutionConsistency",
+      "judgeability",
+      "sampleConsistency",
+      "constraintSufficiency",
+      "concerns",
+      "rationale"
+    ]) {
+      expect(system).toContain(key);
+    }
+  });
+
   it("命题品味与 ICPC 适配分别覆盖历史通过/否决的实际区分轴", () => {
     const { editorial, contestFit } = flowViews();
     const editorialSystem = buildEditorialJudgeMessages(editorial)[0]!.content;

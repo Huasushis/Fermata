@@ -581,7 +581,9 @@ export function buildTechnicalAuditorMessages(
         "你没有代码执行环境，而且参考实现正文不会发送给外部模型。即使材料里另附参考实现，也只能知道其是否存在、",
         "语言和长度，不能声称静态核对、编译、运行、通过样例或读到了服务端 EOF。正确性是底线核验，不是命题",
         "品味评分。\n\n",
-        "输出严格 JSON：四项 check 使用 verified/concern/not_assessed，并给 concerns 与 rationale。",
+        "输出严格 JSON，字段名固定为：statementSolutionConsistency、judgeability、sampleConsistency、",
+        "constraintSufficiency（都是 verified/concern/not_assessed 之一）、concerns（字符串数组）、",
+        "rationale（字符串）。不要把字段名改成其它拼写。",
         "参考实现的验证结果由本地可信旁路另行填写，不属于你的输出。"
       ].join(""))
     },
