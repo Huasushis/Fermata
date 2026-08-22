@@ -378,6 +378,70 @@ describe("历史人工标准驱动的多角色提示词", () => {
       expect(system).toContain(key);
     }
   });
+  it("技术核验的结构化轮把语义轮内容交给格式轮再做 schema 校验", async () => {
+    const semanticOutput = "SYNTHETIC_SEMANTIC_AUDIT";
+    const bodies: Record<string, unknown>[] = [];
+    const fetchImpl = vi.fn(async (
+      _url: string | URL | Request,
+      init?: RequestInit
+    ) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return new Response(JSON.stringify({
+          choices: [{
+            message: { content: semanticOutput },
+            finish_reason: "stop"
+          }]
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (!JSON.stringify(body.messages).includes(semanticOutput)) {
+        return new Response(JSON.stringify({
+          choices: [{
+            message: { content: "SYNTHETIC_INVALID_FORMAT_OUTPUT" },
+            finish_reason: "stop"
+          }]
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        choices: [{
+          message: { content: JSON.stringify(wireRolePayloads.technical_auditor) },
+          finish_reason: "stop"
+        }]
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    const baseModels = modelConfigs();
+    const models = {
+      ...baseModels,
+      technical_auditor: {
+        ...baseModels.technical_auditor,
+        spec: {
+          ...baseModels.technical_auditor.spec,
+          model: "deepseek-v4-flash",
+          thinkingRequest: "enabled" as const,
+          reasoningEffort: "max" as const
+        },
+        runtime: { ...baseModels.technical_auditor.runtime, fetch: fetchImpl }
+      }
+    } as ReviewFlowModelConfigs;
+    const bundle = createReviewFlowLlmBundle({
+      models,
+      difficultyAnchors: [],
+      profileName: "synthetic-profile",
+      experimentVersion: "synthetic-experiment",
+      engineBuildFingerprint: "c".repeat(64),
+      productionGrant: null
+    });
+
+    const result = trustedRoleExecutionResultSchema.parse(
+      await bundle.roles.technicalAuditor(flowViews().technical)
+    );
+    expect(result.payload).toMatchObject(
+      wireRolePayloads.technical_auditor as Record<string, unknown>
+    );
+    expect(bodies).toHaveLength(2);
+  });
+
 
   it("命题品味与 ICPC 适配分别覆盖历史通过/否决的实际区分轴", () => {
     const { editorial, contestFit } = flowViews();
