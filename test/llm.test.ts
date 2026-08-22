@@ -5,6 +5,7 @@ import {
   chatCompleteWithReceipt,
   chatCompleteJson,
   chatCompleteJsonWithReceipt,
+  chatCompleteTwoRoundJsonWithReceipt,
   getLlmFailureAudit,
   LlmRequestStartGate,
   LlmJsonOutputError,
@@ -3992,5 +3993,51 @@ describe("chatComplete：统一机器 JSON Schema transport", () => {
       status: 429,
       retryAfterMs: 7_000
     });
+  });
+});
+
+describe("两轮 JSON：phase2 结构化轮不继承 phase1 的 max thinking", () => {
+  it("phase1 语义轮保持 max thinking，phase2 格式/修复轮不再发送 thinking 与 reasoning_effort", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    let calls = 0;
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      calls += 1;
+      if (calls === 1) {
+        return completionResponse("语义轮自由文本结论");
+      }
+      if (calls === 2) {
+        return completionResponse("这个不是 JSON");
+      }
+      return completionResponse('{"rating": 1500}');
+    });
+    const result = await chatCompleteTwoRoundJsonWithReceipt(
+      provider,
+      {
+        ...spec,
+        provider: "aether",
+        model: "deepseek-v4-flash",
+        thinkingRequest: "enabled",
+        reasoningEffort: "max"
+      },
+      [{ role: "user", content: "语义轮输入" }],
+      (_semanticOutput, _semanticReasoning) => [{ role: "user", content: "格式轮输入" }],
+      resultSchema,
+      { ...runtime, fetch: fetchMock }
+    );
+    expect(result.data).toEqual({ rating: 1500 });
+    expect(bodies).toHaveLength(3);
+    // phase1 保持 max thinking 是既有必需行为，不能退化。
+    expect(bodies[0]).toMatchObject({
+      thinking: { type: "enabled" },
+      reasoning_effort: "max"
+    });
+    // phase2 格式轮与修复轮必须是兼容的结构化提取规格，不得携带 max thinking。
+    // 当前实现把这个 spec 原样传给两轮，导致这里失败（RED）。
+    expect(bodies[1].thinking).toBeUndefined();
+    expect(bodies[1].reasoning_effort).toBeUndefined();
+    expect(bodies[2].thinking).toBeUndefined();
+    expect(bodies[2].reasoning_effort).toBeUndefined();
   });
 });

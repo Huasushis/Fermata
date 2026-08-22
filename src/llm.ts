@@ -1277,6 +1277,22 @@ function directStructuredMessages<T>(
 }
 
 /**
+ * 为 phase2 结构化提取/修复轮派生专用规格：清除 max-thinking 请求字段，
+ * 让格式轮以兼容模式输出满足 schema 的 JSON，避免推理链与强制 JSON 争用
+ * 同一调用的输出预算。provider 凭据经由独立的 provider 参数传入，因此清空
+ * spec.provider 只改变请求校验分支，不改变传输目标。
+ */
+function derivedStructuredExtractionSpec(spec: ModelCallSpec): ModelCallSpec {
+  return {
+    ...spec,
+    provider: undefined,
+    thinking: false,
+    thinkingRequest: undefined,
+    reasoningEffort: undefined
+  };
+}
+
+/**
  * 两轮 JSON 设计的可选轮次审计回调。只用于透明观测（例如为每个轮次单独记录
  * 首次有效输出时间与传输证据），不改变提示词、模型配置、schema 或失败语义。
  */
@@ -1338,8 +1354,9 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
   const firstFormatMessages: ChatMessage[] = [jsonInstruction, ...formatMessages];
   let firstFormat: ChatCompletionWithReceipt;
   roundAudit?.onRoundStart("format");
+  const extractionSpec = derivedStructuredExtractionSpec(spec);
   try {
-    firstFormat = await chatCompleteWithReceipt(provider, spec, firstFormatMessages, runtime, {
+    firstFormat = await chatCompleteWithReceipt(provider, extractionSpec, firstFormatMessages, runtime, {
       requestJson: false,
       maxOutputTokens: options.maxOutputTokens
     });
@@ -1377,7 +1394,7 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
   let secondFormat: ChatCompletionWithReceipt;
   roundAudit?.onRoundStart("format_repair");
   try {
-    secondFormat = await chatCompleteWithReceipt(provider, spec, repairMessages, runtime, {
+    secondFormat = await chatCompleteWithReceipt(provider, extractionSpec, repairMessages, runtime, {
       requestJson: false,
       maxOutputTokens: options.maxOutputTokens
     });
@@ -1647,8 +1664,9 @@ async function runTwoRoundFormatPath<T>(
   const firstFormatMessages: ChatMessage[] = [jsonInstruction, ...formatMessages];
   let firstFormat: ChatCompletionWithReceipt;
   roundAudit?.onRoundStart("format");
+  const extractionSpec = derivedStructuredExtractionSpec(spec);
   try {
-    firstFormat = await chatCompleteWithReceipt(provider, spec, firstFormatMessages, runtime, {
+    firstFormat = await chatCompleteWithReceipt(provider, extractionSpec, firstFormatMessages, runtime, {
       requestJson: false,
       maxOutputTokens: options.maxOutputTokens
     });
@@ -1685,7 +1703,7 @@ async function runTwoRoundFormatPath<T>(
   let secondFormat: ChatCompletionWithReceipt;
   roundAudit?.onRoundStart("format_repair");
   try {
-    secondFormat = await chatCompleteWithReceipt(provider, spec, repairMessages, runtime, {
+    secondFormat = await chatCompleteWithReceipt(provider, extractionSpec, repairMessages, runtime, {
       requestJson: false,
       maxOutputTokens: options.maxOutputTokens
     });
