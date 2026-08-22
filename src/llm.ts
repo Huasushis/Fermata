@@ -1316,6 +1316,15 @@ function derivedStructuredExtractionSpec(spec: ModelCallSpec): ModelCallSpec {
     reasoningEffort: undefined
   };
 }
+function strictSchemaOutputOption<T>(schema: z.ZodType<T>): ChatCompletionOptions {
+  return {
+    responseJsonSchema: {
+      name: "fermata_review_flow_role_v1",
+      schema: z.toJSONSchema(schema) as Readonly<Record<string, unknown>>
+    }
+  };
+}
+
 
 /**
  * 两轮 JSON 设计的可选轮次审计回调。只用于透明观测（例如为每个轮次单独记录
@@ -1382,7 +1391,7 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
   const extractionSpec = derivedStructuredExtractionSpec(spec);
   try {
     firstFormat = await chatCompleteWithReceipt(provider, extractionSpec, firstFormatMessages, runtime, {
-      requestJson: false,
+      ...strictSchemaOutputOption(schema),
       maxOutputTokens: options.maxOutputTokens
     });
     assertStructuredCompletionTransport(firstFormat.receipt);
@@ -1420,7 +1429,7 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
   roundAudit?.onRoundStart("format_repair");
   try {
     secondFormat = await chatCompleteWithReceipt(provider, extractionSpec, repairMessages, runtime, {
-      requestJson: false,
+      ...strictSchemaOutputOption(schema),
       maxOutputTokens: options.maxOutputTokens
     });
     assertStructuredCompletionTransport(secondFormat.receipt);
@@ -1570,7 +1579,7 @@ export async function chatCompleteReasoningSalvageJsonWithReceipt<T>(
       firstFinalMessages,
       runtime,
       {
-        requestJson: false,
+        ...strictSchemaOutputOption(schema),
         maxOutputTokens: options.maxOutputTokens
       }
     );
@@ -1620,7 +1629,7 @@ export async function chatCompleteReasoningSalvageJsonWithReceipt<T>(
       repairMessages,
       runtime,
       {
-        requestJson: false,
+        ...strictSchemaOutputOption(schema),
         maxOutputTokens: options.maxOutputTokens
       }
     );
@@ -1693,7 +1702,7 @@ async function runTwoRoundFormatPath<T>(
   const extractionSpec = derivedStructuredExtractionSpec(spec);
   try {
     firstFormat = await chatCompleteWithReceipt(provider, extractionSpec, firstFormatMessages, runtime, {
-      requestJson: false,
+      ...strictSchemaOutputOption(schema),
       maxOutputTokens: options.maxOutputTokens
     });
     assertStructuredCompletionTransport(firstFormat.receipt);
@@ -1730,7 +1739,7 @@ async function runTwoRoundFormatPath<T>(
   roundAudit?.onRoundStart("format_repair");
   try {
     secondFormat = await chatCompleteWithReceipt(provider, extractionSpec, repairMessages, runtime, {
-      requestJson: false,
+      ...strictSchemaOutputOption(schema),
       maxOutputTokens: options.maxOutputTokens
     });
     assertStructuredCompletionTransport(secondFormat.receipt);
@@ -1905,7 +1914,10 @@ export async function chatCompleteStagedSolverJsonWithReceipt<T>(
   let firstFormat: ChatCompletionWithReceipt;
   try {
     firstFormat = await chatCompleteWithReceipt(
-      provider, spec, firstFormatMessages, runtime, semanticRunOptions
+      provider, spec, firstFormatMessages, runtime, {
+        ...strictSchemaOutputOption(schema),
+        maxOutputTokens: options.maxOutputTokens
+      }
     );
     assertStructuredCompletionTransport(firstFormat.receipt);
   } catch (error) {
@@ -1946,7 +1958,10 @@ export async function chatCompleteStagedSolverJsonWithReceipt<T>(
   let secondFormat: ChatCompletionWithReceipt;
   try {
     secondFormat = await chatCompleteWithReceipt(
-      provider, spec, repairMessages, runtime, semanticRunOptions
+      provider, spec, repairMessages, runtime, {
+        ...strictSchemaOutputOption(schema),
+        maxOutputTokens: options.maxOutputTokens
+      }
     );
     assertStructuredCompletionTransport(secondFormat.receipt);
   } catch (error) {

@@ -4096,5 +4096,101 @@ describe("两轮 JSON：phase2 结构化轮不继承 phase1 的 max thinking", (
     expect(bodies[1].reasoning_effort).toBeUndefined();
     expect(bodies[2].thinking).toBeUndefined();
     expect(bodies[2].reasoning_effort).toBeUndefined();
+    for (const body of bodies.slice(1)) {
+      expect(body).toMatchObject({
+        response_format: {
+          type: "json_schema",
+          json_schema: { strict: true }
+        }
+      });
+    }
+  });
+  it("semantic draft stays ordinary text while formatter requests strict schema output", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return completionResponse(
+        bodies.length === 1 ? "合成语义草稿自由文本" : '{"rating": 1500}'
+      );
+    });
+    const result = await chatCompleteTwoRoundJsonWithReceipt(
+      provider,
+      {
+        ...spec,
+        provider: "aether",
+        model: "deepseek-v4-flash",
+        thinkingRequest: "enabled",
+        reasoningEffort: "max"
+      },
+      [{ role: "user", content: "合成语义输入" }],
+      (semanticOutput) => [{
+        role: "user",
+        content: `把语义草稿格式化为 role 对象：${semanticOutput}`
+      }],
+      resultSchema,
+      { ...runtime, fetch: fetchMock }
+    );
+
+    expect(result.data).toEqual({ rating: 1500 });
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).not.toHaveProperty("response_format");
+    expect(bodies[0]).toMatchObject({
+      thinking: { type: "enabled" },
+      reasoning_effort: "max"
+    });
+    expect(bodies[1]).toMatchObject({
+      response_format: {
+        type: "json_schema",
+        json_schema: {
+          strict: true,
+          schema: {
+            type: "object",
+            additionalProperties: false
+          }
+        }
+      }
+    });
+  });
+  it("formatter length termination is terminal and does not trigger a repair", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      if (bodies.length === 1) {
+        return completionResponse("合成语义草稿自由文本");
+      }
+      return new Response(JSON.stringify({
+        choices: [{
+          message: { role: "assistant", content: "不完整的格式输出" },
+          finish_reason: "length"
+        }]
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    const error = await chatCompleteTwoRoundJsonWithReceipt(
+      provider,
+      {
+        ...spec,
+        provider: "aether",
+        model: "deepseek-v4-flash",
+        thinkingRequest: "enabled",
+        reasoningEffort: "max"
+      },
+      [{ role: "user", content: "合成语义输入" }],
+      (semanticOutput) => [{
+        role: "user",
+        content: `把语义草稿格式化为 role 对象：${semanticOutput}`
+      }],
+      resultSchema,
+      { ...runtime, fetch: fetchMock }
+    ).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({ code: "LLM_OUTPUT_LENGTH_LIMIT" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(bodies[0]).not.toHaveProperty("response_format");
+    expect(bodies[1]).toMatchObject({
+      response_format: {
+        type: "json_schema",
+        json_schema: { strict: true }
+      }
+    });
   });
 });

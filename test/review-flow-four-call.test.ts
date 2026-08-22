@@ -81,8 +81,7 @@ function stageOutput(stage: "A" | "B" | "C" | "D" | "formatter"): string {
 
 /**
  * 识别合成请求体中的四阶段：B/C/D 通过 response_format 名称；两轮 A 阶段
- * 都不带 response_format，靠末条用户消息是否含"目标 JSON Schema"区分
- * 语义轮与格式轮。
+ * 语义轮不带 response_format，格式轮通过统一 strict JSON Schema 标记。
  */
 function syntheticFourCallStage(body: {
   readonly response_format?: {
@@ -97,6 +96,16 @@ function syntheticFourCallStage(body: {
     ?.match(/_([abcd])_v1$/u)?.[1]?.toUpperCase();
   if (stage === "A" || stage === "B" || stage === "C" || stage === "D") {
     return stage;
+  }
+  if (
+    responseFormat?.json_schema?.name === "fermata_review_flow_role_v1" &&
+    (body.messages ?? []).some(
+      (message) =>
+        typeof message.content === "string" &&
+        message.content.includes("目标 JSON Schema")
+    )
+  ) {
+    return "A_FORMAT";
   }
   if (responseFormat !== undefined) return undefined;
   const containsSchemaInstruction = (body.messages ?? []).some(
@@ -449,7 +458,7 @@ describe("四语义请求 DAG 冻结接口", () => {
       expect(body).not.toHaveProperty("maxOutputTokens");
     }
     expect(bodies.filter((body) => body.response_format === undefined))
-      .toHaveLength(2);
+      .toHaveLength(1);
     const formatBody = bodies.find((body) =>
       String((body.messages as readonly { content: string }[]).at(-1)?.content).includes(
         "目标 JSON Schema"
@@ -457,7 +466,12 @@ describe("四语义请求 DAG 冻结接口", () => {
     );
     expect(formatBody).toBeDefined();
     expect(formatBody?.max_tokens).toBe(maximumExplicitLlmOutputTokens);
-    expect(formatBody).not.toHaveProperty("thinking");
+    expect(formatBody).toMatchObject({
+      response_format: {
+        type: "json_schema",
+        json_schema: { strict: true }
+      }
+    });
     expect(formatBody).not.toHaveProperty("reasoning_effort");
     for (const body of bodies.filter((candidate) => candidate !== formatBody)) {
       expect(body).toMatchObject({
@@ -517,7 +531,12 @@ describe("两轮 A 阶段（语义→格式）", () => {
       expect(call).not.toHaveProperty("reasoning_effort");
       expect(call).not.toHaveProperty("max_completion_tokens");
       expect(call).not.toHaveProperty("maxOutputTokens");
-      expect(call.response_format).toBeUndefined();
+      expect(call).toMatchObject({
+        response_format: {
+          type: "json_schema",
+          json_schema: { strict: true }
+        }
+      });
     }
   });
 
