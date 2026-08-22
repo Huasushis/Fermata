@@ -78,10 +78,11 @@ import {
   type ReviewFlowEvaluationTerminationSignal
 } from "../experiments/lib/review-flow-evaluation-runner";
 import {
+  buildExecutionReceiptSeal,
   loadReviewFlowEvaluationCheckpointForReveal,
+  ReviewFlowEvaluationCheckpoint,
   reviewFlowEvaluationIdentitySchema,
   reviewFlowEvaluationPredictionIdentityFingerprint,
-  ReviewFlowEvaluationCheckpoint,
   type ReviewFlowEvaluationCheckpointState,
   type ReviewFlowEvaluationBaselineBinding,
   type ReviewFlowEvaluationExpectedCase,
@@ -1230,8 +1231,8 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
       expect(state.entries.slice(1).every(
         (entry) => !("pilotTiming" in entry)
       )).toBe(true);
-      // 三题 smoke 不得冒充 frozen32 完整标定。
-      expect(state.executionSeal?.complete).toBe(false);
+      // 三题 smoke 只绑定其 immutable selected case set，不冒充 frozen32。
+      expect(state.executionSeal?.complete).toBe(true);
       checkpoint.close();
     }
   );
@@ -1672,6 +1673,100 @@ describe("32 案例 × 11 角色 = 352 收据封存契约", () => {
     }
     expect(totalReceipts).toBe(352);
     expect(tupleSet.size).toBe(352);
+    checkpoint.close();
+  });
+  it("representative3-v3 三案例 × 11 角色收据可以完整封存", () => {
+    const fixture = createRepresentative3StateFixture({}, "representative3-v3");
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    for (const entry of fixture.expectedCases) {
+      checkpoint.markActive(entry.safeId);
+      checkpoint.markCompleted(entry.safeId, uniqueProjection(entry.safeId), undefined, {
+        schemaVersion: 1,
+        firstByteMs: 1,
+        endToEndMs: 2
+      });
+    }
+    const state = checkpoint.sealExecution();
+    expect(state.executionSeal?.complete).toBe(true);
+    expect(state.entries).toHaveLength(3);
+    expect(
+      state.entries
+        .filter((entry) => entry.status === "completed")
+        .reduce((count, entry) => count + entry.projection.roleReceipts.length, 0)
+    ).toBe(33);
+    checkpoint.close();
+  });
+  it("代表性三题封存绑定 selected case set 并拒绝错误收据集合", () => {
+    const fixture = createRepresentative3StateFixture({}, "representative3-v3");
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    for (const entry of fixture.expectedCases) {
+      checkpoint.markActive(entry.safeId);
+      checkpoint.markCompleted(entry.safeId, uniqueProjection(entry.safeId), undefined, {
+        schemaVersion: 1,
+        firstByteMs: 1,
+        endToEndMs: 2
+      });
+    }
+    const state = checkpoint.snapshot();
+    const valid = buildExecutionReceiptSeal(
+      fixture.expectedCases,
+      fixture.identity.caseSelection,
+      state.entries
+    );
+    expect(valid).toMatchObject({
+      selectionProfile: {
+        kind: "representative3",
+        selector: "representative3-v3"
+      },
+      expectedCaseCount: 3,
+      expectedRoleCountPerCase: 11,
+      expectedReceiptCount: 33,
+      actualCaseCount: 3,
+      actualReceiptCount: 33,
+      complete: true
+    });
+    expect(valid.receiptTuples).toHaveLength(33);
+    expect(
+      buildExecutionReceiptSeal(
+        fixture.expectedCases,
+        undefined,
+        state.entries
+      ).complete
+    ).toBe(false);
+
+    const invalidSeals = [
+      (entries: typeof state.entries) => {
+        const completed = entries[0]!;
+        if (completed.status !== "completed") throw new Error("TEST_STATE");
+        completed.projection.roleReceipts.pop();
+      },
+      (entries: typeof state.entries) => {
+        const completed = entries[0]!;
+        if (completed.status !== "completed") throw new Error("TEST_STATE");
+        completed.projection.roleReceipts[1]!.role =
+          completed.projection.roleReceipts[0]!.role;
+      },
+      (entries: typeof state.entries) => {
+        const completed = entries[0]!;
+        if (completed.status !== "completed") throw new Error("TEST_STATE");
+        completed.projection.roleReceipts[0]!.role = "adversary";
+      },
+      (entries: typeof state.entries) => {
+        entries[0]!.safeId = "case-0032";
+      }
+    ].map((mutate) => {
+      const entries = structuredClone(state.entries);
+      mutate(entries);
+      return buildExecutionReceiptSeal(
+        fixture.expectedCases,
+        fixture.identity.caseSelection,
+        entries
+      );
+    });
+    expect(invalidSeals.every((seal) => !seal.complete)).toBe(true);
+    expect(invalidSeals.every((seal) => seal.receiptTuples.length === 0)).toBe(
+      true
+    );
     checkpoint.close();
   });
 

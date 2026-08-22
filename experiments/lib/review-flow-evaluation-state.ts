@@ -531,12 +531,13 @@ export const reviewFlowEvaluationCheckpointSchema = z
     }
     if (state.executionSeal !== null) {
       const expectedFingerprint = executionCompletionFingerprint(state);
-      const receiptSeal = buildExecutionReceiptSeal(state.entries);
+      const receiptSeal = buildExecutionReceiptSeal(
+        state.expectedCases,
+        state.identity.caseSelection,
+        state.entries
+      );
       const actuallyComplete =
-        state.termination === null &&
-        state.entries.length === 32 &&
-        state.entries.every((entry) => entry.status === "completed") &&
-        receiptSeal.receiptTuples.length === 352;
+        state.termination === null && receiptSeal.complete;
       if (
         state.executionSeal.completionFingerprint !== expectedFingerprint ||
         state.executionSeal.complete !== actuallyComplete
@@ -943,12 +944,13 @@ export class ReviewFlowEvaluationCheckpoint {
     }
     if (this.#state.executionSeal !== null) return this.snapshot();
     const sealedAt = this.#now().toISOString();
-    const receiptSeal = buildExecutionReceiptSeal(this.#state.entries);
+    const receiptSeal = buildExecutionReceiptSeal(
+      this.#state.expectedCases,
+      this.#state.identity.caseSelection,
+      this.#state.entries
+    );
     const complete =
-      this.#state.termination === null &&
-      this.#state.entries.length === 32 &&
-      this.#state.entries.every((entry) => entry.status === "completed") &&
-      receiptSeal.receiptTuples.length === 352;
+      this.#state.termination === null && receiptSeal.complete;
     const draft = {
       ...this.#state,
       executionSeal: {
@@ -1175,6 +1177,7 @@ function executionCompletionFingerprint(
   state: Pick<
     ReviewFlowEvaluationCheckpointState,
     | "runId"
+    | "identity"
     | "identityFingerprint"
     | "expectedCases"
     | "entries"
@@ -1183,7 +1186,11 @@ function executionCompletionFingerprint(
     | "representative3Timing"
   >
 ): string {
-  const receiptSeal = buildExecutionReceiptSeal(state.entries);
+  const receiptSeal = buildExecutionReceiptSeal(
+    state.expectedCases,
+    state.identity.caseSelection,
+    state.entries
+  );
   return hashCanonicalValue({
     protocol: "review-flow-evaluation-execution-completion-v3",
     runId: state.runId,
@@ -1200,34 +1207,52 @@ function executionCompletionFingerprint(
 }
 
 /**
- * 构造 32 案例 × 11 角色 = 352 条唯一 (safeId, role, receiptHash) 元组的封存摘要。
- * 仅当所有条目均为 completed 且恰好 32 条、每条恰好 11 个角色收据时返回非空摘要；
- * 否则返回空摘要（与终态不一致检查配合使用）。
+ * 封存当前 immutable case set 与固定 11-role topology 的收据摘要。
+ * full32 默认 profile 仍要求 32 cases/352 receipts；selected profile 使用
+ * identity 中的 selector 与 orderedSelectionSha256 绑定已选 case set。
  */
-function buildExecutionReceiptSeal(
+export function buildExecutionReceiptSeal(
+  expectedCases: readonly ReviewFlowEvaluationExpectedCase[],
+  caseSelection: ReviewFlowEvaluationIdentity["caseSelection"],
   entries: readonly ReviewFlowEvaluationEntry[]
-): {
-  readonly protocol: "review-flow-evaluation-receipt-seal-v1";
-  readonly expectedCaseCount: number;
-  readonly expectedRoleCountPerCase: number;
-  readonly expectedReceiptCount: number;
-  readonly actualCaseCount: number;
-  readonly actualReceiptCount: number;
-  readonly receiptTuples: readonly {
-    readonly safeId: string;
-    readonly role: string;
-    readonly receiptHash: string;
-  }[];
-} {
-  const expectedCaseCount = 32;
-  const expectedRoleCountPerCase = 11;
+) {
+  const expectedCaseIds = expectedCases.map((entry) => entry.safeId);
+  const expectedCaseCount = expectedCaseIds.length;
+  const expectedRoleCountPerCase = reviewFlowRoleSchema.options.length;
   const expectedReceiptCount = expectedCaseCount * expectedRoleCountPerCase;
   const expectedRoles = reviewFlowRoleSchema.options;
-  const receiptTuples: { safeId: string; role: string; receiptHash: string }[] = [];
+  const orderedSelectionSha256 =
+    reviewFlowEvaluationOrderedSelectionSha256(expectedCases);
+  const selectionProfile = caseSelection === undefined
+    ? { kind: "full32" as const }
+    : {
+        kind: "representative3" as const,
+        selector: caseSelection.selector
+      };
+  const expectedIdsAreUnique =
+    new Set(expectedCaseIds).size === expectedCaseIds.length;
+  const selectionIsBound =
+    caseSelection === undefined
+      ? expectedCaseCount === 32
+      : expectedCaseCount === 3 &&
+        caseSelection.selectedCaseCount === expectedCaseCount &&
+        caseSelection.orderedSelectionSha256 === orderedSelectionSha256;
+  const entriesMatchExpectedCases =
+    entries.length === expectedCaseCount &&
+    entries.every(
+      (entry, index) => entry.safeId === expectedCaseIds[index]
+    );
+  const allEntriesCompleted = entries.every(
+    (entry) => entry.status === "completed"
+  );
+  const receiptTuples: {
+    safeId: string;
+    role: string;
+    receiptHash: string;
+  }[] = [];
   for (const entry of entries) {
     if (entry.status !== "completed") continue;
-    const projection = entry.projection;
-    for (const receipt of projection.roleReceipts) {
+    for (const receipt of entry.projection.roleReceipts) {
       receiptTuples.push({
         safeId: entry.safeId,
         role: receipt.role,
@@ -1235,26 +1260,38 @@ function buildExecutionReceiptSeal(
       });
     }
   }
+  const rolesMatchExpected = entries.every((entry) => {
+    if (entry.status !== "completed") return false;
+    return entry.projection.roleReceipts.length === expectedRoleCountPerCase &&
+      entry.projection.roleReceipts.every(
+        (receipt, index) => receipt.role === expectedRoles[index]
+      );
+  });
+  const tuplesAreUnique =
+    new Set(
+      receiptTuples.map(
+        (tuple) => `${tuple.safeId}|${tuple.role}|${tuple.receiptHash}`
+      )
+    ).size === receiptTuples.length;
+  const complete =
+    selectionIsBound &&
+    expectedIdsAreUnique &&
+    entriesMatchExpectedCases &&
+    allEntriesCompleted &&
+    rolesMatchExpected &&
+    receiptTuples.length === expectedReceiptCount &&
+    tuplesAreUnique;
   return {
-    protocol: "review-flow-evaluation-receipt-seal-v1",
+    selectionProfile,
+    orderedSelectionSha256,
+    expectedCaseIds,
     expectedCaseCount,
     expectedRoleCountPerCase,
     expectedReceiptCount,
-    actualCaseCount: entries.filter((e) => e.status === "completed").length,
+    actualCaseCount: entries.filter((entry) => entry.status === "completed").length,
     actualReceiptCount: receiptTuples.length,
-    receiptTuples: entries.length === expectedCaseCount &&
-      receiptTuples.length === expectedReceiptCount &&
-      receiptTuples.every((t) =>
-        expectedRoles.includes(t.role as never)
-      ) &&
-      new Set(receiptTuples.map((t) => `${t.safeId}|${t.role}|${t.receiptHash}`)).size === expectedReceiptCount &&
-      entries.every((entry) => {
-        if (entry.status !== "completed") return true;
-        return entry.projection.roleReceipts.length === expectedRoleCountPerCase &&
-          entry.projection.roleReceipts.every((r, i) => r.role === expectedRoles[i]);
-      })
-      ? receiptTuples
-      : []
+    complete,
+    receiptTuples: complete ? receiptTuples : []
   };
 }
 
