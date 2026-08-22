@@ -17,6 +17,7 @@ import {
   withLlmRequestStartGate,
   type ModelCallSpec
 } from "../src/llm";
+import { originalityPayloadSchema } from "../src/review-flow/schemas";
 
 const provider = { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" };
 const spec = { model: "test-model", temperature: 0.2, thinking: false };
@@ -3896,6 +3897,62 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
       )
     ).rejects.toBeInstanceOf(RangeError);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("保留原创性 schema 失败的三字段安全诊断，不泄漏响应内容", async () => {
+    const valid = {
+      originalityLevel: 4,
+      sameProblemAsExisting: false,
+      highestSimilarity: 0,
+      evidenceIds: [],
+      rationale: "synthetic rationale"
+    };
+    const capture = async (payload: unknown) => {
+      let calls = 0;
+      const fetchMock = vi.fn(async () => {
+        calls += 1;
+        return completionResponse(calls === 1 ? "synthetic semantic output" : JSON.stringify(payload));
+      });
+      const error = await chatCompleteTwoRoundJsonWithReceipt(
+        provider,
+        spec,
+        [],
+        (semanticOutput) => [{ role: "user", content: semanticOutput }],
+        originalityPayloadSchema,
+        { ...runtime, fetch: fetchMock },
+        { safeSchemaDiagnostic: "originality" }
+      ).catch((caught: unknown) => caught);
+      const audit = getLlmFailureAudit(error);
+      const diagnostic = audit?.schemaDiagnostic;
+      expect(error).toBeInstanceOf(LlmJsonOutputError);
+      expect(Object.keys(diagnostic ?? {}).sort()).toEqual([
+        "code",
+        "expectedCategory",
+        "path"
+      ]);
+      const serializedAudit = JSON.stringify(audit);
+      expect(serializedAudit).not.toContain("secret-value");
+      expect(serializedAudit).not.toContain("private-message");
+      expect(serializedAudit).not.toContain("unexpectedKey");
+      expect(serializedAudit).not.toContain("模型两次输出");
+      return diagnostic;
+    };
+
+    await expect(capture({ ...valid, highestSimilarity: "secret-value" })).resolves.toMatchObject({
+      code: "invalid_type",
+      path: "/highestSimilarity",
+      expectedCategory: "number_0_1"
+    });
+    await expect(capture({ ...valid, highestSimilarity: 2 })).resolves.toMatchObject({
+      code: "too_big",
+      path: "/highestSimilarity",
+      expectedCategory: "number_0_1"
+    });
+    await expect(capture({ ...valid, unexpectedKey: "private-message" })).resolves.toMatchObject({
+      code: "unrecognized_keys",
+      path: "/",
+      expectedCategory: "exact_key_set"
+    });
   });
 
   it("两次都不合法时抛出 LlmJsonOutputError", async () => {

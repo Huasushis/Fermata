@@ -306,6 +306,27 @@ export interface LlmReasoningSalvageJsonReceipt {
  * 响应正文、服务商错误说明或响应标识。WeakMap 绑定保证这些字段不会因
  * 序列化 Error 意外进入普通日志。
  */
+export type SafeSchemaDiagnosticPath =
+  | "/originalityLevel"
+  | "/sameProblemAsExisting"
+  | "/highestSimilarity"
+  | "/evidenceIds"
+  | "/evidenceIds/*"
+  | "/rationale"
+  | "/";
+export type SafeSchemaDiagnosticCategory =
+  | "level_1_5"
+  | "boolean"
+  | "number_0_1"
+  | "safe_id_array"
+  | "short_text"
+  | "exact_key_set";
+export interface SafeSchemaDiagnostic {
+  readonly code: string;
+  readonly path: SafeSchemaDiagnosticPath;
+  readonly expectedCategory: SafeSchemaDiagnosticCategory;
+}
+
 export interface LlmFailureAudit {
   readonly schemaVersion: 1;
   readonly requestCount: 1 | 2 | 3 | 4;
@@ -329,6 +350,7 @@ export interface LlmFailureAudit {
   };
   /** null 表示尚未走到结构化 JSON 校验；false 表示校验未成功。 */
   readonly jsonSchemaValidated: false | null;
+  readonly schemaDiagnostic?: SafeSchemaDiagnostic;
 }
 
 const llmFailureAudits = new WeakMap<object, LlmFailureAudit>();
@@ -465,6 +487,8 @@ export interface ChatCompletionOptions {
 export interface ChatCompletionJsonOptions {
   /** 首轮和唯一一次 JSON 修复轮共用同一个输出 token 硬上限。 */
   readonly maxOutputTokens?: number;
+  /** Opt-in, value-free Zod metadata for the originality formatter probe only. */
+  readonly safeSchemaDiagnostic?: "originality";
 }
 
 /**
@@ -1165,7 +1189,7 @@ export async function chatCompleteJsonWithReceipt<T>(
     promoteJsonFailureAudit(error, 1, [], 0);
     throw error;
   }
-  const firstAttempt = tryParseAndValidate(first.content, schema);
+  const firstAttempt = tryParseAndValidate(first.content, schema, options.safeSchemaDiagnostic);
   if (firstAttempt.success) {
     return {
       data: firstAttempt.data,
@@ -1206,7 +1230,7 @@ export async function chatCompleteJsonWithReceipt<T>(
     );
     throw error;
   }
-  const secondAttempt = tryParseAndValidate(second.content, schema);
+  const secondAttempt = tryParseAndValidate(second.content, schema, options.safeSchemaDiagnostic);
   if (secondAttempt.success) {
     return {
       data: secondAttempt.data,
@@ -1229,7 +1253,8 @@ export async function chatCompleteJsonWithReceipt<T>(
     requestAudit: mutableAuditFromReceipt(second.receipt),
     completedResponses: [first.receipt, second.receipt],
     priorTransportAttemptCount: first.receipt.transportAttemptCount,
-    jsonSchemaValidated: false
+    jsonSchemaValidated: false,
+    schemaDiagnostic: secondAttempt.schemaDiagnostic
   });
   throw error;
 }
@@ -1366,7 +1391,7 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
     throw error;
   }
   roundAudit?.onRoundSettled("format", firstFormat.receipt);
-  const firstAttempt = tryParseAndValidate(firstFormat.content, schema);
+  const firstAttempt = tryParseAndValidate(firstFormat.content, schema, options.safeSchemaDiagnostic);
   if (firstAttempt.success) {
     return {
       data: firstAttempt.data,
@@ -1408,7 +1433,7 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
     throw error;
   }
   roundAudit?.onRoundSettled("format_repair", secondFormat.receipt);
-  const secondAttempt = tryParseAndValidate(secondFormat.content, schema);
+  const secondAttempt = tryParseAndValidate(secondFormat.content, schema, options.safeSchemaDiagnostic);
   if (secondAttempt.success) {
     return {
       data: secondAttempt.data,
@@ -1434,7 +1459,8 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
     completedResponses: [semantic.receipt, firstFormat.receipt, secondFormat.receipt],
     priorTransportAttemptCount:
       semantic.receipt.transportAttemptCount + firstFormat.receipt.transportAttemptCount,
-    jsonSchemaValidated: false
+    jsonSchemaValidated: false,
+    schemaDiagnostic: secondAttempt.schemaDiagnostic
   });
   throw error;
 }
@@ -1985,9 +2011,42 @@ export async function chatCompleteStagedSolverJsonWithReceipt<T>(
 // 内部实现
 // ---------------------------------------------------------------------------
 
-type ParseResult<T> = { readonly success: true; readonly data: T } | { readonly success: false; readonly error: string };
+type ParseResult<T> =
+  | { readonly success: true; readonly data: T }
+  | {
+      readonly success: false;
+      readonly error: string;
+      readonly schemaDiagnostic?: SafeSchemaDiagnostic;
+    };
 
-function tryParseAndValidate<T>(content: string, schema: z.ZodType<T>): ParseResult<T> {
+function normalizeOriginalitySchemaIssue(issue: z.ZodIssue): SafeSchemaDiagnostic {
+  const firstPathSegment = issue.path[0];
+  let path: SafeSchemaDiagnosticPath = "/";
+  let expectedCategory: SafeSchemaDiagnosticCategory = "exact_key_set";
+  if (issue.path.length === 1 && firstPathSegment === "originalityLevel") {
+    path = "/originalityLevel";
+    expectedCategory = "level_1_5";
+  } else if (issue.path.length === 1 && firstPathSegment === "sameProblemAsExisting") {
+    path = "/sameProblemAsExisting";
+    expectedCategory = "boolean";
+  } else if (issue.path.length === 1 && firstPathSegment === "highestSimilarity") {
+    path = "/highestSimilarity";
+    expectedCategory = "number_0_1";
+  } else if (firstPathSegment === "evidenceIds") {
+    path = issue.path.length === 1 ? "/evidenceIds" : "/evidenceIds/*";
+    expectedCategory = "safe_id_array";
+  } else if (issue.path.length === 1 && firstPathSegment === "rationale") {
+    path = "/rationale";
+    expectedCategory = "short_text";
+  }
+  return Object.freeze({ code: issue.code, path, expectedCategory });
+}
+
+function tryParseAndValidate<T>(
+  content: string,
+  schema: z.ZodType<T>,
+  safeSchemaDiagnostic?: ChatCompletionJsonOptions["safeSchemaDiagnostic"]
+): ParseResult<T> {
   const extracted = extractJsonObject(content);
   if (extracted === null) {
     return { success: false, error: "回复里找不到看起来像 JSON 对象的内容" };
@@ -2000,7 +2059,16 @@ function tryParseAndValidate<T>(content: string, schema: z.ZodType<T>): ParseRes
   }
   const parsed = schema.safeParse(raw);
   if (!parsed.success) {
-    return { success: false, error: parsed.error.message };
+    const issue = parsed.error.issues[0];
+    const schemaDiagnostic =
+      safeSchemaDiagnostic === "originality" && issue !== undefined
+        ? normalizeOriginalitySchemaIssue(issue)
+        : undefined;
+    return {
+      success: false,
+      error: parsed.error.message,
+      ...(schemaDiagnostic === undefined ? {} : { schemaDiagnostic })
+    };
   }
   return { success: true, data: parsed.data };
 }
@@ -2087,6 +2155,7 @@ function rememberLlmFailureAudit(
     readonly completedResponses?: readonly LlmTransportReceipt[];
     readonly priorTransportAttemptCount?: number;
     readonly jsonSchemaValidated: false | null;
+    readonly schemaDiagnostic?: SafeSchemaDiagnostic;
   }
 ): void {
   if ((typeof error !== "object" && typeof error !== "function") || error === null) {
@@ -2111,6 +2180,9 @@ function rememberLlmFailureAudit(
     acceptedEventShapes: acceptedShapeAudit(input.requestAudit),
     firstRejectedEvent: input.requestAudit.firstRejectedEvent
   });
+  const safeSchemaDiagnostic = input.schemaDiagnostic === undefined
+    ? undefined
+    : Object.freeze({ ...input.schemaDiagnostic });
   llmFailureAudits.set(error, Object.freeze({
     schemaVersion: 1,
     requestCount: input.requestCount,
@@ -2119,7 +2191,10 @@ function rememberLlmFailureAudit(
     completedResponses: Object.freeze(completedResponses),
     terminal,
     stream,
-    jsonSchemaValidated: input.jsonSchemaValidated
+    jsonSchemaValidated: input.jsonSchemaValidated,
+    ...(safeSchemaDiagnostic === undefined
+      ? {}
+      : { schemaDiagnostic: safeSchemaDiagnostic })
   }));
 }
 
@@ -2198,7 +2273,8 @@ function promoteJsonFailureAudit(
     },
     completedResponses,
     priorTransportAttemptCount,
-    jsonSchemaValidated: false
+    jsonSchemaValidated: false,
+    schemaDiagnostic: existing.schemaDiagnostic
   });
 }
 
