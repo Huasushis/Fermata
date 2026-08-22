@@ -9,6 +9,7 @@ import {
   LlmRequestError,
   LlmRetainedTextTooLargeError,
   LlmResponseFormatError,
+  maximumExplicitLlmOutputTokens,
   serializeTargetJsonSchema,
   type ChatMessage,
   type ChatCompletionWithReceipt,
@@ -214,6 +215,7 @@ async function executeProductionCall(
         firstValidOutputMs ??= Date.now() - startedAt;
       }),
       {
+        maxOutputTokens: maximumExplicitLlmOutputTokens,
         responseJsonSchema: request.schema === null
           ? undefined
           : {
@@ -318,7 +320,8 @@ async function executeSalvageFinalizer(
     finalizerMessages,
     buildCallRuntime(request, formatterConfig, lifecycle, startedAt, onValidOutput),
     {
-      requestJson: true
+      requestJson: true,
+      maxOutputTokens: maximumExplicitLlmOutputTokens
     }
   );
   // 验证 finalizer 输出是合法 JSON
@@ -340,7 +343,8 @@ async function executeSalvageFinalizer(
       repairMessages,
       buildCallRuntime(request, formatterConfig, lifecycle, startedAt, onValidOutput),
       {
-        requestJson: true
+        requestJson: true,
+        maxOutputTokens: maximumExplicitLlmOutputTokens
       }
     );
     JSON.parse(secondFinal.content);
@@ -421,7 +425,7 @@ async function executeProductionStageATwoRound(
             Date.now() - currentRoundAcc.startedAtMs;
         }
       }),
-      {},
+      { maxOutputTokens: maximumExplicitLlmOutputTokens },
       {
         onRoundStart: (round) => {
           if (round === "semantic" || round === "format" || round === "format_repair") {

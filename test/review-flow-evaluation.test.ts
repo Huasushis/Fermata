@@ -844,6 +844,49 @@ describe("checkpoint、11-role receipt 与停止闸门", () => {
     expect(resumedState.executionSeal?.complete).toBe(false);
     resumed.close();
   });
+  it("代表性三题 HTTP 200 output_limit 且无 EOF 时封存为 0/3 failed", async () => {
+    const fixture = createRepresentative3StateFixture({}, "representative3-v3");
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const outputLimitFailure = {
+      ...fixedFailure("REVIEW_FLOW_OUTPUT_LIMIT", 200),
+      failureKind: "output_limit" as const,
+      completedRoleCount: 0,
+      failedRoleCount: 1,
+      failedRoles: [{
+        role: "solver",
+        failureKind: "output_limit" as const,
+        requestCount: 1,
+        transportAttemptCount: 1,
+        completedResponseCount: 0
+      }]
+    };
+    const execute = vi.fn(async () => ({
+      status: "incomplete" as const,
+      failure: outputLimitFailure
+    }));
+    const state = await runReviewFlowEvaluationCases({
+      checkpoint,
+      cases: preparedStateCases(fixture),
+      executor: { execute },
+      concurrency: 3,
+      maxCaseAttempts: 1
+    });
+    expect(execute).toHaveBeenCalledTimes(3);
+    expect(state.entries.map((entry) => entry.status)).toEqual([
+      "failed",
+      "failed",
+      "failed"
+    ]);
+    expect(state.entries.every((entry) =>
+      entry.status === "failed" &&
+      entry.failure.failureKind === "output_limit" &&
+      entry.failure.httpStatus === 200 &&
+      entry.failure.failedRoles[0]?.completedResponseCount === 0
+    )).toBe(true);
+    expect(state.entries.filter((entry) => entry.status === "completed")).toHaveLength(0);
+    expect(state.executionSeal?.complete).toBe(false);
+    checkpoint.close();
+  });
 
   it("可重试失败在同一案例内重生闸门整体重跑，最后一次尝试才封存", async () => {
     const fixture = createStateFixture(2);

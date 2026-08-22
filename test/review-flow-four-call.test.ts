@@ -10,7 +10,7 @@ import {
   FairLlmRequestScheduler,
   LlmStageRequestError
 } from "../src/llm-scheduler";
-import { LlmRequestError, LlmResponseFormatError } from "../src/llm";
+import { LlmRequestError, LlmResponseFormatError, maximumExplicitLlmOutputTokens } from "../src/llm";
 import {
   runProductionFourCallReviewDag,
   type FourCallRequestLifecycle,
@@ -374,7 +374,7 @@ describe("四语义请求 DAG 冻结接口", () => {
       }
     })).resolves.toMatchObject({ reusedStages: ["B"] });
   });
-  it("production adapter emits two-round A plus single-round B/C/D without outbound caps", async () => {
+  it("production adapter sends provider maximum output tokens; semantic rounds use thinking=max", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -444,13 +444,9 @@ describe("四语义请求 DAG 冻结接口", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(5);
     expect(bodies).toHaveLength(5);
     for (const body of bodies) {
-      expect(body).not.toHaveProperty("max_tokens");
+      expect(body.max_tokens).toBe(maximumExplicitLlmOutputTokens);
       expect(body).not.toHaveProperty("max_completion_tokens");
       expect(body).not.toHaveProperty("maxOutputTokens");
-      expect(body).toMatchObject({
-        thinking: { type: "enabled" },
-        reasoning_effort: "max"
-      });
     }
     expect(bodies.filter((body) => body.response_format === undefined))
       .toHaveLength(2);
@@ -460,12 +456,20 @@ describe("四语义请求 DAG 冻结接口", () => {
       )
     );
     expect(formatBody).toBeDefined();
-    expect(formatBody).not.toHaveProperty("max_tokens");
+    expect(formatBody?.max_tokens).toBe(maximumExplicitLlmOutputTokens);
+    expect(formatBody).not.toHaveProperty("thinking");
+    expect(formatBody).not.toHaveProperty("reasoning_effort");
+    for (const body of bodies.filter((candidate) => candidate !== formatBody)) {
+      expect(body).toMatchObject({
+        thinking: { type: "enabled" },
+        reasoning_effort: "max"
+      });
+    }
   });
 });
 
 describe("两轮 A 阶段（语义→格式）", () => {
-  it("routes A through reasoning-then-format rounds without outbound caps and with reasoning=max", async () => {
+  it("routes A through reasoning-then-format rounds with provider maximum tokens; semantic reasoning=max", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -497,12 +501,20 @@ describe("两轮 A 阶段（语义→格式）", () => {
     );
     expect(semanticCalls).toHaveLength(1);
     expect(formatCalls).toHaveLength(1);
-    for (const call of [...semanticCalls, ...formatCalls]) {
+    for (const call of semanticCalls) {
       expect(call).toMatchObject({
         thinking: { type: "enabled" },
         reasoning_effort: "max"
       });
-      expect(call).not.toHaveProperty("max_tokens");
+      expect(call.max_tokens).toBe(maximumExplicitLlmOutputTokens);
+      expect(call).not.toHaveProperty("max_completion_tokens");
+      expect(call).not.toHaveProperty("maxOutputTokens");
+      expect(call.response_format).toBeUndefined();
+    }
+    for (const call of formatCalls) {
+      expect(call.max_tokens).toBe(maximumExplicitLlmOutputTokens);
+      expect(call).not.toHaveProperty("thinking");
+      expect(call).not.toHaveProperty("reasoning_effort");
       expect(call).not.toHaveProperty("max_completion_tokens");
       expect(call).not.toHaveProperty("maxOutputTokens");
       expect(call.response_format).toBeUndefined();
@@ -611,7 +623,7 @@ describe("两轮 A 阶段（语义→格式）", () => {
     for (const stage of ["B", "C", "D"] as const) {
       const calls = bodies.filter((body) => syntheticFourCallStage(body) === stage);
       expect(calls).toHaveLength(1);
-      expect(calls[0]).not.toHaveProperty("max_tokens");
+      expect(calls[0]?.max_tokens).toBe(maximumExplicitLlmOutputTokens);
       expect(calls[0]).not.toHaveProperty("max_completion_tokens");
       expect(calls[0]).not.toHaveProperty("maxOutputTokens");
     }
