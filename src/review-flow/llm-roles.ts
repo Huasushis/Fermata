@@ -642,11 +642,10 @@ export function buildEditorialJudgeMessages(
         "重点包括：非模板化与新意、核心洞察深度、思路是否自然优雅、选手发现过程是否有趣，以及整体参赛体验。\n\n",
         "必须同时记录正向与负向证据。常见算法不等于模板题，困难也不自动等于好题；代码短不自动优雅，代码长也",
         "不自动低质。区分可通过修改改善的表达问题与核心创意、体验上的根本问题。不要因为技术核验无错就默认高分。\n\n",
-        "所有 Level 均为 1–5，1 表示很弱、5 表示很强；qualityLevel 是综合命题质量。输出严格 JSON：",
-        "qualityLevel、noveltyLevel、ideaDepthLevel、naturalnessLevel、",
-        "contestantExperienceLevel、evidence、rationale。evidence 每项必须给 dimension、strength/concern、",
-        "severity、confidence 与具体但简洁的依据。evidenceCoverage 必须分别声明正向和负向证据是 found 还是",
-        "none_found；只有确实有对应方向证据时才能写 found，不能为了凑齐两面而虚构。"
+        "所有 Level 均为 1–5，1 表示很弱、5 表示很强；qualityLevel 是综合命题质量。输出严格 JSON，字段必须是：",
+        "qualityLevel、noveltyLevel、ideaDepthLevel、naturalnessLevel、contestantExperienceLevel、evidenceCoverage、",
+        "evidence、rationale。evidenceCoverage 的 strengths 和 concerns 只能分别是 found 或 none_found；evidence 每项",
+        "必须严格包含 dimension、direction（只能是 strength 或 concern）、severity、confidence、summary。只有确实有对应方向证据时才能写 found，不能为了凑齐两面而虚构。"
       ].join(""))
     },
     { role: "user", content: privateContext(compactEditorialView(view)) }
@@ -684,10 +683,10 @@ export function buildContestFitFormatterMessages(
     {
       role: "system",
       content: guardedSystemPrompt("contest_fit", [
-        "上一条消息是审稿人对题目的自然语言结论。你只把该结论转换为严格 JSON，不添加、不修改、不删除任何",
-        "判断，不引入语义输出中没有的事实。JSON 字段：icpcFit、implementationBurden、",
-        "thinkingImplementationBalance、knowledgeFairness、problemsetRole、roleConfidence、",
-        "evidenceCoverage、evidence、rationale。evidence 只包含语义结论中真正引用过的证据；不确定就省略。",
+        "上一条消息是审稿人对题目的自然语言结论。你只把该结论转换为严格 JSON，不添加、不修改、不删除任何判断，",
+        "不引入语义输出中没有的事实。JSON 顶层字段必须是：icpcFit、implementationBurden、thinkingImplementationBalance、",
+        "knowledgeFairness、problemsetRole、roleConfidence、evidenceCoverage、evidence、rationale。",
+        "evidenceCoverage 的 strengths 和 concerns 只能分别是 found 或 none_found；evidence 每项必须严格包含 dimension、direction、severity、confidence、summary；evidence 只包含语义结论中真正引用过的证据。",
         "先输出序列化后的 JSON 对象本身，不要先写分析、复述或解释；序列化结果控制在 3000 字符以内。"
       ].join(""))
     },

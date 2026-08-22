@@ -511,6 +511,29 @@ describe("历史人工标准驱动的多角色提示词", () => {
     expect(contestSystem).toContain(historicalReviewRubricPromptText);
     expect(editorialSystem).toContain(historicalReviewRubric.rubricVersion);
   });
+  it("编辑与比赛适配格式轮逐字绑定嵌套证据 schema 字段", () => {
+    const { editorial } = flowViews();
+    const editorialSystem = buildEditorialJudgeMessages(editorial)[0]!.content;
+    const contestFormatterSystem = buildContestFitFormatterMessages(
+      "SYNTHETIC_SEMANTIC_CONCLUSION",
+      null
+    )[0]!.content;
+    for (const system of [editorialSystem, contestFormatterSystem]) {
+      for (const key of [
+        "evidenceCoverage",
+        "strengths",
+        "concerns",
+        "dimension",
+        "direction",
+        "severity",
+        "confidence",
+        "summary"
+      ]) {
+        expect(system).toContain(key);
+      }
+    }
+  });
+
 
   it("所有角色都经过同一提示注入边界，待审材料中的伪指令只能留在 user JSON", () => {
     const builders = [
