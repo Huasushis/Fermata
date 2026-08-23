@@ -565,6 +565,34 @@ const createCriticConflictSchema = (evidenceId: z.ZodType<string>) => z
   })
   .strict();
 
+function rejectInvalidCriticReferences(
+  payload: {
+    readonly conflicts: readonly {
+      readonly leftEvidenceId: string;
+      readonly rightEvidenceId: string;
+    }[];
+    readonly missingRoles: readonly string[];
+  },
+  context: z.RefinementCtx
+): void {
+  payload.missingRoles.forEach((_, index) => {
+    context.addIssue({
+      code: "custom",
+      path: ["missingRoles", index],
+      message: "完整证据视图不允许缺失角色。"
+    });
+  });
+  payload.conflicts.forEach((conflict, index) => {
+    if (conflict.leftEvidenceId === conflict.rightEvidenceId) {
+      context.addIssue({
+        code: "custom",
+        path: ["conflicts", index, "rightEvidenceId"],
+        message: "冲突必须引用两个不同的证据。"
+      });
+    }
+  });
+}
+
 function criticPayloadSchemaForEvidenceId(
   evidenceId: z.ZodType<string>
 ) {
@@ -574,7 +602,8 @@ function criticPayloadSchemaForEvidenceId(
       missingRoles: z.array(reviewFlowRoleSchema).max(20),
       rationale: shortTextSchema
     })
-    .strict();
+    .strict()
+    .superRefine(rejectInvalidCriticReferences);
 }
 
 export const criticPayloadSchema = criticPayloadSchemaForEvidenceId(evidenceIdSchema);

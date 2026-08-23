@@ -16,6 +16,7 @@ import {
   type ReviewInput
 } from "../urmotiv-schemas";
 import {
+  canonicalEvidenceIds,
   deepFreeze,
   hashCanonicalValue,
   sealEvidenceArtifact,
@@ -26,7 +27,7 @@ import {
   adjudicatorPayloadSchema,
   adversaryPayloadSchema,
   contestFitPayloadSchema,
-  criticPayloadSchema,
+  createCriticPayloadSchema,
   difficultyPayloadSchema,
   digestSchema,
   editorialPayloadSchema,
@@ -1174,6 +1175,8 @@ async function runReviewEvidenceFlowTracked(
     originality,
     tags
   ];
+  const criticEvidenceIds = canonicalEvidenceIds(coreEvidence);
+  const criticSchema = createCriticPayloadSchema(criticEvidenceIds);
   const criticView = buildCriticView(source.problemContentHash, coreEvidence);
   const adversaryView = buildAdversaryView(criticView);
   const [critic, adversary] = await runIndependentRoles({
@@ -1184,11 +1187,11 @@ async function runReviewEvidenceFlowTracked(
     specs: [
       {
         role: "critic",
-        schema: criticPayloadSchema,
+        schema: criticSchema,
         inputHash: hashCanonicalValue(criticView),
         run: () => roles.critic(criticView),
         postValidate: (artifact: EvidenceArtifact<CriticPayload>) => assertCriticReferences(
-          coreEvidence,
+          criticEvidenceIds,
           artifact.payload
         )
       },
@@ -1772,10 +1775,10 @@ function assertOriginalityEvidence(
 }
 
 function assertCriticReferences(
-  evidence: readonly EvidenceArtifact<unknown>[],
+  evidenceIds: readonly string[],
   critic: CriticPayload
 ): void {
-  const ids = new Set(evidence.map((artifact) => artifact.evidenceId));
+  const ids = new Set(evidenceIds);
   if (
     critic.missingRoles.length > 0 ||
     critic.conflicts.some((conflict) =>

@@ -16,7 +16,7 @@ import {
   type ProductionReviewGrant,
   type ProductionReviewGrantClaims
 } from "../production-eligibility";
-import { deepFreeze, hashCanonicalValue } from "./evidence";
+import { canonicalEvidenceIds, deepFreeze, hashCanonicalValue } from "./evidence";
 import {
   historicalReviewRubricDigest,
   historicalReviewRubricPromptDigest,
@@ -278,7 +278,7 @@ export function createReviewFlowLlmBundle(input: {
     critic: async (view) => runJsonRole(
       models.critic,
       buildCriticMessages(view),
-      createCriticPayloadSchema(view.evidence.map((artifact) => artifact.evidenceId))
+      createCriticPayloadSchema(canonicalEvidenceIds(view.evidence))
     ),
     adversary: async (view) => runJsonRole(
       models.adversary,

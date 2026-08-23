@@ -760,6 +760,104 @@ describe("历史人工标准驱动的多角色提示词", () => {
       .toEqual(allowedEvidenceIds);
   });
 
+  it("critic formatter repairs canonical self-reference before post-validation", async () => {
+    const { artifacts } = flowViews();
+    const evidence = [
+      artifacts.solver,
+      artifacts.solutionAnalyst,
+      artifacts.technicalAudit
+    ];
+    const criticView = buildCriticView(problemContentHash, evidence);
+    const allowedEvidenceIds = evidence.map((artifact) => artifact.evidenceId);
+    const validPayload = {
+      conflicts: [],
+      missingRoles: [],
+      rationale: "合成证据无冲突。"
+    };
+    const requests: Record<string, unknown>[] = [];
+    const fetchImpl = vi.fn(async (
+      _url: string | URL | Request,
+      init?: RequestInit
+    ) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      const content = requests.length === 1
+        ? "合成批评语义草稿。"
+        : requests.length === 2
+          ? JSON.stringify({
+            conflicts: [{
+              leftEvidenceId: allowedEvidenceIds[0],
+              rightEvidenceId: allowedEvidenceIds[0],
+              code: "EVIDENCE_MISMATCH",
+              severity: "warning",
+              rationale: "合成自引用。"
+            }],
+            missingRoles: [],
+            rationale: "合成自引用。"
+          })
+          : JSON.stringify(validPayload);
+      return new Response(JSON.stringify({
+        choices: [{
+          message: { content },
+          finish_reason: "stop"
+        }]
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    const baseModels = modelConfigs();
+    const criticModel = modelConfig("deepseek-v4-flash");
+    const stagedCriticModel = {
+      ...criticModel,
+      spec: {
+        ...criticModel.spec,
+        thinkingRequest: "enabled" as const,
+        reasoningEffort: "max" as const
+      }
+    };
+    const bundle = createReviewFlowLlmBundle({
+      models: {
+        ...baseModels,
+        critic: {
+          ...stagedCriticModel,
+          runtime: { ...stagedCriticModel.runtime, fetch: fetchImpl }
+        }
+      },
+      difficultyAnchors: [],
+      profileName: "synthetic-profile",
+      experimentVersion: "synthetic-experiment",
+      engineBuildFingerprint: "c".repeat(64),
+      productionGrant: null
+    });
+
+    const result = trustedRoleExecutionResultSchema.parse(
+      await bundle.roles.critic(criticView)
+    );
+    expect(result.payload).toEqual(validPayload);
+    expect(requests).toHaveLength(3);
+    expect(requests[0]).not.toHaveProperty("response_format");
+    const formatSchema = z.object({
+      response_format: z.object({
+        json_schema: z.object({
+          schema: z.object({
+            properties: z.object({
+              conflicts: z.object({
+                items: z.object({
+                  properties: z.object({
+                    leftEvidenceId: z.object({ enum: z.array(z.string()) }),
+                    rightEvidenceId: z.object({ enum: z.array(z.string()) })
+                  })
+                })
+              })
+            })
+          })
+        })
+      })
+    }).passthrough().parse(requests[1]).response_format.json_schema.schema;
+    expect(formatSchema.properties.conflicts.items.properties.leftEvidenceId.enum)
+      .toEqual(allowedEvidenceIds);
+    expect(formatSchema.properties.conflicts.items.properties.rightEvidenceId.enum)
+      .toEqual(allowedEvidenceIds);
+  });
+
   it("11 个正式角色逐一调用各自模型槽位并完成严格 HTTP receipt", async () => {
     const uniqueModels = Object.fromEntries(
       reviewFlowRoleSchema.options.map((role) => [role, `wire-model-${role}`])

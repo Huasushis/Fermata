@@ -27,6 +27,12 @@ export interface EvidenceArtifact<TPayload> {
   readonly payload: Readonly<TPayload>;
 }
 
+export function canonicalEvidenceIds(
+  evidence: readonly { readonly evidenceId: string }[]
+): readonly string[] {
+  return evidence.map((artifact) => artifact.evidenceId);
+}
+
 export type EvidenceExecutionBinding =
   | {
       readonly trust: "untrusted_local";
