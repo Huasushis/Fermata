@@ -327,15 +327,50 @@ export interface SafeSchemaDiagnostic {
   readonly expectedCategory: SafeSchemaDiagnosticCategory;
 }
 
+export interface LlmTransportAudit {
+  readonly providerRequestCount: number;
+  readonly retryCount: number;
+  readonly responseByteCount: number;
+  readonly usageTotalTokens: number | null;
+  readonly usageComplete: boolean;
+  readonly maxOutputTokens: number | null;
+  readonly finishReason: LlmSseFinishReasonClass | null;
+  readonly eofObserved: boolean;
+  readonly finishReasonStopObserved: boolean;
+  readonly sseDoneObserved: boolean | null;
+}
+
+export interface LlmCompletionAudit {
+  readonly logicalRequestCount: number;
+  readonly transportAttemptCount: number;
+  readonly providerRequestCount: number;
+  readonly retryCount: number;
+  readonly responseByteCount: number;
+  readonly usageTotalTokens: number | null;
+  readonly usageComplete: boolean;
+  readonly maxOutputTokens: number | null;
+  readonly finishReason: LlmSseFinishReasonClass | null;
+  readonly eofObserved: boolean;
+  readonly finishReasonStopObserved: boolean;
+  readonly sseDoneObserved: boolean | null;
+}
+
 export interface LlmFailureAudit {
   readonly schemaVersion: 1;
   readonly requestCount: 1 | 2 | 3 | 4;
   readonly transportAttemptCount: number;
+  readonly providerRequestCount: number;
+  readonly retryCount: number;
+  readonly maxOutputTokens: number | null;
+  readonly responseByteCount: number;
+  readonly usageTotalTokens: number | null;
+  readonly usageComplete: boolean;
   readonly completedResponses: readonly LlmTransportReceipt[];
   readonly terminal: {
     readonly status: number | null;
     readonly responseMode: LlmResponseMode | null;
     readonly eofObserved: boolean;
+    readonly finishReason: LlmSseFinishReasonClass | null;
     readonly finishReasonStopObserved: boolean;
     readonly sseDoneObserved: boolean | null;
   };
@@ -353,7 +388,87 @@ export interface LlmFailureAudit {
   readonly schemaDiagnostic?: SafeSchemaDiagnostic;
 }
 
+const llmTransportAudits = new WeakMap<object, LlmTransportAudit>();
+const llmCompletionAudits = new WeakMap<object, LlmCompletionAudit>();
 const llmFailureAudits = new WeakMap<object, LlmFailureAudit>();
+
+export function getLlmTransportAudit(value: unknown): LlmTransportAudit | null {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) {
+    return null;
+  }
+  return llmTransportAudits.get(value) ?? null;
+}
+
+export function getLlmCompletionAudit(value: unknown): LlmCompletionAudit | null {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) {
+    return null;
+  }
+  const existing = llmCompletionAudits.get(value);
+  if (existing !== undefined) return existing;
+  const responseValues = (value as { readonly responses?: unknown }).responses;
+  if (!Array.isArray(responseValues) || responseValues.length === 0) return null;
+  const audits = responseValues.map(getLlmTransportAudit);
+  if (audits.some((audit) => audit === null)) return null;
+  const entries = audits as LlmTransportAudit[];
+  const logicalRequestCount = Number.isSafeInteger(
+    (value as { readonly requestCount?: unknown }).requestCount
+  )
+    ? (value as { readonly requestCount: number }).requestCount
+    : entries.length;
+  const providerRequestCount = entries.reduce(
+    (sum, audit) => sum + audit.providerRequestCount,
+    0
+  );
+  const sseEntries = entries.filter((audit) => audit.sseDoneObserved !== null);
+  const maxOutputTokens = entries[0]?.maxOutputTokens ?? null;
+  const usageValues = entries.flatMap((audit) =>
+    audit.usageTotalTokens === null ? [] : [audit.usageTotalTokens]
+  );
+  const audit = Object.freeze({
+    logicalRequestCount,
+    transportAttemptCount: providerRequestCount,
+    providerRequestCount,
+    retryCount: entries.reduce((sum, entry) => sum + entry.retryCount, 0),
+    responseByteCount: entries.reduce(
+      (sum, entry) => sum + entry.responseByteCount,
+      0
+    ),
+    usageTotalTokens: usageValues.length === 0
+      ? null
+      : usageValues.reduce((sum, value) => sum + value, 0),
+    usageComplete: entries.every((entry) => entry.usageComplete),
+    maxOutputTokens: entries.every(
+      (entry) => entry.maxOutputTokens === maxOutputTokens
+    )
+      ? maxOutputTokens
+      : null,
+    finishReason: entries.at(-1)?.finishReason ?? null,
+    eofObserved: entries.every((entry) => entry.eofObserved),
+    finishReasonStopObserved: entries.every(
+      (entry) => entry.finishReasonStopObserved
+    ),
+    sseDoneObserved: sseEntries.length === 0
+      ? null
+      : sseEntries.every((entry) => entry.sseDoneObserved === true)
+  });
+  llmCompletionAudits.set(value, audit);
+  return audit;
+}
+
+export function copyLlmCompletionAudit(source: unknown, target: unknown): void {
+  if ((typeof target !== "object" && typeof target !== "function") || target === null) {
+    return;
+  }
+  const audit = getLlmCompletionAudit(source);
+  if (audit !== null) llmCompletionAudits.set(target, audit);
+}
+
+function rememberLlmTransportAudit(
+  receipt: object,
+  audit: LlmTransportAudit
+): void {
+  llmTransportAudits.set(receipt, Object.freeze({ ...audit }));
+}
 
 export function getLlmFailureAudit(error: unknown): LlmFailureAudit | null {
   if ((typeof error !== "object" && typeof error !== "function") || error === null) {
@@ -863,11 +978,14 @@ export async function chatCompleteWithReceipt(
   if (spec.reasoningEffort !== undefined) {
     body.reasoning_effort = spec.reasoningEffort;
   }
-  if (options.maxOutputTokens !== undefined) {
-    body.max_tokens = validateMaxOutputTokens(options.maxOutputTokens);
+  const maxOutputTokens = options.maxOutputTokens === undefined
+    ? null
+    : validateMaxOutputTokens(options.maxOutputTokens);
+  if (maxOutputTokens !== null) {
+    body.max_tokens = maxOutputTokens;
   }
 
-  const requestAudit = createMutableLlmRequestAudit();
+  const requestAudit = createMutableLlmRequestAudit(maxOutputTokens);
   let response: Awaited<ReturnType<typeof requestWithRetry>>;
   try {
     response = await requestWithRetry(
@@ -924,17 +1042,19 @@ export async function chatCompleteWithReceipt(
   const result = spec.thinking
     ? extracted
     : { content: extracted.content, reasoning: null };
+  const receipt: LlmTransportReceipt = Object.freeze({
+    schemaVersion: 2,
+    transportAttemptCount: response.attemptCount,
+    eofVerified: true,
+    responseMode: response.responseMode,
+    finishReasonStopVerified: true,
+    acceptedEventShapes: acceptedShapeAudit(requestAudit),
+    sseDoneObserved: response.sseDoneObserved
+  });
+  rememberLlmTransportAudit(receipt, mutableLlmTransportAudit(requestAudit));
   return {
     ...result,
-    receipt: {
-      schemaVersion: 2,
-      transportAttemptCount: response.attemptCount,
-      eofVerified: true,
-      responseMode: response.responseMode,
-      finishReasonStopVerified: true,
-      acceptedEventShapes: acceptedShapeAudit(requestAudit),
-      sseDoneObserved: response.sseDoneObserved
-    }
+    receipt
   };
 }
 
@@ -985,11 +1105,14 @@ export async function chatCompleteSalvageableWithReceipt(
   if (spec.reasoningEffort !== undefined) {
     body.reasoning_effort = spec.reasoningEffort;
   }
-  if (options.maxOutputTokens !== undefined) {
-    body.max_tokens = validateMaxOutputTokens(options.maxOutputTokens);
+  const maxOutputTokens = options.maxOutputTokens === undefined
+    ? null
+    : validateMaxOutputTokens(options.maxOutputTokens);
+  if (maxOutputTokens !== null) {
+    body.max_tokens = maxOutputTokens;
   }
 
-  const requestAudit = createMutableLlmRequestAudit();
+  const requestAudit = createMutableLlmRequestAudit(maxOutputTokens);
   let response: Awaited<ReturnType<typeof requestWithRetry>>;
   try {
     response = await requestWithRetry(
@@ -1035,21 +1158,23 @@ export async function chatCompleteSalvageableWithReceipt(
   if (response.salvaged) {
     // 抢救路径：从 raw stream result 提取 reasoning，不提取 content（content 为空）。
     const reasoning = extractSalvagedReasoning(response.raw);
+    const receipt: LlmSalvageTransportReceipt = Object.freeze({
+      schemaVersion: 2,
+      transportAttemptCount: response.attemptCount,
+      eofVerified: true,
+      responseMode: response.responseMode as LlmResponseMode,
+      finishReasonStopVerified: false,
+      finishReasonLengthSalvaged: true,
+      salvagedReasoningLength: reasoning.length,
+      acceptedEventShapes: acceptedShapeAudit(requestAudit),
+      sseDoneObserved: response.sseDoneObserved
+    });
+    rememberLlmTransportAudit(receipt, mutableLlmTransportAudit(requestAudit));
     return {
       content: "",
       reasoning,
       salvaged: true,
-      receipt: {
-        schemaVersion: 2,
-        transportAttemptCount: response.attemptCount,
-        eofVerified: true,
-        responseMode: response.responseMode as LlmResponseMode,
-        finishReasonStopVerified: false,
-        finishReasonLengthSalvaged: true,
-        salvagedReasoningLength: reasoning.length,
-        acceptedEventShapes: acceptedShapeAudit(requestAudit),
-        sseDoneObserved: response.sseDoneObserved
-      }
+      receipt
     };
   }
   if (response.responseMode === null || !response.finishReasonStopVerified) {
@@ -1065,18 +1190,20 @@ export async function chatCompleteSalvageableWithReceipt(
   const result = spec.thinking
     ? extracted
     : { content: extracted.content, reasoning: null };
+  const receipt: LlmTransportReceipt = Object.freeze({
+    schemaVersion: 2,
+    transportAttemptCount: response.attemptCount,
+    eofVerified: true,
+    responseMode: response.responseMode,
+    finishReasonStopVerified: true,
+    acceptedEventShapes: acceptedShapeAudit(requestAudit),
+    sseDoneObserved: response.sseDoneObserved
+  });
+  rememberLlmTransportAudit(receipt, mutableLlmTransportAudit(requestAudit));
   return {
     ...result,
     salvaged: false,
-    receipt: {
-      schemaVersion: 2,
-      transportAttemptCount: response.attemptCount,
-      eofVerified: true,
-      responseMode: response.responseMode,
-      finishReasonStopVerified: true,
-      acceptedEventShapes: acceptedShapeAudit(requestAudit),
-      sseDoneObserved: response.sseDoneObserved
-    }
+    receipt
   };
 }
 
@@ -2112,6 +2239,7 @@ interface MutableLlmRequestAudit {
   status: number | null;
   responseMode: LlmResponseMode | null;
   eofObserved: boolean;
+  finishReason: LlmSseFinishReasonClass | null;
   finishReasonStopObserved: boolean;
   sseDoneObserved: boolean | null;
   streamEventCount: number;
@@ -2125,14 +2253,18 @@ interface MutableLlmRequestAudit {
   usageEventCount: number;
   usageTotalTokens: number | null;
   firstRejectedEvent: LlmSseRejectedEventAudit | null;
+  maxOutputTokens: number | null;
 }
 
-function createMutableLlmRequestAudit(): MutableLlmRequestAudit {
+function createMutableLlmRequestAudit(
+  maxOutputTokens: number | null = null
+): MutableLlmRequestAudit {
   return {
     attemptCount: 0,
     status: null,
     responseMode: null,
     eofObserved: false,
+    finishReason: null,
     finishReasonStopObserved: false,
     sseDoneObserved: null,
     streamEventCount: 0,
@@ -2141,7 +2273,8 @@ function createMutableLlmRequestAudit(): MutableLlmRequestAudit {
     streamChunkCount: 0,
     usageEventCount: 0,
     usageTotalTokens: null,
-    firstRejectedEvent: null
+    firstRejectedEvent: null,
+    maxOutputTokens
   };
 }
 
@@ -2151,6 +2284,7 @@ function resetMutableLlmRequestAuditForAttempt(
   audit.status = null;
   audit.responseMode = null;
   audit.eofObserved = false;
+  audit.finishReason = null;
   audit.finishReasonStopObserved = false;
   audit.sseDoneObserved = null;
   audit.streamEventCount = 0;
@@ -2160,6 +2294,23 @@ function resetMutableLlmRequestAuditForAttempt(
   audit.usageEventCount = 0;
   audit.usageTotalTokens = null;
   audit.firstRejectedEvent = null;
+}
+
+function mutableLlmTransportAudit(
+  audit: MutableLlmRequestAudit
+): LlmTransportAudit {
+  return {
+    providerRequestCount: audit.attemptCount,
+    retryCount: Math.max(0, audit.attemptCount - 1),
+    responseByteCount: audit.streamUtf8Bytes,
+    usageTotalTokens: audit.usageTotalTokens,
+    usageComplete: audit.usageEventCount > 0,
+    maxOutputTokens: audit.maxOutputTokens,
+    finishReason: audit.finishReason,
+    eofObserved: audit.eofObserved,
+    finishReasonStopObserved: audit.finishReasonStopObserved,
+    sseDoneObserved: audit.sseDoneObserved
+  };
 }
 
 function rememberLlmFailureAudit(
@@ -2176,13 +2327,29 @@ function rememberLlmFailureAudit(
   if ((typeof error !== "object" && typeof error !== "function") || error === null) {
     return;
   }
-  const completedResponses = (input.completedResponses ?? []).map((receipt) =>
+  const sourceResponses = input.completedResponses ?? [];
+  const completedAudits = sourceResponses.map(getLlmTransportAudit);
+  const completedAuditsKnown = completedAudits.every((audit) => audit !== null);
+  const terminalAudit = mutableLlmTransportAudit(input.requestAudit);
+  const terminalAlreadyCompleted = sourceResponses.length === input.requestCount;
+  const aggregateAudits = completedAuditsKnown
+    ? [
+        ...(completedAudits as LlmTransportAudit[]),
+        ...(terminalAlreadyCompleted ? [] : [terminalAudit])
+      ]
+    : [terminalAudit];
+  const usageValues = aggregateAudits.flatMap((audit) =>
+    audit.usageTotalTokens === null ? [] : [audit.usageTotalTokens]
+  );
+  const maxOutputTokens = aggregateAudits[0]?.maxOutputTokens ?? null;
+  const completedResponses = sourceResponses.map((receipt) =>
     Object.freeze({ ...receipt })
   );
   const terminal = Object.freeze({
     status: input.requestAudit.status,
     responseMode: input.requestAudit.responseMode,
     eofObserved: input.requestAudit.eofObserved,
+    finishReason: input.requestAudit.finishReason,
     finishReasonStopObserved: input.requestAudit.finishReasonStopObserved,
     sseDoneObserved: input.requestAudit.sseDoneObserved
   });
@@ -2198,11 +2365,32 @@ function rememberLlmFailureAudit(
   const safeSchemaDiagnostic = input.schemaDiagnostic === undefined
     ? undefined
     : Object.freeze({ ...input.schemaDiagnostic });
+  const transportAttemptCount =
+    (input.priorTransportAttemptCount ?? 0) + input.requestAudit.attemptCount;
   llmFailureAudits.set(error, Object.freeze({
     schemaVersion: 1,
     requestCount: input.requestCount,
-    transportAttemptCount:
-      (input.priorTransportAttemptCount ?? 0) + input.requestAudit.attemptCount,
+    transportAttemptCount,
+    providerRequestCount: transportAttemptCount,
+    retryCount: aggregateAudits.reduce(
+      (sum, audit) => sum + audit.retryCount,
+      0
+    ),
+    maxOutputTokens: aggregateAudits.every(
+      (audit) => audit.maxOutputTokens === maxOutputTokens
+    )
+      ? maxOutputTokens
+      : null,
+    responseByteCount: aggregateAudits.reduce(
+      (sum, audit) => sum + audit.responseByteCount,
+      0
+    ),
+    usageTotalTokens: usageValues.length === 0
+      ? null
+      : usageValues.reduce((sum, value) => sum + value, 0),
+    usageComplete:
+      aggregateAudits.length === input.requestCount &&
+      aggregateAudits.every((audit) => audit.usageComplete),
     completedResponses: Object.freeze(completedResponses),
     terminal,
     stream,
@@ -2214,14 +2402,22 @@ function rememberLlmFailureAudit(
 }
 
 function mutableAuditFromReceipt(
-  receipt: LlmTransportReceipt | LlmSalvageTransportReceipt
+  receipt: LlmTransportReceipt | LlmSalvageTransportReceipt,
+  maxOutputTokens: number | null = null
 ): MutableLlmRequestAudit {
+  const transportAudit = getLlmTransportAudit(receipt);
   return {
     attemptCount: receipt.transportAttemptCount,
     status: 200,
     responseMode: receipt.responseMode,
     eofObserved: true,
-    finishReasonStopObserved: "finishReasonStopVerified" in receipt && receipt.finishReasonStopVerified,
+    finishReason:
+      transportAudit?.finishReason ??
+      ("finishReasonLengthSalvaged" in receipt && receipt.finishReasonLengthSalvaged
+        ? "length"
+        : "stop"),
+    finishReasonStopObserved:
+      "finishReasonStopVerified" in receipt && receipt.finishReasonStopVerified,
     sseDoneObserved: receipt.sseDoneObserved,
     streamEventCount: 0,
     acceptedEventShapeCounts: new Map(
@@ -2230,11 +2426,12 @@ function mutableAuditFromReceipt(
         { ...entry }
       ])
     ),
-    streamUtf8Bytes: 0,
+    streamUtf8Bytes: transportAudit?.responseByteCount ?? 0,
     streamChunkCount: 0,
-    usageEventCount: 0,
-    usageTotalTokens: null,
-    firstRejectedEvent: null
+    usageEventCount: transportAudit?.usageComplete ? 1 : 0,
+    usageTotalTokens: transportAudit?.usageTotalTokens ?? null,
+    firstRejectedEvent: null,
+    maxOutputTokens: transportAudit?.maxOutputTokens ?? maxOutputTokens
   };
 }
 
@@ -2271,6 +2468,7 @@ function promoteJsonFailureAudit(
       status: existing.terminal.status,
       responseMode: existing.terminal.responseMode,
       eofObserved: existing.terminal.eofObserved,
+      finishReason: existing.terminal.finishReason,
       finishReasonStopObserved: existing.terminal.finishReasonStopObserved,
       sseDoneObserved: existing.terminal.sseDoneObserved,
       streamEventCount: existing.stream.eventCount,
@@ -2284,7 +2482,8 @@ function promoteJsonFailureAudit(
       streamChunkCount: existing.stream.chunkCount,
       usageEventCount: existing.stream.usageEventCount,
       usageTotalTokens: existing.stream.usageTotalTokens,
-      firstRejectedEvent: existing.stream.firstRejectedEvent
+      firstRejectedEvent: existing.stream.firstRejectedEvent,
+      maxOutputTokens: existing.maxOutputTokens
     },
     completedResponses,
     priorTransportAttemptCount,
@@ -2886,7 +3085,8 @@ async function parseResponseBody(
   const text = await readResponseTextWithLimit(
     response,
     requestController,
-    observer
+    observer,
+    audit
   );
   audit.eofObserved = true;
   let raw: unknown;
@@ -2899,6 +3099,7 @@ async function parseResponseBody(
   // 它必须明确 finish_reason=stop 且最终 content 非空白，然后才算
   // 收到有效模型输出。reasoning-only 不会被暗中升格为最终答案。
   extractChatCompletion(raw, true);
+  audit.finishReason = "stop";
   audit.finishReasonStopObserved = true;
   observer.onValidOutput();
   return {
@@ -2912,7 +3113,8 @@ async function parseResponseBody(
 async function readResponseTextWithLimit(
   response: Response,
   requestController: AbortController,
-  observer: ResponseBodyActivityObserver
+  observer: ResponseBodyActivityObserver,
+  audit: MutableLlmRequestAudit
 ): Promise<string> {
   if (response.body === null) throw new LlmResponseFormatError("missing_body");
   const reader = response.body.getReader();
@@ -2941,7 +3143,14 @@ async function readResponseTextWithLimit(
           throw new LlmResponseFormatError("json_utf8");
         }
       }
-      if (chunk.value.byteLength > 0) observer.onResponseByte();
+      if (chunk.value.byteLength > 0) {
+        audit.streamUtf8Bytes = addResponseChunkSize(
+          audit.streamUtf8Bytes,
+          chunk.value.byteLength
+        );
+        audit.streamChunkCount += 1;
+        observer.onResponseByte();
+      }
       if (firstProtocolError !== undefined) {
         if (chunk.value.byteLength > 0) {
           observer.onInvalidResponseDrainActivity();
@@ -3003,7 +3212,14 @@ async function drainResponseAfterProtocolError(
         audit.eofObserved = true;
         throw firstProtocolError;
       }
-      if (chunk.value.byteLength > 0) observer.onResponseByte();
+      if (chunk.value.byteLength > 0) {
+        audit.streamUtf8Bytes = addResponseChunkSize(
+          audit.streamUtf8Bytes,
+          chunk.value.byteLength
+        );
+        audit.streamChunkCount += 1;
+        observer.onResponseByte();
+      }
       // 排空阶段不解码、不拼接、不解析，也不保留任何响应字节。
       if (chunk.value.byteLength > 0) {
         observer.onInvalidResponseDrainActivity();
@@ -3425,7 +3641,8 @@ async function readChatCompletionEventStream(
       const hasValidOutput = consumeObservedChatCompletionEvent(
         event,
         state,
-        observer
+        observer,
+        audit
       );
       recordAcceptedSseEvent(event, audit);
       audit.sseDoneObserved = state.sawDone;
@@ -4402,19 +4619,22 @@ function publishUnresolvedPostDoneData(
 function consumeObservedChatCompletionEvent(
   event: string,
   state: ChatCompletionStreamState,
-  observer: ResponseBodyActivityObserver
+  observer: ResponseBodyActivityObserver,
+  audit: MutableLlmRequestAudit
 ): boolean {
   return consumeChatCompletionEvent(
     event,
     state,
-    (shape) => updatePostDoneTailShape(state, shape, observer)
+    (shape) => updatePostDoneTailShape(state, shape, observer),
+    audit
   );
 }
 
 function consumeChatCompletionEvent(
   event: string,
   state: ChatCompletionStreamState,
-  observePostDoneShape: (shape: PostDoneTailShape) => void
+  observePostDoneShape: (shape: PostDoneTailShape) => void,
+  audit: MutableLlmRequestAudit
 ): boolean {
   const dataFields = event
     .split("\n")
@@ -4493,6 +4713,9 @@ function consumeChatCompletionEvent(
   }
   state.sawChoice = true;
   const choiceRecord = choice as Record<string, unknown>;
+  audit.finishReason = classifyFinishReason(
+    fieldValue(choiceRecord, "finish_reason")
+  );
   if (
     state.salvageOnLengthLimit &&
     choiceRecord.finish_reason === "length"

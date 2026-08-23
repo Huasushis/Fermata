@@ -340,6 +340,17 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
               );
             } catch {
               startGate.releaseCaseRequestStartGate(caseRequestStartGate);
+              try {
+                input.checkpoint.recordUnknownCaseAttempt(
+                  safeId,
+                  caseAttempts,
+                  "REVIEW_FLOW_EVALUATION_EXECUTION_THROWN"
+                );
+              } catch {
+                localFatal = true;
+                finalized = true;
+                continue;
+              }
               latestThrown = true;
               continue;
             }
@@ -347,6 +358,32 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
 
             if (outcome.status === "incomplete") {
               latestIncomplete = outcome.failure;
+              try {
+                if (outcome.failure.roleAttempts === undefined) {
+                  input.checkpoint.recordUnknownCaseAttempt(
+                    safeId,
+                    caseAttempts,
+                    "REVIEW_FLOW_EVALUATION_EXECUTION_THROWN"
+                  );
+                } else {
+                  const failedRole = outcome.failure.roleAttempts.find(
+                    (role) => role.outcome === "failed"
+                  );
+                  input.checkpoint.recordCaseAttempt(safeId, {
+                    schemaVersion: 1,
+                    attempt: caseAttempts,
+                    outcome: "failed",
+                    accountingComplete: true,
+                    errorCategory: outcome.failure.failureKind,
+                    errorCode: failedRole?.errorCode ?? null,
+                    roleAttempts: outcome.failure.roleAttempts
+                  });
+                }
+              } catch {
+                localFatal = true;
+                finalized = true;
+                continue;
+              }
               if (
                 isRetryableReviewFlowEvaluationFailure(outcome.failure) &&
                 caseAttempts < maxCaseAttempts &&
@@ -368,6 +405,17 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
             }
             if (selection !== undefined && !validCaseTiming(outcome.timing)) {
               try {
+                if (outcome.roleAttempts !== undefined) {
+                  input.checkpoint.recordCaseAttempt(safeId, {
+                    schemaVersion: 1,
+                    attempt: caseAttempts,
+                    outcome: "failed",
+                    accountingComplete: true,
+                    errorCategory: null,
+                    errorCode: "REVIEW_FLOW_EVALUATION_TIMING_RECEIPT_MISSING",
+                    roleAttempts: [...outcome.roleAttempts]
+                  });
+                }
                 input.checkpoint.markFailed(
                   safeId,
                   timingReceiptMissingFailure(caseAttempts)
@@ -379,6 +427,17 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
               continue;
             }
             try {
+              if (outcome.roleAttempts !== undefined) {
+                input.checkpoint.recordCaseAttempt(safeId, {
+                  schemaVersion: 1,
+                  attempt: caseAttempts,
+                  outcome: "completed",
+                  accountingComplete: true,
+                  errorCategory: null,
+                  errorCode: null,
+                  roleAttempts: [...outcome.roleAttempts]
+                });
+              }
               markCompleted(
                 input.checkpoint,
                 safeId,

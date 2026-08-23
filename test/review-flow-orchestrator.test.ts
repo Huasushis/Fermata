@@ -719,6 +719,62 @@ describe("冻结证据多角色审题编排", () => {
     expect(JSON.stringify(outcome)).not.toContain(solutionSentinel);
     expect(JSON.stringify(outcome)).not.toContain("projection");
   });
+  it("audit-chain RED: protocol failure projects one failed and ten dependency-blocked roles", async () => {
+    const privateOutput = "PRIVATE_ORCHESTRATOR_PROTOCOL_SENTINEL";
+    const { runner } = syntheticTrustedRunner(
+      vi.fn(async () => new Response(privateOutput, {
+        status: 200,
+        headers: { "Content-Type": "text/plain" }
+      }))
+    );
+    const outcome = await runReviewEvidenceFlowCalibrationOutcome({
+      taskSource: trustedTaskSource(),
+      trustedRunner: runner,
+      executionContext: executionContext(),
+      requestStartGate: new LlmRequestStartGate()
+    });
+
+    expect(outcome.status).toBe("incomplete");
+    if (outcome.status !== "incomplete") throw new Error("expected incomplete");
+    const roleAttempts = (outcome.failure as unknown as {
+      readonly roleAttempts: readonly Record<string, unknown>[];
+    }).roleAttempts;
+    expect(roleAttempts).toHaveLength(11);
+    expect(roleAttempts[0]).toMatchObject({
+      schemaVersion: 1,
+      role: "solver",
+      roleStage: "foundation",
+      outcome: "failed",
+      errorCategory: "protocol",
+      errorCode: "LLM_RESPONSE_FORMAT_INVALID",
+      failureStage: "content_type",
+      failureSubstage: null,
+      httpStatus: 200,
+      finishReason: null,
+      maxTokens: null,
+      usageTotalTokens: null,
+      usageComplete: false,
+      responseByteCount: new TextEncoder().encode(privateOutput).byteLength,
+      eofObserved: true,
+      stopObserved: false,
+      doneObserved: null,
+      logicalRequestCount: 1,
+      transportAttemptCount: 1,
+      providerRequestCount: 1,
+      retryCount: 0,
+      dependencyBlocked: false
+    });
+    expect(roleAttempts.slice(1).every((entry) =>
+      entry.outcome === "dependency_blocked" &&
+      entry.dependencyBlocked === true &&
+      entry.logicalRequestCount === 0 &&
+      entry.providerRequestCount === 0
+    )).toBe(true);
+    const serialized = JSON.stringify(roleAttempts);
+    expect(serialized).not.toContain(privateOutput);
+    expect(serialized).not.toContain("llm.example");
+    expect(serialized).not.toContain("test-model");
+  });
 
   it("标定闸门在角色启动前已关闭时归类为 cancelled 且不发请求", async () => {
     const { runner, fetchImpl } = syntheticTrustedRunner();

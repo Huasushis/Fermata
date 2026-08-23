@@ -280,6 +280,90 @@ describe("chatComplete：正常路径", () => {
     });
     expect(JSON.stringify(caught)).not.toContain(privateBody);
   });
+  it("audit-chain RED: output_limit keeps exact content-free terminal accounting", async () => {
+    const privateOutput = "PRIVATE_OUTPUT_LIMIT_SENTINEL";
+    const event = JSON.stringify({
+      choices: [{
+        delta: { content: privateOutput },
+        finish_reason: "length"
+      }],
+      usage: {
+        prompt_tokens: 3,
+        completion_tokens: 4,
+        total_tokens: 7
+      }
+    });
+    const body = `data: ${event}\n\n`;
+    let caught: unknown;
+    try {
+      await chatCompleteWithReceipt(provider, spec, [], {
+        ...runtime,
+        fetch: vi.fn(async () => new Response(body, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" }
+        }))
+      }, { maxOutputTokens: 2_048 });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({ code: "LLM_OUTPUT_LENGTH_LIMIT" });
+    expect(getLlmFailureAudit(caught)).toMatchObject({
+      maxOutputTokens: 2_048,
+      providerRequestCount: 1,
+      retryCount: 0,
+      responseByteCount: new TextEncoder().encode(body).byteLength,
+      usageTotalTokens: 7,
+      usageComplete: true,
+      terminal: {
+        status: 200,
+        responseMode: "sse",
+        eofObserved: true,
+        finishReason: "length",
+        finishReasonStopObserved: false,
+        sseDoneObserved: false
+      }
+    });
+    expect(JSON.stringify(getLlmFailureAudit(caught))).not.toContain(privateOutput);
+  });
+
+  it("audit-chain RED: protocol failure keeps bytes and closed stage without response text", async () => {
+    const privateOutput = "PRIVATE_PROTOCOL_RESPONSE_SENTINEL";
+    let caught: unknown;
+    try {
+      await chatCompleteWithReceipt(provider, spec, [], {
+        ...runtime,
+        fetch: vi.fn(async () => new Response(privateOutput, {
+          status: 200,
+          headers: { "Content-Type": "text/plain" }
+        }))
+      }, { maxOutputTokens: 4_096 });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "content_type"
+    });
+    expect(getLlmFailureAudit(caught)).toMatchObject({
+      maxOutputTokens: 4_096,
+      providerRequestCount: 1,
+      retryCount: 0,
+      responseByteCount: new TextEncoder().encode(privateOutput).byteLength,
+      usageTotalTokens: null,
+      usageComplete: false,
+      terminal: {
+        status: 200,
+        responseMode: "json",
+        eofObserved: true,
+        finishReason: null,
+        finishReasonStopObserved: false,
+        sseDoneObserved: null
+      }
+    });
+    expect(JSON.stringify(getLlmFailureAudit(caught))).not.toContain(privateOutput);
+  });
 
   it("请求前已取消时 fetch=0 且 HTTP 尝试数也必须为 0", async () => {
     const controller = new AbortController();

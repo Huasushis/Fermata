@@ -21,6 +21,7 @@ import {
 import {
   reviewFlowEvaluationBaselineBindingSchema,
   reviewFlowEvaluationIdentitySchema,
+  summarizeReviewFlowEvaluationAuditLedger,
   type ReviewFlowEvaluationCheckpointState,
   type ReviewFlowEvaluationEntry
 } from "./review-flow-evaluation-state";
@@ -213,13 +214,21 @@ const caseCountsSchema = z
   })
   .strict();
 
-/** 全部案例/角色/尝试的耐久账本；任一字段缺失都必须让摘要不完整。 */
+/** 全部案例/角色/尝试的耐久账本；缺失旧账本时以 null 明示未知。 */
 const accountingSchema = z
   .object({
-    logicalRequests: z.number().int().nonnegative(),
-    transportAttempts: z.number().int().nonnegative(),
+    exact: z.boolean(),
+    caseAttempts: z.number().int().nonnegative().nullable(),
+    logicalRequests: z.number().int().nonnegative().nullable(),
+    transportAttempts: z.number().int().nonnegative().nullable(),
+    providerRequests: z.number().int().nonnegative().nullable(),
     receivedByteResponses: z.number().int().nonnegative(),
-    retries: z.number().int().nonnegative(),
+    retries: z.number().int().nonnegative().nullable(),
+    usageTotalTokens: z.number().int().nonnegative().nullable(),
+    unknownUsageRoleCount: z.number().int().nonnegative().nullable(),
+    responseBytes: z.number().int().nonnegative().nullable(),
+    unknownResponseByteRoleCount: z.number().int().nonnegative().nullable(),
+    dependencyBlockedRoleCount: z.number().int().nonnegative().nullable(),
     schemaErrors: z.number().int().nonnegative(),
     formatterCorrections: z.number().int().nonnegative(),
     repairCount: z.number().int().nonnegative()
@@ -322,10 +331,21 @@ export const reviewFlowEvaluationReportSummarySchema = z
       summary.caseResults.length !== summary.caseCounts.expected ||
       summary.caseCounts.expectedEqualsTerminal !== true ||
       summary.caseCounts.unaccounted !== 0 ||
-      summary.accounting.logicalRequests <
-        summary.accounting.receivedByteResponses ||
-      summary.accounting.transportAttempts <
-        summary.accounting.receivedByteResponses ||
+      (summary.complete &&
+        (!summary.accounting.exact ||
+          summary.accounting.logicalRequests === null ||
+          summary.accounting.transportAttempts === null ||
+          summary.accounting.providerRequests === null)) ||
+      (summary.accounting.logicalRequests !== null &&
+        summary.accounting.logicalRequests <
+          summary.accounting.receivedByteResponses) ||
+      (summary.accounting.transportAttempts !== null &&
+        summary.accounting.transportAttempts <
+          summary.accounting.receivedByteResponses) ||
+      (summary.accounting.transportAttempts !== null &&
+        summary.accounting.providerRequests !== null &&
+        summary.accounting.transportAttempts !==
+          summary.accounting.providerRequests) ||
       (summary.dataset.purpose === "development" &&
         summary.dataset.holdoutIdentity !== null) ||
       (summary.dataset.purpose === "holdout" &&
@@ -437,7 +457,7 @@ export function buildReviewFlowEvaluationReport(input: {
     cancelled: 0,
     http499: 0
   };
-  const accounting = {
+  const legacyAccounting = {
     logicalRequests: 0,
     transportAttempts: 0,
     receivedByteResponses: 0,
@@ -450,9 +470,9 @@ export function buildReviewFlowEvaluationReport(input: {
     if (entry.status === "completed") {
       terminalStatusCounts.completed += 1;
       for (const receipt of entry.projection.roleReceipts) {
-        accounting.logicalRequests += receipt.requestCount;
-        accounting.transportAttempts += receipt.transportAttemptCount;
-        accounting.receivedByteResponses += receipt.responses.length;
+        legacyAccounting.logicalRequests += receipt.requestCount;
+        legacyAccounting.transportAttempts += receipt.transportAttemptCount;
+        legacyAccounting.receivedByteResponses += receipt.responses.length;
       }
       continue;
     }
@@ -464,15 +484,15 @@ export function buildReviewFlowEvaluationReport(input: {
         terminalStatusCounts.cancelled += 1;
       }
       for (const roleFailure of entry.failure.failedRoles) {
-        accounting.logicalRequests += roleFailure.requestCount;
-        accounting.transportAttempts += roleFailure.transportAttemptCount;
-        accounting.receivedByteResponses += roleFailure.completedResponseCount;
-        accounting.retries += Math.max(
+        legacyAccounting.logicalRequests += roleFailure.requestCount;
+        legacyAccounting.transportAttempts += roleFailure.transportAttemptCount;
+        legacyAccounting.receivedByteResponses += roleFailure.completedResponseCount;
+        legacyAccounting.retries += Math.max(
           0,
           roleFailure.transportAttemptCount - roleFailure.requestCount
         );
         if (roleFailure.failureKind === "schema_output") {
-          accounting.schemaErrors += 1;
+          legacyAccounting.schemaErrors += 1;
         }
       }
       continue;
@@ -505,7 +525,18 @@ export function buildReviewFlowEvaluationReport(input: {
         terminalStatusCounts.failed ===
       input.checkpoint.entries.length
   };
-  const complete = input.checkpoint.executionSeal!.complete;
+  const auditAccounting = summarizeReviewFlowEvaluationAuditLedger(
+    input.checkpoint.auditLedger
+  );
+  const accounting = {
+    ...auditAccounting,
+    receivedByteResponses: legacyAccounting.receivedByteResponses,
+    schemaErrors: legacyAccounting.schemaErrors,
+    formatterCorrections: legacyAccounting.formatterCorrections,
+    repairCount: legacyAccounting.repairCount
+  };
+  const complete =
+    input.checkpoint.executionSeal!.complete && auditAccounting.exact;
   const completed = completedProjectionMap(input.checkpoint.entries);
   const summary = reviewFlowEvaluationReportSummarySchema.parse({
     schemaVersion: 2,

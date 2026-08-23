@@ -13,8 +13,10 @@ import type { ModelSpec } from "../../src/config";
 import type { LlmRequestStartGate } from "../../src/llm";
 import type { PipelineModelConfig } from "../../src/pipelines/types";
 import {
+  reviewFlowRoleAttemptsSchema,
   runReviewEvidenceFlowCalibrationOutcome,
-  type ReviewFlowCalibrationProjection
+  type ReviewFlowCalibrationProjection,
+  type ReviewFlowRoleAttemptAudit
 } from "../../src/review-flow/orchestrator";
 import {
   createReviewFlowLlmBundle,
@@ -74,6 +76,7 @@ export type ReviewFlowEvaluationExecutionOutcome =
   | {
       readonly status: "complete";
       readonly projection: ReviewFlowCalibrationProjection;
+      readonly roleAttempts?: readonly ReviewFlowRoleAttemptAudit[];
       readonly timing?: ReviewFlowEvaluationCaseTiming;
     }
   | {
@@ -264,6 +267,9 @@ export function createReviewFlowEvaluationAdapter(input: {
           return {
             status: "complete" as const,
             projection: outcome.projection,
+            roleAttempts: reviewFlowRoleAttemptsSchema.parse(
+              outcome.roleAttempts
+            ),
             timing: timingReceipt
           };
         }
@@ -394,6 +400,7 @@ function normalizeIncompleteFailure(
       transportAttemptCount: role.transportAttemptCount,
       completedResponseCount: role.completedResponseCount
     })),
+    roleAttempts: [...failure.roleAttempts],
     caseAttempts: 1
   };
 }

@@ -81,6 +81,7 @@ import {
   buildExecutionReceiptSeal,
   loadReviewFlowEvaluationCheckpointForReveal,
   ReviewFlowEvaluationCheckpoint,
+  reviewFlowEvaluationCheckpointSchema,
   reviewFlowEvaluationIdentitySchema,
   reviewFlowEvaluationPredictionIdentityFingerprint,
   type ReviewFlowEvaluationCheckpointState,
@@ -4148,6 +4149,49 @@ function fixedFailure(code: string, httpStatus: number | null) {
     caseAttempts: 1
   };
 }
+function auditRoleStage(role: string) {
+  if (["solver", "solution_analyst", "technical_auditor"].includes(role)) {
+    return "foundation";
+  }
+  if (["difficulty", "editorial_judge", "contest_fit", "originality", "tags"].includes(role)) {
+    return "independent";
+  }
+  if (["critic", "adversary"].includes(role)) return "critique";
+  return "adjudication";
+}
+
+function auditRoleAttempts(failedRole?: string) {
+  return reviewFlowRoleSchema.options.map((role) => {
+    const failed = role === failedRole;
+    const blocked = failedRole !== undefined && !failed;
+    return {
+      schemaVersion: 1 as const,
+      role,
+      roleStage: auditRoleStage(role),
+      outcome: failed ? "failed" as const : blocked
+        ? "dependency_blocked" as const
+        : "completed" as const,
+      errorCategory: failed ? "output_limit" as const : null,
+      errorCode: failed ? "LLM_OUTPUT_LENGTH_LIMIT" as const : null,
+      failureStage: null,
+      failureSubstage: null,
+      httpStatus: failed ? 200 : null,
+      finishReason: failed ? "length" as const : blocked ? null : "stop" as const,
+      maxTokens: null,
+      usageTotalTokens: failed ? 7 : null,
+      usageComplete: failed,
+      responseByteCount: failed ? 13 : blocked ? 0 : 5,
+      eofObserved: blocked ? null : true,
+      stopObserved: blocked ? null : !failed,
+      doneObserved: blocked ? null : !failed,
+      logicalRequestCount: blocked ? 0 : 1,
+      transportAttemptCount: failed ? 2 : blocked ? 0 : 1,
+      providerRequestCount: failed ? 2 : blocked ? 0 : 1,
+      retryCount: failed ? 1 : 0,
+      dependencyBlocked: blocked
+    };
+  });
+}
 
 function deferred<T>(): {
   readonly promise: Promise<T>;
@@ -4658,6 +4702,148 @@ function narrowEnvironment(): Record<string, string> {
     AETHER_API_KEY: "aether-secret-key"
   };
 }
+
+describe("audit-chain RED terminal persistence", () => {
+  it("persists every retry attempt, exact totals, and a private 0600 receipt before close", async () => {
+    const fixture = createDatasetFixture("audit-chain-red");
+    const dataset = loadDataset(fixture, "development_scored");
+    const identity = {
+      ...identityFixture("development"),
+      datasetFingerprint: dataset.datasetFingerprint,
+      manifestSha256: dataset.manifestSha256,
+      configurationSummary: {
+        ...identityFixture("development").configurationSummary,
+        caseAttempts: 2
+      }
+    };
+    const chain = createDatasetCheckpoint(
+      fixture,
+      dataset,
+      "baseline",
+      "audit-chain-red",
+      null,
+      "audit-chain-red",
+      { identity }
+    );
+    chain.checkpoint.bindGlobalClaim("c".repeat(64));
+    const firstSafeId = dataset.cases[0]!.safeId;
+    let firstCaseCalls = 0;
+    const execute = vi.fn(async (prepared: string) => {
+      if (prepared === firstSafeId) {
+        firstCaseCalls += 1;
+        if (firstCaseCalls === 1) {
+          return {
+            status: "incomplete" as const,
+            failure: {
+              ...fixedFailure("REVIEW_FLOW_ROLE_FAILED", 200),
+              failureKind: "output_limit" as const,
+              completedRoleCount: 0,
+              failedRoleCount: 1,
+              failedRoles: [{
+                role: "solver",
+                failureKind: "output_limit" as const,
+                requestCount: 1,
+                transportAttemptCount: 2,
+                completedResponseCount: 0
+              }],
+              roleAttempts: auditRoleAttempts("solver")
+            }
+          };
+        }
+        const durable = chain.checkpoint.snapshot() as unknown as {
+          readonly auditLedger: {
+            readonly cases: readonly {
+              readonly attempts: readonly unknown[];
+            }[];
+          };
+        };
+        expect(durable.auditLedger.cases[0]!.attempts).toHaveLength(1);
+      }
+      return {
+        status: "complete" as const,
+        projection: projection("approve"),
+        roleAttempts: auditRoleAttempts()
+      };
+    });
+    const state = await runReviewFlowEvaluationCases({
+      checkpoint: chain.checkpoint,
+      cases: dataset.cases.map((entry) => ({
+        safeId: entry.safeId,
+        prepared: entry.safeId
+      })),
+      executor: { execute: execute as never },
+      concurrency: 1,
+      maxCaseAttempts: 2
+    });
+    const ledger = (state as unknown as {
+      readonly auditLedger: {
+        readonly cases: readonly {
+          readonly attempts: readonly { readonly outcome: string }[];
+        }[];
+      };
+    }).auditLedger;
+    expect(ledger.cases[0]!.attempts.map((attempt) => attempt.outcome)).toEqual([
+      "failed",
+      "completed"
+    ]);
+    expect(ledger.cases.reduce(
+      (sum, entry) => sum + entry.attempts.length,
+      0
+    )).toBe(33);
+
+    const receipt = (chain.checkpoint as unknown as {
+      writeTerminalReceipt(): unknown;
+    }).writeTerminalReceipt();
+    expect(receipt).toMatchObject({
+      schemaVersion: 1,
+      status: "complete",
+      caseCount: 32
+    });
+    const receiptPath = join(chain.outputDirectory, "terminal-receipt.private.json");
+    expect(statSync(receiptPath).mode & 0o777).toBe(0o600);
+    const receiptText = readFileSync(receiptPath, "utf8");
+    for (const forbidden of [
+      firstSafeId,
+      state.runId,
+      state.label,
+      "aether",
+      "model-solver",
+      chain.outputDirectory,
+      "createdAt",
+      "sha256"
+    ]) {
+      expect(receiptText).not.toContain(forbidden);
+    }
+
+    const report = buildReviewFlowEvaluationReport({ dataset, checkpoint: state });
+    expect(report.summary.accounting).toMatchObject({
+      exact: true,
+      caseAttempts: 33,
+      logicalRequests: 353,
+      transportAttempts: 354,
+      providerRequests: 354,
+      retries: 1,
+      usageTotalTokens: 7,
+      unknownUsageRoleCount: 352,
+      responseBytes: 1_773,
+      unknownResponseByteRoleCount: 0,
+      dependencyBlockedRoleCount: 10
+    });
+    chain.checkpoint.close();
+  });
+
+  it("loads a schema-v2 checkpoint without an audit ledger as explicit legacy unknown", () => {
+    const fixture = createStateFixture(1);
+    const checkpoint = openCheckpoint(fixture, { bindClaim: true });
+    const legacy = { ...checkpoint.snapshot() } as Record<string, unknown>;
+    delete legacy.auditLedger;
+    const parsed = reviewFlowEvaluationCheckpointSchema.parse(legacy) as unknown as {
+      readonly auditLedger: null;
+    };
+    expect(parsed.auditLedger).toBeNull();
+    checkpoint.close();
+  });
+});
 
 describe("T0145-RED 终端摘要账本完整性", () => {
   it("部分角色失败+未启动案例必须暴露逐案例/逐角色/逐尝试账本，缺失字段 completeness=false", () => {

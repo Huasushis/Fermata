@@ -3,6 +3,7 @@ import {
   chatCompleteJsonWithReceipt,
   chatCompleteStagedSolverJsonWithReceipt,
   chatCompleteTwoRoundJsonWithReceipt,
+  copyLlmCompletionAudit,
   llmTransportProtocolVersion,
   maximumExplicitLlmOutputTokens,
   serializeTargetJsonSchema,
@@ -896,11 +897,13 @@ function trustedRoleExecution(
   payload: unknown,
   receipt: LlmJsonCompletionReceipt
 ): unknown {
-  return trustedRoleExecutionResultSchema.parse({
+  const parsed = trustedRoleExecutionResultSchema.parse({
     schemaVersion: 1,
     payload,
     receipt
   });
+  copyLlmCompletionAudit(receipt, parsed.receipt);
+  return parsed;
 }
 
 /**

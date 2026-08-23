@@ -397,6 +397,7 @@ async function runPredictionOrDevelopment(input: {
   });
   let checkpoint: ReviewFlowEvaluationCheckpoint | undefined;
   let removeSignalHandlers: (() => void) | undefined;
+  let terminalReceiptWritten = false;
   try {
     const dataset = options.purpose === "development"
       ? loadDevelopmentDatasetAfterUsageRegistration({
@@ -531,6 +532,8 @@ async function runPredictionOrDevelopment(input: {
       startGate: gate,
       maxCaseAttempts: options.maxCaseAttempts
     });
+    checkpoint.writeTerminalReceipt();
+    terminalReceiptWritten = true;
     removeSignalHandlers();
     removeSignalHandlers = undefined;
 
@@ -581,8 +584,23 @@ async function runPredictionOrDevelopment(input: {
     }
   } finally {
     removeSignalHandlers?.();
-    checkpoint?.close();
+    let terminalReceiptFailure: unknown;
+    if (checkpoint !== undefined && !terminalReceiptWritten) {
+      try {
+        checkpoint.sealExecution();
+        checkpoint.writeTerminalReceipt();
+        terminalReceiptWritten = true;
+      } catch (error) {
+        terminalReceiptFailure = error;
+      }
+    }
+    if (checkpoint === undefined || terminalReceiptWritten) {
+      checkpoint?.close();
+    }
     registry.close();
+    if (terminalReceiptFailure !== undefined) {
+      throw terminalReceiptFailure;
+    }
   }
 }
 

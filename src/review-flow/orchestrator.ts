@@ -1,12 +1,17 @@
 import { z } from "zod";
 import {
+  getLlmCompletionAudit,
   getLlmFailureAudit,
   isLlmRequestStartGate,
   LlmRequestError,
   llmTransportProtocolVersion,
   withLlmRequestStartGate,
+  type LlmCompletionAudit,
   type LlmFailureAudit,
-  type LlmRequestStartGate
+  type LlmRequestStartGate,
+  type LlmResponseFormatFailureStage,
+  type LlmResponseFormatFailureSubstage,
+  type LlmSseFinishReasonClass
 } from "../llm";
 import {
   codeforcesDifficultySchema,
@@ -140,6 +145,167 @@ export const reviewFlowFailureKindAllowlist = Object.freeze([
 
 export type ReviewFlowFailureKind =
   (typeof reviewFlowFailureKindAllowlist)[number];
+export const reviewFlowRoleStageSchema = z.enum([
+  "foundation",
+  "independent",
+  "critique",
+  "adjudication"
+]);
+export type ReviewFlowRoleStage = z.infer<typeof reviewFlowRoleStageSchema>;
+
+export const reviewFlowAuditErrorCodeSchema = z.enum([
+  ...reviewFlowInternalErrorCodeAllowlist,
+  "REVIEW_FLOW_UNEXPECTED_FAILURE",
+  "LLM_HTTP_ERROR",
+  "LLM_NETWORK_FAILED",
+  "LLM_STREAM_INTERRUPTED",
+  "LLM_FIRST_OUTPUT_TIMEOUT",
+  "LLM_OUTPUT_IDLE_TIMEOUT",
+  "LLM_TOTAL_TIMEOUT",
+  "LLM_CANCELLED",
+  "LLM_REQUEST_START_BLOCKED",
+  "LLM_OUTPUT_LENGTH_LIMIT",
+  "LLM_RETAINED_TEXT_TOO_LARGE",
+  "LLM_OUTPUT_CONTENT_FILTERED",
+  "LLM_RESPONSE_FORMAT_INVALID",
+  "LLM_JSON_OUTPUT_INVALID",
+  "LLM_JSON_SCHEMA_INVALID",
+  "ZOD_ERROR"
+]);
+export type ReviewFlowAuditErrorCode = z.infer<
+  typeof reviewFlowAuditErrorCodeSchema
+>;
+
+const reviewFlowFailureStageSchema = z.enum([
+  "missing_body",
+  "content_type",
+  "json_utf8",
+  "json_parse",
+  "response_shape",
+  "sse_utf8",
+  "event_json",
+  "event_shape",
+  "delta_shape",
+  "finish_shape",
+  "trailing_data"
+]);
+const reviewFlowFailureSubstageSchema = z.enum([
+  "duplicate_done",
+  "data_after_done",
+  "data_after_done_usage_metadata_only",
+  "data_after_done_benign_controls_only",
+  "data_after_done_json_syntax_invalid",
+  "data_after_done_json_non_object",
+  "data_after_done_error_object",
+  "data_after_done_unknown_object_or_scan_limit",
+  "data_after_done_choices_present",
+  "data_after_done_content_or_tool_present",
+  "data_after_done_other_or_unclassifiable",
+  "data_after_done_tail_incomplete",
+  "choice_after_stop"
+]);
+export const reviewFlowSafeFinishReasonSchema = z.enum([
+  "missing",
+  "null",
+  "stop",
+  "length",
+  "content_filter",
+  "unknown"
+]);
+export type ReviewFlowSafeFinishReason = z.infer<
+  typeof reviewFlowSafeFinishReasonSchema
+>;
+
+export const reviewFlowRoleAttemptAuditSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    role: reviewFlowRoleSchema,
+    roleStage: reviewFlowRoleStageSchema,
+    outcome: z.enum(["completed", "failed", "dependency_blocked"]),
+    errorCategory: z.enum(reviewFlowFailureKindAllowlist).nullable(),
+    errorCode: reviewFlowAuditErrorCodeSchema.nullable(),
+    failureStage: reviewFlowFailureStageSchema.nullable(),
+    failureSubstage: reviewFlowFailureSubstageSchema.nullable(),
+    httpStatus: z.number().int().min(100).max(599).nullable(),
+    finishReason: reviewFlowSafeFinishReasonSchema.nullable(),
+    maxTokens: z.number().int().positive().nullable(),
+    usageTotalTokens: z.number().int().nonnegative().nullable(),
+    usageComplete: z.boolean(),
+    responseByteCount: z.number().int().nonnegative().nullable(),
+    eofObserved: z.boolean().nullable(),
+    stopObserved: z.boolean().nullable(),
+    doneObserved: z.boolean().nullable(),
+    logicalRequestCount: z.number().int().min(0).max(4),
+    transportAttemptCount: z.number().int().min(0).max(4_000),
+    providerRequestCount: z.number().int().min(0).max(4_000),
+    retryCount: z.number().int().min(0).max(4_000),
+    dependencyBlocked: z.boolean()
+  })
+  .strict()
+  .superRefine((audit, context) => {
+    if (audit.transportAttemptCount !== audit.providerRequestCount) {
+      context.addIssue({
+        code: "custom",
+        path: ["providerRequestCount"],
+        message: "providerRequestCount 必须等于实际 transportAttemptCount。"
+      });
+    }
+    if (audit.retryCount > audit.providerRequestCount) {
+      context.addIssue({
+        code: "custom",
+        path: ["retryCount"],
+        message: "retryCount 不能超过 providerRequestCount。"
+      });
+    }
+    if (
+      (audit.outcome === "dependency_blocked") !== audit.dependencyBlocked ||
+      (audit.dependencyBlocked &&
+        (audit.logicalRequestCount !== 0 ||
+          audit.transportAttemptCount !== 0 ||
+          audit.providerRequestCount !== 0 ||
+          audit.retryCount !== 0 ||
+          (audit.responseByteCount !== 0 &&
+            audit.responseByteCount !== null)))
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["dependencyBlocked"],
+        message: "依赖阻断角色不得伪造请求或响应计数。"
+      });
+    }
+  });
+export type ReviewFlowRoleAttemptAudit = z.infer<
+  typeof reviewFlowRoleAttemptAuditSchema
+>;
+
+export const reviewFlowRoleAttemptsSchema = z
+  .array(reviewFlowRoleAttemptAuditSchema)
+  .length(reviewFlowRoleSchema.options.length)
+  .superRefine((audits, context) => {
+    for (let index = 0; index < reviewFlowRoleSchema.options.length; index++) {
+      if (audits[index]?.role !== reviewFlowRoleSchema.options[index]) {
+        context.addIssue({
+          code: "custom",
+          path: [index, "role"],
+          message: "角色尝试必须完整且按固定拓扑顺序排列。"
+        });
+      }
+    }
+  });
+
+export function reviewFlowRoleStage(role: ReviewFlowRole): ReviewFlowRoleStage {
+  if (["solver", "solution_analyst", "technical_auditor"].includes(role)) {
+    return "foundation";
+  }
+  if (
+    ["difficulty", "editorial_judge", "contest_fit", "originality", "tags"]
+      .includes(role)
+  ) {
+    return "independent";
+  }
+  if (["critic", "adversary"].includes(role)) return "critique";
+  return "adjudication";
+}
 
 export type ReviewFlowOutcomeErrorCode =
   | ReviewFlowInternalErrorCode
@@ -270,6 +436,7 @@ export interface ReviewFlowIncompleteFailure {
   readonly runBinding: ReviewFlowSafeRunBinding | null;
   readonly failedRoles: readonly ReviewFlowRoleFailureSummary[];
   readonly completedRoles: readonly ReviewFlowRoleCompletionSummary[];
+  readonly roleAttempts: readonly ReviewFlowRoleAttemptAudit[];
 }
 
 export type ReviewFlowOutcome =
@@ -538,7 +705,8 @@ export const reviewFlowIncompleteFailureSchema = z
     sourceSnapshotHash: z.union([digestSchema, z.null()]),
     runBinding: z.union([reviewFlowSafeRunBindingSchema, z.null()]),
     failedRoles: z.array(reviewFlowRoleFailureSummarySchema),
-    completedRoles: z.array(reviewFlowRoleCompletionSummarySchema)
+    completedRoles: z.array(reviewFlowRoleCompletionSummarySchema),
+    roleAttempts: reviewFlowRoleAttemptsSchema
   })
   .strict()
   .superRefine((failure, context) => {
@@ -566,6 +734,21 @@ export const reviewFlowIncompleteFailureSchema = z
         });
       }
     }
+    const failedSet = new Set(failure.failedRoles.map((role) => role.role));
+    for (const attempt of failure.roleAttempts) {
+      const expectedOutcome = completedSet.has(attempt.role)
+        ? "completed"
+        : failedSet.has(attempt.role)
+          ? "failed"
+          : "dependency_blocked";
+      if (attempt.outcome !== expectedOutcome) {
+        context.addIssue({
+          code: "custom",
+          path: ["roleAttempts", expectedOrder.indexOf(attempt.role), "outcome"],
+          message: "角色尝试状态必须与完成/失败/依赖阻断集合一致。"
+        });
+      }
+    }
     // failureId 必须从规范化基重算一致。
     const failureBase = {
       schemaVersion: 1 as const,
@@ -574,7 +757,8 @@ export const reviewFlowIncompleteFailureSchema = z
       sourceSnapshotHash: failure.sourceSnapshotHash,
       runBinding: failure.runBinding,
       failedRoles: failure.failedRoles,
-      completedRoles: failure.completedRoles
+      completedRoles: failure.completedRoles,
+      roleAttempts: failure.roleAttempts
     };
     if (failure.failureId !== hashCanonicalValue(failureBase)) {
       context.addIssue({
@@ -595,7 +779,8 @@ export const reviewFlowCalibrationOutcomeSchema = z
     z
       .object({
         status: z.literal("complete"),
-        projection: reviewFlowCalibrationProjectionSchema
+        projection: reviewFlowCalibrationProjectionSchema,
+        roleAttempts: reviewFlowRoleAttemptsSchema
       })
       .strict(),
     z
@@ -627,10 +812,15 @@ export type ReviewFlowCalibrationOutcome =
   | {
       readonly status: "complete";
       readonly projection: ReviewFlowCalibrationProjection;
+      readonly roleAttempts?: readonly ReviewFlowRoleAttemptAudit[];
     }
   | Extract<ReviewFlowOutcome, { readonly status: "incomplete" }>;
 
 const privateArtifacts = new WeakMap<ReviewFlowDecision, ReviewFlowArtifacts>();
+const privateRoleAttempts = new WeakMap<
+  ReviewFlowDecision,
+  readonly ReviewFlowRoleAttemptAudit[]
+>();
 const privateSubmissions = new WeakMap<
   ReviewFlowDecision,
   {
@@ -752,6 +942,7 @@ interface ReviewFlowRunTracker {
   runBinding: ReviewFlowSafeRunBinding | null;
   readonly completions: Map<ReviewFlowRole, ReviewFlowRoleCompletionSummary>;
   readonly failures: Map<ReviewFlowRole, ReviewFlowRoleFailureSummary>;
+  readonly roleAttempts: Map<ReviewFlowRole, ReviewFlowRoleAttemptAudit>;
   readonly onTerminalRoleFailure?: (
     role: ReviewFlowRole,
     failureKind: ReviewFlowFailureKind,
@@ -771,6 +962,7 @@ function createReviewFlowRunTracker(
     runBinding: null,
     completions: new Map(),
     failures: new Map(),
+    roleAttempts: new Map(),
     onTerminalRoleFailure
   };
 }
@@ -832,7 +1024,8 @@ export async function runReviewEvidenceFlowOutcome(
       failedRoles: orderedRoleValues(tracker.failures).map(
         normalizeReviewFlowRoleFailureSummary
       ),
-      completedRoles: orderedRoleValues(tracker.completions)
+      completedRoles: orderedRoleValues(tracker.completions),
+      roleAttempts: orderedRoleAttempts(tracker, true)
     };
     const failure: ReviewFlowIncompleteFailure = deepFreeze({
       ...failureBase,
@@ -869,10 +1062,12 @@ export async function runReviewEvidenceFlowCalibrationOutcome(
 
   const { decision } = outcome;
   const artifacts = privateArtifacts.get(decision);
+  const roleAttempts = privateRoleAttempts.get(decision);
   const submission = privateSubmissions.get(decision);
   try {
     if (
       artifacts === undefined ||
+      roleAttempts === undefined ||
       submission === undefined ||
       decision.executionEligible ||
       isProductionEligibleReviewFlowLlmBundle(input.trustedRunner)
@@ -964,11 +1159,16 @@ export async function runReviewEvidenceFlowCalibrationOutcome(
         }))
       )
     });
-    return deepFreeze({ status: "complete" as const, projection });
+    return deepFreeze({
+      status: "complete" as const,
+      projection,
+      roleAttempts
+    });
   } catch {
     throw new Error("REVIEW_FLOW_CALIBRATION_INPUT_FORBIDDEN");
   } finally {
     privateArtifacts.delete(decision);
+    privateRoleAttempts.delete(decision);
     privateSubmissions.delete(decision);
   }
 }
@@ -1327,6 +1527,7 @@ async function runReviewEvidenceFlowTracked(
     })
   });
   privateArtifacts.set(decision, artifacts);
+  privateRoleAttempts.set(decision, orderedRoleAttempts(tracker, false));
   privateSubmissions.set(decision, { review, taskSource, consumed: false });
   return decision;
 }
@@ -1339,11 +1540,19 @@ async function runAndSeal<TPayload>(input: {
   readonly spec: RoleSpec<TPayload>;
 }): Promise<EvidenceArtifact<TPayload>> {
   let completedReceipt: RoleCompletionReceipt | null = null;
+  let completionAudit: LlmCompletionAudit | null = null;
   try {
     if (input.requestStartGate !== null && !input.requestStartGate.canStartRequest()) {
       throw new LlmRequestError("LLM_REQUEST_START_BLOCKED");
     }
     const rawResult = await input.spec.run();
+    const rawReceipt =
+      typeof rawResult === "object" &&
+      rawResult !== null &&
+      "receipt" in rawResult
+        ? (rawResult as { readonly receipt?: unknown }).receipt
+        : null;
+    completionAudit = getLlmCompletionAudit(rawReceipt);
     const trustedResult = input.binding.runContextHash === null
       ? null
       : trustedRoleExecutionResultSchema.parse(rawResult);
@@ -1394,6 +1603,10 @@ async function runAndSeal<TPayload>(input: {
         sseDoneObserved: response.responseMode === "sse" ? true : null
       })) ?? []
     }));
+    input.tracker.roleAttempts.set(
+      input.spec.role,
+      completedRoleAttemptAudit(input.spec.role, receipt, completionAudit)
+    );
     return artifact;
   } catch (error) {
     // 不在单个角色失败时关闭共享案例请求闸门。关闭它会拒绝同批已发出
@@ -1404,6 +1617,7 @@ async function runAndSeal<TPayload>(input: {
     const failureKind = classifyRoleFailure(error);
     input.tracker.onTerminalRoleFailure?.(input.spec.role, failureKind, error);
     input.tracker.completions.delete(input.spec.role);
+    input.tracker.roleAttempts.delete(input.spec.role);
     const llmAudit = getLlmFailureAudit(error);
     input.tracker.failures.set(
       input.spec.role,
@@ -1414,6 +1628,17 @@ async function runAndSeal<TPayload>(input: {
           failureKind,
           completedReceipt
         )
+    );
+    input.tracker.roleAttempts.set(
+      input.spec.role,
+      failedRoleAttemptAudit(
+        input.spec.role,
+        failureKind,
+        error,
+        llmAudit,
+        completedReceipt,
+        completionAudit
+      )
     );
     if (error instanceof ReviewFlowError) throw error;
     throw new ReviewFlowError("REVIEW_FLOW_ROLE_FAILED", input.spec.role, failureKind);
@@ -1664,6 +1889,188 @@ function classifyRoleFailure(error: unknown): ReviewFlowFailureKind {
     return "output_limit";
   }
   return "role_internal";
+}
+function safeAuditErrorCode(error: unknown): ReviewFlowAuditErrorCode | null {
+  if (error instanceof z.ZodError) return "ZOD_ERROR";
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return null;
+  }
+  const parsed = reviewFlowAuditErrorCodeSchema.safeParse(
+    (error as { readonly code?: unknown }).code
+  );
+  return parsed.success ? parsed.data : null;
+}
+
+function safeFailureLocation(error: unknown): {
+  readonly stage: LlmResponseFormatFailureStage | null;
+  readonly substage: LlmResponseFormatFailureSubstage | null;
+} {
+  if (typeof error !== "object" || error === null) {
+    return { stage: null, substage: null };
+  }
+  const stage = reviewFlowFailureStageSchema.safeParse(
+    (error as { readonly formatFailureStage?: unknown }).formatFailureStage
+  );
+  const substage = reviewFlowFailureSubstageSchema.safeParse(
+    (error as { readonly formatFailureSubstage?: unknown }).formatFailureSubstage
+  );
+  return {
+    stage: stage.success ? stage.data : null,
+    substage: substage.success ? substage.data : null
+  };
+}
+
+function safeFinishReason(
+  reason: LlmSseFinishReasonClass | null
+): ReviewFlowSafeFinishReason | null {
+  if (reason === null) return null;
+  if (reason === "unknown_string" || reason === "non_string") return "unknown";
+  return reason;
+}
+
+function completedRoleAttemptAudit(
+  role: ReviewFlowRole,
+  receipt: RoleCompletionReceipt | null,
+  audit: LlmCompletionAudit | null
+): ReviewFlowRoleAttemptAudit {
+  const transportAttemptCount = receipt?.transportAttemptCount ?? 0;
+  const retryCount = audit?.retryCount ?? receipt?.responses.reduce(
+    (sum, response) => sum + Math.max(0, response.transportAttemptCount - 1),
+    0
+  ) ?? 0;
+  return deepFreeze(reviewFlowRoleAttemptAuditSchema.parse({
+    schemaVersion: 1,
+    role,
+    roleStage: reviewFlowRoleStage(role),
+    outcome: "completed",
+    errorCategory: null,
+    errorCode: null,
+    failureStage: null,
+    failureSubstage: null,
+    httpStatus: null,
+    finishReason: safeFinishReason(
+      audit?.finishReason ?? (receipt === null ? null : "stop")
+    ),
+    maxTokens: audit?.maxOutputTokens ?? null,
+    usageTotalTokens: audit?.usageTotalTokens ?? null,
+    usageComplete: audit?.usageComplete ?? false,
+    responseByteCount: audit?.responseByteCount ?? null,
+    eofObserved: audit?.eofObserved ?? (receipt === null ? null : true),
+    stopObserved:
+      audit?.finishReasonStopObserved ?? (receipt === null ? null : true),
+    doneObserved: audit?.sseDoneObserved ?? null,
+    logicalRequestCount: receipt?.requestCount ?? 0,
+    transportAttemptCount,
+    providerRequestCount: audit?.providerRequestCount ?? transportAttemptCount,
+    retryCount,
+    dependencyBlocked: false
+  }));
+}
+
+function failedRoleAttemptAudit(
+  role: ReviewFlowRole,
+  failureKind: ReviewFlowFailureKind,
+  error: unknown,
+  llmAudit: LlmFailureAudit | null,
+  receipt: RoleCompletionReceipt | null,
+  completionAudit: LlmCompletionAudit | null
+): ReviewFlowRoleAttemptAudit {
+  const location = safeFailureLocation(error);
+  const logicalRequestCount =
+    llmAudit?.requestCount ?? receipt?.requestCount ?? 0;
+  const transportAttemptCount =
+    llmAudit?.transportAttemptCount ?? receipt?.transportAttemptCount ?? 0;
+  const retryCount = llmAudit?.retryCount ?? completionAudit?.retryCount ??
+    receipt?.responses.reduce(
+      (sum, response) => sum + Math.max(0, response.transportAttemptCount - 1),
+      0
+    ) ?? 0;
+  return deepFreeze(reviewFlowRoleAttemptAuditSchema.parse({
+    schemaVersion: 1,
+    role,
+    roleStage: reviewFlowRoleStage(role),
+    outcome: "failed",
+    errorCategory: failureKind,
+    errorCode: safeAuditErrorCode(error),
+    failureStage: location.stage,
+    failureSubstage: location.substage,
+    httpStatus:
+      llmAudit?.terminal.status ?? (receipt === null ? null : 200),
+    finishReason: safeFinishReason(
+      llmAudit?.terminal.finishReason ?? completionAudit?.finishReason ?? null
+    ),
+    maxTokens:
+      llmAudit?.maxOutputTokens ?? completionAudit?.maxOutputTokens ?? null,
+    usageTotalTokens:
+      llmAudit?.usageTotalTokens ?? completionAudit?.usageTotalTokens ?? null,
+    usageComplete:
+      llmAudit?.usageComplete ?? completionAudit?.usageComplete ?? false,
+    responseByteCount:
+      llmAudit?.responseByteCount ?? completionAudit?.responseByteCount ?? null,
+    eofObserved:
+      llmAudit?.terminal.eofObserved ?? completionAudit?.eofObserved ?? null,
+    stopObserved:
+      llmAudit?.terminal.finishReasonStopObserved ??
+      completionAudit?.finishReasonStopObserved ??
+      null,
+    doneObserved:
+      llmAudit?.terminal.sseDoneObserved ??
+      completionAudit?.sseDoneObserved ??
+      null,
+    logicalRequestCount,
+    transportAttemptCount,
+    providerRequestCount:
+      llmAudit?.providerRequestCount ??
+      completionAudit?.providerRequestCount ??
+      transportAttemptCount,
+    retryCount,
+    dependencyBlocked: false
+  }));
+}
+
+function dependencyBlockedRoleAttemptAudit(
+  role: ReviewFlowRole
+): ReviewFlowRoleAttemptAudit {
+  return deepFreeze(reviewFlowRoleAttemptAuditSchema.parse({
+    schemaVersion: 1,
+    role,
+    roleStage: reviewFlowRoleStage(role),
+    outcome: "dependency_blocked",
+    errorCategory: null,
+    errorCode: null,
+    failureStage: null,
+    failureSubstage: null,
+    httpStatus: null,
+    finishReason: null,
+    maxTokens: null,
+    usageTotalTokens: null,
+    usageComplete: false,
+    responseByteCount: 0,
+    eofObserved: null,
+    stopObserved: null,
+    doneObserved: null,
+    logicalRequestCount: 0,
+    transportAttemptCount: 0,
+    providerRequestCount: 0,
+    retryCount: 0,
+    dependencyBlocked: true
+  }));
+}
+
+function orderedRoleAttempts(
+  tracker: ReviewFlowRunTracker,
+  allowDependencyBlocked: boolean
+): readonly ReviewFlowRoleAttemptAudit[] {
+  const attempts = reviewFlowRoleSchema.options.map((role) =>
+    tracker.roleAttempts.get(role) ?? dependencyBlockedRoleAttemptAudit(role)
+  );
+  if (
+    !allowDependencyBlocked &&
+    attempts.some((attempt) => attempt.outcome !== "completed")
+  ) {
+    throw new ReviewFlowError("REVIEW_FLOW_ROLE_FAILED", null, "role_internal");
+  }
+  return deepFreeze(reviewFlowRoleAttemptsSchema.parse(attempts));
 }
 
 function summarizeCompletedReceiptFailure(

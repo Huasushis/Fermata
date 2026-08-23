@@ -33,10 +33,14 @@ import {
   type PrivateDirectoryHandle
 } from "../../scripts/private-runtime.mjs";
 import {
+  reviewFlowAuditErrorCodeSchema,
   reviewFlowCalibrationProjectionSchema,
-  reviewFlowFailureKindAllowlist
+  reviewFlowFailureKindAllowlist,
+  reviewFlowRoleAttemptsSchema,
+  reviewFlowRoleStage,
+  type ReviewFlowRoleAttemptAudit
 } from "../../src/review-flow/orchestrator";
-import { hashCanonicalValue } from "../../src/review-flow/evidence";
+import { deepFreeze, hashCanonicalValue } from "../../src/review-flow/evidence";
 import { reviewFlowRoleSchema } from "../../src/review-flow/schemas";
 import {
   readPrivateArtifactBytes
@@ -266,10 +270,183 @@ const failureSchema = z
     completedRoleCount: z.number().int().min(0).max(11),
     failedRoleCount: z.number().int().min(0).max(11),
     failedRoles: z.array(roleFailureSchema),
+    roleAttempts: reviewFlowRoleAttemptsSchema.optional(),
     caseAttempts: z.number().int().min(1).max(8).default(1)
   })
   .strict();
 export type ReviewFlowEvaluationFailure = z.infer<typeof failureSchema>;
+export const reviewFlowEvaluationCaseErrorCodeSchema = z.enum([
+  ...reviewFlowAuditErrorCodeSchema.options,
+  "REVIEW_FLOW_EVALUATION_TIMING_RECEIPT_MISSING",
+  "REVIEW_FLOW_EVALUATION_EXECUTION_THROWN"
+]);
+export type ReviewFlowEvaluationCaseErrorCode = z.infer<
+  typeof reviewFlowEvaluationCaseErrorCodeSchema
+>;
+
+
+export const reviewFlowEvaluationCaseAttemptSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    attempt: z.number().int().min(1).max(8),
+    outcome: z.enum(["completed", "failed"]),
+    accountingComplete: z.boolean(),
+    errorCategory: z.enum(reviewFlowFailureKindAllowlist).nullable(),
+    errorCode: reviewFlowEvaluationCaseErrorCodeSchema.nullable(),
+    roleAttempts: reviewFlowRoleAttemptsSchema
+  })
+  .strict()
+  .superRefine((attempt, context) => {
+    const completedRoles = attempt.roleAttempts.filter(
+      (role) => role.outcome === "completed"
+    ).length;
+    if (
+      attempt.outcome === "completed" &&
+      completedRoles !== reviewFlowRoleSchema.options.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["roleAttempts"],
+        message: "完成案例尝试必须完成全部角色。"
+      });
+    }
+  });
+export type ReviewFlowEvaluationCaseAttempt = z.infer<
+  typeof reviewFlowEvaluationCaseAttemptSchema
+>;
+
+export const reviewFlowEvaluationAuditLedgerSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    cases: z.array(
+      z
+        .object({
+          caseOrdinal: z.number().int().positive().max(1_000),
+          attempts: z
+            .array(reviewFlowEvaluationCaseAttemptSchema)
+            .max(8)
+        })
+        .strict()
+        .superRefine((entry, context) => {
+          for (let index = 0; index < entry.attempts.length; index++) {
+            if (entry.attempts[index]?.attempt !== index + 1) {
+              context.addIssue({
+                code: "custom",
+                path: ["attempts", index, "attempt"],
+                message: "案例尝试编号必须从 1 连续递增。"
+              });
+            }
+          }
+        })
+    ).min(1).max(1_000)
+  })
+  .strict();
+export type ReviewFlowEvaluationAuditLedger = z.infer<
+  typeof reviewFlowEvaluationAuditLedgerSchema
+>;
+const nullableAuditCountSchema = z.number().int().nonnegative().nullable();
+
+export const reviewFlowEvaluationAuditAccountingSchema = z
+  .object({
+    exact: z.boolean(),
+    caseAttempts: nullableAuditCountSchema,
+    logicalRequests: nullableAuditCountSchema,
+    transportAttempts: nullableAuditCountSchema,
+    providerRequests: nullableAuditCountSchema,
+    retries: nullableAuditCountSchema,
+    usageTotalTokens: nullableAuditCountSchema,
+    unknownUsageRoleCount: nullableAuditCountSchema,
+    responseBytes: nullableAuditCountSchema,
+    unknownResponseByteRoleCount: nullableAuditCountSchema,
+    dependencyBlockedRoleCount: nullableAuditCountSchema
+  })
+  .strict();
+export type ReviewFlowEvaluationAuditAccounting = z.infer<
+  typeof reviewFlowEvaluationAuditAccountingSchema
+>;
+
+export function summarizeReviewFlowEvaluationAuditLedger(
+  ledger: ReviewFlowEvaluationAuditLedger | null
+): ReviewFlowEvaluationAuditAccounting {
+  if (ledger === null) {
+    return reviewFlowEvaluationAuditAccountingSchema.parse({
+      exact: false,
+      caseAttempts: null,
+      logicalRequests: null,
+      transportAttempts: null,
+      providerRequests: null,
+      retries: null,
+      usageTotalTokens: null,
+      unknownUsageRoleCount: null,
+      responseBytes: null,
+      unknownResponseByteRoleCount: null,
+      dependencyBlockedRoleCount: null
+    });
+  }
+  const attempts = ledger.cases.flatMap((entry) => entry.attempts);
+  const roles = attempts.flatMap((attempt) => attempt.roleAttempts);
+  const countedRoles = roles.filter((role) => !role.dependencyBlocked);
+  const usageValues = countedRoles.flatMap((role) =>
+    role.usageTotalTokens === null ? [] : [role.usageTotalTokens]
+  );
+  const byteValues = countedRoles.flatMap((role) =>
+    role.responseByteCount === null ? [] : [role.responseByteCount]
+  );
+  return reviewFlowEvaluationAuditAccountingSchema.parse({
+    exact: attempts.every((attempt) => attempt.accountingComplete),
+    caseAttempts: attempts.length,
+    logicalRequests: roles.reduce(
+      (sum, role) => sum + role.logicalRequestCount,
+      0
+    ),
+    transportAttempts: roles.reduce(
+      (sum, role) => sum + role.transportAttemptCount,
+      0
+    ),
+    providerRequests: roles.reduce(
+      (sum, role) => sum + role.providerRequestCount,
+      0
+    ),
+    retries: roles.reduce((sum, role) => sum + role.retryCount, 0),
+    usageTotalTokens: usageValues.length === 0
+      ? null
+      : usageValues.reduce((sum, value) => sum + value, 0),
+    unknownUsageRoleCount: countedRoles.filter(
+      (role) => role.usageTotalTokens === null
+    ).length,
+    responseBytes: byteValues.length === 0
+      ? null
+      : byteValues.reduce((sum, value) => sum + value, 0),
+    unknownResponseByteRoleCount: countedRoles.filter(
+      (role) => role.responseByteCount === null
+    ).length,
+    dependencyBlockedRoleCount: roles.filter(
+      (role) => role.dependencyBlocked
+    ).length
+  });
+}
+
+export const reviewFlowEvaluationTerminalReceiptSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    status: z.enum(["complete", "incomplete"]),
+    caseCount: z.number().int().positive().max(1_000),
+    caseAttempts: z
+      .array(
+        z
+          .object({
+            caseOrdinal: z.number().int().positive().max(1_000),
+            attempts: z.array(reviewFlowEvaluationCaseAttemptSchema).max(8)
+          })
+          .strict()
+      )
+      .nullable(),
+    accounting: reviewFlowEvaluationAuditAccountingSchema
+  })
+  .strict();
+export type ReviewFlowEvaluationTerminalReceipt = z.infer<
+  typeof reviewFlowEvaluationTerminalReceiptSchema
+>;
 
 export const reviewFlowEvaluationCaseTimingSchema = z
   .object({
@@ -425,6 +602,7 @@ export const reviewFlowEvaluationCheckpointSchema = z
     thresholdPolicySha256: digestSchema.nullable(),
     expectedCases: z.array(expectedCaseSchema).min(1).max(1_000),
     entries: z.array(reviewFlowEvaluationEntrySchema).min(1).max(1_000),
+    auditLedger: reviewFlowEvaluationAuditLedgerSchema.nullable().default(null),
     globalClaimSha256: digestSchema.nullable(),
     termination: terminationSchema.nullable(),
     executionSeal: executionSealSchema.nullable(),
@@ -437,6 +615,19 @@ export const reviewFlowEvaluationCheckpointSchema = z
   })
   .strict()
   .superRefine((state, context) => {
+    if (
+      state.auditLedger !== null &&
+      (state.auditLedger.cases.length !== state.expectedCases.length ||
+        state.auditLedger.cases.some(
+          (entry, index) => entry.caseOrdinal !== index + 1
+        ))
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["auditLedger"],
+        message: "审计账本必须与预期案例一一对应并按序编号。"
+      });
+    }
     const candidateDevelopment =
       state.variant === "candidate" && state.identity.purpose === "development";
     const candidateHoldout =
@@ -755,6 +946,13 @@ export class ReviewFlowEvaluationCheckpoint {
           safeId: entry.safeId,
           status: "pending" as const
         })),
+        auditLedger: {
+          schemaVersion: 1,
+          cases: expectedCases.map((_, index) => ({
+            caseOrdinal: index + 1,
+            attempts: []
+          }))
+        },
         globalClaimSha256: null,
         termination: null,
         executionSeal: null,
@@ -854,6 +1052,67 @@ export class ReviewFlowEvaluationCheckpoint {
       };
     });
   }
+  public recordCaseAttempt(
+    safeId: string,
+    attempt: ReviewFlowEvaluationCaseAttempt
+  ): void {
+    this.assertOpen();
+    const parsed = reviewFlowEvaluationCaseAttemptSchema.parse(attempt);
+    const caseIndex = this.#state.entries.findIndex(
+      (entry) => entry.safeId === safeId
+    );
+    if (
+      caseIndex < 0 ||
+      this.#state.entries[caseIndex]?.status !== "active" ||
+      this.#state.auditLedger === null
+    ) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_AUDIT_LEDGER_UNAVAILABLE"
+      );
+    }
+    const caseLedger = this.#state.auditLedger.cases[caseIndex];
+    if (
+      caseLedger === undefined ||
+      parsed.attempt !== caseLedger.attempts.length + 1
+    ) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_CASE_ATTEMPT_OUT_OF_ORDER"
+      );
+    }
+    this.update({
+      auditLedger: {
+        schemaVersion: 1,
+        cases: this.#state.auditLedger.cases.map((entry, index) =>
+          index === caseIndex
+            ? {
+                ...entry,
+                attempts: [...entry.attempts, parsed]
+              }
+            : entry
+        )
+      }
+    });
+  }
+  public recordUnknownCaseAttempt(
+    safeId: string,
+    attempt: number,
+    errorCode: ReviewFlowEvaluationCaseErrorCode
+  ): void {
+    this.recordCaseAttempt(
+      safeId,
+      legacyFailedCaseAttempt(attempt, {
+        code: errorCode,
+        failureKind: null,
+        httpStatus: null,
+        completedRoleCount: 0,
+        failedRoleCount: 0,
+        failedRoles: [],
+        caseAttempts: attempt
+      })
+    );
+  }
+
+
 
   public markCompleted(
     safeId: string,
@@ -862,6 +1121,12 @@ export class ReviewFlowEvaluationCheckpoint {
     caseTiming?: ReviewFlowEvaluationCaseTiming
   ): void {
     const parsed = reviewFlowCalibrationProjectionSchema.parse(projection);
+    this.ensureTerminalCaseAttempt(
+      safeId,
+      "completed",
+      parsed,
+      undefined
+    );
     const parsedPilotTiming = pilotTiming === undefined
       ? undefined
       : reviewFlowEvaluationPilotTimingReceiptSchema.parse(pilotTiming);
@@ -895,6 +1160,12 @@ export class ReviewFlowEvaluationCheckpoint {
     pilotTiming?: ReviewFlowEvaluationPilotTimingReceipt
   ): void {
     const parsed = failureSchema.parse(failure);
+    this.ensureTerminalCaseAttempt(
+      safeId,
+      "failed",
+      undefined,
+      parsed
+    );
     const parsedPilotTiming = pilotTiming === undefined
       ? undefined
       : reviewFlowEvaluationPilotTimingReceiptSchema.parse(pilotTiming);
@@ -965,6 +1236,79 @@ export class ReviewFlowEvaluationCheckpoint {
     this.persist();
     return this.snapshot();
   }
+  public writeTerminalReceipt(): ReviewFlowEvaluationTerminalReceipt {
+    this.assertOpen();
+    if (this.#state.executionSeal === null) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_EXECUTION_NOT_SEALED"
+      );
+    }
+    const accounting = summarizeReviewFlowEvaluationAuditLedger(
+      this.#state.auditLedger
+    );
+    const terminalCases = this.#state.auditLedger?.cases ?? null;
+    const complete =
+      this.#state.executionSeal.complete &&
+      accounting.exact &&
+      terminalCases !== null &&
+      terminalCases.length === this.#state.expectedCases.length &&
+      terminalCases.every(
+        (entry) => entry.attempts.at(-1)?.outcome === "completed"
+      );
+    const receipt = reviewFlowEvaluationTerminalReceiptSchema.parse({
+      schemaVersion: 1,
+      status: complete ? "complete" : "incomplete",
+      caseCount: this.#state.expectedCases.length,
+      caseAttempts: terminalCases,
+      accounting
+    });
+    const fileName = "terminal-receipt.private.json";
+    const temporaryName = `${fileName}.tmp-${process.pid}-${randomUUID()}`;
+    const temporaryPath = anchoredPrivatePath(this.#directory, temporaryName);
+    const targetPath = anchoredPrivatePath(this.#directory, fileName);
+    let descriptor: number | undefined;
+    try {
+      descriptor = openSync(
+        temporaryPath,
+        constants.O_WRONLY |
+          constants.O_CREAT |
+          constants.O_EXCL |
+          (constants.O_NOFOLLOW ?? 0),
+        0o600
+      );
+      fchmodSync(descriptor, 0o600);
+      writeFileSync(descriptor, `${JSON.stringify(receipt, null, 2)}\n`, "utf8");
+      fsyncSync(descriptor);
+      closeSync(descriptor);
+      descriptor = undefined;
+      renameSync(temporaryPath, targetPath);
+      fsyncSync(this.#directory.descriptor);
+      const finalStat = lstatSync(targetPath, { bigint: true });
+      const currentUid = typeof process.getuid === "function"
+        ? BigInt(process.getuid())
+        : finalStat.uid;
+      if (
+        !finalStat.isFile() ||
+        finalStat.nlink !== 1n ||
+        (finalStat.mode & 0o777n) !== 0o600n ||
+        finalStat.uid !== currentUid
+      ) {
+        throw new Error("terminal receipt mode");
+      }
+    } catch {
+      if (descriptor !== undefined) closeQuietly(descriptor);
+      try {
+        unlinkSync(temporaryPath);
+      } catch {
+        // 只清理本次随机命名的临时文件。
+      }
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_TERMINAL_RECEIPT_WRITE_FAILED"
+      );
+    }
+    return deepFreeze(receipt);
+  }
+
 
   public acknowledgePublication(
     publication: Omit<ReviewFlowEvaluationPublicationBinding, "acknowledgedAt">
@@ -1023,6 +1367,46 @@ export class ReviewFlowEvaluationCheckpoint {
         "REVIEW_FLOW_EVALUATION_CHECKPOINT_INVALID"
       );
     }
+  }
+
+  private ensureTerminalCaseAttempt(
+    safeId: string,
+    outcome: "completed" | "failed",
+    projection:
+      | z.infer<typeof reviewFlowCalibrationProjectionSchema>
+      | undefined,
+    failure: ReviewFlowEvaluationFailure | undefined
+  ): void {
+    const caseIndex = this.#state.entries.findIndex(
+      (entry) => entry.safeId === safeId
+    );
+    const caseLedger = caseIndex < 0 || this.#state.auditLedger === null
+      ? undefined
+      : this.#state.auditLedger.cases[caseIndex];
+    if (caseLedger === undefined) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_AUDIT_LEDGER_UNAVAILABLE"
+      );
+    }
+    const lastAttempt = caseLedger.attempts.at(-1);
+    if (lastAttempt?.outcome === outcome) return;
+    if (outcome === "completed" && projection !== undefined) {
+      this.recordCaseAttempt(
+        safeId,
+        legacyCompletedCaseAttempt(caseLedger.attempts.length + 1, projection)
+      );
+      return;
+    }
+    if (outcome === "failed" && failure !== undefined) {
+      this.recordCaseAttempt(
+        safeId,
+        legacyFailedCaseAttempt(caseLedger.attempts.length + 1, failure)
+      );
+      return;
+    }
+    throw new ReviewFlowEvaluationCheckpointError(
+      "REVIEW_FLOW_EVALUATION_CASE_ATTEMPT_MISSING"
+    );
   }
 
   private replaceEntry(
@@ -1173,6 +1557,154 @@ export class ReviewFlowEvaluationCheckpoint {
   }
 }
 
+function legacyCompletedCaseAttempt(
+  attempt: number,
+  projection: z.infer<typeof reviewFlowCalibrationProjectionSchema>
+): ReviewFlowEvaluationCaseAttempt {
+  const receipts = new Map(
+    projection.roleReceipts.map((receipt) => [receipt.role, receipt])
+  );
+  const roleAttempts = reviewFlowRoleSchema.options.map((role) => {
+    const receipt = receipts.get(role);
+    if (receipt === undefined) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_COMPLETION_AUDIT_MISSING"
+      );
+    }
+    const sseResponses = receipt.responses.filter(
+      (response) => response.responseMode === "sse"
+    );
+    return {
+      schemaVersion: 1 as const,
+      role,
+      roleStage: reviewFlowRoleStage(role),
+      outcome: "completed" as const,
+      errorCategory: null,
+      errorCode: null,
+      failureStage: null,
+      failureSubstage: null,
+      httpStatus: null,
+      finishReason: "stop" as const,
+      maxTokens: null,
+      usageTotalTokens: null,
+      usageComplete: false,
+      responseByteCount: null,
+      eofObserved: true,
+      stopObserved: true,
+      doneObserved: sseResponses.length === 0
+        ? null
+        : sseResponses.every((response) => response.sseDoneObserved === true),
+      logicalRequestCount: receipt.requestCount,
+      transportAttemptCount: receipt.transportAttemptCount,
+      providerRequestCount: receipt.transportAttemptCount,
+      retryCount: Math.max(
+        0,
+        receipt.transportAttemptCount - receipt.requestCount
+      ),
+      dependencyBlocked: false
+    };
+  });
+  return reviewFlowEvaluationCaseAttemptSchema.parse({
+    schemaVersion: 1,
+    attempt,
+    outcome: "completed",
+    accountingComplete: false,
+    errorCategory: null,
+    errorCode: null,
+    roleAttempts
+  });
+}
+
+function legacyFailedCaseAttempt(
+  attempt: number,
+  failure: ReviewFlowEvaluationFailure
+): ReviewFlowEvaluationCaseAttempt {
+  const safeErrorCode =
+    reviewFlowEvaluationCaseErrorCodeSchema.safeParse(failure.code);
+  if (failure.roleAttempts !== undefined) {
+    return reviewFlowEvaluationCaseAttemptSchema.parse({
+      schemaVersion: 1,
+      attempt,
+      outcome: "failed",
+      accountingComplete: true,
+      errorCategory: failure.failureKind,
+      errorCode: safeErrorCode.success ? safeErrorCode.data : null,
+      roleAttempts: failure.roleAttempts
+    });
+  }
+  const failures = new Map(
+    failure.failedRoles.flatMap((entry) => {
+      const role = reviewFlowRoleSchema.safeParse(entry.role);
+      return role.success ? [[role.data, entry] as const] : [];
+    })
+  );
+  const roleAttempts = reviewFlowRoleSchema.options.map((role) => {
+    const failed = failures.get(role);
+    if (failed === undefined) {
+      return {
+        schemaVersion: 1 as const,
+        role,
+        roleStage: reviewFlowRoleStage(role),
+        outcome: "dependency_blocked" as const,
+        errorCategory: null,
+        errorCode: null,
+        failureStage: null,
+        failureSubstage: null,
+        httpStatus: null,
+        finishReason: null,
+        maxTokens: null,
+        usageTotalTokens: null,
+        usageComplete: false,
+        responseByteCount: 0,
+        eofObserved: null,
+        stopObserved: null,
+        doneObserved: null,
+        logicalRequestCount: 0,
+        transportAttemptCount: 0,
+        providerRequestCount: 0,
+        retryCount: 0,
+        dependencyBlocked: true
+      };
+    }
+    return {
+      schemaVersion: 1 as const,
+      role,
+      roleStage: reviewFlowRoleStage(role),
+      outcome: "failed" as const,
+      errorCategory: failed.failureKind,
+      errorCode: null,
+      failureStage: null,
+      failureSubstage: null,
+      httpStatus: failure.httpStatus,
+      finishReason: null,
+      maxTokens: null,
+      usageTotalTokens: null,
+      usageComplete: false,
+      responseByteCount: null,
+      eofObserved: null,
+      stopObserved: null,
+      doneObserved: null,
+      logicalRequestCount: failed.requestCount,
+      transportAttemptCount: failed.transportAttemptCount,
+      providerRequestCount: failed.transportAttemptCount,
+      retryCount: Math.max(
+        0,
+        failed.transportAttemptCount - failed.requestCount
+      ),
+      dependencyBlocked: false
+    };
+  });
+  return reviewFlowEvaluationCaseAttemptSchema.parse({
+    schemaVersion: 1,
+    attempt,
+    outcome: "failed",
+    accountingComplete: false,
+    errorCategory: failure.failureKind,
+    errorCode: safeErrorCode.success ? safeErrorCode.data : null,
+    roleAttempts
+  });
+}
+
 function executionCompletionFingerprint(
   state: Pick<
     ReviewFlowEvaluationCheckpointState,
@@ -1181,6 +1713,7 @@ function executionCompletionFingerprint(
     | "identityFingerprint"
     | "expectedCases"
     | "entries"
+    | "auditLedger"
     | "globalClaimSha256"
     | "termination"
     | "representative3Timing"
@@ -1192,11 +1725,12 @@ function executionCompletionFingerprint(
     state.entries
   );
   return hashCanonicalValue({
-    protocol: "review-flow-evaluation-execution-completion-v3",
+    protocol: "review-flow-evaluation-execution-completion-v4",
     runId: state.runId,
     identityFingerprint: state.identityFingerprint,
     expectedCases: state.expectedCases,
     entries: state.entries,
+    auditLedger: state.auditLedger,
     receiptSeal,
     globalClaimSha256: state.globalClaimSha256,
     termination: state.termination,
