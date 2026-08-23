@@ -10,6 +10,7 @@ import {
   reviewFlowEvaluationDatasetSummarySchema,
   reviewFlowEvaluationDigestSchema,
   reviewFlowEvaluationLabelSchema,
+  reviewFlowEvaluationMetricIsApplicable,
   reviewFlowEvaluationSafeIdSchema,
   reviewFlowEvaluationTechnicalReasonSchema,
   type ReviewFlowEvaluationDatasetBundle,
@@ -761,7 +762,11 @@ function scoreHistoricalOutcomes(
   let scoredCaseCount = 0;
   for (const evaluationCase of cases) {
     const gold = revealedGold(evaluationCase);
-    if (gold.evaluationScope !== "verdict_and_taste") continue;
+    if (
+      gold.evaluationScope !== "verdict_and_taste" ||
+      !reviewFlowEvaluationMetricIsApplicable(gold, "historicalOutcome") ||
+      gold.historicalOutcome === undefined
+    ) continue;
     const projection = completed.get(evaluationCase.safeId);
     if (projection === undefined) continue;
     const predicted = predictHistoricalOutcome(projection);
@@ -817,6 +822,7 @@ function scoreObservedHistoricalTasteReasons(
     const gold = revealedGold(evaluationCase);
     if (
       gold.evaluationScope !== "verdict_and_taste" ||
+      !reviewFlowEvaluationMetricIsApplicable(gold, "historicalOutcome") ||
       gold.observedHistoricalTasteReasons.length === 0
     ) continue;
     const projection = completed.get(evaluationCase.safeId);
@@ -850,6 +856,7 @@ function scoreObservedHistoricalTechnicalReasons(
     const gold = revealedGold(evaluationCase);
     if (
       gold.evaluationScope !== "verdict_and_taste" ||
+      !reviewFlowEvaluationMetricIsApplicable(gold, "historicalOutcome") ||
       gold.observedHistoricalTechnicalReasons.length === 0
     ) continue;
     const projection = completed.get(evaluationCase.safeId);
@@ -946,6 +953,7 @@ function scoreIndependentDifficulty(
     const gold = revealedGold(evaluationCase);
     if (
       gold.evaluationScope !== "verdict_and_taste" ||
+      !reviewFlowEvaluationMetricIsApplicable(gold, "independentDifficulty") ||
       gold.independentDifficulty === undefined
     ) continue;
     const projection = completed.get(evaluationCase.safeId);
@@ -1012,7 +1020,12 @@ function scoreContestUse(
   let exactMatches = 0;
   for (const evaluationCase of cases) {
     const gold = revealedGold(evaluationCase);
-    if (gold.evaluationScope !== "verdict_and_taste") continue;
+    if (
+      gold.evaluationScope !== "verdict_and_taste" ||
+      !reviewFlowEvaluationMetricIsApplicable(gold, "contestUse") ||
+      gold.contestUse === undefined ||
+      gold.historicalOutcome === undefined
+    ) continue;
     coverage[gold.contestUse] += 1;
     if (gold.historicalOutcome === "accepted") coverage.historicalAccepted += 1;
     else coverage.historicalRejected += 1;
@@ -1113,6 +1126,12 @@ function buildCaseResult(
 ): z.infer<typeof caseResultSchema> {
   const projection = entry.status === "completed" ? entry.projection : null;
   const verdictGold = gold.evaluationScope === "verdict_and_taste" ? gold : null;
+  const historicalOutcomeApplicable =
+    verdictGold !== null &&
+    reviewFlowEvaluationMetricIsApplicable(verdictGold, "historicalOutcome");
+  const contestUseApplicable =
+    verdictGold !== null &&
+    reviewFlowEvaluationMetricIsApplicable(verdictGold, "contestUse");
   const expectedDuplicate = gold.evaluationScope === "originality_only"
     ? true
     : gold.independentOriginality?.confirmedDuplicate ?? null;
@@ -1125,16 +1144,17 @@ function buildCaseResult(
         : entry.status === "active"
           ? "interrupted"
           : entry.status,
-    historicalOutcome: verdictGold?.historicalOutcome ?? null,
+    historicalOutcome:
+      historicalOutcomeApplicable ? verdictGold?.historicalOutcome ?? null : null,
     predictedHistoricalOutcome:
-      verdictGold !== null && projection !== null
+      historicalOutcomeApplicable && projection !== null
         ? predictHistoricalOutcome(projection)
         : null,
     independentVerdict: verdictGold?.independentVerdict?.verdict ?? null,
     predictedVerdict: verdictGold !== null ? projection?.verdict ?? null : null,
-    contestUse: verdictGold?.contestUse ?? null,
+    contestUse: contestUseApplicable ? verdictGold?.contestUse ?? null : null,
     predictedContestUse:
-      verdictGold !== null && projection !== null
+      contestUseApplicable && projection !== null
         ? predictContestUse(projection)
         : null,
     independentlyLabeledDuplicate: expectedDuplicate,

@@ -2449,6 +2449,83 @@ describe("严格私有报告、恢复与计分", () => {
     expect(report.json).not.toContain("PRIVATE_SOLUTION_SENTINEL");
     chain.checkpoint.close();
   });
+  it("metric applicability keeps pass/fail separate from difficulty-only cases", () => {
+    const fixture = createDatasetFixture("metric-applicability");
+    const dataset = loadDataset(fixture, "development_scored");
+    expect(dataset.cases).toHaveLength(3);
+    expect(dataset.summary).toMatchObject({
+      historicalOutcomeCounts: { accepted: 1, rejected: 1 },
+      contestUseCounts: { used: 0, not_used: 0, unknown: 0 },
+      difficultyLabeledCaseCount: 1
+    });
+    const chain = createDatasetCheckpoint(
+      fixture,
+      dataset,
+      "baseline",
+      "metric-applicability",
+      null,
+      "metric-applicability",
+      {
+        identity: {
+          ...identityFixture(),
+          datasetFingerprint: dataset.datasetFingerprint,
+          manifestSha256: dataset.manifestSha256,
+          caseSelection: {
+            schemaVersion: 1,
+            selector: "representative3-v1",
+            parentDatasetFingerprint: dataset.datasetFingerprint,
+            parentManifestSha256: dataset.manifestSha256,
+            parentBridgeCompletionSha256: dataset.bridgeCompletionSha256,
+            parentCaseCount: 32,
+            orderedSelectionSha256:
+              reviewFlowEvaluationOrderedSelectionSha256(dataset.cases),
+            selectedCaseCount: 3
+          }
+        }
+      }
+    );
+    chain.checkpoint.bindGlobalClaim("b".repeat(64));
+    for (const safeId of dataset.cases.map((entry) => entry.safeId)) {
+      chain.checkpoint.markActive(safeId);
+      chain.checkpoint.markCompleted(
+        safeId,
+        safeId === "case-0001"
+          ? projection("approve")
+          : safeId === "case-0002"
+            ? projection("reject")
+            : projection("reject"),
+        undefined,
+        { schemaVersion: 1, firstByteMs: 1, endToEndMs: 2 }
+      );
+    }
+    const state = chain.checkpoint.sealExecution();
+    const report = buildReviewFlowEvaluationReport({ dataset, checkpoint: state });
+    expect(report.summary.scoring.historicalOutcomeBinary).toMatchObject({
+      scoredCaseCount: 2,
+      exactMatches: 2,
+      accuracy: 1
+    });
+    expect(report.summary.scoring.independentDifficulty).toMatchObject({
+      scoredCaseCount: 1,
+      codeforcesMae: 0,
+      thinkingExactRate: 1,
+      codingExactRate: 1
+    });
+    expect(report.summary.scoring.contestUse.coverage).toMatchObject({
+      used: 0,
+      not_used: 0,
+      unknown: 0
+    });
+    expect(report.summary.scoring.contestUse.knownUseBinary.scoredCaseCount).toBe(0);
+    expect(report.summary.caseResults.find((entry) => entry.safeId === "case-0003")).toMatchObject({
+      historicalOutcome: null,
+      predictedHistoricalOutcome: null,
+      contestUse: null,
+      predictedContestUse: null
+    });
+    chain.checkpoint.close();
+  });
+
 
   it("incomplete/499 令所有准确率失效且 eligible 永远 false", () => {
     const fixture = createDatasetFixture();
@@ -3086,7 +3163,78 @@ function createDatasetFixture(seed = "default"): DatasetFixture {
   const catalogBytes = jsonBytes(catalog);
   writePrivateFile(join(suiteDirectory, "tag-catalog.private.json"), catalogBytes);
   const developmentMaterials: RevealCaseMaterial[] = [];
-  if (seed.startsWith("representative3-v2")) {
+  if (seed === "metric-applicability") {
+    developmentMaterials.push(
+      writeDatasetCase({
+        directory: suiteDirectory,
+        goldDirectory: developmentRevealDirectory,
+        partition: "development",
+        safeId: "case-0001",
+        subjectId: `subject-${safeToken(seed)}-dev-0001`,
+        numericId: numericSeed(seed, 1),
+        catalog,
+        gold: (common) => ({
+          ...common,
+          evaluationScope: "verdict_and_taste",
+          metricApplicability: {
+            historicalOutcome: true,
+            contestUse: false,
+            independentDifficulty: false
+          },
+          historicalOutcome: "accepted",
+          observedHistoricalTasteReasons: [],
+          observedHistoricalTechnicalReasons: []
+        })
+      }),
+      writeDatasetCase({
+        directory: suiteDirectory,
+        goldDirectory: developmentRevealDirectory,
+        partition: "development",
+        safeId: "case-0002",
+        subjectId: `subject-${safeToken(seed)}-dev-0002`,
+        numericId: numericSeed(seed, 2),
+        catalog,
+        gold: (common) => ({
+          ...common,
+          evaluationScope: "verdict_and_taste",
+          metricApplicability: {
+            historicalOutcome: true,
+            contestUse: false,
+            independentDifficulty: false
+          },
+          historicalOutcome: "rejected",
+          observedHistoricalTasteReasons: [],
+          observedHistoricalTechnicalReasons: []
+        })
+      }),
+      writeDatasetCase({
+        directory: suiteDirectory,
+        goldDirectory: developmentRevealDirectory,
+        partition: "development",
+        safeId: "case-0003",
+        subjectId: `subject-${safeToken(seed)}-dev-0003`,
+        numericId: numericSeed(seed, 3),
+        catalog,
+        gold: (common) => ({
+          ...common,
+          evaluationScope: "verdict_and_taste",
+          metricApplicability: {
+            historicalOutcome: false,
+            contestUse: false,
+            independentDifficulty: true
+          },
+          observedHistoricalTasteReasons: [],
+          observedHistoricalTechnicalReasons: [],
+          independentDifficulty: {
+            annotation: "independent_human_without_submitter_metadata",
+            codeforcesDifficulty: 1800,
+            thinkingLevel: 3,
+            codingLevel: 2
+          }
+        })
+      })
+    );
+  } else if (seed.startsWith("representative3-v2")) {
     const countMismatch = seed.includes("count-mismatch");
     for (let index = 1; index <= 32; index++) {
       const padded = String(index).padStart(4, "0");

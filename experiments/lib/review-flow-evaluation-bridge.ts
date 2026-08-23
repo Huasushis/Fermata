@@ -41,7 +41,9 @@ import {
   reviewFlowEvaluationGeneratorDependencyFileCount,
   reviewFlowEvaluationHoldoutPredictionBindingSha256,
   reviewFlowEvaluationHoldoutRegistrationSchema,
+  reviewFlowEvaluationIndependentDifficultySchema,
   reviewFlowEvaluationManifestSchema,
+  reviewFlowEvaluationMetricApplicabilitySchema,
   reviewFlowEvaluationPlaceholderTagIdsSchema,
   reviewFlowEvaluationRevealDescriptorSchema,
   reviewFlowEvaluationSafeIdSchema,
@@ -287,7 +289,6 @@ const upstreamBindingsSchema = z
     cases: z.array(upstreamBindingCaseSchema).min(1).max(10_000)
   })
   .strict();
-
 const upstreamGoldCommon = {
   version: z.literal(2),
   artifactKind: z.literal("historical_review_gold"),
@@ -299,8 +300,11 @@ const upstreamGoldSchema = z.discriminatedUnion("evaluationScope", [
     .object({
       ...upstreamGoldCommon,
       evaluationScope: z.literal("verdict_and_taste"),
-      verdict: z.enum(["accepted", "rejected"]),
-      contestUse: z.enum(["used", "not_used", "unknown"])
+      metricApplicability: reviewFlowEvaluationMetricApplicabilitySchema,
+      verdict: z.enum(["accepted", "rejected"]).optional(),
+      contestUse: z.enum(["used", "not_used", "unknown"]).optional(),
+      independentDifficulty:
+        reviewFlowEvaluationIndependentDifficultySchema.optional()
     })
     .strict(),
   z
@@ -326,8 +330,11 @@ const upstreamPlanCaseSchema = z.discriminatedUnion("evaluationScope", [
     .object({
       ...upstreamPlanCommon,
       evaluationScope: z.literal("verdict_and_taste"),
-      verdict: z.enum(["accepted", "rejected"]),
-      contestUse: z.enum(["used", "not_used", "unknown"])
+      metricApplicability: reviewFlowEvaluationMetricApplicabilitySchema,
+      verdict: z.enum(["accepted", "rejected"]).optional(),
+      contestUse: z.enum(["used", "not_used", "unknown"]).optional(),
+      independentDifficulty:
+        reviewFlowEvaluationIndependentDifficultySchema.optional()
     })
     .strict(),
   z
@@ -2957,12 +2964,20 @@ function buildGold(input: {
   return reviewFlowEvaluationGoldSchema.parse({
     ...common,
     evaluationScope: "verdict_and_taste",
-    historicalOutcome: input.upstreamGold.verdict,
-    contestUse: input.upstreamGold.contestUse,
+    metricApplicability: input.upstreamGold.metricApplicability,
+    ...(input.upstreamGold.verdict !== undefined
+      ? { historicalOutcome: input.upstreamGold.verdict }
+      : {}),
+    ...(input.upstreamGold.contestUse !== undefined
+      ? { contestUse: input.upstreamGold.contestUse }
+      : {}),
     observedHistoricalTasteReasons:
       input.historicalReasons.taste,
     observedHistoricalTechnicalReasons:
-      input.historicalReasons.technical
+      input.historicalReasons.technical,
+    ...(input.upstreamGold.independentDifficulty !== undefined
+      ? { independentDifficulty: input.upstreamGold.independentDifficulty }
+      : {})
   });
 }
 
@@ -3131,6 +3146,10 @@ function upstreamGoldMatchesPlan(
   }
   return gold.evaluationScope === "verdict_and_taste" &&
     plan.evaluationScope === "verdict_and_taste" &&
+    hashCanonicalValue(gold.metricApplicability) ===
+      hashCanonicalValue(plan.metricApplicability) &&
+    hashCanonicalValue(gold.independentDifficulty ?? null) ===
+      hashCanonicalValue(plan.independentDifficulty ?? null) &&
     gold.verdict === plan.verdict &&
     gold.contestUse === plan.contestUse;
 }

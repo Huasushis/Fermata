@@ -280,7 +280,7 @@ const independentOriginalitySchema = z
   })
   .strict();
 
-const independentDifficultySchema = z
+export const reviewFlowEvaluationIndependentDifficultySchema = z
   .object({
     annotation: z.literal("independent_human_without_submitter_metadata"),
     codeforcesDifficulty: codeforcesDifficultySchema,
@@ -289,12 +289,22 @@ const independentDifficultySchema = z
   })
   .strict();
 
+export const reviewFlowEvaluationMetricApplicabilitySchema = z
+  .object({
+    historicalOutcome: z.boolean().default(true),
+    contestUse: z.boolean().default(true),
+    independentDifficulty: z.boolean().optional()
+  })
+  .strict()
+  .optional();
+
 const verdictAndTasteGoldSchema = z
   .object({
     ...reviewFlowEvaluationGoldCommonShape,
     evaluationScope: z.literal("verdict_and_taste"),
-    historicalOutcome: z.enum(["accepted", "rejected"]),
-    contestUse: z.enum(["used", "not_used", "unknown"]),
+    metricApplicability: reviewFlowEvaluationMetricApplicabilitySchema,
+    historicalOutcome: z.enum(["accepted", "rejected"]).optional(),
+    contestUse: z.enum(["used", "not_used", "unknown"]).optional(),
     // XML 意见是稀疏观察：缺席不构成负例，只计算召回。
     observedHistoricalTasteReasons: z
       .array(reviewFlowEvaluationTasteReasonSchema)
@@ -310,10 +320,62 @@ const verdictAndTasteGoldSchema = z
       .min(1)
       .max(30)
       .optional(),
-    independentDifficulty: independentDifficultySchema.optional()
+    independentDifficulty:
+      reviewFlowEvaluationIndependentDifficultySchema.optional()
   })
   .strict()
   .superRefine((gold, context) => {
+    const applicability = gold.metricApplicability ?? {
+      historicalOutcome: true,
+      contestUse: true
+    };
+    const historicalOutcomeApplicable = applicability.historicalOutcome;
+    const contestUseApplicable = applicability.contestUse;
+    const difficultyApplicability = applicability.independentDifficulty;
+    if (contestUseApplicable && !historicalOutcomeApplicable) {
+      context.addIssue({
+        code: "custom",
+        path: ["metricApplicability", "contestUse"],
+        message: "contestUse 必须依附于历史通过/否决指标。"
+      });
+    }
+    if (
+      historicalOutcomeApplicable !==
+      (gold.historicalOutcome !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["historicalOutcome"],
+        message: "历史通过/否决字段必须与适用范围一致。"
+      });
+    }
+    if (contestUseApplicable !== (gold.contestUse !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["contestUse"],
+        message: "contestUse 字段必须与适用范围一致。"
+      });
+    }
+    if (
+      difficultyApplicability === true &&
+      gold.independentDifficulty === undefined
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["independentDifficulty"],
+        message: "独立难度适用时必须提供独立难度真值。"
+      });
+    }
+    if (
+      difficultyApplicability === false &&
+      gold.independentDifficulty !== undefined
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["independentDifficulty"],
+        message: "独立难度不适用时不能提供独立难度真值。"
+      });
+    }
     assertUniqueReasons(
       gold.observedHistoricalTasteReasons,
       context,
@@ -364,6 +426,27 @@ export const reviewFlowEvaluationGoldSchema = z.discriminatedUnion(
 export type ReviewFlowEvaluationGold = z.infer<
   typeof reviewFlowEvaluationGoldSchema
 >;
+export type ReviewFlowEvaluationMetric =
+  | "historicalOutcome"
+  | "contestUse"
+  | "independentDifficulty";
+
+export function reviewFlowEvaluationMetricIsApplicable(
+  gold: ReviewFlowEvaluationGold,
+  metric: ReviewFlowEvaluationMetric
+): boolean {
+  if (gold.evaluationScope !== "verdict_and_taste") return false;
+  const applicability = gold.metricApplicability;
+  if (metric === "historicalOutcome") {
+    return applicability?.historicalOutcome ?? true;
+  }
+  if (metric === "contestUse") {
+    return applicability?.contestUse ?? true;
+  }
+  return applicability?.independentDifficulty ??
+    gold.independentDifficulty !== undefined;
+}
+
 
 const verdictCountsSchema = z
   .object({
@@ -1675,16 +1758,26 @@ function summarizeGold(
   const contestUseCounts = { used: 0, not_used: 0, unknown: 0 };
   for (const item of gold) {
     if (item.evaluationScope !== "verdict_and_taste") continue;
-    historicalOutcomeCounts[item.historicalOutcome] += 1;
-    contestUseCounts[item.contestUse] += 1;
+    if (
+      reviewFlowEvaluationMetricIsApplicable(item, "historicalOutcome") &&
+      item.historicalOutcome !== undefined
+    ) {
+      historicalOutcomeCounts[item.historicalOutcome] += 1;
+      for (const reason of item.observedHistoricalTasteReasons) {
+        observedHistoricalTasteDimensionCounts[reason.dimension] += 1;
+      }
+      for (const reason of item.observedHistoricalTechnicalReasons) {
+        observedHistoricalTechnicalReasonCounts[reason] += 1;
+      }
+    }
+    if (
+      reviewFlowEvaluationMetricIsApplicable(item, "contestUse") &&
+      item.contestUse !== undefined
+    ) {
+      contestUseCounts[item.contestUse] += 1;
+    }
     if (item.independentVerdict !== undefined) {
       independentVerdictCounts[item.independentVerdict.verdict] += 1;
-    }
-    for (const reason of item.observedHistoricalTasteReasons) {
-      observedHistoricalTasteDimensionCounts[reason.dimension] += 1;
-    }
-    for (const reason of item.observedHistoricalTechnicalReasons) {
-      observedHistoricalTechnicalReasonCounts[reason] += 1;
     }
   }
   return reviewFlowEvaluationDatasetSummarySchema.parse({
@@ -1730,6 +1823,7 @@ function summarizeGold(
     difficultyLabeledCaseCount: gold.filter(
       (item) =>
         item.evaluationScope === "verdict_and_taste" &&
+        reviewFlowEvaluationMetricIsApplicable(item, "independentDifficulty") &&
         item.independentDifficulty !== undefined
     ).length
   });
