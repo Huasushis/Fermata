@@ -764,9 +764,7 @@ function scoreHistoricalOutcomes(
     if (gold.evaluationScope !== "verdict_and_taste") continue;
     const projection = completed.get(evaluationCase.safeId);
     if (projection === undefined) continue;
-    const predicted = projection.verdict === "approve"
-      ? "accepted" as const
-      : "not_accepted" as const;
+    const predicted = predictHistoricalOutcome(projection);
     const expected = gold.historicalOutcome;
     matrix[expected][predicted] += 1;
     scoredCaseCount += 1;
@@ -1130,9 +1128,7 @@ function buildCaseResult(
     historicalOutcome: verdictGold?.historicalOutcome ?? null,
     predictedHistoricalOutcome:
       verdictGold !== null && projection !== null
-        ? projection.verdict === "approve"
-          ? "accepted"
-          : "not_accepted"
+        ? predictHistoricalOutcome(projection)
         : null,
     independentVerdict: verdictGold?.independentVerdict?.verdict ?? null,
     predictedVerdict: verdictGold !== null ? projection?.verdict ?? null : null,
@@ -1251,6 +1247,12 @@ function predictedTechnicalReasons(
     reasons.add("reference_implementation_incorrect");
   }
   return reasons;
+}
+
+function predictHistoricalOutcome(
+  projection: ReviewFlowCalibrationProjection
+): "accepted" | "not_accepted" {
+  return projection.verdict === "reject" ? "not_accepted" : "accepted";
 }
 
 function predictContestUse(

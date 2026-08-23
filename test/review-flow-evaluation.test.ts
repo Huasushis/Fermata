@@ -2407,6 +2407,7 @@ describe("严格私有报告、恢复与计分", () => {
       if (safeId === "case-0001") return projection("approve");
       if (safeId === "case-0002") return projection("reject", { judgeabilityConcern: true, contestUse: "not_used" });
       if (safeId === "case-0003") return projection("reject", { judgeabilityConcern: true, contestUse: "not_used" });
+      if (safeId === "case-0004") return projection("request_changes", { contestUse: "not_used" });
       return projection("approve", { contestUse: "not_used" });
     });
     const state = chain.checkpoint.sealExecution();
@@ -2416,6 +2417,16 @@ describe("严格私有报告、恢复与计分", () => {
     expect(report.summary.scoring.historicalOutcomeBinary).toMatchObject({
       scoredCaseCount: 32,
       accuracy: 1
+    });
+    expect(report.summary.caseResults.find((entry) => entry.safeId === "case-0004")).toMatchObject({
+      historicalOutcome: "accepted",
+      predictedHistoricalOutcome: "accepted",
+      predictedVerdict: "request_changes"
+    });
+    expect(report.summary.caseResults.find((entry) => entry.safeId === "case-0002")).toMatchObject({
+      historicalOutcome: "rejected",
+      predictedHistoricalOutcome: "not_accepted",
+      predictedVerdict: "reject"
     });
     expect(report.summary.scoring.independentThreeWayVerdict).toMatchObject({
       scoredCaseCount: 1,
