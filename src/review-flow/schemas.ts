@@ -555,26 +555,39 @@ export function createTagsPayloadSchema(
 }
 export type TagsPayload = z.infer<typeof tagsPayloadSchema>;
 
-export const criticPayloadSchema = z
+const createCriticConflictSchema = (evidenceId: z.ZodType<string>) => z
   .object({
-    conflicts: z
-      .array(
-        z
-          .object({
-            leftEvidenceId: evidenceIdSchema,
-            rightEvidenceId: evidenceIdSchema,
-            code: z.string().regex(/^[A-Z0-9_]{1,120}$/u),
-            severity: z.enum(["note", "warning", "blocker"]),
-            rationale: z.string().trim().min(1).max(2_000)
-          })
-          .strict()
-      )
-      .max(200),
-    missingRoles: z.array(reviewFlowRoleSchema).max(20),
-    rationale: shortTextSchema
+    leftEvidenceId: evidenceId,
+    rightEvidenceId: evidenceId,
+    code: z.string().regex(/^[A-Z0-9_]{1,120}$/u),
+    severity: z.enum(["note", "warning", "blocker"]),
+    rationale: z.string().trim().min(1).max(2_000)
   })
   .strict();
+
+function criticPayloadSchemaForEvidenceId(
+  evidenceId: z.ZodType<string>
+) {
+  return z
+    .object({
+      conflicts: z.array(createCriticConflictSchema(evidenceId)).max(200),
+      missingRoles: z.array(reviewFlowRoleSchema).max(20),
+      rationale: shortTextSchema
+    })
+    .strict();
+}
+
+export const criticPayloadSchema = criticPayloadSchemaForEvidenceId(evidenceIdSchema);
 export type CriticPayload = z.infer<typeof criticPayloadSchema>;
+
+export function createCriticPayloadSchema(allowedEvidenceIds: readonly string[]) {
+  const canonicalEvidenceIds = [...new Set(allowedEvidenceIds)];
+  if (canonicalEvidenceIds.length === 0) {
+    throw new Error("REVIEW_FLOW_CRITIC_EVIDENCE_EMPTY");
+  }
+  const evidenceId = z.enum(canonicalEvidenceIds as [string, ...string[]]);
+  return criticPayloadSchemaForEvidenceId(evidenceId);
+}
 
 export const adversaryPayloadSchema = z
   .object({

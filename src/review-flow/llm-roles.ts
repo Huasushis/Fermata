@@ -27,9 +27,9 @@ import {
   adjudicatorPayloadSchema,
   adversaryPayloadSchema,
   contestFitPayloadSchema,
-  criticPayloadSchema,
-  difficultyPayloadSchema,
+  createCriticPayloadSchema,
   digestSchema,
+  difficultyPayloadSchema,
   editorialPayloadSchema,
   originalityPayloadSchema,
   reviewFlowRoleSchema,
@@ -278,7 +278,7 @@ export function createReviewFlowLlmBundle(input: {
     critic: async (view) => runJsonRole(
       models.critic,
       buildCriticMessages(view),
-      criticPayloadSchema
+      createCriticPayloadSchema(view.evidence.map((artifact) => artifact.evidenceId))
     ),
     adversary: async (view) => runJsonRole(
       models.adversary,
