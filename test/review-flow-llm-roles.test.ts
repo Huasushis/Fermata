@@ -25,6 +25,7 @@ import {
   buildSolverMessages,
   buildTagsSemanticMessages,
   buildTechnicalAuditorMessages,
+  canonicalizeAdjudicatorPayload,
   createReviewFlowLlmBundle,
   isProductionEligibleReviewFlowLlmBundle,
   isTrustedReviewFlowLlmBundle,
@@ -35,6 +36,7 @@ import {
   historicalReviewRubricPromptText
 } from "../src/review-flow/historical-rubric";
 import {
+  createAdjudicatorPayloadSchema,
   adversaryPayloadSchema,
   contestFitPayloadSchema,
   criticPayloadSchema,
@@ -45,9 +47,10 @@ import {
   solutionAnalystPayloadSchema,
   solverPayloadSchema,
   tagsPayloadSchema,
+  technicalAuditPayloadSchema,
   createTagsPayloadSchema,
   trustedRoleExecutionResultSchema,
-  technicalAuditPayloadSchema,
+  type AdjudicatorPayload,
   type ReviewFlowRole
 } from "../src/review-flow/schemas";
 import {
@@ -616,6 +619,64 @@ describe("历史人工标准驱动的多角色提示词", () => {
   });
 
 
+
+  it("adjudicator phase2 enforces dynamic enum, canonicalizes duplicates, and preserves order", async () => {
+    const allowedEvidenceIds = ["core.first", "core.second"];
+    const schema = createAdjudicatorPayloadSchema(allowedEvidenceIds);
+    const basePayload: Omit<AdjudicatorPayload, "citedEvidenceIds"> = {
+      verdict: "approve",
+      qualityLevel: 4,
+      fixability: "none",
+      strengths: ["合成优点"],
+      improvements: "无需修改。",
+      publicComment: "",
+      privateNote: ""
+    };
+    const duplicatePayload: AdjudicatorPayload = {
+      ...basePayload,
+      citedEvidenceIds: [
+        allowedEvidenceIds[0]!,
+        allowedEvidenceIds[0]!,
+        allowedEvidenceIds[1]!,
+        allowedEvidenceIds[0]!
+      ]
+    };
+    expect(canonicalizeAdjudicatorPayload(duplicatePayload).citedEvidenceIds).toEqual(
+      ["core.first", "core.second"]
+    );
+    expect(canonicalizeAdjudicatorPayload({
+      ...duplicatePayload,
+      citedEvidenceIds: ["core.second", "core.first", "core.second"]
+    }).citedEvidenceIds).toEqual(["core.second", "core.first"]);
+    expect(schema.safeParse(duplicatePayload).success).toBe(true);
+    expect(schema.safeParse({
+      ...duplicatePayload,
+      citedEvidenceIds: ["core.first", "core.first", "unknown"]
+    }).success).toBe(false);
+    expect(schema.safeParse({ ...duplicatePayload, citedEvidenceIds: [] }).success).toBe(false);
+    expect(schema.safeParse({
+      ...duplicatePayload,
+      citedEvidenceIds: ["core.first", 17]
+    }).success).toBe(false);
+    expect(schema.safeParse({
+      ...duplicatePayload,
+      citedEvidenceIds: ["core.first", "core.second"]
+    }).success).toBe(true);
+    const schemaJson = JSON.parse(serializeTargetJsonSchema(schema)) as {
+      properties: {
+        citedEvidenceIds: {
+          uniqueItems?: boolean;
+          minItems: number;
+          items: { enum: string[] };
+        };
+      };
+    };
+    expect(schemaJson.properties.citedEvidenceIds.items.enum).toEqual(allowedEvidenceIds);
+    expect(schemaJson.properties.citedEvidenceIds.minItems).toBe(1);
+    if ("uniqueItems" in schemaJson.properties.citedEvidenceIds) {
+      expect(schemaJson.properties.citedEvidenceIds.uniqueItems).toBe(true);
+    }
+  });
 
   it("所有角色都经过同一提示注入边界，待审材料中的伪指令只能留在 user JSON", () => {
     const builders = [
@@ -1291,5 +1352,51 @@ describe("历史人工标准驱动的多角色提示词", () => {
       expect(body).not.toHaveProperty("max_completion_tokens");
       expect(body).not.toHaveProperty("maxOutputTokens");
     }
+  });
+  it("provider adjudicator path parses the strict enum before stable duplicate canonicalization", async () => {
+    const views = flowViews();
+    const coreEvidence: EvidenceArtifact<unknown>[] = [
+      views.artifacts.solver,
+      views.artifacts.solutionAnalyst,
+      views.artifacts.technicalAudit
+    ];
+    const criticView = buildCriticView(problemContentHash, coreEvidence);
+    const critic = syntheticArtifact("critic", criticPayloadSchema, wireRolePayloads.critic);
+    const adversary = syntheticArtifact("adversary", adversaryPayloadSchema, wireRolePayloads.adversary);
+    const adjudicatorView = buildAdjudicatorView(criticView, critic, adversary);
+    const first = adjudicatorView.evidence[0]!.evidenceId;
+    const second = adjudicatorView.evidence[1]!.evidenceId;
+    const payload = {
+      ...(wireRolePayloads.adjudicator as Record<string, unknown>),
+      citedEvidenceIds: [first, first, second, first]
+    };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      choices: [{
+        message: { content: JSON.stringify(payload) },
+        finish_reason: "stop"
+      }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    }));
+    const models = modelConfigs() as Record<ReviewFlowRole, PipelineModelConfig>;
+    models.adjudicator = {
+      ...models.adjudicator,
+      runtime: { ...models.adjudicator.runtime, fetch: fetchImpl }
+    };
+    const bundle = createReviewFlowLlmBundle({
+      models: models as ReviewFlowModelConfigs,
+      difficultyAnchors: [],
+      profileName: "synthetic-profile",
+      experimentVersion: "synthetic-experiment",
+      engineBuildFingerprint: "c".repeat(64),
+      productionGrant: null
+    });
+    const result = trustedRoleExecutionResultSchema.parse(
+      await bundle.roles.adjudicator(adjudicatorView)
+    );
+    expect((result.payload as { citedEvidenceIds: readonly string[] }).citedEvidenceIds)
+      .toEqual([first, second]);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 });

@@ -1697,6 +1697,35 @@ describe("冻结证据多角色审题编排", () => {
     expect(outcome.failure.completedRoles).toHaveLength(10);
     expect(outcome.failure.completedRoles.map((entry) => entry.role)).not.toContain("adjudicator");
   });
+  it("内部直接构造的 adjudicator 重复引用仍由原 validator 拒绝", async () => {
+    const outcome = await runReviewEvidenceFlowOutcome({
+      source: source(),
+      identities: identities(),
+      roles: defaultRoles({
+        adjudicator: async (view) => ({
+          verdict: "approve",
+          qualityLevel: 4,
+          fixability: "none",
+          strengths: ["合成优点"],
+          improvements: "材料已满足合成验收要求。",
+          publicComment: "",
+          privateNote: "",
+          citedEvidenceIds: [
+            view.evidence[0]!.evidenceId,
+            view.evidence[0]!.evidenceId
+          ]
+        })
+      })
+    });
+    expect(outcome.status).toBe("incomplete");
+    if (outcome.status !== "incomplete") throw new Error("expected incomplete");
+    expect(outcome.failure.failedRoles).toEqual([
+      expect.objectContaining({
+        role: "adjudicator",
+        failureKind: "validation"
+      })
+    ]);
+  });
 
   it("外部技术角色只看到标程存在性摘要，不能读取标程源码", async () => {
     let observedReference: unknown;

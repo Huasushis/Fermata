@@ -39,11 +39,11 @@ import {
   createTagsPayloadSchema,
   technicalCheckStatusSchema,
   trustedRoleExecutionResultSchema,
+  type AdjudicatorPayload,
   type ReviewFlowRole,
   type RoleIdentity,
   maximumReviewFlowSourceBytes
 } from "./schemas";
-
 const promptVersions: Readonly<Record<ReviewFlowRole, string>> = {
   solver: "historical-rubric-solver-v2",
   solution_analyst: "historical-rubric-solution-v2",
@@ -285,11 +285,17 @@ export function createReviewFlowLlmBundle(input: {
       buildAdversaryMessages(view),
       createAdversaryPayloadSchema(canonicalEvidenceIds(view.evidence))
     ),
-    adjudicator: async (view) => runJsonRole(
-      models.adjudicator,
-      buildAdjudicatorMessages(view),
-      createAdjudicatorPayloadSchema(canonicalEvidenceIds(view.evidence))
-    )
+    adjudicator: async (view) => {
+      const result = await runJson<AdjudicatorPayload>(
+        models.adjudicator,
+        buildAdjudicatorMessages(view),
+        createAdjudicatorPayloadSchema(canonicalEvidenceIds(view.evidence))
+      );
+      return trustedRoleExecution(
+        canonicalizeAdjudicatorPayload(result.data),
+        result.receipt
+      );
+    }
   };
 
   const productionClaims = input.productionGrant === null
@@ -834,6 +840,15 @@ async function runJsonRole<T>(
 ): Promise<unknown> {
   const result = await runJson(model, messages, schema);
   return trustedRoleExecution(result.data, result.receipt);
+}
+
+export function canonicalizeAdjudicatorPayload(
+  payload: AdjudicatorPayload
+): AdjudicatorPayload {
+  return {
+    ...payload,
+    citedEvidenceIds: [...new Set(payload.citedEvidenceIds)]
+  };
 }
 
 /** JSON 角色（非 solver）在两轮模式下：第一轮完整深度思考，第二轮严格结构输出。 */
