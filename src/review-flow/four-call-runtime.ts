@@ -2,23 +2,19 @@ import type { PipelineModelConfig } from "../pipelines/types";
 import {
   chatCompleteTwoRoundJsonWithReceipt,
   chatCompleteWithReceipt,
-  chatCompleteSalvageableWithReceipt,
   chatCompleteReasoningSalvageJsonWithReceipt,
   getLlmFailureAudit,
   LlmJsonOutputError,
   LlmRequestError,
-  LlmRetainedTextTooLargeError,
   LlmResponseFormatError,
-  maximumExplicitLlmOutputTokens,
+  LlmRetainedTextTooLargeError,
   serializeTargetJsonSchema,
   type ChatMessage,
   type ChatCompletionWithReceipt,
-  type ChatCompletionSalvageableResult,
   type LlmJsonCompletionReceipt,
   type LlmReasoningSalvageJsonReceipt,
   type LlmRuntimeOptions,
   type LlmSseAcceptedShapeAudit,
-  type LlmSalvageTransportReceipt,
   type LlmTransportReceipt,
   type LlmResponseFormatFailureStage,
   type LlmResponseFormatFailureSubstage,
@@ -204,9 +200,9 @@ async function executeProductionCall(
   const startedAt = Date.now();
   let firstValidOutputMs: number | null = null;
   let validOutputEventCount = 0;
-  let completion: ChatCompletionWithReceipt | { content: string; receipt: LlmTransportReceipt | LlmSalvageTransportReceipt; salvagedContent: true };
+  let completion: ChatCompletionWithReceipt;
   try {
-    const salvageable = await chatCompleteSalvageableWithReceipt(
+    completion = await chatCompleteWithReceipt(
       config.credentials,
       config.spec,
       request.messages as ChatMessage[],
@@ -215,7 +211,6 @@ async function executeProductionCall(
         firstValidOutputMs ??= Date.now() - startedAt;
       }),
       {
-        maxOutputTokens: maximumExplicitLlmOutputTokens,
         responseJsonSchema: request.schema === null
           ? undefined
           : {
@@ -224,29 +219,6 @@ async function executeProductionCall(
             }
       }
     );
-    if (!salvageable.salvaged) {
-      completion = salvageable;
-    } else {
-      // 抢救路径：C/D 的 Pro 分析轮 finish_reason="length"，reasoning 非空。
-      // 用 formatter（Flash）做 finalizer 提取结构化 JSON。
-      const finalizerOutput = await executeSalvageFinalizer(
-        request,
-        config,
-        formatterConfig,
-        salvageable.reasoning,
-        salvageable.receipt,
-        lifecycle,
-        startedAt,
-        () => {
-          validOutputEventCount += 1;
-        }
-      );
-      completion = {
-        content: finalizerOutput.content,
-        receipt: finalizerOutput.receipt,
-        salvagedContent: true
-      };
-    }
   } catch (error) {
     const classified = classifyTransportFailure(error);
     lifecycle?.requestFailed(
@@ -263,9 +235,7 @@ async function executeProductionCall(
     );
     throw classified;
   }
-  const transportReceipt = "salvagedContent" in completion
-    ? completion.receipt
-    : completion.receipt;
+  const transportReceipt = completion.receipt;
   lifecycle?.requestCompleted(request, Object.freeze({
     firstValidOutputMs,
     endToEndMs: Date.now() - startedAt,
@@ -280,78 +250,6 @@ async function executeProductionCall(
   };
 }
 
-/**
- * C/D 抢救 finalizer：把 Pro 分析轮的 reasoning 传给 Flash，
- * 由 Flash 提取满足 schema 的 JSON。不含原始 reasoning 的 receipt。
- */
-async function executeSalvageFinalizer(
-  request: FourCallRequest,
-  config: PipelineModelConfig,
-  formatterConfig: PipelineModelConfig,
-  analysisReasoning: string,
-  analysisReceipt: LlmSalvageTransportReceipt,
-  lifecycle: FourCallRequestLifecycle | undefined,
-  startedAt: number,
-  onValidOutput: () => void
-): Promise<{ content: string; receipt: LlmTransportReceipt }> {
-  const schemaDescription = request.schema === null
-    ? "一个 JSON 对象"
-    : JSON.stringify(request.schema, null, 2);
-  const finalizerMessages: ChatMessage[] = [
-    {
-      role: "system",
-      content: "只输出一个满足要求的 JSON 对象本身，不要输出任何解释、前后缀文字，也不要用 Markdown 代码块包裹。"
-    },
-    {
-      role: "user",
-      content: [
-        "以下是一段分析推理文本。请从中提取最终结论，转换为符合要求的 JSON。不要重新推理，只做信息提取和格式转换：",
-        analysisReasoning
-      ].join("\n")
-    },
-    {
-      role: "user",
-      content: `目标 JSON Schema：\n${schemaDescription}`
-    }
-  ];
-  const firstFinal = await chatCompleteWithReceipt(
-    formatterConfig.credentials,
-    formatterConfig.spec,
-    finalizerMessages,
-    buildCallRuntime(request, formatterConfig, lifecycle, startedAt, onValidOutput),
-    {
-      requestJson: true,
-      maxOutputTokens: maximumExplicitLlmOutputTokens
-    }
-  );
-  // 验证 finalizer 输出是合法 JSON
-  try {
-    JSON.parse(firstFinal.content);
-  } catch {
-    // finalizer 输出不是合法 JSON，修复轮
-    const repairMessages: ChatMessage[] = [
-      ...finalizerMessages,
-      { role: "assistant", content: firstFinal.content },
-      {
-        role: "user",
-        content: "上一条回复不是合法 JSON。请只重新输出一个满足要求的 JSON 对象，不要包含任何其它文字或代码块标记。"
-      }
-    ];
-    const secondFinal = await chatCompleteWithReceipt(
-      formatterConfig.credentials,
-      formatterConfig.spec,
-      repairMessages,
-      buildCallRuntime(request, formatterConfig, lifecycle, startedAt, onValidOutput),
-      {
-        requestJson: true,
-        maxOutputTokens: maximumExplicitLlmOutputTokens
-      }
-    );
-    JSON.parse(secondFinal.content);
-    return { content: secondFinal.content, receipt: secondFinal.receipt };
-  }
-  return { content: firstFinal.content, receipt: firstFinal.receipt };
-}
 
 /**
  * 构造传输层运行时：逐阶段逻辑重试统一交由 FairLlmRequestScheduler 计数，
@@ -425,7 +323,7 @@ async function executeProductionStageATwoRound(
             Date.now() - currentRoundAcc.startedAtMs;
         }
       }),
-      { maxOutputTokens: maximumExplicitLlmOutputTokens },
+      {},
       {
         onRoundStart: (round) => {
           if (round === "semantic" || round === "format" || round === "format_repair") {

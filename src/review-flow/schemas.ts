@@ -24,6 +24,14 @@ export type ReviewFlowRole = z.infer<typeof reviewFlowRoleSchema>;
 export const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
 export const evidenceIdSchema = z.string().regex(/^ev-[0-9a-f]{32}$/u);
 const safeIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u);
+function allowedEvidenceIdSchema(
+  allowedEvidenceIds: readonly string[]
+): z.ZodType<string> {
+  const canonicalEvidenceIds = [...new Set(allowedEvidenceIds)];
+  return canonicalEvidenceIds.length === 0
+    ? z.never() as z.ZodType<string>
+    : z.enum(canonicalEvidenceIds as [string, ...string[]]);
+}
 const boundedTextSchema = z.string().max(2_000_000);
 const shortTextSchema = z.string().trim().min(1).max(4_000);
 export const maximumReviewFlowSourceBytes = 8 * 1024 * 1024;
@@ -507,16 +515,29 @@ export const contestFitPayloadSchema = z
   .superRefine(requireBidirectionalEvidenceCoverage);
 export type ContestFitPayload = z.infer<typeof contestFitPayloadSchema>;
 
-export const originalityPayloadSchema = z
-  .object({
-    originalityLevel: difficultyLevelSchema,
-    sameProblemAsExisting: z.boolean(),
-    highestSimilarity: z.number().finite().min(0).max(1),
-    evidenceIds: z.array(safeIdSchema).max(1_000),
-    rationale: shortTextSchema
-  })
-  .strict();
+function originalityPayloadSchemaForEvidenceId(evidenceId: z.ZodType<string>) {
+  return z
+    .object({
+      originalityLevel: difficultyLevelSchema,
+      sameProblemAsExisting: z.boolean(),
+      highestSimilarity: z.number().finite().min(0).max(1),
+      evidenceIds: z.array(evidenceId).max(1_000),
+      rationale: shortTextSchema
+    })
+    .strict();
+}
+
+export const originalityPayloadSchema =
+  originalityPayloadSchemaForEvidenceId(safeIdSchema);
 export type OriginalityPayload = z.infer<typeof originalityPayloadSchema>;
+
+export function createOriginalityPayloadSchema(
+  allowedEvidenceIds: readonly string[]
+) {
+  return originalityPayloadSchemaForEvidenceId(
+    allowedEvidenceIdSchema(allowedEvidenceIds)
+  );
+}
 
 function rejectDuplicateTagIds(
   payload: { readonly tagIds: readonly string[] },
@@ -618,50 +639,76 @@ export function createCriticPayloadSchema(allowedEvidenceIds: readonly string[])
   return criticPayloadSchemaForEvidenceId(evidenceId);
 }
 
-export const adversaryPayloadSchema = z
-  .object({
-    counterexamples: z
-      .array(
-        z
-          .object({
-            targetEvidenceId: evidenceIdSchema,
-            scenario: z.string().trim().min(1).max(4_000),
-            impact: z.enum(["none", "minor", "major", "fatal"])
-          })
-          .strict()
-      )
-      .max(200),
-    rationale: shortTextSchema
-  })
-  .strict();
+function adversaryPayloadSchemaForEvidenceId(evidenceId: z.ZodType<string>) {
+  return z
+    .object({
+      counterexamples: z
+        .array(
+          z
+            .object({
+              targetEvidenceId: evidenceId,
+              scenario: z.string().trim().min(1).max(4_000),
+              impact: z.enum(["none", "minor", "major", "fatal"])
+            })
+            .strict()
+        )
+        .max(200),
+      rationale: shortTextSchema
+    })
+    .strict();
+}
+
+export const adversaryPayloadSchema =
+  adversaryPayloadSchemaForEvidenceId(evidenceIdSchema);
 export type AdversaryPayload = z.infer<typeof adversaryPayloadSchema>;
 
-export const adjudicatorPayloadSchema = z
-  .object({
-    verdict: reviewVerdictSchema,
-    qualityLevel: difficultyLevelSchema,
-    fixability: z.enum(["none", "minor", "major", "fundamental"]),
-    strengths: z.array(z.string().trim().min(1).max(2_000)).max(50),
-    improvements: z.string().trim().min(1).max(20_000),
-    publicComment: z.string().trim().max(20_000).default(""),
-    privateNote: z.string().trim().max(20_000).default(""),
-    citedEvidenceIds: z.array(evidenceIdSchema).min(1).max(100)
-  })
-  .strict()
-  .superRefine((payload, context) => {
-    const invalid =
-      (payload.verdict === "approve" && ["major", "fundamental"].includes(payload.fixability)) ||
-      (payload.verdict === "request_changes" && !["minor", "major"].includes(payload.fixability)) ||
-      (payload.verdict === "reject" && payload.fixability !== "fundamental");
-    if (invalid) {
-      context.addIssue({
-        code: "custom",
-        path: ["fixability"],
-        message: "裁决与可修改性不一致。"
-      });
-    }
-  });
+export function createAdversaryPayloadSchema(
+  allowedEvidenceIds: readonly string[]
+) {
+  return adversaryPayloadSchemaForEvidenceId(
+    allowedEvidenceIdSchema(allowedEvidenceIds)
+  );
+}
+
+function adjudicatorPayloadSchemaForEvidenceId(evidenceId: z.ZodType<string>) {
+  return z
+    .object({
+      verdict: reviewVerdictSchema,
+      qualityLevel: difficultyLevelSchema,
+      fixability: z.enum(["none", "minor", "major", "fundamental"]),
+      strengths: z.array(z.string().trim().min(1).max(2_000)).max(50),
+      improvements: z.string().trim().min(1).max(20_000),
+      publicComment: z.string().trim().max(20_000).default(""),
+      privateNote: z.string().trim().max(20_000).default(""),
+      citedEvidenceIds: z.array(evidenceId).min(1).max(100)
+    })
+    .strict()
+    .superRefine((payload, context) => {
+      const invalid =
+        (payload.verdict === "approve" && ["major", "fundamental"].includes(payload.fixability)) ||
+        (payload.verdict === "request_changes" && !["minor", "major"].includes(payload.fixability)) ||
+        (payload.verdict === "reject" && payload.fixability !== "fundamental");
+      if (invalid) {
+        context.addIssue({
+          code: "custom",
+          path: ["fixability"],
+          message: "裁决与可修改性不一致。"
+        });
+      }
+    });
+}
+
+export const adjudicatorPayloadSchema =
+  adjudicatorPayloadSchemaForEvidenceId(evidenceIdSchema);
 export type AdjudicatorPayload = z.infer<typeof adjudicatorPayloadSchema>;
+
+export function createAdjudicatorPayloadSchema(
+  allowedEvidenceIds: readonly string[]
+) {
+  return adjudicatorPayloadSchemaForEvidenceId(
+    allowedEvidenceIdSchema(allowedEvidenceIds)
+  );
+}
 
 export const roleIdentitySchema = z
   .object({

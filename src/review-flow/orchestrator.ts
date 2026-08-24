@@ -29,16 +29,16 @@ import {
   type EvidenceArtifact
 } from "./evidence";
 import {
-  adjudicatorPayloadSchema,
-  adversaryPayloadSchema,
   contestFitPayloadSchema,
+  createAdjudicatorPayloadSchema,
+  createAdversaryPayloadSchema,
   createCriticPayloadSchema,
+  createOriginalityPayloadSchema,
   difficultyPayloadSchema,
   digestSchema,
   editorialPayloadSchema,
   editorialDimensionSchema,
   hardBlockerCodeSchema,
-  originalityPayloadSchema,
   reviewFlowRoleSchema,
   reviewFlowAssignmentContextSchema,
   reviewFlowExecutionContextSchema,
@@ -1316,6 +1316,9 @@ async function runReviewEvidenceFlowTracked(
   });
   const originalityView = buildOriginalityView(source, statement);
   const tagsView = buildTagsView(source, statement);
+  const originalitySchema = createOriginalityPayloadSchema(
+    canonicalEvidenceIds(originalityView.duplicateEvidence)
+  );
 
   // 品味、ICPC 适配、难度、原创性和标签相互隔离；任一失败时仍等待
   // 其它在途请求收束，避免把某一角色的先验判断泄漏给另一角色。
@@ -1345,7 +1348,7 @@ async function runReviewEvidenceFlowTracked(
       },
       {
         role: "originality",
-        schema: originalityPayloadSchema,
+        schema: originalitySchema,
         inputHash: hashCanonicalValue(originalityView),
         run: () => roles.originality(originalityView),
         postValidate: (artifact: EvidenceArtifact<OriginalityPayload>) => assertOriginalityEvidence(
@@ -1379,6 +1382,9 @@ async function runReviewEvidenceFlowTracked(
   const criticSchema = createCriticPayloadSchema(criticEvidenceIds);
   const criticView = buildCriticView(source.problemContentHash, coreEvidence);
   const adversaryView = buildAdversaryView(criticView);
+  const adversarySchema = createAdversaryPayloadSchema(
+    canonicalEvidenceIds(adversaryView.evidence)
+  );
   const [critic, adversary] = await runIndependentRoles({
     binding,
     tracker,
@@ -1397,7 +1403,7 @@ async function runReviewEvidenceFlowTracked(
       },
       {
         role: "adversary",
-        schema: adversaryPayloadSchema,
+        schema: adversarySchema,
         inputHash: hashCanonicalValue(adversaryView),
         run: () => roles.adversary(adversaryView),
         postValidate: (artifact: EvidenceArtifact<AdversaryPayload>) => assertAdversaryReferences(
@@ -1412,6 +1418,9 @@ async function runReviewEvidenceFlowTracked(
     critic,
     adversary
   ];
+  const adjudicatorSchema = createAdjudicatorPayloadSchema(
+    canonicalEvidenceIds(preAdjudicationEvidence)
+  );
   const hardBlockers = collectHardBlockers({
     solutionAnalyst: solutionAnalyst.payload,
     technicalAudit: technicalAudit.payload,
@@ -1428,7 +1437,7 @@ async function runReviewEvidenceFlowTracked(
     requestStartGate,
     spec: {
       role: "adjudicator",
-      schema: adjudicatorPayloadSchema,
+      schema: adjudicatorSchema,
       inputHash: hashCanonicalValue(adjudicatorView),
       run: () => roles.adjudicator(adjudicatorView),
       postValidate: (artifact) => {

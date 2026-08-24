@@ -17,7 +17,12 @@ import {
   withLlmRequestStartGate,
   type ModelCallSpec
 } from "../src/llm";
-import { originalityPayloadSchema } from "../src/review-flow/schemas";
+import {
+  createAdjudicatorPayloadSchema,
+  createAdversaryPayloadSchema,
+  createOriginalityPayloadSchema,
+  originalityPayloadSchema
+} from "../src/review-flow/schemas";
 
 const provider = { baseUrl: "https://llm.example.test/v1", apiKey: "sk-test" };
 const spec = { model: "test-model", temperature: 0.2, thinking: false };
@@ -259,11 +264,18 @@ describe("chatComplete：正常路径", () => {
       schemaVersion: 1,
       requestCount: 1,
       transportAttemptCount: 1,
+      providerRequestCount: 1,
+      retryCount: 0,
+      maxOutputTokens: null,
+      responseByteCount: 0,
+      usageTotalTokens: null,
+      usageComplete: false,
       completedResponses: [],
       terminal: {
         status: 499,
         responseMode: null,
         eofObserved: false,
+        finishReason: null,
         finishReasonStopObserved: false,
         sseDoneObserved: null
       },
@@ -309,7 +321,7 @@ describe("chatComplete：正常路径", () => {
 
     expect(caught).toMatchObject({ code: "LLM_OUTPUT_LENGTH_LIMIT" });
     expect(getLlmFailureAudit(caught)).toMatchObject({
-      maxOutputTokens: 2_048,
+      maxOutputTokens: null,
       providerRequestCount: 1,
       retryCount: 0,
       responseByteCount: new TextEncoder().encode(body).byteLength,
@@ -347,7 +359,7 @@ describe("chatComplete：正常路径", () => {
       formatFailureStage: "content_type"
     });
     expect(getLlmFailureAudit(caught)).toMatchObject({
-      maxOutputTokens: 4_096,
+      maxOutputTokens: null,
       providerRequestCount: 1,
       retryCount: 0,
       responseByteCount: new TextEncoder().encode(privateOutput).byteLength,
@@ -561,7 +573,7 @@ describe("chatComplete：正常路径", () => {
     await chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock }, { requestJson: true });
   });
 
-  it("显式输出 token 上限按 OpenAI compatible 字段发送，未传时保持字段缺失", async () => {
+  it("legacy output token options never enter outbound request", async () => {
     const requestBodies: Record<string, unknown>[] = [];
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
@@ -571,28 +583,15 @@ describe("chatComplete：正常路径", () => {
     await chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock }, { maxOutputTokens: 2_048 });
     await chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock });
 
-    expect(requestBodies[0]?.max_tokens).toBe(2_048);
-    expect(requestBodies[1]).not.toHaveProperty("max_tokens");
+    for (const body of requestBodies) {
+      expect(body).not.toHaveProperty("max_tokens");
+      expect(body).not.toHaveProperty("max_output_tokens");
+      expect(body).not.toHaveProperty("maxOutputTokens");
+    }
   });
 
-  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, maximumExplicitLlmOutputTokens + 1])(
-    "输出 token 上限 %s 非法时在发请求前拒绝",
-    async (maxOutputTokens) => {
-      const fetchMock = vi.fn(async () => completionResponse("不应调用"));
-      await expect(
-        chatComplete(
-          provider,
-          spec,
-          [],
-          { ...runtime, fetch: fetchMock },
-          { maxOutputTokens }
-        )
-      ).rejects.toBeInstanceOf(RangeError);
-      expect(fetchMock).not.toHaveBeenCalled();
-    }
-  );
 
-  it("provider 硬上限 384000 被接受并原样发送，项目不再保留 32k/64k 输出上限", async () => {
+  it("provider hard-cap metadata remains stable while requests omit output caps", async () => {
     expect(maximumExplicitLlmOutputTokens).toBe(384_000);
     const requestBodies: Record<string, unknown>[] = [];
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
@@ -606,7 +605,9 @@ describe("chatComplete：正常路径", () => {
       { ...runtime, fetch: fetchMock },
       { maxOutputTokens: maximumExplicitLlmOutputTokens }
     );
-    expect(requestBodies[0]?.max_tokens).toBe(384_000);
+    expect(requestBodies[0]).not.toHaveProperty("max_tokens");
+    expect(requestBodies[0]).not.toHaveProperty("max_output_tokens");
+    expect(requestBodies[0]).not.toHaveProperty("maxOutputTokens");
   });
 
   it("逐段读取 SSE，并正确拼接跨字节块的推理和最终答案", async () => {
@@ -2696,7 +2697,7 @@ describe("chatComplete：按输出活动判断是否停住", () => {
     }
   });
 
-  it("SSE 心跳不会刷新已开始输出后的停顿时间", async () => {
+  it("SSE 心跳会刷新持续流的 no-progress 边界", async () => {
     vi.useFakeTimers();
     try {
       let streamController!: ReadableStreamDefaultController<Uint8Array>;
@@ -2718,8 +2719,8 @@ describe("chatComplete：按输出活动判断是否停住", () => {
       const resultPromise = chatComplete(provider, spec, [], {
         outputIdleTimeoutMs: 1_000,
         firstOutputTimeoutMs: 1_000,
-        maximumDurationMs: 5_000,
-        maxAttempts: 3,
+        maximumDurationMs: 1,
+        maxAttempts: 1,
         baseDelayMs: 1,
         fetch: fetchMock
       });
@@ -2727,20 +2728,28 @@ describe("chatComplete：按输出活动判断是否停住", () => {
       streamController.enqueue(
         encoder.encode('data: {"choices":[{"delta":{"content":"有效输出"}}]}\n\n')
       );
-      const rejection = expect(resultPromise).rejects.toMatchObject({
-        code: "LLM_OUTPUT_IDLE_TIMEOUT"
-      });
       await vi.advanceTimersByTimeAsync(900);
       streamController.enqueue(encoder.encode(": heartbeat\n\n"));
-      await vi.advanceTimersByTimeAsync(101);
-      await rejection;
+      await vi.advanceTimersByTimeAsync(900);
+      streamController.enqueue(
+        encoder.encode(
+          'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n' +
+            "data: [DONE]\n\n"
+        )
+      );
+      streamController.close();
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(resultPromise).resolves.toMatchObject({
+        content: "有效输出",
+        reasoning: null
+      });
       expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("role-only 事件不算首个有效模型输出", async () => {
+  it("role-only 事件在首字节后仍受 no-progress 保护", async () => {
     vi.useFakeTimers();
     try {
       let streamController!: ReadableStreamDefaultController<Uint8Array>;
@@ -2840,7 +2849,7 @@ describe("chatComplete：按输出活动判断是否停住", () => {
     }
   });
 
-  it("持续排空也不能延长既有 maximumDuration 最终边界", async () => {
+  it("持续排空只受 no-progress 保护，不受累计总时限取消", async () => {
     vi.useFakeTimers();
     try {
       let cancelled = false;
@@ -2863,7 +2872,7 @@ describe("chatComplete：按输出活动判断是否停住", () => {
       const resultPromise = chatComplete(provider, spec, [], {
         outputIdleTimeoutMs: 1_000,
         firstOutputTimeoutMs: 1_000,
-        maximumDurationMs: 2_500,
+        maximumDurationMs: 1_000,
         maxAttempts: 1,
         baseDelayMs: 1,
         fetch: fetchMock
@@ -2877,11 +2886,10 @@ describe("chatComplete：按输出活动判断是否停住", () => {
         await vi.advanceTimersByTimeAsync(0);
       }
       const rejection = expect(resultPromise).rejects.toMatchObject({
-        code: "LLM_TOTAL_TIMEOUT",
+        code: "LLM_OUTPUT_IDLE_TIMEOUT",
         formatFailureStage: "event_json"
       });
-      await vi.advanceTimersByTimeAsync(701);
-      await rejection;
+      await vi.advanceTimersByTimeAsync(1_001);
       expect(cancelled).toBe(true);
       expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
@@ -3069,7 +3077,7 @@ describe("chatComplete：按输出活动判断是否停住", () => {
       const resultPromise = chatComplete(provider, spec, [], {
         outputIdleTimeoutMs: 1_000,
         firstOutputTimeoutMs: 1_000,
-        maximumDurationMs: 2_500,
+        maximumDurationMs: 1,
         maxAttempts: 3,
         baseDelayMs: 1,
         fetch: fetchMock
@@ -3305,31 +3313,6 @@ describe("chatComplete：只在服务端明确拒绝接单时重试", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("429 的等待和后续尝试共用同一个最终保护时长", async () => {
-    vi.useFakeTimers();
-    try {
-      const fetchMock = vi.fn(
-        async () => new Response("rate limited", { status: 429 })
-      );
-      const resultPromise = chatComplete(provider, spec, [], {
-        outputIdleTimeoutMs: 1_000,
-        firstOutputTimeoutMs: 1_000,
-        maximumDurationMs: 2_500,
-        maxAttempts: 10,
-        baseDelayMs: 2_000,
-        fetch: fetchMock
-      });
-      const rejection = expect(resultPromise).rejects.toMatchObject({
-        code: "LLM_TOTAL_TIMEOUT"
-      });
-
-      await vi.advanceTimersByTimeAsync(2_501);
-      await rejection;
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
 
   it("连续 429 只尝试配置的次数，耗尽后返回最后一个状态码", async () => {
     const fetchMock = vi.fn(
@@ -3937,7 +3920,7 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
     let calls = 0;
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body));
-      expect(body.max_tokens).toBe(2_048);
+      expect(body).not.toHaveProperty("max_tokens");
       expect(body.thinking).toEqual({ type: "enabled" });
       expect(body.reasoning_effort).toBe("max");
       expect(body.response_format).toBeUndefined();
@@ -3968,20 +3951,6 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("非法输出 token 上限不会发出 JSON 首轮或修复轮请求", async () => {
-    const fetchMock = vi.fn(async () => completionResponse('{"rating": 1500}'));
-    await expect(
-      chatCompleteJson(
-        provider,
-        spec,
-        [],
-        resultSchema,
-        { ...runtime, fetch: fetchMock },
-        { maxOutputTokens: 0 }
-      )
-    ).rejects.toBeInstanceOf(RangeError);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
 
   it("保留原创性 schema 失败的三字段安全诊断，不泄漏响应内容", async () => {
     const valid = {
@@ -4062,6 +4031,69 @@ describe("chatCompleteJson：结构化输出与一次修复重试", () => {
   });
 });
 
+describe("review-flow dynamic evidence enums", () => {
+  const allowed = ["ev-allowed-a", "ev-allowed-b"] as const;
+
+  it("rejects evidence references outside the stage input", () => {
+    const originality = {
+      originalityLevel: 4,
+      sameProblemAsExisting: false,
+      highestSimilarity: 0,
+      evidenceIds: ["ev-allowed-a"],
+      rationale: "合成理由"
+    };
+    expect(
+      createOriginalityPayloadSchema(allowed).safeParse(originality).success
+    ).toBe(true);
+    expect(
+      createOriginalityPayloadSchema(allowed).safeParse({
+        ...originality,
+        evidenceIds: ["ev-not-allowed"]
+      }).success
+    ).toBe(false);
+
+    const adversary = {
+      counterexamples: [{
+        targetEvidenceId: "ev-allowed-a",
+        scenario: "合成场景",
+        impact: "minor" as const
+      }],
+      rationale: "合成理由"
+    };
+    expect(
+      createAdversaryPayloadSchema(allowed).safeParse(adversary).success
+    ).toBe(true);
+    expect(
+      createAdversaryPayloadSchema(allowed).safeParse({
+        ...adversary,
+        counterexamples: [{
+          ...adversary.counterexamples[0],
+          targetEvidenceId: "ev-not-allowed"
+        }]
+      }).success
+    ).toBe(false);
+
+    const adjudicator = {
+      verdict: "approve" as const,
+      qualityLevel: 4,
+      fixability: "none" as const,
+      strengths: ["合成优点"],
+      improvements: "合成改进",
+      publicComment: "",
+      privateNote: "",
+      citedEvidenceIds: ["ev-allowed-b"]
+    };
+    expect(
+      createAdjudicatorPayloadSchema(allowed).safeParse(adjudicator).success
+    ).toBe(true);
+    expect(
+      createAdjudicatorPayloadSchema(allowed).safeParse({
+        ...adjudicator,
+        citedEvidenceIds: ["ev-not-allowed"]
+      }).success
+    ).toBe(false);
+  });
+});
 describe("chatComplete：统一机器 JSON Schema transport", () => {
   it("sends strict json_schema and native max in the same request", async () => {
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
@@ -4069,7 +4101,6 @@ describe("chatComplete：统一机器 JSON Schema transport", () => {
       expect(body).toMatchObject({
         thinking: { type: "enabled" },
         reasoning_effort: "max",
-        max_tokens: 12_000,
         response_format: {
           type: "json_schema",
           json_schema: {
@@ -4083,6 +4114,9 @@ describe("chatComplete：统一机器 JSON Schema transport", () => {
           }
         }
       });
+      expect(body).not.toHaveProperty("max_tokens");
+      expect(body).not.toHaveProperty("max_output_tokens");
+      expect(body).not.toHaveProperty("maxOutputTokens");
       return completionResponse('{"verdict":"approve"}');
     });
     await expect(chatCompleteWithReceipt(

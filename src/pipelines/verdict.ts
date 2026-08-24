@@ -23,7 +23,7 @@
  * 如果以后机器人 API 提供带版本的目录快照，再单独设计标签建议。
  */
 import { z } from "zod";
-import { chatCompleteJson, maximumExplicitLlmOutputTokens, type ChatMessage } from "../llm";
+import { chatCompleteJson, type ChatMessage } from "../llm";
 import {
   reviewInputSchema,
   robotReviewTaskSchema,
@@ -84,8 +84,6 @@ export async function runVerdictPipeline(input: VerdictPipelineInput): Promise<V
     messages,
     verdictRawOutputSchema,
     input.model.runtime,
-    // 显式请求提供商硬上限，避免省略时落入提供商默认 4096。
-    { maxOutputTokens: maximumExplicitLlmOutputTokens }
   );
 
   const forcedDuplicateReject = shouldForceRejectAsDuplicate(

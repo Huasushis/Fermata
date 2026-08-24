@@ -1,6 +1,5 @@
 /**
- * Token consumption probe v2: test with max_tokens=512000 on a complex prompt.
- * Uses raw HTTP to bypass the local maximumExplicitLlmOutputTokens validation.
+ * Token consumption probe v2 using the provider's uncapped streaming default.
  * Public-domain content only.
  */
 import { readFileSync } from "node:fs";
@@ -34,9 +33,6 @@ Provide:
 
 Be thorough and precise. This analysis will be used to judge whether a proposed solution is correct.`;
 
-const maxTokens = parseInt(process.argv[2] ?? "512000", 10);
-console.log(`Probe with max_tokens=${maxTokens}, reasoning_effort=max...`);
-console.log("Prompt length:", complexPrompt.length, "chars");
 
 const body = {
   model: "deepseek-v4-pro",
@@ -44,7 +40,6 @@ const body = {
   stream: true,
   thinking: { type: "enabled" },
   reasoning_effort: "max",
-  max_tokens: maxTokens,
   temperature: 0.4,
 };
 

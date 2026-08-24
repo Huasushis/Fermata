@@ -12,7 +12,6 @@ import { z } from "zod";
 import {
   chatComplete,
   chatCompleteJson,
-  maximumExplicitLlmOutputTokens,
   type ChatCompletionResult,
   type ChatMessage
 } from "../llm";
@@ -94,8 +93,6 @@ export async function runThinkingPipeline(input: ThinkingPipelineInput): Promise
     input.solverModel.spec,
     solverMessages,
     input.solverModel.runtime,
-    // 显式请求提供商硬上限，避免省略时落入提供商默认 4096。
-    { maxOutputTokens: maximumExplicitLlmOutputTokens }
   );
   const solverNarrative = mergeSolverNarrative(solverResult);
 
@@ -106,7 +103,6 @@ export async function runThinkingPipeline(input: ThinkingPipelineInput): Promise
     analystMessages,
     thinkingSignalsRawSchema,
     input.analystModel.runtime,
-    { maxOutputTokens: maximumExplicitLlmOutputTokens }
   );
 
   const signals: ThinkingSignals = {

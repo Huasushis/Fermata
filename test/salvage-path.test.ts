@@ -13,6 +13,10 @@
  *   8. 请求/尝试次数计数包含 finalizer
  */
 import { describe, expect, it, vi } from "vitest";
+import {
+  chatCompleteSalvageableWithReceipt,
+  getLlmFailureAudit
+} from "../src/llm";
 import { FairLlmRequestScheduler } from "../src/llm-scheduler";
 import {
   runProductionFourCallReviewDag,
@@ -120,7 +124,7 @@ function sseResponse(body: string): Response {
  * - A 格式/finalizer 轮：无 response_format，含"目标 JSON Schema"
  * - C/D salvage finalizer：response_format={type:json_object}
  */
-type SyntheticStage = "A" | "A_FORMAT" | "B" | "C" | "D" | "FORMATTER" | "FINALIZER" | "FINALIZER_REPAIR";
+type SyntheticStage = "A" | "A_CONT" | "A_FORMAT" | "B" | "C" | "D" | "FORMATTER" | "FINALIZER" | "FINALIZER_REPAIR";
 
 function syntheticStage(body: Record<string, unknown>): SyntheticStage | undefined {
   expect(body).not.toHaveProperty("max_tokens");
@@ -130,6 +134,12 @@ function syntheticStage(body: Record<string, unknown>): SyntheticStage | undefin
     | { type?: string; json_schema?: { name?: string } }
     | undefined;
   const messages = (body.messages ?? []) as Array<{ content?: unknown }>;
+  const hasContinuation = messages.some(
+    (m) => typeof m.content === "string" && (
+      m.content.includes("前序模型段") || m.content.includes("请继续完成")
+    )
+  );
+  if (hasContinuation) return "A_CONT";
   const hasSchemaInstruction = messages.some(
     (m) => typeof m.content === "string" && m.content.includes("目标 JSON Schema")
   );
@@ -142,6 +152,7 @@ function syntheticStage(body: Record<string, unknown>): SyntheticStage | undefin
   if (schemaStage === "B" || schemaStage === "C" || schemaStage === "D") {
     return schemaStage;
   }
+  if (schemaName === "fermata_review_flow_role_v1") return "A_FORMAT";
   if (schemaName.endsWith("_formatter_v1") || schemaName.includes("formatter")) {
     return "FORMATTER";
   }
@@ -150,8 +161,8 @@ function syntheticStage(body: Record<string, unknown>): SyntheticStage | undefin
   }
   if (responseFormat !== undefined) return undefined;
   return hasSchemaInstruction ? "A_FORMAT" : "A";
-}
 
+}
 function proConfig(fetchImpl: NonNullable<PipelineModelConfig["runtime"]["fetch"]>): PipelineModelConfig {
   return {
     credentials: { baseUrl: "https://provider.example/v1", apiKey: "synthetic-key" },
@@ -215,7 +226,7 @@ describe("reasoning-length salvage 路径", () => {
     expect(failures[0]!.kind).toBe("output_limit");
   });
 
-  it("A salvage: reasoning 非空 + content 为空 → finalizer 路径成功", async () => {
+  it("A length → 仅续写一次后进入独立 strict schema 格式轮", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -223,6 +234,9 @@ describe("reasoning-length salvage 路径", () => {
       const stage = syntheticStage(body);
       if (stage === "A") {
         return sseResponse(sseReasoningLengthStream("合成推理：题目可解，构造路径存在。"));
+      }
+      if (stage === "A_CONT") {
+        return sseResponse(sseContentStream("续写完成。"));
       }
       if (stage === "A_FORMAT") {
         return sseResponse(sseContentStream(stageOutput("A")));
@@ -239,8 +253,77 @@ describe("reasoning-length salvage 路径", () => {
     expect(result.output.d.verdict).toBe("approve");
     const aSemantic = bodies.filter((b) => syntheticStage(b) === "A");
     expect(aSemantic).toHaveLength(1);
+    const aContinuation = bodies.filter((b) => syntheticStage(b) === "A_CONT");
+    expect(aContinuation).toHaveLength(1);
+    expect((aContinuation[0]!.messages as Array<{ content?: string }>).some(
+      (message) => message.content?.includes("合成推理：题目可解，构造路径存在。") === true
+    )).toBe(true);
     const aFormat = bodies.filter((b) => syntheticStage(b) === "A_FORMAT");
     expect(aFormat.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("续写轮再次 length 时 fail closed，并保留前序 length receipt", async () => {
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      const stage = syntheticStage(body);
+      if (stage === "A") {
+        return sseResponse(sseReasoningLengthStream("第一段推理。"));
+      }
+      if (stage === "A_CONT") {
+        return sseResponse(sseReasoningLengthStream("第二段仍被截断。"));
+      }
+      throw new Error(`unexpected stage: ${stage}`);
+    });
+
+    const caught = await chatCompleteSalvageableWithReceipt(
+      proConfig(fetchImpl).credentials,
+      proConfig(fetchImpl).spec,
+      [{ role: "user", content: "synthetic" }],
+      proConfig(fetchImpl).runtime
+    ).catch((error: unknown) => error);
+
+    expect(caught).toMatchObject({ code: "LLM_OUTPUT_LENGTH_LIMIT" });
+    const audit = getLlmFailureAudit(caught);
+    expect(audit).toMatchObject({
+      requestCount: 2,
+      transportAttemptCount: 2,
+      completedResponses: [{
+        finishReasonLengthSalvaged: true,
+        transportAttemptCount: 1,
+        eofVerified: true
+      }],
+      terminal: {
+        responseMode: "sse",
+        eofObserved: true,
+        finishReason: "length",
+        sseDoneObserved: true
+      }
+    });
+    expect(audit?.completedResponses).toHaveLength(1);
+  });
+
+  it("length 后的第二个 data event 即使 choices 为空也拒绝", async () => {
+    const fetchImpl = vi.fn(async () => sseResponse([
+      `data: ${JSON.stringify({
+        choices: [{ delta: { reasoning_content: "第一段推理。" }, finish_reason: "length" }]
+      })}`,
+      `data: ${JSON.stringify({ choices: [] })}`,
+      "data: [DONE]"
+    ].join("\n\n") + "\n\n"));
+
+    const caught = await chatCompleteSalvageableWithReceipt(
+      proConfig(fetchImpl).credentials,
+      proConfig(fetchImpl).spec,
+      [{ role: "user", content: "synthetic" }],
+      proConfig(fetchImpl).runtime
+    ).catch((error: unknown) => error);
+
+    expect(caught).toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "trailing_data",
+      formatFailureSubstage: "choice_after_length"
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("A salvage: reasoning 为空 + content 为空 → 仍然失败", async () => {
@@ -294,13 +377,16 @@ describe("reasoning-length salvage 路径", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(5);
   });
 
-  it("finalizer 输出非合法 JSON → 修复轮；修复轮仍失败 → 终态失败", async () => {
+  it("续写完成后格式轮非法 JSON → 仅允许一次修复，仍失败即关闭", async () => {
     let finalizerAttempts = 0;
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       const stage = syntheticStage(body);
       if (stage === "A") {
         return sseResponse(sseReasoningLengthStream("合成推理。"));
+      }
+      if (stage === "A_CONT") {
+        return sseResponse(sseContentStream("续写完成。"));
       }
       if (stage === "A_FORMAT") {
         finalizerAttempts += 1;
@@ -328,6 +414,9 @@ describe("reasoning-length salvage 路径", () => {
       const stage = syntheticStage(body);
       if (stage === "A") {
         return sseResponse(sseReasoningLengthStream("合成推理。"));
+      }
+      if (stage === "A_CONT") {
+        return sseResponse(sseContentStream("续写完成。"));
       }
       if (stage === "A_FORMAT") {
         return new Response(null, { status: 503 });
@@ -389,6 +478,9 @@ describe("reasoning-length salvage 路径", () => {
       const stage = syntheticStage(body);
       if (stage === "A") return sseResponse(sseReasoningLengthStream("合成推理。"));
       if (stage === "A_FORMAT") return sseResponse(sseContentStream(stageOutput("A")));
+      if (stage === "A_CONT") {
+        return sseResponse(sseContentStream("续写完成。"));
+      }
       if (stage === "B" || stage === "C" || stage === "D") {
         return sseResponse(sseContentStream(stageOutput(stage)));
       }

@@ -365,7 +365,8 @@ export interface LlmFailureAudit {
   readonly responseByteCount: number;
   readonly usageTotalTokens: number | null;
   readonly usageComplete: boolean;
-  readonly completedResponses: readonly LlmTransportReceipt[];
+  readonly completedResponses:
+    readonly (LlmTransportReceipt | LlmSalvageTransportReceipt)[];
   readonly terminal: {
     readonly status: number | null;
     readonly responseMode: LlmResponseMode | null;
@@ -852,7 +853,8 @@ export type LlmResponseFormatFailureSubstage =
   | "data_after_done_content_or_tool_present"
   | "data_after_done_other_or_unclassifiable"
   | "data_after_done_tail_incomplete"
-  | "choice_after_stop";
+  | "choice_after_stop"
+  | "choice_after_length";
 
 const safeFormatFailureSubstageValues = new Set<
   LlmResponseFormatFailureSubstage
@@ -869,7 +871,8 @@ const safeFormatFailureSubstageValues = new Set<
   "data_after_done_content_or_tool_present",
   "data_after_done_other_or_unclassifiable",
   "data_after_done_tail_incomplete",
-  "choice_after_stop"
+  "choice_after_stop",
+  "choice_after_length"
 ]);
 
 function assertSafeFormatFailureSubstage(
@@ -978,15 +981,8 @@ export async function chatCompleteWithReceipt(
   if (spec.reasoningEffort !== undefined) {
     body.reasoning_effort = spec.reasoningEffort;
   }
-  const maxOutputTokens = options.maxOutputTokens === undefined
-    ? null
-    : validateMaxOutputTokens(options.maxOutputTokens);
-  if (maxOutputTokens !== null) {
-    body.max_tokens = maxOutputTokens;
-  }
-
-  const requestAudit = createMutableLlmRequestAudit(maxOutputTokens);
-  let response: Awaited<ReturnType<typeof requestWithRetry>>;
+  const requestAudit = createMutableLlmRequestAudit(null);
+  let response: LlmRequestResult;
   try {
     response = await requestWithRetry(
       fetchImpl,
@@ -1059,11 +1055,10 @@ export async function chatCompleteWithReceipt(
 }
 
 /**
- * 与 chatCompleteWithReceipt 相同，但启用 reasoning-length salvage：当
- * finish_reason="length" 且 reasoning 非空、content 为空时，不抛
- * LLM_OUTPUT_LENGTH_LIMIT，而是返回 salvaged=true 和完整 reasoning 文本。
- * reasoning 仅在内存中返回给调用方用于 finalizer 阶段，不写入 receipt。
- * 正常 finish_reason="stop" 路径完全不受影响（salvaged=false）。
+ * Phase 1 自由流的长度续写路径。finish_reason="length" 只有在完整 EOF、
+ * SSE DONE、前序 receipt 和同一 provider/stream 绑定都成立时才允许一次续写；
+ * 续写本身绝不带 response_format/schema，第二次 length 或任何协议错误都会
+ * fail closed。正常 stop 路径完全不受影响。
  */
 export async function chatCompleteSalvageableWithReceipt(
   provider: ProviderCredentialsLike,
@@ -1073,6 +1068,9 @@ export async function chatCompleteSalvageableWithReceipt(
   options: ChatCompletionOptions = {}
 ): Promise<ChatCompletionSalvageableResult> {
   validateThinkingRequest(spec);
+  if (options.requestJson === true || options.responseJsonSchema !== undefined) {
+    throw new Error("LLM_PHASE1_SCHEMA_FORBIDDEN");
+  }
   const fetchImpl = runtime.fetch ?? productionLlmFetch;
   const url = new URL("chat/completions", ensureTrailingSlash(provider.baseUrl));
   const body: Record<string, unknown> = {
@@ -1081,39 +1079,14 @@ export async function chatCompleteSalvageableWithReceipt(
     stream: true,
     messages
   };
-  if (options.requestJson === true && options.responseJsonSchema !== undefined) {
-    throw new Error("LLM_RESPONSE_FORMAT_CONFLICT");
-  }
-  if (options.responseJsonSchema !== undefined) {
-    if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/u.test(options.responseJsonSchema.name)) {
-      throw new Error("LLM_RESPONSE_SCHEMA_NAME_INVALID");
-    }
-    body.response_format = {
-      type: "json_schema",
-      json_schema: {
-        name: options.responseJsonSchema.name,
-        strict: true,
-        schema: options.responseJsonSchema.schema
-      }
-    };
-  } else if (options.requestJson === true) {
-    body.response_format = { type: "json_object" };
-  }
   if (spec.thinkingRequest !== undefined) {
     body.thinking = { type: spec.thinkingRequest };
   }
   if (spec.reasoningEffort !== undefined) {
     body.reasoning_effort = spec.reasoningEffort;
   }
-  const maxOutputTokens = options.maxOutputTokens === undefined
-    ? null
-    : validateMaxOutputTokens(options.maxOutputTokens);
-  if (maxOutputTokens !== null) {
-    body.max_tokens = maxOutputTokens;
-  }
-
-  const requestAudit = createMutableLlmRequestAudit(maxOutputTokens);
-  let response: Awaited<ReturnType<typeof requestWithRetry>>;
+  const requestAudit = createMutableLlmRequestAudit(null);
+  let response: LlmRequestResult;
   try {
     response = await requestWithRetry(
       fetchImpl,
@@ -1156,24 +1129,147 @@ export async function chatCompleteSalvageableWithReceipt(
     throw error;
   }
   if (response.salvaged) {
-    // 抢救路径：从 raw stream result 提取 reasoning，不提取 content（content 为空）。
-    const reasoning = extractSalvagedReasoning(response.raw);
-    const receipt: LlmSalvageTransportReceipt = Object.freeze({
+    const segment = extractLengthLimitedSegment(response.raw);
+    const firstReceipt: LlmSalvageTransportReceipt = Object.freeze({
       schemaVersion: 2,
       transportAttemptCount: response.attemptCount,
       eofVerified: true,
       responseMode: response.responseMode as LlmResponseMode,
       finishReasonStopVerified: false,
       finishReasonLengthSalvaged: true,
-      salvagedReasoningLength: reasoning.length,
+      salvagedReasoningLength: segment.reasoning.length,
       acceptedEventShapes: acceptedShapeAudit(requestAudit),
       sseDoneObserved: response.sseDoneObserved
     });
-    rememberLlmTransportAudit(receipt, mutableLlmTransportAudit(requestAudit));
+    rememberLlmTransportAudit(firstReceipt, mutableLlmTransportAudit(requestAudit));
+    if (
+      firstReceipt.responseMode !== "sse" ||
+      firstReceipt.sseDoneObserved !== true ||
+      firstReceipt.eofVerified !== true
+    ) {
+      const error = new LlmResponseFormatError("response_shape");
+      rememberLlmFailureAudit(error, {
+        requestCount: 1,
+        requestAudit,
+        jsonSchemaValidated: null
+      });
+      throw error;
+    }
+
+    // This binding is intentionally created from the completed first stream. It
+    // prevents a continuation from silently switching provider, URL, fetch
+    // implementation, or predecessor receipt.
+    const binding = Object.freeze({
+      provider,
+      fetchImpl,
+      url,
+      precedingReceipt: firstReceipt
+    });
+    const continuationMessages = buildLengthContinuationMessages(messages, segment);
+    const continuationBody: Record<string, unknown> = {
+      model: spec.model,
+      temperature: spec.temperature,
+      stream: true,
+      messages: continuationMessages
+    };
+    if (spec.thinkingRequest !== undefined) {
+      continuationBody.thinking = { type: spec.thinkingRequest };
+    }
+    if (spec.reasoningEffort !== undefined) {
+      continuationBody.reasoning_effort = spec.reasoningEffort;
+    }
+    const continuationAudit = createMutableLlmRequestAudit(null);
+    let continuation: LlmRequestResult;
+    try {
+      continuation = await requestWithRetry(
+        binding.fetchImpl,
+        binding.url,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream, application/json",
+            Authorization: `Bearer ${binding.provider.apiKey}`
+          },
+          body: JSON.stringify(continuationBody)
+        },
+        runtime,
+        continuationAudit,
+        false
+      );
+    } catch (error) {
+      rememberLlmFailureAudit(error, {
+        requestCount: 2,
+        requestAudit: continuationAudit,
+        completedResponses: [binding.precedingReceipt],
+        priorTransportAttemptCount: binding.precedingReceipt.transportAttemptCount,
+        jsonSchemaValidated: null
+      });
+      throw error;
+    }
+    if (!continuation.ok) {
+      const error = new LlmRequestError(
+        "LLM_HTTP_ERROR",
+        continuation.status,
+        undefined,
+        undefined,
+        continuation.retryAfterMs
+      );
+      rememberLlmFailureAudit(error, {
+        requestCount: 2,
+        requestAudit: continuationAudit,
+        completedResponses: [binding.precedingReceipt],
+        priorTransportAttemptCount: binding.precedingReceipt.transportAttemptCount,
+        jsonSchemaValidated: null
+      });
+      throw error;
+    }
+    if (
+      continuation.responseMode === null ||
+      continuation.responseMode !== binding.precedingReceipt.responseMode ||
+      !continuation.finishReasonStopVerified ||
+      continuation.sseDoneObserved !== true
+    ) {
+      const error = new LlmResponseFormatError("response_shape");
+      rememberLlmFailureAudit(error, {
+        requestCount: 2,
+        requestAudit: continuationAudit,
+        completedResponses: [binding.precedingReceipt],
+        priorTransportAttemptCount: binding.precedingReceipt.transportAttemptCount,
+        jsonSchemaValidated: null
+      });
+      throw error;
+    }
+    const continued = extractChatCompletion(continuation.raw);
+    const continuationReceipt: LlmTransportReceipt = Object.freeze({
+      schemaVersion: 2,
+      transportAttemptCount: continuation.attemptCount,
+      eofVerified: true,
+      responseMode: continuation.responseMode,
+      finishReasonStopVerified: true,
+      acceptedEventShapes: acceptedShapeAudit(continuationAudit),
+      sseDoneObserved: continuation.sseDoneObserved
+    });
+    const receipt: LlmTransportReceipt = Object.freeze({
+      ...continuationReceipt,
+      transportAttemptCount:
+        binding.precedingReceipt.transportAttemptCount +
+        continuationReceipt.transportAttemptCount,
+      acceptedEventShapes: Object.freeze([
+        ...binding.precedingReceipt.acceptedEventShapes,
+        ...continuationReceipt.acceptedEventShapes
+      ])
+    });
+    rememberLlmTransportAudit(receipt, combineContinuationAudits(
+      mutableLlmTransportAudit(requestAudit),
+      mutableLlmTransportAudit(continuationAudit)
+    ));
+    const combinedContent = segment.content + continued.content;
+    const combinedReasoning = segment.reasoning + (continued.reasoning ?? "");
     return {
-      content: "",
-      reasoning,
-      salvaged: true,
+      content: combinedContent,
+      reasoning: spec.thinking ? combinedReasoning : null,
+      salvaged: false,
       receipt
     };
   }
@@ -1207,12 +1303,12 @@ export async function chatCompleteSalvageableWithReceipt(
   };
 }
 
-/**
- * 从抢救路径的 raw stream result 提取 reasoning 文本。
- * chatCompletionStreamResult 产生的结构是 { choices: [{ message: { content, reasoning_content? } }] }。
- * 抢救路径保证 content 为空、reasoning_content 非空。
- */
-function extractSalvagedReasoning(raw: unknown): string {
+interface LengthLimitedSegment {
+  readonly reasoning: string;
+  readonly content: string;
+}
+
+function extractLengthLimitedSegment(raw: unknown): LengthLimitedSegment {
   if (typeof raw !== "object" || raw === null) {
     throw new LlmResponseFormatError("response_shape");
   }
@@ -1228,11 +1324,64 @@ function extractSalvagedReasoning(raw: unknown): string {
   if (typeof message !== "object" || message === null) {
     throw new LlmResponseFormatError("response_shape");
   }
-  const reasoning = (message as Record<string, unknown>).reasoning_content;
-  if (typeof reasoning !== "string" || reasoning.trim().length === 0) {
-    throw new LlmResponseFormatError("response_shape");
+  const messageRecord = message as Record<string, unknown>;
+  const reasoningContent = messageRecord.reasoning_content;
+  const reasoning = typeof reasoningContent === "string"
+    ? reasoningContent
+    : typeof messageRecord.reasoning === "string"
+      ? messageRecord.reasoning
+      : "";
+  const content = typeof messageRecord.content === "string"
+    ? messageRecord.content
+    : "";
+  if (reasoning.trim().length === 0 && content.trim().length === 0) {
+    throw new LlmRequestError("LLM_OUTPUT_LENGTH_LIMIT");
   }
-  return reasoning;
+  return { reasoning, content };
+}
+
+function buildLengthContinuationMessages(
+  originalMessages: readonly ChatMessage[],
+  segment: LengthLimitedSegment
+): ChatMessage[] {
+  const completeSegment = [
+    "前序模型段（完整携带，不得省略、压缩或改写）：",
+    `reasoning_content:\n${segment.reasoning}`,
+    `content:\n${segment.content}`
+  ].join("\n\n");
+  return [
+    ...originalMessages,
+    { role: "assistant", content: completeSegment },
+    {
+      role: "user",
+      content: "请继续完成上一条回复，只补充尚未完成的部分，不要重述或改变前序模型段。"
+    }
+  ];
+}
+
+function combineContinuationAudits(
+  first: LlmTransportAudit,
+  second: LlmTransportAudit
+): LlmTransportAudit {
+  const usageValues = [first.usageTotalTokens, second.usageTotalTokens]
+    .filter((value): value is number => value !== null);
+  return {
+    providerRequestCount: first.providerRequestCount + second.providerRequestCount,
+    retryCount: first.retryCount + second.retryCount,
+    responseByteCount: first.responseByteCount + second.responseByteCount,
+    usageTotalTokens: usageValues.length === 0
+      ? null
+      : usageValues.reduce((sum, value) => sum + value, 0),
+    usageComplete: first.usageComplete && second.usageComplete,
+    maxOutputTokens: null,
+    finishReason: second.finishReason,
+    eofObserved: first.eofObserved && second.eofObserved,
+    finishReasonStopObserved:
+      first.finishReasonStopObserved || second.finishReasonStopObserved,
+    sseDoneObserved: first.sseDoneObserved === null || second.sseDoneObserved === null
+      ? null
+      : first.sseDoneObserved && second.sseDoneObserved
+  };
 }
 
 /**
@@ -1303,14 +1452,15 @@ export async function chatCompleteJsonWithReceipt<T>(
     ? directStructuredMessages(messages, schema)
     : messages;
   const firstMessages: ChatMessage[] = [jsonInstruction, ...roleMessages];
-  // 当前接入的网关并不都正确支持 response_format。直接用提示词约束 JSON，
-  // 避免先付费生成一次空 content，再为了探测兼容性重复发送完整题目。
   let first: ChatCompletionWithReceipt;
   try {
-    first = await chatCompleteWithReceipt(provider, spec, firstMessages, runtime, {
-      requestJson: false,
-      maxOutputTokens: options.maxOutputTokens
-    });
+    first = await chatCompleteWithReceipt(
+      provider,
+      spec,
+      firstMessages,
+      runtime,
+      { requestJson: false }
+    );
     assertStructuredCompletionTransport(first.receipt);
   } catch (error) {
     promoteJsonFailureAudit(error, 1, [], 0);
@@ -1340,13 +1490,15 @@ export async function chatCompleteJsonWithReceipt<T>(
       content: `上一条回复不满足要求：${firstAttempt.error}。请只重新输出一个满足要求的 JSON 对象，不要包含任何其它文字或代码块标记。`
     }
   ];
-  // 修复轮固定用纯提示词方式，避免再次踩到 response_format 的空内容问题。
   let second: ChatCompletionWithReceipt;
   try {
-    second = await chatCompleteWithReceipt(provider, spec, repairMessages, runtime, {
-      requestJson: false,
-      maxOutputTokens: options.maxOutputTokens
-    });
+    second = await chatCompleteWithReceipt(
+      provider,
+      spec,
+      repairMessages,
+      runtime,
+      { requestJson: false }
+    );
     assertStructuredCompletionTransport(second.receipt);
   } catch (error) {
     promoteJsonFailureAudit(
@@ -1483,23 +1635,18 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
   options: ChatCompletionJsonOptions = {},
   roundAudit?: TwoRoundJsonRoundAudit
 ): Promise<{ data: T; reasoning: string | null; receipt: LlmJsonCompletionReceipt }> {
-  if (runtime.directStructuredOutput === true) {
-    return chatCompleteJsonWithReceipt(
+  let semantic: ChatCompletionSalvageableResult;
+  roundAudit?.onRoundStart("semantic");
+  try {
+    semantic = await chatCompleteSalvageableWithReceipt(
       provider,
       spec,
       semanticMessages,
-      schema,
-      runtime,
-      options
+      runtime
     );
-  }
-  let semantic: ChatCompletionWithReceipt;
-  roundAudit?.onRoundStart("semantic");
-  try {
-    semantic = await chatCompleteWithReceipt(provider, spec, semanticMessages, runtime, {
-      requestJson: false,
-      maxOutputTokens: options.maxOutputTokens
-    });
+    if (semantic.salvaged) {
+      throw new LlmResponseFormatError("response_shape");
+    }
     assertStructuredCompletionTransport(semantic.receipt);
   } catch (error) {
     promoteJsonFailureAudit(error, 1, [], 0);
@@ -1519,7 +1666,6 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
   try {
     firstFormat = await chatCompleteWithReceipt(provider, extractionSpec, firstFormatMessages, runtime, {
       ...strictSchemaOutputOption(schema),
-      maxOutputTokens: options.maxOutputTokens
     });
     assertStructuredCompletionTransport(firstFormat.receipt);
   } catch (error) {
@@ -1557,7 +1703,6 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
   try {
     secondFormat = await chatCompleteWithReceipt(provider, extractionSpec, repairMessages, runtime, {
       ...strictSchemaOutputOption(schema),
-      maxOutputTokens: options.maxOutputTokens
     });
     assertStructuredCompletionTransport(secondFormat.receipt);
   } catch (error) {
@@ -1657,7 +1802,6 @@ export async function chatCompleteReasoningSalvageJsonWithReceipt<T>(
     runtime,
     {
       requestJson: false,
-      maxOutputTokens: options.maxOutputTokens
     }
   );
   if (!analysis.salvaged) {
@@ -1707,7 +1851,6 @@ export async function chatCompleteReasoningSalvageJsonWithReceipt<T>(
       runtime,
       {
         ...strictSchemaOutputOption(schema),
-        maxOutputTokens: options.maxOutputTokens
       }
     );
     assertStructuredCompletionTransport(firstFinal.receipt);
@@ -1757,7 +1900,6 @@ export async function chatCompleteReasoningSalvageJsonWithReceipt<T>(
       runtime,
       {
         ...strictSchemaOutputOption(schema),
-        maxOutputTokens: options.maxOutputTokens
       }
     );
     assertStructuredCompletionTransport(secondFinal.receipt);
@@ -1830,7 +1972,6 @@ async function runTwoRoundFormatPath<T>(
   try {
     firstFormat = await chatCompleteWithReceipt(provider, extractionSpec, firstFormatMessages, runtime, {
       ...strictSchemaOutputOption(schema),
-      maxOutputTokens: options.maxOutputTokens
     });
     assertStructuredCompletionTransport(firstFormat.receipt);
   } catch (error) {
@@ -1867,7 +2008,6 @@ async function runTwoRoundFormatPath<T>(
   try {
     secondFormat = await chatCompleteWithReceipt(provider, extractionSpec, repairMessages, runtime, {
       ...strictSchemaOutputOption(schema),
-      maxOutputTokens: options.maxOutputTokens
     });
     assertStructuredCompletionTransport(secondFormat.receipt);
   } catch (error) {
@@ -1938,7 +2078,6 @@ export async function chatCompleteStagedSolverJsonWithReceipt<T>(
       exploration = await chatCompleteWithReceipt(
         provider, spec, explorationMessages, runtime, {
           requestJson: false,
-          maxOutputTokens: options.maxOutputTokens
         }
       );
       assertStructuredCompletionTransport(exploration.receipt);
@@ -1999,7 +2138,6 @@ export async function chatCompleteStagedSolverJsonWithReceipt<T>(
   }
   const semanticRunOptions = {
     requestJson: false,
-    maxOutputTokens: options.maxOutputTokens
   };
 
   let exploration: ChatCompletionWithReceipt;
@@ -2043,7 +2181,6 @@ export async function chatCompleteStagedSolverJsonWithReceipt<T>(
     firstFormat = await chatCompleteWithReceipt(
       provider, spec, firstFormatMessages, runtime, {
         ...strictSchemaOutputOption(schema),
-        maxOutputTokens: options.maxOutputTokens
       }
     );
     assertStructuredCompletionTransport(firstFormat.receipt);
@@ -2087,7 +2224,6 @@ export async function chatCompleteStagedSolverJsonWithReceipt<T>(
     secondFormat = await chatCompleteWithReceipt(
       provider, spec, repairMessages, runtime, {
         ...strictSchemaOutputOption(schema),
-        maxOutputTokens: options.maxOutputTokens
       }
     );
     assertStructuredCompletionTransport(secondFormat.receipt);
@@ -2318,7 +2454,10 @@ function rememberLlmFailureAudit(
   input: {
     readonly requestCount: 1 | 2 | 3 | 4;
     readonly requestAudit: MutableLlmRequestAudit;
-    readonly completedResponses?: readonly LlmTransportReceipt[];
+    readonly completedResponses?: readonly (
+      | LlmTransportReceipt
+      | LlmSalvageTransportReceipt
+    )[];
     readonly priorTransportAttemptCount?: number;
     readonly jsonSchemaValidated: false | null;
     readonly schemaDiagnostic?: SafeSchemaDiagnostic;
@@ -2451,11 +2590,18 @@ function assertStructuredCompletionTransport(
 function promoteJsonFailureAudit(
   error: unknown,
   requestCount: 1 | 2 | 3 | 4,
-  completedResponses: readonly LlmTransportReceipt[],
+  completedResponses: readonly (
+    | LlmTransportReceipt
+    | LlmSalvageTransportReceipt
+  )[],
   priorTransportAttemptCount: number
 ): void {
   const existing = getLlmFailureAudit(error);
   if (existing === null) return;
+  const effectiveCompletedResponses =
+    completedResponses.length === 0
+      ? existing.completedResponses
+      : completedResponses;
   rememberLlmFailureAudit(error, {
     requestCount,
     requestAudit: {
@@ -2485,21 +2631,14 @@ function promoteJsonFailureAudit(
       firstRejectedEvent: existing.stream.firstRejectedEvent,
       maxOutputTokens: existing.maxOutputTokens
     },
-    completedResponses,
+    completedResponses: effectiveCompletedResponses,
     priorTransportAttemptCount,
     jsonSchemaValidated: false,
     schemaDiagnostic: existing.schemaDiagnostic
   });
 }
 
-async function requestWithRetry(
-  fetchImpl: FetchLike,
-  url: URL,
-  init: RequestInit,
-  runtime: LlmRuntimeOptions,
-  audit: MutableLlmRequestAudit,
-  salvageOnLengthLimit = false
-): Promise<{
+interface LlmRequestResult {
   readonly ok: boolean;
   readonly status: number;
   readonly raw: unknown;
@@ -2509,9 +2648,17 @@ async function requestWithRetry(
   readonly sseDoneObserved: boolean | null;
   readonly retryAfterMs: number | null;
   readonly salvaged: boolean;
-}> {
+}
+
+async function requestWithRetry(
+  fetchImpl: FetchLike,
+  url: URL,
+  init: RequestInit,
+  runtime: LlmRuntimeOptions,
+  audit: MutableLlmRequestAudit,
+  salvageOnLengthLimit = false
+): Promise<LlmRequestResult> {
   const durations = resolveLlmRequestDurations(runtime);
-  const deadline = Date.now() + durations.maximumDurationMs;
   let attempt = 1;
   let retryAfterMs: number | null = null;
   for (;;) {
@@ -2520,32 +2667,14 @@ async function requestWithRetry(
     if (runtime.signal?.aborted) {
       throw new LlmRequestError("LLM_CANCELLED");
     }
-    const executeAttempt = async (): Promise<{
-      readonly ok: boolean;
-      readonly status: number;
-      readonly raw: unknown;
-      readonly attemptCount: number;
-      readonly responseMode: LlmResponseMode | null;
-      readonly finishReasonStopVerified: boolean;
-      readonly sseDoneObserved: boolean | null;
-      readonly retryAfterMs: number | null;
-      readonly salvaged: boolean;
-    } | null> => {
+    const executeAttempt = async (): Promise<LlmRequestResult | null> => {
       // 排队结束后重新检查；soft-stop 期间排队的任务不能跨过调度边界发起请求。
       assertLlmRequestMayStart();
       if (runtime.signal?.aborted) {
         throw new LlmRequestError("LLM_CANCELLED");
       }
-      const remainingDurationMs = deadline - Date.now();
-      if (remainingDurationMs <= 0) {
-        throw new LlmRequestError("LLM_TOTAL_TIMEOUT");
-      }
       const controller = new AbortController();
-      const watchdog = new LlmRequestWatchdog(
-        controller,
-        durations,
-        remainingDurationMs
-      );
+      const watchdog = new LlmRequestWatchdog(controller, durations);
       const cancelForTaskState = (): void => {
         controller.abort();
       };
@@ -2586,9 +2715,6 @@ async function requestWithRetry(
           if (timeoutError !== undefined) {
             throw timeoutError;
           }
-          if (Date.now() >= deadline) {
-            throw new LlmRequestError("LLM_TOTAL_TIMEOUT");
-          }
           if (response.status !== 429 || attempt >= runtime.maxAttempts) {
             return {
               ok: false,
@@ -2613,6 +2739,7 @@ async function requestWithRetry(
               runtime.onSafeOutputActivity?.();
             },
             onResponseByte: () => {
+              watchdog.receivedStreamActivity();
               runtime.onResponseBodyByte?.();
             },
             onInvalidResponseDrainStarted: (
@@ -2635,8 +2762,6 @@ async function requestWithRetry(
         if (timeoutError !== undefined) {
           throw timeoutError;
         }
-        // 首个有效模型事件会清除绝对保护计时。正常持续输出后只看
-        // 有效事件间的停顿，因此不能在这里再用初始 deadline 拒绝结果。
         return {
           ok: true,
           status: response.status,
@@ -2707,7 +2832,6 @@ async function requestWithRetry(
     assertLlmRequestMayStart();
     await delayBeforeRetry(
       Math.max(backoffMs(runtime.baseDelayMs, attempt), retryAfterMs ?? 0),
-      deadline,
       runtime.signal
     );
     attempt += 1;
@@ -2737,18 +2861,16 @@ type LlmTimeoutCode =
 interface LlmRequestDurations {
   readonly firstOutputTimeoutMs: number;
   readonly outputIdleTimeoutMs: number;
-  readonly maximumDurationMs: number;
 }
 
 class LlmRequestWatchdog {
   readonly #controller: AbortController;
   readonly #firstOutputTimeoutMs: number;
   readonly #outputIdleTimeoutMs: number;
-  readonly #maximumDurationMs: number;
   #firstOutputTimer: NodeJS.Timeout | null = null;
   #outputIdleTimer: NodeJS.Timeout | null = null;
-  #maximumDurationTimer: NodeJS.Timeout | null = null;
   #timeoutCode: LlmTimeoutCode | null = null;
+  #receivedStreamActivity = false;
   #receivedValidOutput = false;
   #drainingInvalidResponse = false;
   #formatFailureStage: LlmResponseFormatFailureStage | undefined;
@@ -2756,56 +2878,42 @@ class LlmRequestWatchdog {
 
   public constructor(
     controller: AbortController,
-    durations: LlmRequestDurations,
-    remainingDurationMs: number
+    durations: LlmRequestDurations
   ) {
     this.#controller = controller;
     this.#outputIdleTimeoutMs = durations.outputIdleTimeoutMs;
     this.#firstOutputTimeoutMs = durations.firstOutputTimeoutMs;
-    this.#maximumDurationMs = remainingDurationMs;
     this.#firstOutputTimer = setTimeout(() => {
       this.#abort("LLM_FIRST_OUTPUT_TIMEOUT");
     }, this.#firstOutputTimeoutMs);
-    this.#maximumDurationTimer = setTimeout(() => {
-      this.#abort("LLM_TOTAL_TIMEOUT");
-    }, this.#maximumDurationMs);
   }
 
-  public receivedValidOutput(): void {
+  /** 非空流块只在已出现合法模型输出后刷新 no-progress。 */
+  public receivedStreamActivity(): void {
     if (this.#timeoutCode !== null) return;
-    if (!this.#receivedValidOutput) {
-      this.#receivedValidOutput = true;
-      if (this.#firstOutputTimer !== null) {
-        clearTimeout(this.#firstOutputTimer);
-        this.#firstOutputTimer = null;
-      }
-      // maximumDurationMs 只约束首个有效事件前的阶段，不得把正在
-      // 持续产生有效输出的付费请求当作超时取消。
-      if (this.#maximumDurationTimer !== null) {
-        clearTimeout(this.#maximumDurationTimer);
-        this.#maximumDurationTimer = null;
-      }
-    }
-    if (this.#outputIdleTimer !== null) {
-      clearTimeout(this.#outputIdleTimer);
-    }
+    if (!this.#receivedValidOutput && !this.#drainingInvalidResponse) return;
+    clearTimeout(this.#outputIdleTimer!);
     this.#outputIdleTimer = setTimeout(() => {
       this.#abort("LLM_OUTPUT_IDLE_TIMEOUT");
     }, this.#outputIdleTimeoutMs);
   }
 
+  public receivedValidOutput(): void {
+    if (this.#timeoutCode !== null) return;
+    this.#receivedValidOutput = true;
+    clearTimeout(this.#firstOutputTimer!);
+    this.#firstOutputTimer = null;
+    this.receivedStreamActivity();
+  }
+
   /**
-   * 协议首错并不证明 HTTP 正文已经结束。进入排空阶段后，首输出等待改为
-   * 对原始分块的连续停顿保护；若此前已有合法输出并清除了最终保护，则从
-   * 排空开始重新用同一 maximumDurationMs 建立最终边界。它不是 120 秒之类
-   * 的隐藏短时限，也不会因持续收到分块而无限延长。
+   * 协议首错并不证明 HTTP 正文已经结束。进入排空阶段后只允许连续流活动
+   * 刷新 no-progress；真实 EOF 之前不会升级或替换首错。
    */
   public invalidResponseDrainStarted(
     formatFailureStage?: LlmResponseFormatFailureStage,
     formatFailureSubstage?: LlmResponseFormatFailureSubstage
   ): void {
-    // DONE 后的诊断只有在真实 EOF 才能落最终结构分类。读取期间统一保留
-    // tail-incomplete；超时、取消或断流不能带走一个尚未收口的暂态判断。
     this.#formatFailureStage = formatFailureStage;
     this.#formatFailureSubstage = formatFailureSubstage;
     if (this.#timeoutCode !== null) return;
@@ -2814,11 +2922,6 @@ class LlmRequestWatchdog {
     if (this.#firstOutputTimer !== null) {
       clearTimeout(this.#firstOutputTimer);
       this.#firstOutputTimer = null;
-    }
-    if (this.#maximumDurationTimer === null) {
-      this.#maximumDurationTimer = setTimeout(() => {
-        this.#abort("LLM_TOTAL_TIMEOUT");
-      }, this.#maximumDurationMs);
     }
     this.receivedInvalidResponseDrainActivity();
   }
@@ -2855,16 +2958,11 @@ class LlmRequestWatchdog {
   }
 
   public close(): void {
-    for (const timer of [
-      this.#firstOutputTimer,
-      this.#outputIdleTimer,
-      this.#maximumDurationTimer
-    ]) {
+    for (const timer of [this.#firstOutputTimer, this.#outputIdleTimer]) {
       if (timer !== null) clearTimeout(timer);
     }
     this.#firstOutputTimer = null;
     this.#outputIdleTimer = null;
-    this.#maximumDurationTimer = null;
   }
 
   #abort(code: LlmTimeoutCode): void {
@@ -2886,27 +2984,9 @@ function resolveLlmRequestDurations(
       Math.max(defaultLlmFirstOutputTimeoutMs, outputIdleTimeoutMs),
     "firstOutputTimeoutMs"
   );
-  const maximumDurationMs = positiveDuration(
-    runtime.maximumDurationMs ??
-      Math.max(
-        defaultLlmMaximumDurationMs,
-        firstOutputTimeoutMs,
-        outputIdleTimeoutMs
-      ),
-    "maximumDurationMs"
-  );
-  if (
-    maximumDurationMs < firstOutputTimeoutMs ||
-    maximumDurationMs < outputIdleTimeoutMs
-  ) {
-    throw new TypeError(
-      "maximumDurationMs 不能小于第一段输出或输出停顿的等待时间。"
-    );
-  }
   return {
     firstOutputTimeoutMs,
-    outputIdleTimeoutMs,
-    maximumDurationMs
+    outputIdleTimeoutMs
   };
 }
 
@@ -2917,18 +2997,6 @@ function positiveDuration(value: number, name: string): number {
   return value;
 }
 
-function validateMaxOutputTokens(value: number): number {
-  if (
-    !Number.isSafeInteger(value) ||
-    value < 1 ||
-    value > maximumExplicitLlmOutputTokens
-  ) {
-    throw new RangeError(
-      `maxOutputTokens 必须是 1 到 ${maximumExplicitLlmOutputTokens} 之间的整数。`
-    );
-  }
-  return value;
-}
 
 function backoffMs(baseDelayMs: number, attempt: number): number {
   return baseDelayMs * 2 ** (attempt - 1);
@@ -2982,28 +3050,10 @@ function waitForOrAbort<T>(
 
 async function delayBeforeRetry(
   ms: number,
-  deadline: number,
   signal?: AbortSignal
 ): Promise<void> {
   if (signal?.aborted) {
     throw new LlmRequestError("LLM_CANCELLED");
-  }
-  const remainingDurationMs = deadline - Date.now();
-  if (remainingDurationMs <= 0) {
-    throw new LlmRequestError("LLM_TOTAL_TIMEOUT");
-  }
-  if (ms >= remainingDurationMs) {
-    try {
-      await (signal === undefined
-        ? delay(remainingDurationMs)
-        : waitForOrAbort(delay(remainingDurationMs), signal));
-    } catch {
-      if (signal?.aborted) {
-        throw new LlmRequestError("LLM_CANCELLED");
-      }
-      throw new LlmRequestError("LLM_TOTAL_TIMEOUT");
-    }
-    throw new LlmRequestError("LLM_TOTAL_TIMEOUT");
   }
   try {
     await (signal === undefined
@@ -3634,7 +3684,25 @@ async function readChatCompletionEventStream(
     currentLineMayBeData: true,
     currentLinePrefix: ""
   };
+  let firstProtocolError:
+    | LlmResponseFormatError
+    | LlmRequestError
+    | undefined;
+
   const consumeEvent = (event: string): void => {
+    if (firstProtocolError !== undefined) {
+      if (
+        firstProtocolError instanceof LlmRequestError &&
+        firstProtocolError.code === "LLM_OUTPUT_LENGTH_LIMIT"
+      ) {
+        const data = sseDataFields(event).join("\n").trim();
+        if (data === "[DONE]") {
+          state.sawDone = true;
+          audit.sseDoneObserved = true;
+        }
+      }
+      return;
+    }
     audit.streamEventCount += 1;
     observeSseUsage(event, audit);
     try {
@@ -3654,10 +3722,23 @@ async function readChatCompletionEventStream(
         event,
         audit.streamEventCount
       );
+      if (
+        error instanceof LlmRequestError &&
+        error.code === "LLM_OUTPUT_LENGTH_LIMIT"
+      ) {
+        firstProtocolError = error;
+        clearEventStreamEventBuffer(eventBuffer);
+        resetPostDonePendingDataScan(postDonePendingDataScan, state);
+        state.content = "";
+        state.reasoning = "";
+        observer.onInvalidResponseDrainStarted();
+        return;
+      }
       throw error;
     }
   };
   const observePartialEventText = (text: string): void => {
+    if (firstProtocolError !== undefined) return;
     scanUnresolvedPostDoneData(
       text,
       postDonePendingDataScan,
@@ -3665,14 +3746,11 @@ async function readChatCompletionEventStream(
       observer
     );
   };
+
   let totalBytes = 0;
   let responseChunkCount = 0;
   let readerFinished = false;
   let readerErrored = false;
-  let firstProtocolError:
-    | LlmResponseFormatError
-    | LlmRequestError
-    | undefined;
 
   try {
     for (;;) {
@@ -3786,6 +3864,28 @@ async function readChatCompletionEventStream(
       if (firstProtocolError !== undefined) {
         if (chunk.value.byteLength > 0) {
           observer.onInvalidResponseDrainActivity();
+        }
+        if (
+          firstProtocolError instanceof LlmRequestError &&
+          firstProtocolError.code === "LLM_OUTPUT_LENGTH_LIMIT" &&
+          chunk.value.byteLength > 0
+        ) {
+          try {
+            const normalized = normalizeEventStreamText(
+              trailingCarriageReturn,
+              decodeEventStreamText(decoder, chunk.value),
+              false
+            );
+            trailingCarriageReturn = normalized.trailingCarriageReturn;
+            consumeEventStreamText(
+              normalized.text,
+              eventBuffer,
+              consumeEvent,
+              () => {}
+            );
+          } catch {
+            clearEventStreamEventBuffer(eventBuffer);
+          }
         }
         continue;
       }
@@ -4656,6 +4756,11 @@ function consumeChatCompletionEvent(
   if (data === "[DONE]") {
     state.sawDone = true;
     return false;
+  }
+  if (state.sawLengthSalvage) {
+    // length 已经是本轮唯一允许的终止信号；DONE/EOF 之外的任何 data
+    // 事件都必须 fail closed，不能依赖事件是否带 choices。
+    throw new LlmResponseFormatError("trailing_data", "choice_after_length");
   }
 
   let raw: unknown;

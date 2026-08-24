@@ -5,7 +5,6 @@ import {
   chatCompleteTwoRoundJsonWithReceipt,
   copyLlmCompletionAudit,
   llmTransportProtocolVersion,
-  maximumExplicitLlmOutputTokens,
   serializeTargetJsonSchema,
   type ChatMessage,
   type LlmJsonCompletionReceipt
@@ -25,14 +24,14 @@ import {
 } from "./historical-rubric";
 import type { ReviewFlowRoles } from "./orchestrator";
 import {
-  adjudicatorPayloadSchema,
-  adversaryPayloadSchema,
   contestFitPayloadSchema,
+  createAdjudicatorPayloadSchema,
+  createAdversaryPayloadSchema,
   createCriticPayloadSchema,
+  createOriginalityPayloadSchema,
   digestSchema,
   difficultyPayloadSchema,
   editorialPayloadSchema,
-  originalityPayloadSchema,
   reviewFlowRoleSchema,
   solutionAnalystPayloadSchema,
   solverPayloadSchema,
@@ -247,7 +246,7 @@ export function createReviewFlowLlmBundle(input: {
         models.originality.spec,
         buildOriginalitySemanticMessages(view),
         buildOriginalityFormatterMessages,
-        originalityPayloadSchema,
+        createOriginalityPayloadSchema(canonicalEvidenceIds(view.duplicateEvidence)),
         models.originality.runtime
       );
       return trustedRoleExecution(data, receipt);
@@ -284,12 +283,12 @@ export function createReviewFlowLlmBundle(input: {
     adversary: async (view) => runJsonRole(
       models.adversary,
       buildAdversaryMessages(view),
-      adversaryPayloadSchema
+      createAdversaryPayloadSchema(canonicalEvidenceIds(view.evidence))
     ),
     adjudicator: async (view) => runJsonRole(
       models.adjudicator,
       buildAdjudicatorMessages(view),
-      adjudicatorPayloadSchema
+      createAdjudicatorPayloadSchema(canonicalEvidenceIds(view.evidence))
     )
   };
 
@@ -865,7 +864,6 @@ function runJsonFormatted<T>(
     ],
     schema,
     model.runtime,
-    { maxOutputTokens: maximumExplicitLlmOutputTokens }
   );
 }
 
@@ -889,7 +887,6 @@ async function runJson<T>(
     [...messages],
     schema,
     model.runtime,
-    { maxOutputTokens: maximumExplicitLlmOutputTokens }
   );
 }
 
