@@ -10,6 +10,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -454,6 +455,153 @@ describe("review-flow dataset v2 与真实 Gold 边界", () => {
     });
     expect(selected.caseSelection?.orderedSelectionSha256).toBe(
       reviewFlowEvaluationOrderedSelectionSha256(selected.cases)
+    );
+  });
+
+  it("私有文件选择器支持五题并拒绝所有文件与集合完整性绕过", () => {
+    const fixture = createDatasetFixture("private-file-v1");
+    const full = loadDataset(fixture, "development_scored");
+    const selectorDirectory = join(fixture.privateRoot, "case-selector");
+    mkdirSync(selectorDirectory, { mode: 0o700 });
+    const selectorPath = join(selectorDirectory, "selected-cases.private.json");
+    const selectedIds = full.cases.slice(0, 5).map((entry) => entry.safeId);
+    const writeSelector = (document: unknown) => {
+      writeFileSync(selectorPath, JSON.stringify(document), {
+        mode: 0o600
+      });
+      chmodSync(selectorPath, 0o600);
+    };
+    const loadSelected = (path: string) => {
+      const registry = newRegistry(
+        fixture,
+        join(fixture.privateRoot, `private-file-registry-${randomUUID()}`)
+      );
+      try {
+        return loadDevelopmentDatasetAfterUsageRegistration({
+          manifestPath: fixture.manifestPath,
+          revealDescriptorPath: fixture.developmentRevealDescriptorPath,
+          datasetPrivateRoot: fixture.privateRoot,
+          containingWorkspace: fixture.workspace,
+          registry,
+          caseSelectorFilePath: path
+        });
+      } finally {
+        registry.close();
+      }
+    };
+    const assertRejectsWithoutCheckpoint = (path: string) => {
+      expect(() => loadSelected(path)).toThrow();
+      expect(
+        existsSync(
+          join(
+            fixture.privateRoot,
+            "not-created",
+            "review-flow-private-subset.checkpoint.private.json"
+          )
+        )
+      ).toBe(false);
+    };
+
+    writeSelector({
+      schemaVersion: 1,
+      caseIds: [...selectedIds].reverse()
+    });
+    expect(statSync(selectorDirectory).mode & 0o777).toBe(0o700);
+    expect(statSync(selectorPath).mode & 0o777).toBe(0o600);
+    expect(statSync(selectorPath).nlink).toBe(1);
+    const first = loadSelected(selectorPath);
+    const second = loadSelected(selectorPath);
+    expect(first.cases.map((entry) => entry.safeId)).toEqual(selectedIds);
+    expect(second.cases.map((entry) => entry.safeId)).toEqual(selectedIds);
+    expect(first.caseSelection).toMatchObject({
+      schemaVersion: 1,
+      selector: "private-file-v1",
+      selectorIdentity: "review-flow-evaluation-private-file-v1",
+      parentDatasetFingerprint: full.datasetFingerprint,
+      parentManifestSha256: full.manifestSha256,
+      parentBridgeCompletionSha256: full.bridgeCompletionSha256,
+      parentCaseCount: full.cases.length,
+      selectedCaseCount: selectedIds.length,
+      selectedCaseSetSha256:
+        reviewFlowEvaluationOrderedSelectionSha256(first.cases),
+      orderedSelectionSha256:
+        reviewFlowEvaluationOrderedSelectionSha256(first.cases)
+    });
+    expect(first.caseSelection).toEqual(second.caseSelection);
+    const selectorSha256 = createHash("sha256")
+      .update(readFileSync(selectorPath))
+      .digest("hex");
+    if (
+      first.caseSelection === undefined ||
+      first.caseSelection.selector !== "private-file-v1"
+    ) {
+      throw new Error("TEST_PRIVATE_CASE_SELECTION_MISSING");
+    }
+    expect(first.caseSelection.selectorSha256).toBe(selectorSha256);
+    const expectedCases = first.cases.map((entry) => ({
+      safeId: entry.safeId,
+      subjectId: entry.subjectId,
+      sourceLineageSha256: entry.sourceLineageSha256,
+      contentSha256: entry.contentSha256
+    }));
+    const firstSeal = buildExecutionReceiptSeal(
+      expectedCases,
+      first.caseSelection,
+      []
+    );
+    const secondSeal = buildExecutionReceiptSeal(
+      expectedCases,
+      second.caseSelection,
+      []
+    );
+    expect(firstSeal).toEqual(secondSeal);
+    expect(firstSeal.selectionProfile).toMatchObject({
+      kind: "privateSubset",
+      selectorSha256,
+      selectedCaseSetSha256:
+        reviewFlowEvaluationOrderedSelectionSha256(first.cases)
+    });
+
+    writeSelector({ schemaVersion: 1, caseIds: [] });
+    assertRejectsWithoutCheckpoint(selectorPath);
+    writeSelector({ schemaVersion: 1, caseIds: [selectedIds[0], selectedIds[0]] });
+    assertRejectsWithoutCheckpoint(selectorPath);
+    writeSelector({ schemaVersion: 1, caseIds: ["case-9999"] });
+    assertRejectsWithoutCheckpoint(selectorPath);
+    writeSelector({
+      schemaVersion: 1,
+      caseIds: [...full.cases.map((entry) => entry.safeId), selectedIds[0]]
+    });
+    assertRejectsWithoutCheckpoint(selectorPath);
+    writeSelector({
+      schemaVersion: 1,
+      caseIds: selectedIds,
+      extra: "reject"
+    });
+    assertRejectsWithoutCheckpoint(selectorPath);
+
+    const regularSelectorPath = join(
+      selectorDirectory,
+      "regular-target.private.json"
+    );
+    writeFileSync(regularSelectorPath, JSON.stringify({
+      schemaVersion: 1,
+      caseIds: selectedIds
+    }), { mode: 0o600 });
+    chmodSync(regularSelectorPath, 0o640);
+    assertRejectsWithoutCheckpoint(regularSelectorPath);
+    chmodSync(regularSelectorPath, 0o600);
+    const symlinkPath = join(selectorDirectory, "symlink.private.json");
+    symlinkSync(regularSelectorPath, symlinkPath);
+    assertRejectsWithoutCheckpoint(symlinkPath);
+    const hardlinkPath = join(selectorDirectory, "hardlink.private.json");
+    linkSync(regularSelectorPath, hardlinkPath);
+    assertRejectsWithoutCheckpoint(hardlinkPath);
+    chmodSync(selectorDirectory, 0o755);
+    assertRejectsWithoutCheckpoint(regularSelectorPath);
+    chmodSync(selectorDirectory, 0o700);
+    assertRejectsWithoutCheckpoint(
+      join(selectorDirectory, "not-found.private.json")
     );
   });
 
@@ -3366,6 +3514,38 @@ describe("adapter、CLI 与窄环境", () => {
       maxCaseAttempts: 1,
       resume: false
     });
+    const privateSubsetArgs = [
+      ...representative3Args.filter(
+        (entry) => !entry.startsWith("--case-selector=")
+      ),
+      "--case-selector-file=/private/selectors/five.private.json"
+    ];
+    expect(resolveReviewFlowEvaluationCliOptions(privateSubsetArgs))
+      .toMatchObject({
+        purpose: "development",
+        caseSelector: null,
+        caseSelectorFilePath: "/private/selectors/five.private.json",
+        maxCaseAttempts: 1,
+        resume: false
+      });
+    for (const invalidPrivateSubsetArgs of [
+      [...privateSubsetArgs, "--resume"],
+      privateSubsetArgs.map((entry) =>
+        entry === "--max-case-attempts=1"
+          ? "--max-case-attempts=3"
+          : entry
+      ),
+      [...privateSubsetArgs, "--failed-only"],
+      privateSubsetArgs.map((entry) =>
+        entry === "--case-selector-file=/private/selectors/five.private.json"
+          ? "--case-selector=/private/selector"
+          : entry
+      )
+    ]) {
+      expect(() =>
+        resolveReviewFlowEvaluationCliOptions(invalidPrivateSubsetArgs)
+      ).toThrow("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+    }
     expect(() => resolveReviewFlowEvaluationCliOptions([
       ...representative3V2Args,
       "--resume"

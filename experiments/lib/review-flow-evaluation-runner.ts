@@ -16,6 +16,9 @@ import type {
   ReviewFlowEvaluationPilotTimingReceipt
 } from "./review-flow-evaluation-state";
 import { ReviewFlowEvaluationCheckpointError } from "./review-flow-evaluation-state";
+import {
+  isReviewFlowEvaluationRepresentative3Selection
+} from "./review-flow-evaluation-dataset";
 
 export interface ReviewFlowEvaluationPreparedCase<TPrepared> {
   readonly safeId: string;
@@ -230,27 +233,33 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
   }
 
   const selection = initial.identity.caseSelection;
+  const representative3Selection =
+    isReviewFlowEvaluationRepresentative3Selection(selection);
   if (
     selection !== undefined &&
     (
       (
-        selection.selector !== "representative3-v1" &&
-        selection.selector !== "representative3-v2" &&
-        selection.selector !== "representative3-v3"
+        !representative3Selection &&
+        selection.selector !== "private-file-v1"
       ) ||
       maxCaseAttempts !== 1 ||
-      initial.entries.length !== 3 ||
+      initial.entries.length !== selection.selectedCaseCount ||
       initial.entries.some((entry) => entry.status !== "pending") ||
       initial.expectedCases.some(
         (entry, index) => input.cases[index]?.safeId !== entry.safeId
       )
     )
   ) {
-    throw new Error("REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_RUN_INVALID");
+    throw new Error(
+      representative3Selection
+        ? "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_RUN_INVALID"
+        : "REVIEW_FLOW_EVALUATION_PRIVATE_SUBSET_RUN_INVALID"
+    );
   }
   const monotonicNow = input.monotonicNow ?? (() => performance.now());
-  const representative3StartedAt =
-    selection === undefined ? null : monotonicNow();
+  const representative3StartedAt = representative3Selection
+    ? monotonicNow()
+    : null;
 
   const runBatch = async (
     pending: readonly string[],
@@ -413,7 +422,10 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
               finalized = true;
               continue;
             }
-            if (selection !== undefined && !validCaseTiming(outcome.timing)) {
+            if (
+              representative3Selection &&
+              !validCaseTiming(outcome.timing)
+            ) {
               try {
                 if (outcome.roleAttempts !== undefined) {
                   input.checkpoint.recordCaseAttempt(safeId, {
@@ -477,24 +489,30 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
 
   const pending = input.checkpoint.pendingSafeIds();
   if (selection !== undefined) {
-    // representative3 在接受零提供方/合成闸门后按建模并发度直接并发执行全部
-    // 三题（不再先独占首题 pilot，也不会因单题 pilot 失败就丢弃其余两题）。
-    // pilot 收据语义保留：完成案例落盘 pilotTiming；任两题不再因 pilot 被跳过。
-    const stage2StartedAt = monotonicNow();
-    await runBatch(pending, input.concurrency, true);
+    // 有选择的案例按建模并发度直接执行；只有 representative3 保留 pilot
+    // 时延收据，其它私有子集不改变请求或模型语义。
+    const stage2StartedAt = representative3Selection
+      ? monotonicNow()
+      : null;
+    await runBatch(pending, input.concurrency, representative3Selection);
     const stage2EndedAt = monotonicNow();
     const completed = input.checkpoint.snapshot();
-    const completedPilot = completed.entries.find(
-      (entry) => entry.status === "completed" && entry.caseTiming !== undefined
-    );
+    const completedPilot = representative3Selection
+      ? completed.entries.find(
+          (entry) =>
+            entry.status === "completed" && entry.caseTiming !== undefined
+        )
+      : undefined;
     const pilotCaseTiming =
       completedPilot?.status === "completed"
         ? completedPilot.caseTiming
         : undefined;
     if (
+      representative3Selection &&
       completed.entries.every((entry) => entry.status === "completed") &&
       pilotCaseTiming !== undefined &&
-      representative3StartedAt !== null
+      representative3StartedAt !== null &&
+      stage2StartedAt !== null
     ) {
       input.checkpoint.bindRepresentative3Timing({
         schemaVersion: 1,

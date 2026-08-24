@@ -12,6 +12,7 @@ import { z } from "zod";
 import {
   closePrivateDirectory,
   openExistingPrivateDirectory,
+  readProtectedEnvFile,
   projectPrivateRoot,
   workspaceRoot,
   type PrivateDirectoryHandle
@@ -73,10 +74,28 @@ export type ReviewFlowEvaluationPurpose = z.infer<
 export const reviewFlowEvaluationCaseSelectorSchema = z.enum([
   "representative3-v1",
   "representative3-v2",
-  "representative3-v3"
+  "representative3-v3",
+  "private-file-v1"
 ]);
 export type ReviewFlowEvaluationCaseSelector = z.infer<
   typeof reviewFlowEvaluationCaseSelectorSchema
+>;
+
+/**
+ * 操作员私有的、只绑定安全案例编号的子集选择文件。文件本身不携带题面、
+ * 题解、Gold 或模型输出；原始文件字节摘要会进入运行身份。
+ */
+export const reviewFlowEvaluationPrivateCaseSelectorSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    caseIds: z
+      .array(reviewFlowEvaluationSafeIdSchema)
+      .min(1)
+      .max(1_000)
+  })
+  .strict();
+export type ReviewFlowEvaluationPrivateCaseSelector = z.infer<
+  typeof reviewFlowEvaluationPrivateCaseSelectorSchema
 >;
 
 const reviewFlowEvaluationCaseSelectionV1Schema = z
@@ -143,16 +162,41 @@ const reviewFlowEvaluationCaseSelectionV3Schema = z
     selectedCaseCount: z.literal(3)
   })
   .strict();
+const reviewFlowEvaluationCaseSelectionPrivateFileSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    selector: z.literal("private-file-v1"),
+    selectorIdentity: z.literal(
+      "review-flow-evaluation-private-file-v1"
+    ),
+    selectorSha256: reviewFlowEvaluationDigestSchema,
+    selectedCaseSetSha256: reviewFlowEvaluationDigestSchema,
+    parentDatasetFingerprint: reviewFlowEvaluationDigestSchema,
+    parentManifestSha256: reviewFlowEvaluationDigestSchema,
+    parentBridgeCompletionSha256: reviewFlowEvaluationDigestSchema,
+    parentCaseCount: z.number().int().positive().max(1_000),
+    orderedSelectionSha256: reviewFlowEvaluationDigestSchema,
+    selectedCaseCount: z.number().int().positive().max(1_000)
+  })
+  .strict();
 
 export const reviewFlowEvaluationCaseSelectionSchema =
   z.discriminatedUnion("selector", [
     reviewFlowEvaluationCaseSelectionV1Schema,
     reviewFlowEvaluationCaseSelectionV2Schema,
-    reviewFlowEvaluationCaseSelectionV3Schema
+    reviewFlowEvaluationCaseSelectionV3Schema,
+    reviewFlowEvaluationCaseSelectionPrivateFileSchema
   ]);
 export type ReviewFlowEvaluationCaseSelection = z.infer<
   typeof reviewFlowEvaluationCaseSelectionSchema
 >;
+
+export function isReviewFlowEvaluationRepresentative3Selection(
+  selection: ReviewFlowEvaluationCaseSelection | undefined | null
+): boolean {
+  return selection?.selector.startsWith("representative3-") === true;
+}
+
 
 /**
  * 历史通过/否决结果发生在题目进入当前 Anklang 语料之前。校准时必须统一排除
@@ -1160,6 +1204,125 @@ export class ReviewFlowEvaluationDatasetError extends Error {
     this.name = "ReviewFlowEvaluationDatasetError";
     this.code = code;
   }
+}
+
+export interface ReviewFlowEvaluationPrivateCaseSelectorBinding {
+  readonly schemaVersion: 1;
+  readonly caseIds: readonly string[];
+  readonly selectorSha256: string;
+  readonly selectedCaseSetSha256: string;
+}
+
+export function loadReviewFlowEvaluationPrivateCaseSelector(input: {
+  readonly selectorPath: string;
+  readonly dataset: ReviewFlowEvaluationDatasetBundle;
+  readonly privateRoot?: string;
+  readonly containingWorkspace?: string;
+}): ReviewFlowEvaluationPrivateCaseSelectorBinding {
+  if (!isAbsolute(input.selectorPath)) {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_PRIVATE_CASE_SELECTOR_PATH_INVALID"
+    );
+  }
+  let selectorBytes: Buffer;
+  try {
+    const selectorText = readProtectedEnvFile(input.selectorPath, {
+      privateRoot: input.privateRoot ?? projectPrivateRoot,
+      containingWorkspace: input.containingWorkspace ?? workspaceRoot,
+      maximumBytes: 64 * 1024
+    });
+    selectorBytes = Buffer.from(selectorText, "utf8");
+  } catch {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_PRIVATE_CASE_SELECTOR_FILE_INVALID"
+    );
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(selectorBytes.toString("utf8")) as unknown;
+  } catch {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_PRIVATE_CASE_SELECTOR_JSON_INVALID"
+    );
+  }
+  const parsed = reviewFlowEvaluationPrivateCaseSelectorSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_PRIVATE_CASE_SELECTOR_SCHEMA_INVALID"
+    );
+  }
+  const caseIds = [...parsed.data.caseIds];
+  if (caseIds.length > input.dataset.cases.length) {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_PRIVATE_CASE_SELECTOR_OVERSIZED"
+    );
+  }
+  if (new Set(caseIds).size !== caseIds.length) {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_PRIVATE_CASE_SELECTOR_DUPLICATE"
+    );
+  }
+  const knownCaseIds = new Set(input.dataset.cases.map((entry) => entry.safeId));
+  if (caseIds.some((safeId) => !knownCaseIds.has(safeId))) {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_PRIVATE_CASE_SELECTOR_UNKNOWN_CASE"
+    );
+  }
+  const selectedIdSet = new Set(caseIds);
+  const selected = input.dataset.cases.filter((entry) =>
+    selectedIdSet.has(entry.safeId)
+  );
+  if (selected.length !== caseIds.length || selected.length === 0) {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_PRIVATE_CASE_SELECTOR_CASE_SET_INVALID"
+    );
+  }
+  return Object.freeze({
+    schemaVersion: 1 as const,
+    caseIds: Object.freeze(selected.map((entry) => entry.safeId)),
+    selectorSha256: sha256(selectorBytes),
+    selectedCaseSetSha256:
+      reviewFlowEvaluationOrderedSelectionSha256(selected)
+  });
+}
+
+export function selectReviewFlowEvaluationPrivateSubset(input: {
+  readonly dataset: ReviewFlowEvaluationDatasetBundle;
+  readonly binding: ReviewFlowEvaluationPrivateCaseSelectorBinding;
+}): ReviewFlowEvaluationSelectedDatasetBundle {
+  const selectedIds = new Set(input.binding.caseIds);
+  const selected = input.dataset.cases.filter((entry) =>
+    selectedIds.has(entry.safeId)
+  );
+  const orderedSelectionSha256 =
+    reviewFlowEvaluationOrderedSelectionSha256(selected);
+  if (
+    selected.length === 0 ||
+    selected.length !== input.binding.caseIds.length ||
+    orderedSelectionSha256 !== input.binding.selectedCaseSetSha256
+  ) {
+    throw new ReviewFlowEvaluationDatasetError(
+      "REVIEW_FLOW_EVALUATION_PRIVATE_CASE_SELECTOR_CASE_SET_CHANGED"
+    );
+  }
+  const caseSelection = reviewFlowEvaluationCaseSelectionSchema.parse({
+    schemaVersion: 1,
+    selector: "private-file-v1",
+    selectorIdentity: "review-flow-evaluation-private-file-v1",
+    selectorSha256: input.binding.selectorSha256,
+    selectedCaseSetSha256: orderedSelectionSha256,
+    parentDatasetFingerprint: input.dataset.datasetFingerprint,
+    parentManifestSha256: input.dataset.manifestSha256,
+    parentBridgeCompletionSha256: input.dataset.bridgeCompletionSha256,
+    parentCaseCount: input.dataset.cases.length,
+    orderedSelectionSha256,
+    selectedCaseCount: selected.length
+  });
+  return deepFreezePhysicalBlind({
+    ...input.dataset,
+    caseSelection,
+    cases: selected
+  });
 }
 
 export function loadReviewFlowEvaluationDataset(input: {

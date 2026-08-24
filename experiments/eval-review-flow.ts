@@ -31,10 +31,12 @@ import {
 } from "./lib/review-flow-evaluation-config";
 import {
   loadReviewFlowEvaluationDataset,
+  loadReviewFlowEvaluationPrivateCaseSelector,
   reviewFlowEvaluationCaseSelectorSchema,
   reviewFlowEvaluationLabelSchema,
   reviewFlowEvaluationPurposeSchema,
   reviewFlowEvaluationSafeIdSchema,
+  selectReviewFlowEvaluationPrivateSubset,
   selectReviewFlowEvaluationRepresentative3,
   selectReviewFlowEvaluationRepresentative3V2,
   selectReviewFlowEvaluationRepresentative3V3,
@@ -97,6 +99,7 @@ export interface ReviewFlowEvaluationRunCliOptions {
   readonly failedOnlySourcePath: string | null;
   readonly failedOnlyCaseIds: readonly string[] | null;
   readonly caseSelector: ReviewFlowEvaluationCaseSelector | null;
+  readonly caseSelectorFilePath: string | null;
   readonly maxCaseAttempts: number;
 }
 
@@ -195,6 +198,7 @@ export function resolveReviewFlowEvaluationCliOptions(
     "development-baseline-label",
     "development-candidate-label",
     "case-selector",
+    "case-selector-file",
     "max-case-attempts",
     "failed-only-source",
     "failed-only-case-ids"
@@ -242,6 +246,14 @@ export function resolveReviewFlowEvaluationCliOptions(
   if (caseSelector !== null && !caseSelector.success) {
     throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
   }
+  const caseSelectorFilePathRaw = values.get("case-selector-file");
+  const caseSelectorFilePath = caseSelectorFilePathRaw ?? null;
+  if (
+    caseSelectorFilePath !== null &&
+    (!isAbsolute(caseSelectorFilePath) || caseSelectorFilePath.length === 0)
+  ) {
+    throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+  }
   const failedOnlySourcePathRaw = values.get("failed-only-source");
   const failedOnlySourcePath = failedOnlySourcePathRaw ?? null;
   const failedOnlyCaseIdsRaw = values.get("failed-only-case-ids");
@@ -280,6 +292,8 @@ export function resolveReviewFlowEvaluationCliOptions(
     values.get("development-baseline-label") ?? null;
   const developmentCandidateLabel =
     values.get("development-candidate-label") ?? null;
+  const hasCaseSelection =
+    caseSelector !== null || caseSelectorFilePath !== null;
   if (
     (variant === "baseline" && baselineLabel !== null) ||
     (variant === "candidate" &&
@@ -294,17 +308,18 @@ export function resolveReviewFlowEvaluationCliOptions(
         developmentBaselineLabel === developmentCandidateLabel ||
         !reviewFlowEvaluationLabelSchema.safeParse(developmentBaselineLabel).success ||
         !reviewFlowEvaluationLabelSchema.safeParse(developmentCandidateLabel).success)) ||
-    (caseSelector !== null &&
+    (hasCaseSelection &&
       (
         purpose.data !== "development" ||
         resume ||
         maxCaseAttempts !== 1
       )) ||
+    (caseSelector !== null && caseSelectorFilePath !== null) ||
     (!failedOnly &&
       (failedOnlySourcePath !== null || failedOnlyCaseIds !== null)) ||
     (failedOnly &&
       (
-        caseSelector !== null ||
+        hasCaseSelection ||
         maxCaseAttempts !== 1 ||
         (resume && failedOnlySourcePath !== null) ||
         (!resume && failedOnlySourcePath === null)
@@ -329,7 +344,8 @@ export function resolveReviewFlowEvaluationCliOptions(
     failedOnlySourcePath,
     failedOnlyCaseIds,
     maxCaseAttempts,
-    caseSelector: caseSelector === null ? null : caseSelector.data
+    caseSelector: caseSelector === null ? null : caseSelector.data,
+    caseSelectorFilePath
   };
 }
 
@@ -375,6 +391,7 @@ export function loadDevelopmentDatasetAfterUsageRegistration(input: {
   readonly containingWorkspace?: string;
   readonly registry: ReviewFlowEvaluationGlobalRegistry;
   readonly caseSelector?: ReviewFlowEvaluationCaseSelector | null;
+  readonly caseSelectorFilePath?: string | null;
 }) {
   const identityDataset = loadReviewFlowEvaluationDataset({
     manifestPath: input.manifestPath,
@@ -382,6 +399,19 @@ export function loadDevelopmentDatasetAfterUsageRegistration(input: {
     containingWorkspace: input.containingWorkspace,
     mode: "development_identity"
   });
+  const caseSelectorFilePath = input.caseSelectorFilePath ?? null;
+  if (input.caseSelector !== undefined && input.caseSelector !== null &&
+      caseSelectorFilePath !== null) {
+    throw new Error("REVIEW_FLOW_EVALUATION_CASE_SELECTOR_CONFLICT");
+  }
+  const privateSelectorBinding = caseSelectorFilePath === null
+    ? null
+    : loadReviewFlowEvaluationPrivateCaseSelector({
+        selectorPath: caseSelectorFilePath,
+        dataset: identityDataset,
+        privateRoot: input.datasetPrivateRoot,
+        containingWorkspace: input.containingWorkspace
+      });
   if (
     input.caseSelector !== undefined &&
     input.caseSelector !== null &&
@@ -414,6 +444,12 @@ export function loadDevelopmentDatasetAfterUsageRegistration(input: {
     })
   ) {
     throw new Error("REVIEW_FLOW_EVALUATION_DEVELOPMENT_DATASET_CHANGED");
+  }
+  if (privateSelectorBinding !== null) {
+    return selectReviewFlowEvaluationPrivateSubset({
+      dataset: scoredDataset,
+      binding: privateSelectorBinding
+    });
   }
   if (input.caseSelector === "representative3-v1") {
     return selectReviewFlowEvaluationRepresentative3(scoredDataset);
@@ -459,7 +495,8 @@ async function runPredictionOrDevelopment(input: {
           datasetPrivateRoot: options.datasetPrivateRoot,
           containingWorkspace: input.runtimeAttestation.originWorkspaceRoot,
           registry,
-          caseSelector: options.caseSelector
+          caseSelector: options.caseSelector,
+          caseSelectorFilePath: options.caseSelectorFilePath
         })
       : loadReviewFlowEvaluationDataset({
           manifestPath: options.manifestPath,

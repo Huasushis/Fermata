@@ -47,6 +47,7 @@ import {
 } from "./private-artifact-io";
 import {
   reviewFlowEvaluationCaseSelectionSchema,
+  isReviewFlowEvaluationRepresentative3Selection,
   reviewFlowEvaluationDigestSchema,
   reviewFlowEvaluationLabelSchema,
   reviewFlowEvaluationOrderedSelectionSha256,
@@ -174,13 +175,22 @@ export const reviewFlowEvaluationIdentitySchema = z
         identity.caseSelection.parentDatasetFingerprint !==
           identity.datasetFingerprint ||
         identity.caseSelection.parentManifestSha256 !== identity.manifestSha256 ||
+        identity.caseSelection.selectedCaseCount >
+          identity.caseSelection.parentCaseCount ||
+        identity.caseSelection.selector === "private-file-v1" &&
+          identity.caseSelection.selectedCaseSetSha256 !==
+            identity.caseSelection.orderedSelectionSha256 ||
         identity.configurationSummary.caseAttempts !== 1
       )
     ) {
       context.addIssue({
         code: "custom",
         path: ["caseSelection"],
-        message: "representative3 只能绑定 development frozen32 与单次案例尝试。"
+        message: isReviewFlowEvaluationRepresentative3Selection(
+          identity.caseSelection
+        )
+          ? "representative3 只能绑定 development frozen32 与单次案例尝试。"
+          : "私有子集只能绑定 development 数据集与单次案例尝试。"
       });
     }
   });
@@ -703,21 +713,31 @@ export const reviewFlowEvaluationCheckpointSchema = z
     if (
       state.identity.caseSelection !== undefined &&
       (
-        state.expectedCases.length !== 3 ||
+        state.expectedCases.length !==
+          state.identity.caseSelection.selectedCaseCount ||
         state.identity.caseSelection.orderedSelectionSha256 !==
-          reviewFlowEvaluationOrderedSelectionSha256(state.expectedCases)
+          reviewFlowEvaluationOrderedSelectionSha256(state.expectedCases) ||
+        state.identity.caseSelection.selector === "private-file-v1" &&
+          state.identity.caseSelection.selectedCaseSetSha256 !==
+            state.identity.caseSelection.orderedSelectionSha256
       )
     ) {
       context.addIssue({
         code: "custom",
         path: ["expectedCases"],
-        message: "representative3 检查点未绑定固定三题有序集合。"
+        message: isReviewFlowEvaluationRepresentative3Selection(
+          state.identity.caseSelection
+        )
+          ? "representative3 检查点未绑定固定三题有序集合。"
+          : "私有子集检查点未绑定声明的有序案例集合。"
       });
     }
     if (
       state.representative3Timing !== undefined &&
       (
-        state.identity.caseSelection === undefined ||
+        !isReviewFlowEvaluationRepresentative3Selection(
+          state.identity.caseSelection
+        ) ||
         state.entries.some((entry) => entry.status !== "completed")
       )
     ) {
@@ -728,7 +748,9 @@ export const reviewFlowEvaluationCheckpointSchema = z
       });
     }
     if (
-      state.identity.caseSelection !== undefined &&
+      isReviewFlowEvaluationRepresentative3Selection(
+        state.identity.caseSelection
+      ) &&
       state.entries.some(
         (entry) =>
           entry.status === "completed" && entry.caseTiming === undefined
@@ -1147,18 +1169,29 @@ export class ReviewFlowEvaluationCheckpoint {
     }
 
     if (identity.caseSelection !== undefined) {
+      const representative3Selection =
+        isReviewFlowEvaluationRepresentative3Selection(
+          identity.caseSelection
+        );
       if (options.resume) {
         throw new ReviewFlowEvaluationCheckpointError(
-          "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_FRESH_ONLY"
+          representative3Selection
+            ? "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_FRESH_ONLY"
+            : "REVIEW_FLOW_EVALUATION_PRIVATE_SUBSET_FRESH_ONLY"
         );
       }
       if (
-        expectedCases.length !== 3 ||
+        expectedCases.length !== identity.caseSelection.selectedCaseCount ||
         identity.caseSelection.orderedSelectionSha256 !==
-          reviewFlowEvaluationOrderedSelectionSha256(expectedCases)
+          reviewFlowEvaluationOrderedSelectionSha256(expectedCases) ||
+        identity.caseSelection.selector === "private-file-v1" &&
+          identity.caseSelection.selectedCaseSetSha256 !==
+            identity.caseSelection.orderedSelectionSha256
       ) {
         throw new ReviewFlowEvaluationCheckpointError(
-          "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_CASE_SET_MISMATCH"
+          representative3Selection
+            ? "REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_CASE_SET_MISMATCH"
+            : "REVIEW_FLOW_EVALUATION_PRIVATE_SUBSET_CASE_SET_MISMATCH"
         );
       }
     }
@@ -1557,7 +1590,9 @@ export class ReviewFlowEvaluationCheckpoint {
     const parsed =
       reviewFlowEvaluationRepresentative3TimingSchema.parse(receipt);
     if (
-      this.#state.identity.caseSelection === undefined ||
+      !isReviewFlowEvaluationRepresentative3Selection(
+        this.#state.identity.caseSelection
+      ) ||
       this.#state.entries.some((entry) => entry.status !== "completed") ||
       this.#state.executionSeal !== null ||
       this.#state.representative3Timing !== undefined
@@ -2122,18 +2157,26 @@ export function buildExecutionReceiptSeal(
     reviewFlowEvaluationOrderedSelectionSha256(expectedCases);
   const selectionProfile = caseSelection === undefined
     ? { kind: "full32" as const }
-    : {
-        kind: "representative3" as const,
-        selector: caseSelection.selector
-      };
+    : caseSelection.selector === "private-file-v1"
+      ? {
+          kind: "privateSubset" as const,
+          selector: caseSelection.selector,
+          selectorSha256: caseSelection.selectorSha256,
+          selectedCaseSetSha256: caseSelection.selectedCaseSetSha256
+        }
+      : {
+          kind: "representative3" as const,
+          selector: caseSelection.selector
+        };
   const expectedIdsAreUnique =
     new Set(expectedCaseIds).size === expectedCaseIds.length;
   const selectionIsBound =
     caseSelection === undefined
       ? expectedCaseCount === 32
-      : expectedCaseCount === 3 &&
-        caseSelection.selectedCaseCount === expectedCaseCount &&
-        caseSelection.orderedSelectionSha256 === orderedSelectionSha256;
+      : expectedCaseCount === caseSelection.selectedCaseCount &&
+        caseSelection.orderedSelectionSha256 === orderedSelectionSha256 &&
+        (caseSelection.selector !== "private-file-v1" ||
+          caseSelection.selectedCaseSetSha256 === orderedSelectionSha256);
   const entriesMatchExpectedCases =
     entries.length === expectedCaseCount &&
     entries.every(
