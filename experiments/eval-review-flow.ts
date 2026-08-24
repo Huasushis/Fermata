@@ -1085,18 +1085,50 @@ function sha256(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+const directScoringStartupErrorClasses: Readonly<Record<string, string>> = {
+  REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID:
+    "DIRECT_SCORING_ARGUMENT_INVALID",
+  REVIEW_FLOW_EVALUATION_DIRECT_SCORING_SCOPE_INVALID:
+    "DIRECT_SCORING_SCOPE_INVALID",
+  REVIEW_FLOW_EVALUATION_DIRECT_SCORING_IDENTITY_INVALID:
+    "DIRECT_SCORING_CODE_IDENTITY_INVALID",
+  REVIEW_FLOW_EVALUATION_CODE_IDENTITY_INVALID:
+    "DIRECT_SCORING_CODE_VERSION_INVALID",
+  REVIEW_FLOW_EVALUATION_CHECKPOINT_INVALID:
+    "DIRECT_SCORING_SOURCE_CHECKPOINT_INVALID",
+  REVIEW_FLOW_EVALUATION_FAILED_ONLY_IDENTITY_MISMATCH:
+    "DIRECT_SCORING_CONTINUATION_IDENTITY_MISMATCH",
+  REVIEW_FLOW_EVALUATION_NODE_VERSION_UNSUPPORTED:
+    "DIRECT_SCORING_NODE_VERSION_UNSUPPORTED",
+  DANGEROUS_NODE_ENVIRONMENT:
+    "DIRECT_SCORING_ENVIRONMENT_INVALID"
+};
+
+export function classifyDirectScoringStartupError(error: unknown): string {
+  return error instanceof Error
+    ? directScoringStartupErrorClasses[error.message] ??
+      "DIRECT_SCORING_PRECHECK_FAILED"
+    : "DIRECT_SCORING_PRECHECK_FAILED";
+}
+
 function isDirectEntry(): boolean {
   return process.argv[1] !== undefined &&
     pathToFileURL(resolve(process.argv[1])).href === import.meta.url;
 }
 
 if (isDirectEntry()) {
+  const argv = process.argv.slice(2);
+  const directScoring = argv.includes("--direct-scoring");
   runReviewFlowEvaluationCli({
-    argv: process.argv.slice(2),
+    argv,
     env: process.env
-  }).catch(() => {
-    // 所有内部错误、私有路径和 provider 细节统一折叠，防止终端日志泄漏。
-    process.stderr.write("11 角色审题实验未能安全完成。\n");
+  }).catch((error: unknown) => {
+    if (directScoring) {
+      process.stderr.write(`${classifyDirectScoringStartupError(error)}\n`);
+    } else {
+      // 默认入口继续折叠所有内部错误、私有路径和 provider 细节。
+      process.stderr.write("11 角色审题实验未能安全完成。\n");
+    }
     process.exitCode = 1;
   });
 }

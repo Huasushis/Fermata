@@ -27,6 +27,7 @@ import {
 } from "../src/urmotiv-schemas";
 import {
   assertUsableReviewFlowEvaluationBaseline,
+  classifyDirectScoringStartupError,
   loadDevelopmentDatasetAfterUsageRegistration,
   resolveReviewFlowEvaluationCliOptions,
   runReviewFlowEvaluationCli
@@ -3600,6 +3601,14 @@ describe("adapter、CLI 与窄环境", () => {
     })).rejects.toThrow();
   });
   it("direct-scoring 显式绕过 attestation，默认仍关闭且不触发 provider", async () => {
+    expect(classifyDirectScoringStartupError(
+      new Error("REVIEW_FLOW_EVALUATION_CHECKPOINT_INVALID")
+    )).toBe("DIRECT_SCORING_SOURCE_CHECKPOINT_INVALID");
+    const folded = classifyDirectScoringStartupError(
+      new Error("/private/secret-value")
+    );
+    expect(folded).toBe("DIRECT_SCORING_PRECHECK_FAILED");
+    expect(folded).not.toContain("secret-value");
     const runPrediction = vi.fn(async () => {});
     const environment = {
       AETHER_BASE_URL: "https://aether.test/v1",
