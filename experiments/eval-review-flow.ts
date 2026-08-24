@@ -71,6 +71,7 @@ import {
 } from "./lib/review-flow-evaluation-state";
 import {
   loadReviewFlowRuntimeAttestation,
+  reviewFlowRuntimeIdentitySchema,
   type ReviewFlowRuntimeAttestation
 } from "./lib/review-flow-runtime-attestation";
 
@@ -966,16 +967,24 @@ function requireHoldoutDatasetBindings(
 
 function assertDirectScoringOptions(
   options: ReviewFlowEvaluationCliOptions
-): asserts options is ReviewFlowEvaluationRunCliOptions & {
-  readonly failedOnly: true;
-  readonly resume: false;
-  readonly failedOnlySourcePath: string;
-} {
+): asserts options is ReviewFlowEvaluationRunCliOptions {
+  const failedOnlyContinuation =
+    options.action === "run" &&
+    options.failedOnly &&
+    options.failedOnlySourcePath !== null &&
+    options.caseSelector === null &&
+    options.caseSelectorFilePath === null;
+  const freshPrivateSelection =
+    options.action === "run" &&
+    !options.failedOnly &&
+    options.failedOnlySourcePath === null &&
+    options.failedOnlyCaseIds === null &&
+    options.caseSelector === null &&
+    options.caseSelectorFilePath !== null;
   if (
     options.action !== "run" ||
-    !options.failedOnly ||
     options.resume ||
-    options.failedOnlySourcePath === null
+    failedOnlyContinuation === freshPrivateSelection
   ) {
     throw new Error("REVIEW_FLOW_EVALUATION_DIRECT_SCORING_SCOPE_INVALID");
   }
@@ -1002,11 +1011,13 @@ function createDirectScoringRuntimeAttestation(
   assertDirectScoringOptions(options);
   const originWorkspaceRoot = resolve(repositoryDirectory, "..");
   const originPrivateRoot = resolve(repositoryDirectory, "private");
-  const source = loadReviewFlowEvaluationCheckpointStateFromPath({
-    checkpointPath: options.failedOnlySourcePath,
-    privateRoot: originPrivateRoot,
-    containingWorkspace: originWorkspaceRoot
-  });
+  const source = options.failedOnlySourcePath === null
+    ? null
+    : loadReviewFlowEvaluationCheckpointStateFromPath({
+        checkpointPath: options.failedOnlySourcePath,
+        privateRoot: originPrivateRoot,
+        containingWorkspace: originWorkspaceRoot
+      });
   const manifest = JSON.parse(
     readFileSync(
       resolve(repositoryDirectory, "config/review-flow-runtime.json"),
@@ -1016,6 +1027,7 @@ function createDirectScoringRuntimeAttestation(
     readonly runnerPath?: unknown;
     readonly codePaths?: unknown;
     readonly productionCodePaths?: unknown;
+    readonly runtime?: unknown;
   };
   if (
     manifest.runnerPath !== "experiments/eval-review-flow.ts" ||
@@ -1039,7 +1051,8 @@ function createDirectScoringRuntimeAttestation(
     bytes: readFileSync(resolve(repositoryDirectory, path))
   }));
   const runner = files.find((file) => file.path === manifest.runnerPath);
-  if (runner === undefined) {
+  const packageLock = files.find((file) => file.path === "package-lock.json");
+  if (runner === undefined || packageLock === undefined) {
     throw new Error("REVIEW_FLOW_EVALUATION_DIRECT_SCORING_IDENTITY_INVALID");
   }
   const productionFiles = files.filter((file) =>
@@ -1054,9 +1067,55 @@ function createDirectScoringRuntimeAttestation(
       hashEvaluationCodeBundle(productionFiles),
     productionDependencyFileCount: productionFiles.length
   };
+  const declaredRuntime = manifest.runtime as {
+    readonly node: {
+      readonly version: string;
+      readonly platform: string;
+      readonly arch: string;
+      readonly sha256: string;
+      readonly byteLength: number;
+    };
+    readonly dependencyBundleSha256: string;
+    readonly dependencyFileCount: number;
+    readonly dependencyByteLength: number;
+    readonly packages: readonly {
+      readonly name: string;
+      readonly version: string;
+      readonly sha256: string;
+      readonly fileCount: number;
+      readonly byteLength: number;
+    }[];
+  };
+  const runtimeIdentity = source?.identity.runtime ??
+    reviewFlowRuntimeIdentitySchema.parse({
+      nodeVersion: declaredRuntime.node.version,
+      platform: declaredRuntime.node.platform,
+      arch: declaredRuntime.node.arch,
+      packageLockSha256: sha256(packageLock.bytes),
+      nodeExecutableSha256: declaredRuntime.node.sha256,
+      nodeExecutableByteLength: declaredRuntime.node.byteLength,
+      dependencyBundleSha256: declaredRuntime.dependencyBundleSha256,
+      dependencyFileCount: declaredRuntime.dependencyFileCount,
+      dependencyByteLength: declaredRuntime.dependencyByteLength,
+      snapshotSha256: hashCanonicalValue({
+        codeIdentity,
+        runtime: declaredRuntime
+      }),
+      snapshotFileCount:
+        declaredRuntime.dependencyFileCount + files.length + 1,
+      packages: declaredRuntime.packages.map((package_) => ({
+        name: package_.name,
+        version: package_.version,
+        sha256: package_.sha256,
+        fileCount: package_.fileCount,
+        byteLength: package_.byteLength
+      })),
+      trustModel:
+        "trusted_bootstrap_same_uid_non_adversarial_trusted_host_system_runtime_unbound_v1"
+    });
   return Object.freeze({
     codeIdentity: Object.freeze(codeIdentity),
-    runtimeIdentity: Object.freeze(source.identity.runtime),
+    runtimeIdentity: Object.freeze(runtimeIdentity),
     originRepositoryRoot: repositoryDirectory,
     originWorkspaceRoot,
     originPrivateRoot

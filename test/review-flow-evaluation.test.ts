@@ -3626,10 +3626,8 @@ describe("adapter、CLI 与窄环境", () => {
       "--partition=development",
       "--label=direct-five",
       "--variant=baseline",
-      "--max-case-attempts=1",
-      "--failed-only",
-      "--failed-only-source=/private/source.checkpoint.private.json",
-      "--failed-only-case-ids=case-0001"
+      "--case-selector-file=/private/selectors/five.private.json",
+      "--max-case-attempts=1"
     ];
     const dependencies = {
       directScoringRuntimeAttestation: {
@@ -3648,6 +3646,18 @@ describe("adapter、CLI 与窄环境", () => {
       dependencies
     })).rejects.toThrow("REVIEW_FLOW_EVALUATION_SAFE_LAUNCH_REQUIRED");
     expect(runPrediction).not.toHaveBeenCalled();
+    await expect(runReviewFlowEvaluationCli({
+      argv: [
+        "--direct-scoring",
+        ...arguments_,
+        "--failed-only",
+        "--failed-only-source=/private/source.checkpoint.private.json"
+      ],
+      env: environment,
+      dependencies
+    })).rejects.toThrow("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+    expect(runPrediction).not.toHaveBeenCalled();
+
 
     await expect(runReviewFlowEvaluationCli({
       argv: ["--direct-scoring", ...arguments_],
@@ -3657,8 +3667,9 @@ describe("adapter、CLI 与窄环境", () => {
     expect(runPrediction).toHaveBeenCalledOnce();
     expect(runPrediction).toHaveBeenCalledWith(expect.objectContaining({
       options: expect.objectContaining({
-        failedOnly: true,
+        failedOnly: false,
         resume: false,
+        caseSelectorFilePath: "/private/selectors/five.private.json",
         maxCaseAttempts: 1
       })
     }));
