@@ -3599,6 +3599,62 @@ describe("adapter、CLI 与窄环境", () => {
       }
     })).rejects.toThrow();
   });
+  it("direct-scoring 显式绕过 attestation，默认仍关闭且不触发 provider", async () => {
+    const runPrediction = vi.fn(async () => {});
+    const environment = {
+      AETHER_BASE_URL: "https://aether.test/v1",
+      AETHER_API_KEY: "test-aether-key",
+      DASHSCOPE_BASE_URL: "https://dashscope.test/v1",
+      DASHSCOPE_API_KEY: "test-dashscope-key",
+      EVAL_CODE_VERSION: "3".repeat(40),
+      EVAL_CONCURRENCY: "5"
+    };
+    const arguments_ = [
+      "--manifest=/private/manifest.json",
+      "--reveal-descriptor=/private/reveal/development.private.json",
+      "--dataset-private-root=/private",
+      "--private-dir=/private/runs",
+      "--partition=development",
+      "--label=direct-five",
+      "--variant=baseline",
+      "--max-case-attempts=1",
+      "--failed-only",
+      "--failed-only-source=/private/source.checkpoint.private.json",
+      "--failed-only-case-ids=case-0001"
+    ];
+    const dependencies = {
+      directScoringRuntimeAttestation: {
+        codeIdentity: codeIdentityFixture(),
+        runtimeIdentity: runtimeIdentityFixture(),
+        originRepositoryRoot: "/repository",
+        originWorkspaceRoot: "/workspace",
+        originPrivateRoot: "/private"
+      },
+      runPredictionOrDevelopment: runPrediction
+    };
+
+    await expect(runReviewFlowEvaluationCli({
+      argv: arguments_,
+      env: environment,
+      dependencies
+    })).rejects.toThrow("REVIEW_FLOW_EVALUATION_SAFE_LAUNCH_REQUIRED");
+    expect(runPrediction).not.toHaveBeenCalled();
+
+    await expect(runReviewFlowEvaluationCli({
+      argv: ["--direct-scoring", ...arguments_],
+      env: environment,
+      dependencies
+    })).resolves.toBeUndefined();
+    expect(runPrediction).toHaveBeenCalledOnce();
+    expect(runPrediction).toHaveBeenCalledWith(expect.objectContaining({
+      options: expect.objectContaining({
+        failedOnly: true,
+        resume: false,
+        maxCaseAttempts: 1
+      })
+    }));
+  });
+
 });
 
 interface DatasetFixture {

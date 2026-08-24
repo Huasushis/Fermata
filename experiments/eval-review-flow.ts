@@ -6,6 +6,7 @@
  * reveal：两条已封存 holdout 链都完整后，一次性揭盲并同时生成前后报告。
  */
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
@@ -17,7 +18,10 @@ import {
 } from "../scripts/run-with-env.mjs";
 import { hashCanonicalValue } from "../src/review-flow/evidence";
 import { loadDifficultyAnchorsStrict } from "./lib/difficulty-anchors-strict";
-import type { EvaluationCodeIdentity } from "./lib/evaluation-code-identity";
+import {
+  hashEvaluationCodeBundle,
+  type EvaluationCodeIdentity
+} from "./lib/evaluation-code-identity";
 import {
   parseBoundedPositiveInteger,
   parseEvaluationCodeVersion
@@ -353,20 +357,47 @@ export async function runReviewFlowEvaluationCli(input: {
   readonly argv: readonly string[];
   readonly env: NodeJS.ProcessEnv;
   readonly now?: () => Date;
+  readonly dependencies?: {
+    readonly directScoringRuntimeAttestation?: ReviewFlowRuntimeAttestation;
+    readonly runPredictionOrDevelopment?: typeof runPredictionOrDevelopment;
+  };
 }): Promise<void> {
-  assertReviewFlowEvaluationRuntime(input.env);
-  const options = resolveReviewFlowEvaluationCliOptions(input.argv);
+  const directScoringArguments = input.argv.filter(
+    (argument) => argument === "--direct-scoring"
+  );
+  if (directScoringArguments.length > 1) {
+    throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+  }
+  const directScoring = directScoringArguments.length === 1;
+  const argv = directScoring
+    ? input.argv.filter((argument) => argument !== "--direct-scoring")
+    : input.argv;
+  if (directScoring) {
+    assertDirectScoringEnvironment(input.env);
+  } else {
+    assertReviewFlowEvaluationRuntime(input.env);
+  }
+  const options = resolveReviewFlowEvaluationCliOptions(argv);
+  if (directScoring) {
+    assertDirectScoringOptions(options);
+  }
   const codeVersion = parseEvaluationCodeVersion(input.env.EVAL_CODE_VERSION);
-  const runtimeAttestation = loadReviewFlowRuntimeAttestation({
-    environment: input.env,
-    currentRepositoryRoot: repositoryDirectory,
-    currentExecutable: process.execPath
-  });
+  const runtimeAttestation = directScoring
+    ? input.dependencies?.directScoringRuntimeAttestation ??
+      createDirectScoringRuntimeAttestation(options, codeVersion)
+    : loadReviewFlowRuntimeAttestation({
+        environment: input.env,
+        currentRepositoryRoot: repositoryDirectory,
+        currentExecutable: process.execPath
+      });
   const codeIdentity = runtimeAttestation.codeIdentity;
   if (codeIdentity.codeVersion !== codeVersion) {
     throw new Error("REVIEW_FLOW_EVALUATION_CODE_IDENTITY_INVALID");
   }
   if (options.action === "reveal") {
+    if (directScoring) {
+      throw new Error("REVIEW_FLOW_EVALUATION_DIRECT_SCORING_SCOPE_INVALID");
+    }
     await runReveal({
       options,
       codeIdentity,
@@ -374,7 +405,10 @@ export async function runReviewFlowEvaluationCli(input: {
     });
     return;
   }
-  await runPredictionOrDevelopment({
+  await (
+    input.dependencies?.runPredictionOrDevelopment ??
+    runPredictionOrDevelopment
+  )({
     options,
     env: input.env,
     codeIdentity,
@@ -928,6 +962,105 @@ function requireHoldoutDatasetBindings(
     identity: dataset.holdoutIdentity,
     registration: dataset.holdoutRegistration
   };
+}
+
+function assertDirectScoringOptions(
+  options: ReviewFlowEvaluationCliOptions
+): asserts options is ReviewFlowEvaluationRunCliOptions & {
+  readonly failedOnly: true;
+  readonly resume: false;
+  readonly failedOnlySourcePath: string;
+} {
+  if (
+    options.action !== "run" ||
+    !options.failedOnly ||
+    options.resume ||
+    options.failedOnlySourcePath === null
+  ) {
+    throw new Error("REVIEW_FLOW_EVALUATION_DIRECT_SCORING_SCOPE_INVALID");
+  }
+}
+
+function assertDirectScoringEnvironment(env: NodeJS.ProcessEnv): void {
+  const major = Number.parseInt(process.versions.node.split(".")[0] ?? "", 10);
+  if (!Number.isSafeInteger(major) || major < 24) {
+    throw new Error("REVIEW_FLOW_EVALUATION_NODE_VERSION_UNSUPPORTED");
+  }
+  assertSafeNodeEnvironment(env);
+  assertNoUnknownPrefixedEnvironmentKeys(
+    env,
+    allowedReviewFlowEvaluationRunEnvironmentKeys,
+    protectedEvaluationEnvironmentPrefixes
+  );
+  assertNarrowReviewFlowEvaluationEnvironment(env);
+}
+
+function createDirectScoringRuntimeAttestation(
+  options: ReviewFlowEvaluationCliOptions,
+  codeVersion: string
+): ReviewFlowRuntimeAttestation {
+  assertDirectScoringOptions(options);
+  const originWorkspaceRoot = resolve(repositoryDirectory, "..");
+  const originPrivateRoot = resolve(repositoryDirectory, "private");
+  const source = loadReviewFlowEvaluationCheckpointStateFromPath({
+    checkpointPath: options.failedOnlySourcePath,
+    privateRoot: originPrivateRoot,
+    containingWorkspace: originWorkspaceRoot
+  });
+  const manifest = JSON.parse(
+    readFileSync(
+      resolve(repositoryDirectory, "config/review-flow-runtime.json"),
+      "utf8"
+    )
+  ) as {
+    readonly runnerPath?: unknown;
+    readonly codePaths?: unknown;
+    readonly productionCodePaths?: unknown;
+  };
+  if (
+    manifest.runnerPath !== "experiments/eval-review-flow.ts" ||
+    !Array.isArray(manifest.codePaths) ||
+    !Array.isArray(manifest.productionCodePaths) ||
+    manifest.codePaths.length === 0 ||
+    manifest.productionCodePaths.length === 0 ||
+    manifest.codePaths.some((path) => typeof path !== "string") ||
+    manifest.productionCodePaths.some((path) => typeof path !== "string") ||
+    !manifest.codePaths.includes(manifest.runnerPath)
+  ) {
+    throw new Error("REVIEW_FLOW_EVALUATION_DIRECT_SCORING_IDENTITY_INVALID");
+  }
+  const codePaths = manifest.codePaths as string[];
+  const productionCodePaths = manifest.productionCodePaths as string[];
+  if (productionCodePaths.some((path) => !codePaths.includes(path))) {
+    throw new Error("REVIEW_FLOW_EVALUATION_DIRECT_SCORING_IDENTITY_INVALID");
+  }
+  const files = codePaths.map((path) => ({
+    path,
+    bytes: readFileSync(resolve(repositoryDirectory, path))
+  }));
+  const runner = files.find((file) => file.path === manifest.runnerPath);
+  if (runner === undefined) {
+    throw new Error("REVIEW_FLOW_EVALUATION_DIRECT_SCORING_IDENTITY_INVALID");
+  }
+  const productionFiles = files.filter((file) =>
+    productionCodePaths.includes(file.path)
+  );
+  const codeIdentity: EvaluationCodeIdentity = {
+    codeVersion,
+    runnerSha256: sha256(runner.bytes),
+    dependencyCodeSha256: hashEvaluationCodeBundle(files),
+    dependencyFileCount: files.length,
+    productionDependencyCodeSha256:
+      hashEvaluationCodeBundle(productionFiles),
+    productionDependencyFileCount: productionFiles.length
+  };
+  return Object.freeze({
+    codeIdentity: Object.freeze(codeIdentity),
+    runtimeIdentity: Object.freeze(source.identity.runtime),
+    originRepositoryRoot: repositoryDirectory,
+    originWorkspaceRoot,
+    originPrivateRoot
+  });
 }
 
 function assertReviewFlowEvaluationRuntime(env: NodeJS.ProcessEnv): void {
