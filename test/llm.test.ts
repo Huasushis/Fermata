@@ -1994,6 +1994,114 @@ describe("chatComplete：正常路径", () => {
     ).rejects.toMatchObject({ code: "LLM_RESPONSE_FORMAT_INVALID" });
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+  it("SSE event_shape 首错只重发一次且成功 receipt 记录两次传输", async () => {
+    const bodies: string[] = [];
+    let callCount = 0;
+    const fetchMock = vi.fn(async (
+      _url: string | URL | Request,
+      init?: RequestInit
+    ) => {
+      bodies.push(String(init?.body));
+      callCount += 1;
+      return callCount === 1
+        ? new Response('data: {"unexpected":true}\n\n', {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" }
+          })
+        : new Response(stoppedSsePrefix(), {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" }
+          });
+    });
+
+    const result = await chatCompleteWithReceipt(provider, spec, [], {
+      ...runtime,
+      maxAttempts: 1,
+      fetch: fetchMock
+    });
+
+    expect(result.content).toBe("合成完整答案");
+    expect(result.receipt.transportAttemptCount).toBe(2);
+    expect(result.receipt.eofVerified).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(bodies[0]).toBe(bodies[1]);
+  });
+
+  it("SSE event_shape 两次失败后保持固定拒绝并保留两次尝试计数", async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      'data: {"unexpected":true}\n\n',
+      { status: 200, headers: { "Content-Type": "text/event-stream" } }
+    ));
+    const error = await chatCompleteWithReceipt(provider, spec, [], {
+      ...runtime,
+      maxAttempts: 1,
+      fetch: fetchMock
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "event_shape"
+    });
+    expect(getLlmFailureAudit(error)).toMatchObject({
+      requestCount: 1,
+      transportAttemptCount: 2,
+      providerRequestCount: 2,
+      retryCount: 1,
+      completedResponses: []
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    {
+      name: "event_json",
+      body: "data: {not-json}\n\n",
+      stage: "event_json"
+    },
+    {
+      name: "delta_shape",
+      body: 'data: {"choices":[{"delta":{"content":7},"finish_reason":"stop"}]}\n\n',
+      stage: "delta_shape"
+    },
+    {
+      name: "finish_shape",
+      body: 'data: {"choices":[{"delta":{},"finish_reason":17}]}\n\n',
+      stage: "finish_shape"
+    },
+    {
+      name: "trailing_data",
+      body: [
+        'data: {"choices":[{"delta":{"content":"合成答案"},"finish_reason":"stop"}]}',
+        "",
+        "data: [DONE]",
+        "",
+        'data: {"choices":[]}',
+        "",
+        ""
+      ].join("\n"),
+      stage: "trailing_data"
+    }
+  ] as const)(
+    "SSE $name 不触发 event_shape 专用重试",
+    async ({ body, stage }) => {
+      const fetchMock = vi.fn(async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      }));
+      const error = await chatCompleteWithReceipt(provider, spec, [], {
+        ...runtime,
+        maxAttempts: 1,
+        fetch: fetchMock
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({
+        code: "LLM_RESPONSE_FORMAT_INVALID",
+        formatFailureStage: stage
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+  );
+
 
   it("SSE 事件首错后静默丢弃多个分块，等真实 EOF 才抛固定首错且不取消", async () => {
     const encoder = new TextEncoder();
@@ -2049,7 +2157,7 @@ describe("chatComplete：正常路径", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("SSE 协议首错只审计字段形状与计数，不保存事件正文且不重试", async () => {
+  it("SSE 协议首错只审计字段形状与计数，不保存事件正文，event_shape 仅重试一次", async () => {
     const privateSentinel = "SYNTHETIC_PRIVATE_EVENT_VALUE";
     const body = [
       ": heartbeat",
@@ -2091,7 +2199,7 @@ describe("chatComplete：正常路径", () => {
     });
     const audit = getLlmFailureAudit(caught);
     expect(audit).toMatchObject({
-      transportAttemptCount: 1,
+      transportAttemptCount: 2,
       terminal: {
         status: 200,
         responseMode: "sse",
@@ -2123,7 +2231,7 @@ describe("chatComplete：正常路径", () => {
       /^[a-f0-9]{64}$/u
     );
     expect(JSON.stringify(audit)).not.toContain(privateSentinel);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("SSE 成功流只按封闭形状聚合事件，不保存任何字段值", async () => {
@@ -2367,7 +2475,7 @@ describe("chatComplete：正常路径", () => {
       }
     }
   ] as const)(
-    "SSE 封闭形状审计覆盖$name，永久失败且零重试",
+    "SSE 封闭形状审计覆盖$name，永久失败且仅对 event_shape 重试一次",
     async ({
       body,
       expectedCode,
@@ -2406,8 +2514,14 @@ describe("chatComplete：正常路径", () => {
           audit.stream.firstRejectedEvent.structure.finishReasonUnknownStringHash
         ).toMatch(/^[a-f0-9]{64}$/u);
       }
+      const expectedAttempts =
+        expectedShape === "delta_field_type" ||
+        expectedShape === "finish_reason_type_or_unknown" ||
+        expectedShape === "json_invalid"
+          ? 1
+          : 2;
+      expect(fetchMock).toHaveBeenCalledTimes(expectedAttempts);
       expect(JSON.stringify(audit)).not.toContain(privateSentinel);
-      expect(fetchMock).toHaveBeenCalledTimes(1);
     }
   );
 

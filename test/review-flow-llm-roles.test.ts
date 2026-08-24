@@ -858,7 +858,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
       .toEqual(allowedEvidenceIds);
   });
 
-  it("11 个正式角色逐一调用各自模型槽位并完成严格 HTTP receipt", async () => {
+  it("11 个正式角色逐一调用各自模型槽位，并仅对四个事件形状角色重试一次", async () => {
     const uniqueModels = Object.fromEntries(
       reviewFlowRoleSchema.options.map((role) => [role, `wire-model-${role}`])
     ) as Record<ReviewFlowRole, string>;
@@ -866,6 +866,14 @@ describe("历史人工标准驱动的多角色提示词", () => {
       reviewFlowRoleSchema.options.map((role) => [uniqueModels[role], role] as const)
     );
     const observedRequests: { readonly role: ReviewFlowRole; readonly model: string }[] = [];
+    const eventShapeRetryRole: Partial<Record<ReviewFlowRole, true>> = {
+      solver: true,
+      editorial_judge: true,
+      adversary: true,
+      adjudicator: true
+    };
+    const roleTransportCounts = new Map<ReviewFlowRole, number>();
+    let adjudicatorEvidenceId: string | undefined;
     const fetchImpl = vi.fn(async (
       _url: string | URL | Request,
       init?: RequestInit
@@ -875,9 +883,25 @@ describe("历史人工标准驱动的多角色提示词", () => {
       const role = roleByModel.get(body.model);
       if (role === undefined) throw new Error("wire_model_unexpected");
       observedRequests.push({ role, model: body.model });
+      const transportCount = (roleTransportCounts.get(role) ?? 0) + 1;
+      roleTransportCounts.set(role, transportCount);
+      if (eventShapeRetryRole[role] === true && transportCount === 1) {
+        return new Response('data: {"unexpected":true}\n\n', {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" }
+        });
+      }
+      const payload =
+        role === "adjudicator" && adjudicatorEvidenceId !== undefined
+          ? Object.assign(
+              {},
+              wireRolePayloads.adjudicator as Record<string, unknown>,
+              { citedEvidenceIds: [adjudicatorEvidenceId] }
+            )
+          : wireRolePayloads[role];
       return new Response(JSON.stringify({
         choices: [{
-          message: { content: JSON.stringify(wireRolePayloads[role]) },
+          message: { content: JSON.stringify(payload) },
           finish_reason: "stop"
         }]
       }), { status: 200, headers: { "Content-Type": "application/json" } });
@@ -947,6 +971,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
       wireRolePayloads.adversary
     );
     const adjudicatorView = buildAdjudicatorView(criticView, critic, adversary);
+    adjudicatorEvidenceId = adjudicatorView.evidence[0]?.evidenceId;
     const invocations: Readonly<Record<ReviewFlowRole, () => Promise<unknown>>> = {
       solver: () => bundle.roles.solver(views.statement),
       solution_analyst: () => bundle.roles.solutionAnalyst(views.solutionAnalyst),
@@ -967,21 +992,23 @@ describe("历史人工标准驱动的多角色提示词", () => {
       const requestIndex = observedRequests.length;
       const expectedRequests =
         role === "solver" ? 3 : role === "tags" || role === "contest_fit" || role === "originality" ? 2 : 1;
+      const eventShapeRetry = eventShapeRetryRole[role] === true;
+      const expectedFetches = expectedRequests + (eventShapeRetry ? 1 : 0);
       const result = trustedRoleExecutionResultSchema.parse(await invocations[role]());
-      expect(observedRequests).toHaveLength(requestIndex + expectedRequests);
-      for (let i = 0; i < expectedRequests; i++) {
+      expect(observedRequests).toHaveLength(requestIndex + expectedFetches);
+      for (let i = 0; i < expectedFetches; i++) {
         expect(observedRequests[requestIndex + i]).toEqual({ role, model: uniqueModels[role] });
       }
       if (role === "solver") {
         expect(result.receipt).toEqual({
           schemaVersion: 2,
           requestCount: 3,
-          transportAttemptCount: 3,
+          transportAttemptCount: 4,
           eofVerified: true,
           jsonSchemaValidated: true,
           responses: [{
             schemaVersion: 2,
-            transportAttemptCount: 1,
+            transportAttemptCount: 2,
             eofVerified: true,
             responseMode: "json",
             finishReasonStopVerified: true,
@@ -1031,15 +1058,16 @@ describe("历史人工标准驱动的多角色提示词", () => {
           }]
         });
       } else {
+        const transportAttemptCount = eventShapeRetry ? 2 : 1;
         expect(result.receipt).toEqual({
           schemaVersion: 2,
           requestCount: 1,
-          transportAttemptCount: 1,
+          transportAttemptCount,
           eofVerified: true,
           jsonSchemaValidated: true,
           responses: [{
             schemaVersion: 2,
-            transportAttemptCount: 1,
+            transportAttemptCount,
             eofVerified: true,
             responseMode: "json",
             finishReasonStopVerified: true,
@@ -1051,7 +1079,7 @@ describe("历史人工标准驱动的多角色提示词", () => {
       completedRoles.push(role);
     }
 
-    expect(fetchImpl).toHaveBeenCalledTimes(reviewFlowRoleSchema.options.length + 5);
+    expect(fetchImpl).toHaveBeenCalledTimes(reviewFlowRoleSchema.options.length + 5 + 4);
     expect(completedRoles).toEqual(reviewFlowRoleSchema.options);
     expect(new Set(observedRequests.map((request) => request.role))).toEqual(
       new Set(reviewFlowRoleSchema.options)

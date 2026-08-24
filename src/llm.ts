@@ -2661,6 +2661,7 @@ async function requestWithRetry(
   const durations = resolveLlmRequestDurations(runtime);
   let attempt = 1;
   let retryAfterMs: number | null = null;
+  let eventShapeRetryUsed = false;
   for (;;) {
     resetMutableLlmRequestAuditForAttempt(audit);
     assertLlmRequestMayStart();
@@ -2785,6 +2786,16 @@ async function requestWithRetry(
             watchdog.formatFailureStage(),
             watchdog.formatFailureSubstage()
           );
+        }
+        if (
+          error instanceof LlmResponseFormatError &&
+          error.formatFailureStage === "event_shape" &&
+          !eventShapeRetryUsed
+        ) {
+          // event_shape is the sole bounded role-request replay exception.
+          // Keep every other protocol/schema/content/error category fail closed.
+          eventShapeRetryUsed = true;
+          return null;
         }
         if (
           error instanceof LlmRetainedTextTooLargeError ||
