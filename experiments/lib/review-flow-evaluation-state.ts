@@ -21,7 +21,7 @@ import {
   writeFileSync,
   writeSync
 } from "node:fs";
-import { isAbsolute } from "node:path";
+import { basename, dirname, isAbsolute } from "node:path";
 import { z } from "zod";
 import {
   anchoredPrivatePath,
@@ -574,6 +574,24 @@ const executionSealSchema = z
     completionFingerprint: digestSchema
   })
   .strict();
+const failedOnlyContinuationSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    mode: z.literal("failed-only"),
+    sourceLabel: reviewFlowEvaluationLabelSchema,
+    sourceRunId: z.string().uuid(),
+    sourceIdentityFingerprint: digestSchema,
+    sourceStateFingerprint: digestSchema,
+    sourceExecutionCompletionFingerprint: digestSchema,
+    sourceFailedCaseIds: z.array(reviewFlowEvaluationSafeIdSchema).min(1).max(1_000),
+    selectedFailedCaseIds: z.array(reviewFlowEvaluationSafeIdSchema).min(1).max(1_000),
+    caseAttempts: z.literal(1)
+  })
+  .strict();
+export type ReviewFlowEvaluationFailedOnlyContinuation = z.infer<
+  typeof failedOnlyContinuationSchema
+>;
+
 
 export const reviewFlowEvaluationPublicationBindingSchema = z
   .object({
@@ -607,6 +625,7 @@ export const reviewFlowEvaluationCheckpointSchema = z
     termination: terminationSchema.nullable(),
     executionSeal: executionSealSchema.nullable(),
     publication: reviewFlowEvaluationPublicationBindingSchema.nullable(),
+    failedOnlyContinuation: failedOnlyContinuationSchema.optional(),
     representative3Timing:
       reviewFlowEvaluationRepresentative3TimingSchema.optional(),
     revision: z.number().int().positive(),
@@ -751,6 +770,26 @@ export const reviewFlowEvaluationCheckpointSchema = z
         message: "发布确认必须绑定已封存执行终态。"
       });
     }
+    const failedOnly = state.failedOnlyContinuation;
+    if (failedOnly !== undefined) {
+      const expectedIds = new Set(state.expectedCases.map((entry) => entry.safeId));
+      const sourceIds = new Set(failedOnly.sourceFailedCaseIds);
+      const selectedIds = new Set(failedOnly.selectedFailedCaseIds);
+      if (
+        state.identity.configurationSummary.caseAttempts !== 1 ||
+        sourceIds.size !== failedOnly.sourceFailedCaseIds.length ||
+        selectedIds.size !== failedOnly.selectedFailedCaseIds.length ||
+        failedOnly.selectedFailedCaseIds.some((safeId) => !sourceIds.has(safeId)) ||
+        failedOnly.sourceFailedCaseIds.some((safeId) => !expectedIds.has(safeId))
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["failedOnlyContinuation"],
+          message: "failed-only continuation binding is invalid."
+        });
+      }
+    }
+
   });
 export type ReviewFlowEvaluationCheckpointState = z.infer<
   typeof reviewFlowEvaluationCheckpointSchema
@@ -818,6 +857,82 @@ export function loadReviewFlowEvaluationCheckpointForReveal(input: {
     closePrivateDirectory(directory);
   }
 }
+export function loadReviewFlowEvaluationCheckpointStateFromPath(input: {
+  readonly checkpointPath: string;
+  readonly privateRoot?: string;
+  readonly containingWorkspace?: string;
+}): ReviewFlowEvaluationCheckpointState {
+  if (!isAbsolute(input.checkpointPath)) {
+    throw new ReviewFlowEvaluationCheckpointError(
+      "REVIEW_FLOW_EVALUATION_PRIVATE_DIRECTORY_INVALID"
+    );
+  }
+  const directoryPath = dirname(input.checkpointPath);
+  const fileName = basename(input.checkpointPath);
+  if (fileName.length === 0 || fileName === "." || fileName === "..") {
+    throw new ReviewFlowEvaluationCheckpointError(
+      "REVIEW_FLOW_EVALUATION_CHECKPOINT_INVALID"
+    );
+  }
+  const directory = openExistingPrivateDirectory(directoryPath, {
+    privateRoot: input.privateRoot ?? projectPrivateRoot,
+    containingWorkspace: input.containingWorkspace ?? workspaceRoot
+  });
+  try {
+    return reviewFlowEvaluationCheckpointSchema.parse(
+      JSON.parse(
+        readPrivateArtifactBytes(directory, fileName, 128 * 1024 * 1024)
+          .toString("utf8")
+      ) as unknown
+    );
+  } catch {
+    throw new ReviewFlowEvaluationCheckpointError(
+      "REVIEW_FLOW_EVALUATION_CHECKPOINT_INVALID"
+    );
+  } finally {
+    closePrivateDirectory(directory);
+  }
+}
+
+function failedOnlyIdentityProjection(
+  identity: ReviewFlowEvaluationIdentity
+): unknown {
+  return {
+    ...identity,
+    codeIdentity: null,
+    configurationFingerprint: null,
+    configurationSummary: {
+      ...identity.configurationSummary,
+      caseAttempts: 1
+    }
+  };
+}
+
+export function assertFailedOnlyContinuationIdentityCompatible(
+  source: ReviewFlowEvaluationIdentity,
+  continuation: ReviewFlowEvaluationIdentity
+): void {
+  if (
+    continuation.configurationSummary.caseAttempts !== 1 ||
+    source.codeIdentity.productionDependencyCodeSha256 !==
+      continuation.codeIdentity.productionDependencyCodeSha256 ||
+    source.codeIdentity.productionDependencyFileCount !==
+      continuation.codeIdentity.productionDependencyFileCount ||
+    source.configurationSummary.caseAttempts < 1 ||
+    (
+      source.configurationSummary.caseAttempts ===
+        continuation.configurationSummary.caseAttempts &&
+      source.configurationFingerprint !== continuation.configurationFingerprint
+    ) ||
+    hashCanonicalValue(failedOnlyIdentityProjection(source)) !==
+      hashCanonicalValue(failedOnlyIdentityProjection(continuation))
+  ) {
+    throw new ReviewFlowEvaluationCheckpointError(
+      "REVIEW_FLOW_EVALUATION_FAILED_ONLY_IDENTITY_MISMATCH"
+    );
+  }
+}
+
 
 export class ReviewFlowEvaluationCheckpointError extends Error {
   public readonly code: string;
@@ -828,6 +943,106 @@ export class ReviewFlowEvaluationCheckpointError extends Error {
     this.code = code;
   }
 }
+function buildFailedOnlyContinuationState(input: {
+  readonly label: string;
+  readonly variant: "baseline" | "candidate";
+  readonly baselineLabel: string | null;
+  readonly baselineBinding: ReviewFlowEvaluationBaselineBinding | null;
+  readonly runId: string;
+  readonly identity: ReviewFlowEvaluationIdentity;
+  readonly holdoutIdentity: string | null;
+  readonly thresholdPolicySha256: string | null;
+  readonly expectedCases: readonly ReviewFlowEvaluationExpectedCase[];
+  readonly source: ReviewFlowEvaluationCheckpointState;
+  readonly selectedFailedCaseIds: readonly string[] | undefined;
+  readonly now: string;
+}): ReviewFlowEvaluationCheckpointState {
+  const source = input.source;
+  if (
+    source.executionSeal === null ||
+    source.executionSeal.complete ||
+    source.auditLedger === null ||
+    source.entries.some((entry) => entry.status === "active" || entry.status === "pending") ||
+    hashCanonicalValue(source.expectedCases) !==
+      hashCanonicalValue(input.expectedCases) ||
+    source.entries.length !== input.expectedCases.length
+  ) {
+    throw new ReviewFlowEvaluationCheckpointError(
+      "REVIEW_FLOW_EVALUATION_FAILED_ONLY_SOURCE_INVALID"
+    );
+  }
+  assertFailedOnlyContinuationIdentityCompatible(
+    source.identity,
+    input.identity
+  );
+  const sourceFailedCaseIds = source.entries.flatMap((entry) =>
+    entry.status === "failed" ? [entry.safeId] : []
+  );
+  if (sourceFailedCaseIds.length === 0) {
+    throw new ReviewFlowEvaluationCheckpointError(
+      "REVIEW_FLOW_EVALUATION_FAILED_ONLY_SOURCE_EMPTY"
+    );
+  }
+  const selectedFailedCaseIds = input.selectedFailedCaseIds === undefined
+    ? sourceFailedCaseIds
+    : [...input.selectedFailedCaseIds];
+  const expectedIds = new Set(input.expectedCases.map((entry) => entry.safeId));
+  const sourceFailedIds = new Set(sourceFailedCaseIds);
+  const selectedIds = new Set(selectedFailedCaseIds);
+  if (
+    selectedFailedCaseIds.length === 0 ||
+    selectedIds.size !== selectedFailedCaseIds.length ||
+    selectedFailedCaseIds.some(
+      (safeId) => !expectedIds.has(safeId) || !sourceFailedIds.has(safeId)
+    )
+  ) {
+    throw new ReviewFlowEvaluationCheckpointError(
+      "REVIEW_FLOW_EVALUATION_FAILED_ONLY_SELECTION_INVALID"
+    );
+  }
+  const selected = new Set(selectedFailedCaseIds);
+  const now = input.now;
+  return reviewFlowEvaluationCheckpointSchema.parse({
+    schemaVersion: 2,
+    label: input.label,
+    variant: input.variant,
+    baselineLabel: input.baselineLabel,
+    baselineBinding: input.baselineBinding,
+    runId: input.runId,
+    identity: input.identity,
+    identityFingerprint: hashCanonicalValue(input.identity),
+    holdoutIdentity: input.holdoutIdentity,
+    thresholdPolicySha256: input.thresholdPolicySha256,
+    expectedCases: input.expectedCases,
+    entries: source.entries.map((entry) =>
+      entry.status === "failed" && selected.has(entry.safeId)
+        ? { safeId: entry.safeId, status: "pending" as const }
+        : entry
+    ),
+    auditLedger: source.auditLedger,
+    globalClaimSha256: null,
+    termination: null,
+    executionSeal: null,
+    publication: null,
+    failedOnlyContinuation: {
+      schemaVersion: 1,
+      mode: "failed-only",
+      sourceLabel: source.label,
+      sourceRunId: source.runId,
+      sourceIdentityFingerprint: source.identityFingerprint,
+      sourceStateFingerprint: hashCanonicalValue(source),
+      sourceExecutionCompletionFingerprint:
+        source.executionSeal.completionFingerprint,
+      sourceFailedCaseIds,
+      selectedFailedCaseIds,
+      caseAttempts: 1
+    },
+    revision: 1,
+    createdAt: now,
+    updatedAt: now
+  });
+}
+
 
 export class ReviewFlowEvaluationCheckpoint {
   readonly #directory: PrivateDirectoryHandle;
@@ -844,6 +1059,8 @@ export class ReviewFlowEvaluationCheckpoint {
     readonly label: string;
     readonly variant: "baseline" | "candidate";
     readonly baselineLabel: string | null;
+    readonly failedOnlySource?: ReviewFlowEvaluationCheckpointState;
+    readonly failedOnlyCaseIds?: readonly string[];
     readonly baselineBinding: ReviewFlowEvaluationBaselineBinding | null;
     readonly identity: ReviewFlowEvaluationIdentity;
     readonly holdoutIdentity?: string | null;
@@ -867,6 +1084,12 @@ export class ReviewFlowEvaluationCheckpoint {
       .min(1)
       .max(1_000)
       .parse(options.expectedCases);
+    if (options.failedOnlySource !== undefined && options.resume) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_FAILED_ONLY_ARGUMENT_INVALID"
+      );
+    }
+
     if (identity.caseSelection !== undefined) {
       if (options.resume) {
         throw new ReviewFlowEvaluationCheckpointError(
@@ -930,37 +1153,53 @@ export class ReviewFlowEvaluationCheckpoint {
       }
 
       const now = this.#now().toISOString();
-      this.#state = reviewFlowEvaluationCheckpointSchema.parse({
-        schemaVersion: 2,
-        label,
-        variant: options.variant,
-        baselineLabel: options.baselineLabel,
-        baselineBinding: options.baselineBinding,
-        runId: (options.randomId ?? randomUUID)(),
-        identity,
-        identityFingerprint: hashCanonicalValue(identity),
-        holdoutIdentity,
-        thresholdPolicySha256,
-        expectedCases,
-        entries: expectedCases.map((entry) => ({
-          safeId: entry.safeId,
-          status: "pending" as const
-        })),
-        auditLedger: {
-          schemaVersion: 1,
-          cases: expectedCases.map((_, index) => ({
-            caseOrdinal: index + 1,
-            attempts: []
-          }))
-        },
-        globalClaimSha256: null,
-        termination: null,
-        executionSeal: null,
-        publication: null,
-        revision: 1,
-        createdAt: now,
-        updatedAt: now
-      });
+      const runId = (options.randomId ?? randomUUID)();
+      this.#state = options.failedOnlySource === undefined
+        ? reviewFlowEvaluationCheckpointSchema.parse({
+            schemaVersion: 2,
+            label,
+            variant: options.variant,
+            baselineLabel: options.baselineLabel,
+            baselineBinding: options.baselineBinding,
+            runId,
+            identity,
+            identityFingerprint: hashCanonicalValue(identity),
+            holdoutIdentity,
+            thresholdPolicySha256,
+            expectedCases,
+            entries: expectedCases.map((entry) => ({
+              safeId: entry.safeId,
+              status: "pending" as const
+            })),
+            auditLedger: {
+              schemaVersion: 1,
+              cases: expectedCases.map((_, index) => ({
+                caseOrdinal: index + 1,
+                attempts: []
+              }))
+            },
+            globalClaimSha256: null,
+            termination: null,
+            executionSeal: null,
+            publication: null,
+            revision: 1,
+            createdAt: now,
+            updatedAt: now
+          })
+        : buildFailedOnlyContinuationState({
+            label,
+            variant: options.variant,
+            baselineLabel: options.baselineLabel,
+            baselineBinding: options.baselineBinding,
+            runId,
+            identity,
+            holdoutIdentity,
+            thresholdPolicySha256,
+            expectedCases,
+            source: options.failedOnlySource,
+            selectedFailedCaseIds: options.failedOnlyCaseIds,
+            now
+          });
       this.persist();
     } catch (error) {
       this.releaseResources();
@@ -988,9 +1227,16 @@ export class ReviewFlowEvaluationCheckpoint {
     this.assertOpen();
     const parsed = digestSchema.parse(claimSha256);
     if (this.#state.globalClaimSha256 === parsed) return;
+    const failedOnlyOpen =
+      this.#state.failedOnlyContinuation !== undefined &&
+      this.#state.executionSeal === null &&
+      !this.#state.entries.some((entry) => entry.status === "active");
     if (
       this.#state.globalClaimSha256 !== null ||
-      this.#state.entries.some((entry) => entry.status !== "pending") ||
+      (
+        this.#state.entries.some((entry) => entry.status !== "pending") &&
+        !failedOnlyOpen
+      ) ||
       this.#state.executionSeal !== null
     ) {
       throw new ReviewFlowEvaluationCheckpointError(
@@ -1005,6 +1251,67 @@ export class ReviewFlowEvaluationCheckpoint {
       entry.status === "pending" ? [entry.safeId] : []
     );
   }
+
+  public failedOnlyContinuationOpen(): boolean {
+    return this.#state.failedOnlyContinuation !== undefined &&
+      this.#state.executionSeal === null &&
+      this.#state.publication === null &&
+      !this.#state.entries.some((entry) => entry.status === "active");
+  }
+
+  public prepareFailedOnlySelection(
+    safeIds?: readonly string[]
+  ): void {
+    this.assertOpen();
+    if (!this.failedOnlyContinuationOpen()) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_FAILED_ONLY_NOT_RESUMABLE"
+      );
+    }
+    const failedIds = this.#state.entries.flatMap((entry) =>
+      entry.status === "failed" ? [entry.safeId] : []
+    );
+    const selectedIds = safeIds === undefined ? failedIds : [...safeIds];
+    const failedIdSet = new Set(failedIds);
+    const selectedIdSet = new Set(selectedIds);
+    if (
+      selectedIds.length === 0 ||
+      selectedIdSet.size !== selectedIds.length ||
+      selectedIds.some((safeId) => !failedIdSet.has(safeId))
+    ) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_FAILED_ONLY_SELECTION_INVALID"
+      );
+    }
+    this.update({
+      entries: this.#state.entries.map((entry) =>
+        entry.status === "failed" && selectedIdSet.has(entry.safeId)
+          ? { safeId: entry.safeId, status: "pending" as const }
+          : entry
+      ),
+      termination: null
+    });
+  }
+
+  public hasFailedEntries(): boolean {
+    return this.#state.entries.some((entry) => entry.status === "failed");
+  }
+
+  public existingCaseAttemptCount(safeId: string): number {
+    const caseIndex = this.#state.entries.findIndex(
+      (entry) => entry.safeId === safeId
+    );
+    const ledger = caseIndex < 0 || this.#state.auditLedger === null
+      ? undefined
+      : this.#state.auditLedger.cases[caseIndex];
+    if (ledger === undefined) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_AUDIT_LEDGER_UNAVAILABLE"
+      );
+    }
+    return ledger.attempts.length;
+  }
+
 
   public terminallyContaminated(): boolean {
     return this.#state.termination !== null || this.#state.entries.some(

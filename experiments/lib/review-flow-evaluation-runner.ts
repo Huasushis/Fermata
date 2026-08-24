@@ -188,6 +188,7 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
   readonly startGate?: ReviewFlowEvaluationStartGate;
   readonly maxCaseAttempts?: number;
   readonly monotonicNow?: () => number;
+  readonly failedOnly?: boolean;
 }): Promise<ReviewFlowEvaluationCheckpointState> {
   if (
     !Number.isSafeInteger(input.concurrency) ||
@@ -216,8 +217,15 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
     throw new Error("REVIEW_FLOW_EVALUATION_CASE_SET_MISMATCH");
   }
 
-  // active/failed 是不可恢复终态。resume 只对账，不为 pending 再花钱。
-  if (input.checkpoint.terminallyContaminated()) {
+  if (input.failedOnly === true) {
+    if (!input.checkpoint.failedOnlyContinuationOpen()) {
+      if (input.checkpoint.terminallyContaminated()) {
+        return input.checkpoint.sealExecution();
+      }
+      throw new Error("REVIEW_FLOW_EVALUATION_FAILED_ONLY_NOT_RESUMABLE");
+    }
+  } else if (input.checkpoint.terminallyContaminated()) {
+    // active/failed 是不可恢复终态。resume 只对账，不为 pending 再花钱。
     return input.checkpoint.sealExecution();
   }
 
@@ -308,6 +316,8 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
           let latestIncomplete: ReviewFlowEvaluationFailure | null = null;
           let latestThrown = false;
           let finalized = false;
+          const existingAttemptCount =
+            input.checkpoint.existingCaseAttemptCount(safeId);
           while (!finalized && !localFatal) {
             if (!startGate.canStart() || caseAttempts >= maxCaseAttempts) {
               if (latestIncomplete !== null || latestThrown) {
@@ -343,7 +353,7 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
               try {
                 input.checkpoint.recordUnknownCaseAttempt(
                   safeId,
-                  caseAttempts,
+                  existingAttemptCount + caseAttempts,
                   "REVIEW_FLOW_EVALUATION_EXECUTION_THROWN"
                 );
               } catch {
@@ -362,7 +372,7 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
                 if (outcome.failure.roleAttempts === undefined) {
                   input.checkpoint.recordUnknownCaseAttempt(
                     safeId,
-                    caseAttempts,
+                    existingAttemptCount + caseAttempts,
                     "REVIEW_FLOW_EVALUATION_EXECUTION_THROWN"
                   );
                 } else {
@@ -371,7 +381,7 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
                   );
                   input.checkpoint.recordCaseAttempt(safeId, {
                     schemaVersion: 1,
-                    attempt: caseAttempts,
+                    attempt: existingAttemptCount + caseAttempts,
                     outcome: "failed",
                     accountingComplete: true,
                     errorCategory: outcome.failure.failureKind,
@@ -408,7 +418,7 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
                 if (outcome.roleAttempts !== undefined) {
                   input.checkpoint.recordCaseAttempt(safeId, {
                     schemaVersion: 1,
-                    attempt: caseAttempts,
+                    attempt: existingAttemptCount + caseAttempts,
                     outcome: "failed",
                     accountingComplete: true,
                     errorCategory: null,
@@ -430,7 +440,7 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
               if (outcome.roleAttempts !== undefined) {
                 input.checkpoint.recordCaseAttempt(safeId, {
                   schemaVersion: 1,
-                  attempt: caseAttempts,
+                  attempt: existingAttemptCount + caseAttempts,
                   outcome: "completed",
                   accountingComplete: true,
                   errorCategory: null,
@@ -501,6 +511,16 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
     }
   } else {
     await runBatch(pending, input.concurrency, false);
+  }
+  const finished = input.checkpoint.snapshot();
+  if (
+    input.failedOnly === true &&
+    (
+      finished.termination !== null ||
+      finished.entries.some((entry) => entry.status !== "completed")
+    )
+  ) {
+    return finished;
   }
   return input.checkpoint.sealExecution();
 }

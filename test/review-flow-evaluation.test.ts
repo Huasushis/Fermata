@@ -78,6 +78,7 @@ import {
   type ReviewFlowEvaluationTerminationSignal
 } from "../experiments/lib/review-flow-evaluation-runner";
 import {
+  assertFailedOnlyContinuationIdentityCompatible,
   buildExecutionReceiptSeal,
   loadReviewFlowEvaluationCheckpointForReveal,
   ReviewFlowEvaluationCheckpoint,
@@ -1905,6 +1906,169 @@ describe("32 案例 × 11 角色 = 352 收据封存契约", () => {
     expect(checkpoint.terminallyContaminated()).toBe(true);
     checkpoint.close();
   });
+  it("failed-only continuation preserves completed cases and appends one bounded attempt", async () => {
+    const sourceFixture = createStateFixture(32);
+    const source = openCheckpoint(sourceFixture, { bindClaim: true });
+    completeAll(
+      source,
+      sourceFixture.expectedCases
+        .map((entry) => entry.safeId)
+        .filter((safeId) => !["case-0017", "case-0018", "case-0019"].includes(safeId))
+    );
+    source.markActive("case-0017");
+    source.markFailed("case-0017", {
+      ...fixedFailure("REVIEW_FLOW_EVIDENCE_REFERENCE_INVALID", 200),
+      failureKind: "validation" as const
+    });
+    source.markActive("case-0018");
+    source.markFailed("case-0018", {
+      ...fixedFailure("REVIEW_FLOW_PROTOCOL_FAILED", 200),
+      failureKind: "protocol" as const
+    });
+    source.markActive("case-0019");
+    source.markFailed("case-0019", {
+      ...fixedFailure("REVIEW_FLOW_NETWORK_FAILED", null),
+      failureKind: "transport" as const
+    });
+    const sourceState = source.sealExecution();
+    const sourceBytes = readFileSync(
+      join(
+        sourceFixture.outputDirectory,
+        `review-flow-${sourceFixture.label}.checkpoint.private.json`
+      )
+    );
+    source.close();
+
+    const continuationFixture = createStateFixtureIn(
+      sourceFixture,
+      32,
+      "failed-only-continuation",
+      "failed-only-continuation"
+    );
+    const continuationIdentity: ReviewFlowEvaluationIdentity = {
+      ...continuationFixture.identity,
+      codeIdentity: {
+        ...continuationFixture.identity.codeIdentity,
+        codeVersion: "4".repeat(40)
+      }
+    };
+    expect(() =>
+      assertFailedOnlyContinuationIdentityCompatible(sourceState.identity, {
+        ...continuationIdentity,
+        datasetFingerprint: "f".repeat(64)
+      })
+    ).toThrow("REVIEW_FLOW_EVALUATION_FAILED_ONLY_IDENTITY_MISMATCH");
+    const continuation = new ReviewFlowEvaluationCheckpoint({
+      privateDirectory: continuationFixture.outputDirectory,
+      label: continuationFixture.label,
+      variant: "baseline",
+      baselineLabel: null,
+      baselineBinding: null,
+      identity: continuationIdentity,
+      expectedCases: continuationFixture.expectedCases,
+      resume: false,
+      privateRoot: continuationFixture.privateRoot,
+      containingWorkspace: continuationFixture.workspace,
+      now: fixedNow,
+      randomId: () => runIdFor(continuationFixture.label),
+      failedOnlySource: sourceState,
+      failedOnlyCaseIds: ["case-0017"]
+    } as never);
+    continuation.bindGlobalClaim("a".repeat(64));
+
+    const imported = continuation.snapshot();
+    expect(imported.entries.filter((entry) => entry.status === "completed")).toHaveLength(29);
+    expect(imported.entries.filter((entry) => entry.status === "pending")).toHaveLength(1);
+    expect(imported.entries.filter((entry) => entry.status === "failed")).toHaveLength(2);
+    expect(imported.entries[0]).toEqual(sourceState.entries[0]);
+    expect(imported.entries[31]).toEqual(sourceState.entries[31]);
+    expect(
+      imported.auditLedger?.cases.every((entry) => entry.attempts.length === 1)
+    ).toBe(true);
+    expect(
+      readFileSync(
+        join(
+          sourceFixture.outputDirectory,
+          `review-flow-${sourceFixture.label}.checkpoint.private.json`
+        )
+      )
+    ).toEqual(sourceBytes);
+
+    const firstContinuation = await runReviewFlowEvaluationCases({
+      checkpoint: continuation,
+      cases: preparedStateCases(continuationFixture),
+      executor: {
+        execute: async () => ({
+          status: "complete" as const,
+          projection: projection("approve")
+        })
+      },
+      concurrency: 1,
+      maxCaseAttempts: 1,
+      failedOnly: true
+    } as never);
+    expect(firstContinuation.entries.filter((entry) => entry.status === "completed")).toHaveLength(30);
+    expect(firstContinuation.entries.filter((entry) => entry.status === "failed")).toHaveLength(2);
+    expect(firstContinuation.executionSeal).toBeNull();
+    expect(firstContinuation.auditLedger?.cases[16]?.attempts).toHaveLength(2);
+
+    continuation.prepareFailedOnlySelection();
+    const secondContinuation = await runReviewFlowEvaluationCases({
+      checkpoint: continuation,
+      cases: preparedStateCases(continuationFixture),
+      executor: {
+        execute: async (safeId: string) => safeId === "case-0018"
+          ? {
+              status: "incomplete" as const,
+              failure: {
+                ...fixedFailure("REVIEW_FLOW_PROTOCOL_FAILED", 200),
+                failureKind: "protocol" as const
+              }
+            }
+          : {
+              status: "incomplete" as const,
+              failure: {
+                ...fixedFailure("REVIEW_FLOW_NETWORK_FAILED", null),
+                failureKind: "transport" as const
+              }
+            }
+      },
+      concurrency: 2,
+      maxCaseAttempts: 1,
+      failedOnly: true
+    } as never);
+    expect(secondContinuation.executionSeal).toBeNull();
+    expect(secondContinuation.auditLedger?.cases[17]?.attempts).toHaveLength(2);
+    expect(secondContinuation.auditLedger?.cases[18]?.attempts).toHaveLength(2);
+
+    continuation.prepareFailedOnlySelection();
+    const finalContinuation = await runReviewFlowEvaluationCases({
+      checkpoint: continuation,
+      cases: preparedStateCases(continuationFixture),
+      executor: {
+        execute: async () => ({
+          status: "complete" as const,
+          projection: projection("approve")
+        })
+      },
+      concurrency: 2,
+      maxCaseAttempts: 1,
+      failedOnly: true
+    } as never);
+    expect(finalContinuation.executionSeal?.complete).toBe(true);
+    expect(finalContinuation.entries.every((entry) => entry.status === "completed")).toBe(true);
+    expect(
+      finalContinuation.auditLedger?.cases.every((entry, index) =>
+        index === 16
+          ? entry.attempts.length === 2
+          : [17, 18].includes(index)
+            ? entry.attempts.length === 3
+            : entry.attempts.length === 1
+      )
+    ).toBe(true);
+    continuation.close();
+  });
+
 });
 
 describe("固定全局 registry 与 holdout 一次性账本", () => {

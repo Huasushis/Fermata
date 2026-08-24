@@ -34,6 +34,7 @@ import {
   reviewFlowEvaluationCaseSelectorSchema,
   reviewFlowEvaluationLabelSchema,
   reviewFlowEvaluationPurposeSchema,
+  reviewFlowEvaluationSafeIdSchema,
   selectReviewFlowEvaluationRepresentative3,
   selectReviewFlowEvaluationRepresentative3V2,
   selectReviewFlowEvaluationRepresentative3V3,
@@ -57,6 +58,7 @@ import {
 } from "./lib/review-flow-evaluation-runner";
 import {
   loadReviewFlowEvaluationCheckpointForReveal,
+  loadReviewFlowEvaluationCheckpointStateFromPath,
   ReviewFlowEvaluationCheckpoint,
   reviewFlowEvaluationBaselineBindingSchema,
   type ReviewFlowEvaluationBaselineBinding
@@ -91,6 +93,9 @@ export interface ReviewFlowEvaluationRunCliOptions {
   readonly developmentBaselineLabel: string | null;
   readonly developmentCandidateLabel: string | null;
   readonly resume: boolean;
+  readonly failedOnly: boolean;
+  readonly failedOnlySourcePath: string | null;
+  readonly failedOnlyCaseIds: readonly string[] | null;
   readonly caseSelector: ReviewFlowEvaluationCaseSelector | null;
   readonly maxCaseAttempts: number;
 }
@@ -114,10 +119,16 @@ export function resolveReviewFlowEvaluationCliOptions(
 ): ReviewFlowEvaluationCliOptions {
   const values = new Map<string, string>();
   let resume = false;
+  let failedOnly = false;
   for (const argument of argv) {
-    if (argument === "--resume") {
-      if (resume) throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
-      resume = true;
+    if (argument === "--resume" || argument === "--failed-only") {
+      if (argument === "--resume") {
+        if (resume) throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+        resume = true;
+      } else {
+        if (failedOnly) throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+        failedOnly = true;
+      }
       continue;
     }
     const match = /^--([a-z-]+)=(.*)$/u.exec(argument);
@@ -128,6 +139,9 @@ export function resolveReviewFlowEvaluationCliOptions(
   }
   const action = values.get("action") ?? "run";
   if (action === "reveal") {
+    if (failedOnly) {
+      throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+    }
     const allowed = new Set([
       "action",
       "manifest",
@@ -181,7 +195,9 @@ export function resolveReviewFlowEvaluationCliOptions(
     "development-baseline-label",
     "development-candidate-label",
     "case-selector",
-    "max-case-attempts"
+    "max-case-attempts",
+    "failed-only-source",
+    "failed-only-case-ids"
   ]);
   if ([...values.keys()].some((key) => !allowed.has(key))) {
     throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
@@ -226,6 +242,31 @@ export function resolveReviewFlowEvaluationCliOptions(
   if (caseSelector !== null && !caseSelector.success) {
     throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
   }
+  const failedOnlySourcePathRaw = values.get("failed-only-source");
+  const failedOnlySourcePath = failedOnlySourcePathRaw ?? null;
+  const failedOnlyCaseIdsRaw = values.get("failed-only-case-ids");
+  const failedOnlyCaseIds = failedOnlyCaseIdsRaw === undefined
+    ? null
+    : failedOnlyCaseIdsRaw.split(",").map((safeId) => {
+        if (!reviewFlowEvaluationSafeIdSchema.safeParse(safeId).success) {
+          throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+        }
+        return safeId;
+      });
+  if (
+    failedOnlySourcePath !== null &&
+    !isAbsolute(failedOnlySourcePath)
+  ) {
+    throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+  }
+  if (
+    failedOnlyCaseIds !== null &&
+    new Set(failedOnlyCaseIds).size !== failedOnlyCaseIds.length
+  ) {
+    throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+  }
+
+
   if (
     !Number.isSafeInteger(maxCaseAttempts) ||
     maxCaseAttempts < 1 ||
@@ -258,6 +299,15 @@ export function resolveReviewFlowEvaluationCliOptions(
         purpose.data !== "development" ||
         resume ||
         maxCaseAttempts !== 1
+      )) ||
+    (!failedOnly &&
+      (failedOnlySourcePath !== null || failedOnlyCaseIds !== null)) ||
+    (failedOnly &&
+      (
+        caseSelector !== null ||
+        maxCaseAttempts !== 1 ||
+        (resume && failedOnlySourcePath !== null) ||
+        (!resume && failedOnlySourcePath === null)
       ))
   ) {
     throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
@@ -275,6 +325,9 @@ export function resolveReviewFlowEvaluationCliOptions(
     developmentBaselineLabel,
     developmentCandidateLabel,
     resume,
+    failedOnly,
+    failedOnlySourcePath,
+    failedOnlyCaseIds,
     maxCaseAttempts,
     caseSelector: caseSelector === null ? null : caseSelector.data
   };
@@ -418,6 +471,13 @@ async function runPredictionOrDevelopment(input: {
       ? requireHoldoutDatasetBindings(dataset)
       : null;
     assertPreregisteredRunLabels(options, dataset);
+    const failedOnlySource = options.failedOnlySourcePath === null
+      ? undefined
+      : loadReviewFlowEvaluationCheckpointStateFromPath({
+          checkpointPath: options.failedOnlySourcePath,
+          privateRoot: input.runtimeAttestation.originPrivateRoot,
+          containingWorkspace: input.runtimeAttestation.originWorkspaceRoot
+        });
     const holdoutPlan = options.purpose === "holdout"
       ? registry.registerHoldoutPlan(dataset).plan
       : null;
@@ -485,11 +545,18 @@ async function runPredictionOrDevelopment(input: {
         sourceLineageSha256: evaluationCase.sourceLineageSha256,
         contentSha256: evaluationCase.contentSha256
       })),
+      failedOnlySource,
+      failedOnlyCaseIds: options.failedOnlyCaseIds ?? undefined,
       resume: options.resume,
       privateRoot: input.runtimeAttestation.originPrivateRoot,
       containingWorkspace: input.runtimeAttestation.originWorkspaceRoot,
       now: input.now
     });
+    if (options.failedOnly && options.resume) {
+      checkpoint.prepareFailedOnlySelection(
+        options.failedOnlyCaseIds ?? undefined
+      );
+    }
     const genesis = checkpoint.genesisBinding();
     const labelClaim = registry.claimLabel({
       genesis,
@@ -530,8 +597,17 @@ async function runPredictionOrDevelopment(input: {
       executor: adapter,
       concurrency,
       startGate: gate,
-      maxCaseAttempts: options.maxCaseAttempts
+      maxCaseAttempts: options.maxCaseAttempts,
+      failedOnly: options.failedOnly
     });
+    if (options.failedOnly && state.executionSeal === null) {
+      removeSignalHandlers();
+      removeSignalHandlers = undefined;
+      process.stdout.write(
+        `failed-only continuation checkpoint persisted: ${options.label}\n`
+      );
+      return;
+    }
     checkpoint.writeTerminalReceipt();
     terminalReceiptWritten = true;
     removeSignalHandlers();
