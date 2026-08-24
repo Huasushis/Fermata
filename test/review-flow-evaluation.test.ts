@@ -124,7 +124,73 @@ describe("review-flow 跨阶段预测身份", () => {
       reviewFlowEvaluationPredictionIdentityFingerprint(original)
     );
   });
+  it("failed-only continuation freezes semantic identity while allowing harness snapshot changes", () => {
+    const source = identityFixture("development");
+    const continuation: ReviewFlowEvaluationIdentity = {
+      ...source,
+      codeIdentity: {
+        ...source.codeIdentity,
+        codeVersion: "8".repeat(40),
+        runnerSha256: "8".repeat(64),
+        dependencyCodeSha256: "8".repeat(64)
+      },
+      runtime: {
+        ...source.runtime,
+        snapshotSha256: "8".repeat(64),
+        snapshotFileCount: source.runtime.snapshotFileCount + 1
+      }
+    };
+
+    expect(() =>
+      assertFailedOnlyContinuationIdentityCompatible(source, continuation)
+    ).not.toThrow();
+
+    const semanticMutations: readonly [
+      string,
+      (identity: ReviewFlowEvaluationIdentity) => void
+    ][] = [
+      ["dataset", (identity) => identity.datasetFingerprint = "f".repeat(64)],
+      ["manifest", (identity) => identity.manifestSha256 = "f".repeat(64)],
+      ["purpose", (identity) => identity.purpose = "holdout"],
+      ["runtime", (identity) => identity.runtime.nodeVersion = "25.0.0"],
+      ["configuration", (identity) => {
+        identity.configurationSummary.concurrency += 1;
+      }],
+      ["provider", (identity) => {
+        identity.providerSummary[0] = {
+          ...identity.providerSummary[0]!,
+          provider: "changed-provider"
+        };
+      }],
+      ["model", (identity) => {
+        identity.providerSummary[0] = {
+          ...identity.providerSummary[0]!,
+          model: "changed-model"
+        };
+      }],
+      ["workflow", (identity) => identity.runnerIdentity = "f".repeat(64)],
+      ["configuration fingerprint", (identity) => {
+        identity.configurationFingerprint = "f".repeat(64);
+      }],
+      ["experiment version", (identity) => {
+        identity.experimentVersion = "changed-experiment";
+      }],
+      ["profile", (identity) => identity.profileName = "changed-profile"],
+      ["production code", (identity) => {
+        identity.codeIdentity.productionDependencyCodeSha256 = "f".repeat(64);
+      }]
+    ];
+    for (const [name, mutate] of semanticMutations) {
+      const changed = structuredClone(continuation);
+      mutate(changed);
+      expect(
+        () => assertFailedOnlyContinuationIdentityCompatible(source, changed),
+        name
+      ).toThrow("REVIEW_FLOW_EVALUATION_FAILED_ONLY_IDENTITY_MISMATCH");
+    }
+  });
 });
+
 
 describe("review-flow dataset v2 与真实 Gold 边界", () => {
   it("development 只打开本分区，缺少可选独立标注不会制造假三态/品味/原创性标签", () => {
@@ -1950,6 +2016,12 @@ describe("32 案例 × 11 角色 = 352 收据封存契约", () => {
       codeIdentity: {
         ...continuationFixture.identity.codeIdentity,
         codeVersion: "4".repeat(40)
+      },
+      runtime: {
+        ...continuationFixture.identity.runtime,
+        snapshotSha256: "8".repeat(64),
+        snapshotFileCount:
+          continuationFixture.identity.runtime.snapshotFileCount + 1
       }
     };
     expect(() =>
@@ -2066,6 +2138,117 @@ describe("32 案例 × 11 角色 = 352 收据封存契约", () => {
             : entry.attempts.length === 1
       )
     ).toBe(true);
+    continuation.close();
+  });
+
+  it("failed-only continuation selects all 16 failures and appends one attempt", async () => {
+    const sourceFixture = createStateFixture(32);
+    const source = openCheckpoint(sourceFixture, { bindClaim: true });
+    const safeIds = sourceFixture.expectedCases.map((entry) => entry.safeId);
+    const completedIds = safeIds.slice(0, 16);
+    const failedIds = safeIds.slice(16);
+    completeAll(source, completedIds);
+    for (const safeId of failedIds) {
+      source.markActive(safeId);
+      source.markFailed(
+        safeId,
+        fixedFailure("REVIEW_FLOW_EVIDENCE_REFERENCE_INVALID", 200)
+      );
+    }
+    const sourceState = source.sealExecution();
+    const sourceBytes = readFileSync(
+      join(
+        sourceFixture.outputDirectory,
+        `review-flow-${sourceFixture.label}.checkpoint.private.json`
+      )
+    );
+    source.close();
+
+    const continuationFixture = createStateFixtureIn(
+      sourceFixture,
+      32,
+      "failed-only-all-16",
+      "failed-only-all-16"
+    );
+    const continuationIdentity: ReviewFlowEvaluationIdentity = {
+      ...continuationFixture.identity,
+      codeIdentity: {
+        ...continuationFixture.identity.codeIdentity,
+        codeVersion: "8".repeat(40),
+        runnerSha256: "8".repeat(64)
+      },
+      runtime: {
+        ...continuationFixture.identity.runtime,
+        snapshotSha256: "8".repeat(64),
+        snapshotFileCount:
+          continuationFixture.identity.runtime.snapshotFileCount + 1
+      }
+    };
+    const continuation = new ReviewFlowEvaluationCheckpoint({
+      privateDirectory: continuationFixture.outputDirectory,
+      label: continuationFixture.label,
+      variant: "baseline",
+      baselineLabel: null,
+      baselineBinding: null,
+      identity: continuationIdentity,
+      expectedCases: continuationFixture.expectedCases,
+      resume: false,
+      privateRoot: continuationFixture.privateRoot,
+      containingWorkspace: continuationFixture.workspace,
+      now: fixedNow,
+      randomId: () => runIdFor(continuationFixture.label),
+      failedOnlySource: sourceState,
+      failedOnlyCaseIds: failedIds
+    } as never);
+    continuation.bindGlobalClaim("a".repeat(64));
+
+    const imported = continuation.snapshot();
+    expect(imported.entries.slice(0, 16)).toEqual(sourceState.entries.slice(0, 16));
+    expect(imported.entries.filter((entry) => entry.status === "completed"))
+      .toHaveLength(16);
+    expect(imported.entries.filter((entry) => entry.status === "pending"))
+      .toHaveLength(16);
+    expect(imported.entries.filter((entry) => entry.status === "failed"))
+      .toHaveLength(0);
+    expect(imported.identity.configurationSummary.caseAttempts).toBe(1);
+    expect(imported.failedOnlyContinuation).toMatchObject({
+      sourceIdentityFingerprint: sourceState.identityFingerprint,
+      continuationIdentityFingerprint: imported.identityFingerprint,
+      sourceFailedCaseIds: failedIds,
+      selectedFailedCaseIds: failedIds,
+      caseAttempts: 1
+    });
+    expect(
+      readFileSync(
+        join(
+          sourceFixture.outputDirectory,
+          `review-flow-${sourceFixture.label}.checkpoint.private.json`
+        )
+      )
+    ).toEqual(sourceBytes);
+
+    const completed = await runReviewFlowEvaluationCases({
+      checkpoint: continuation,
+      cases: preparedStateCases(continuationFixture),
+      executor: {
+        execute: async () => ({
+          status: "complete" as const,
+          projection: projection("approve")
+        })
+      },
+      concurrency: 1,
+      maxCaseAttempts: 1,
+      failedOnly: true
+    } as never);
+    expect(completed.executionSeal?.complete).toBe(true);
+    expect(completed.entries.every((entry) => entry.status === "completed"))
+      .toBe(true);
+    expect(completed.auditLedger?.cases.slice(0, 16).every(
+      (entry) => entry.attempts.length === 1
+    )).toBe(true);
+    expect(completed.auditLedger?.cases.slice(16).every(
+      (entry) => entry.attempts.length === 2
+    )).toBe(true);
     continuation.close();
   });
 

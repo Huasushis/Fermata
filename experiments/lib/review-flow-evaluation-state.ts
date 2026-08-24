@@ -581,6 +581,7 @@ const failedOnlyContinuationSchema = z
     sourceLabel: reviewFlowEvaluationLabelSchema,
     sourceRunId: z.string().uuid(),
     sourceIdentityFingerprint: digestSchema,
+    continuationIdentityFingerprint: digestSchema,
     sourceStateFingerprint: digestSchema,
     sourceExecutionCompletionFingerprint: digestSchema,
     sourceFailedCaseIds: z.array(reviewFlowEvaluationSafeIdSchema).min(1).max(1_000),
@@ -777,6 +778,8 @@ export const reviewFlowEvaluationCheckpointSchema = z
       const selectedIds = new Set(failedOnly.selectedFailedCaseIds);
       if (
         state.identity.configurationSummary.caseAttempts !== 1 ||
+        failedOnly.continuationIdentityFingerprint !==
+          state.identityFingerprint ||
         sourceIds.size !== failedOnly.sourceFailedCaseIds.length ||
         selectedIds.size !== failedOnly.selectedFailedCaseIds.length ||
         failedOnly.selectedFailedCaseIds.some((safeId) => !sourceIds.has(safeId)) ||
@@ -897,9 +900,24 @@ export function loadReviewFlowEvaluationCheckpointStateFromPath(input: {
 function failedOnlyIdentityProjection(
   identity: ReviewFlowEvaluationIdentity
 ): unknown {
+  const {
+    snapshotSha256: _snapshotSha256,
+    snapshotFileCount: _snapshotFileCount,
+    ...stableRuntime
+  } = identity.runtime;
   return {
     ...identity,
-    codeIdentity: null,
+    codeIdentity: {
+      productionDependencyCodeSha256:
+        identity.codeIdentity.productionDependencyCodeSha256,
+      productionDependencyFileCount:
+        identity.codeIdentity.productionDependencyFileCount
+    },
+    runtime: {
+      ...stableRuntime,
+      snapshotSha256: null,
+      snapshotFileCount: null
+    },
     configurationFingerprint: null,
     configurationSummary: {
       ...identity.configurationSummary,
@@ -912,20 +930,31 @@ export function assertFailedOnlyContinuationIdentityCompatible(
   source: ReviewFlowEvaluationIdentity,
   continuation: ReviewFlowEvaluationIdentity
 ): void {
+  let parsedSource: ReviewFlowEvaluationIdentity;
+  let parsedContinuation: ReviewFlowEvaluationIdentity;
+  try {
+    parsedSource = reviewFlowEvaluationIdentitySchema.parse(source);
+    parsedContinuation = reviewFlowEvaluationIdentitySchema.parse(continuation);
+  } catch {
+    throw new ReviewFlowEvaluationCheckpointError(
+      "REVIEW_FLOW_EVALUATION_FAILED_ONLY_IDENTITY_MISMATCH"
+    );
+  }
   if (
-    continuation.configurationSummary.caseAttempts !== 1 ||
-    source.codeIdentity.productionDependencyCodeSha256 !==
-      continuation.codeIdentity.productionDependencyCodeSha256 ||
-    source.codeIdentity.productionDependencyFileCount !==
-      continuation.codeIdentity.productionDependencyFileCount ||
-    source.configurationSummary.caseAttempts < 1 ||
+    parsedContinuation.configurationSummary.caseAttempts !== 1 ||
+    parsedSource.codeIdentity.productionDependencyCodeSha256 !==
+      parsedContinuation.codeIdentity.productionDependencyCodeSha256 ||
+    parsedSource.codeIdentity.productionDependencyFileCount !==
+      parsedContinuation.codeIdentity.productionDependencyFileCount ||
+    parsedSource.configurationSummary.caseAttempts < 1 ||
     (
-      source.configurationSummary.caseAttempts ===
-        continuation.configurationSummary.caseAttempts &&
-      source.configurationFingerprint !== continuation.configurationFingerprint
+      parsedSource.configurationSummary.caseAttempts ===
+        parsedContinuation.configurationSummary.caseAttempts &&
+      parsedSource.configurationFingerprint !==
+        parsedContinuation.configurationFingerprint
     ) ||
-    hashCanonicalValue(failedOnlyIdentityProjection(source)) !==
-      hashCanonicalValue(failedOnlyIdentityProjection(continuation))
+    hashCanonicalValue(failedOnlyIdentityProjection(parsedSource)) !==
+      hashCanonicalValue(failedOnlyIdentityProjection(parsedContinuation))
   ) {
     throw new ReviewFlowEvaluationCheckpointError(
       "REVIEW_FLOW_EVALUATION_FAILED_ONLY_IDENTITY_MISMATCH"
@@ -971,6 +1000,18 @@ function buildFailedOnlyContinuationState(input: {
       "REVIEW_FLOW_EVALUATION_FAILED_ONLY_SOURCE_INVALID"
     );
   }
+  if (
+    source.variant !== input.variant ||
+    source.baselineLabel !== input.baselineLabel ||
+    hashCanonicalValue(source.baselineBinding) !==
+      hashCanonicalValue(input.baselineBinding) ||
+    source.holdoutIdentity !== input.holdoutIdentity ||
+    source.thresholdPolicySha256 !== input.thresholdPolicySha256
+  ) {
+    throw new ReviewFlowEvaluationCheckpointError(
+      "REVIEW_FLOW_EVALUATION_FAILED_ONLY_IDENTITY_MISMATCH"
+    );
+  }
   assertFailedOnlyContinuationIdentityCompatible(
     source.identity,
     input.identity
@@ -1002,6 +1043,24 @@ function buildFailedOnlyContinuationState(input: {
   }
   const selected = new Set(selectedFailedCaseIds);
   const now = input.now;
+  const continuationEntries = source.entries.map((entry) =>
+    entry.status === "failed" && selected.has(entry.safeId)
+      ? { safeId: entry.safeId, status: "pending" as const }
+      : entry
+  );
+  if (
+    hashCanonicalValue(
+      source.entries.filter((entry) => !selected.has(entry.safeId))
+    ) !==
+    hashCanonicalValue(
+      continuationEntries.filter((entry) => !selected.has(entry.safeId))
+    )
+  ) {
+    throw new ReviewFlowEvaluationCheckpointError(
+      "REVIEW_FLOW_EVALUATION_FAILED_ONLY_COMPLETED_CASE_MUTATION"
+    );
+  }
+  const identityFingerprint = hashCanonicalValue(input.identity);
   return reviewFlowEvaluationCheckpointSchema.parse({
     schemaVersion: 2,
     label: input.label,
@@ -1010,15 +1069,11 @@ function buildFailedOnlyContinuationState(input: {
     baselineBinding: input.baselineBinding,
     runId: input.runId,
     identity: input.identity,
-    identityFingerprint: hashCanonicalValue(input.identity),
+    identityFingerprint,
     holdoutIdentity: input.holdoutIdentity,
     thresholdPolicySha256: input.thresholdPolicySha256,
     expectedCases: input.expectedCases,
-    entries: source.entries.map((entry) =>
-      entry.status === "failed" && selected.has(entry.safeId)
-        ? { safeId: entry.safeId, status: "pending" as const }
-        : entry
-    ),
+    entries: continuationEntries,
     auditLedger: source.auditLedger,
     globalClaimSha256: null,
     termination: null,
@@ -1030,6 +1085,7 @@ function buildFailedOnlyContinuationState(input: {
       sourceLabel: source.label,
       sourceRunId: source.runId,
       sourceIdentityFingerprint: source.identityFingerprint,
+      continuationIdentityFingerprint: identityFingerprint,
       sourceStateFingerprint: hashCanonicalValue(source),
       sourceExecutionCompletionFingerprint:
         source.executionSeal.completionFingerprint,
