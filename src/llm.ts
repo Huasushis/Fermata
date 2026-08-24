@@ -202,9 +202,23 @@ export interface LlmSseRejectedEventAudit {
   readonly shapeFingerprint: string;
 }
 
+export type LlmTransportAttemptOutcome = "success" | "failure";
+export type LlmTransportAttemptFailureCode =
+  | "LLM_RESPONSE_FORMAT_INVALID"
+  | "LLM_REQUEST_FAILED";
+export interface LlmTransportAttemptReceipt {
+  readonly attempt: number;
+  readonly outcome: LlmTransportAttemptOutcome;
+  readonly responseMode: LlmResponseMode | null;
+  readonly eofVerified: boolean;
+  readonly finishReasonStopVerified: boolean;
+  readonly sseDoneObserved: boolean | null;
+  readonly failureCode: LlmTransportAttemptFailureCode | null;
+  readonly failureStage: LlmResponseFormatFailureStage | null;
+}
 export interface LlmTransportReceipt {
   readonly schemaVersion: 2;
-  /** 同一逻辑请求中实际进行的 HTTP 尝试数；只有明确 429 才可能大于 1。 */
+  /** 同一逻辑请求中实际进行的 HTTP 尝试数；只有明确 429 或 event_shape 重发才可能大于 1。 */
   readonly transportAttemptCount: number;
   /** 只有读到真实 HTTP 正文 EOF 并通过终止状态机后才会生成 receipt。 */
   readonly eofVerified: true;
@@ -215,6 +229,8 @@ export interface LlmTransportReceipt {
   /** JSON 没有 `[DONE]`；SSE 则如实记录服务端是否发送了协议终止标记。 */
   readonly acceptedEventShapes: readonly LlmSseAcceptedShapeAudit[];
   readonly sseDoneObserved: boolean | null;
+  /** 仅 event_shape 重发路径写入；每条记录只保留固定安全状态与阶段。 */
+  readonly transportAttempts?: readonly LlmTransportAttemptReceipt[];
 }
 
 export interface ChatCompletionWithReceipt extends ChatCompletionResult {
@@ -261,6 +277,7 @@ export interface LlmSalvageTransportReceipt {
   readonly salvagedReasoningLength: number;
   readonly acceptedEventShapes: readonly LlmSseAcceptedShapeAudit[];
   readonly sseDoneObserved: boolean | null;
+  readonly transportAttempts?: readonly LlmTransportAttemptReceipt[];
 }
 
 /**
@@ -326,20 +343,6 @@ export interface SafeSchemaDiagnostic {
   readonly path: SafeSchemaDiagnosticPath;
   readonly expectedCategory: SafeSchemaDiagnosticCategory;
 }
-
-export interface LlmTransportAudit {
-  readonly providerRequestCount: number;
-  readonly retryCount: number;
-  readonly responseByteCount: number;
-  readonly usageTotalTokens: number | null;
-  readonly usageComplete: boolean;
-  readonly maxOutputTokens: number | null;
-  readonly finishReason: LlmSseFinishReasonClass | null;
-  readonly eofObserved: boolean;
-  readonly finishReasonStopObserved: boolean;
-  readonly sseDoneObserved: boolean | null;
-}
-
 export interface LlmCompletionAudit {
   readonly logicalRequestCount: number;
   readonly transportAttemptCount: number;
@@ -355,6 +358,18 @@ export interface LlmCompletionAudit {
   readonly sseDoneObserved: boolean | null;
 }
 
+export interface LlmTransportAudit {
+  readonly providerRequestCount: number;
+  readonly retryCount: number;
+  readonly responseByteCount: number;
+  readonly usageTotalTokens: number | null;
+  readonly usageComplete: boolean;
+  readonly maxOutputTokens: number | null;
+  readonly finishReason: LlmSseFinishReasonClass | null;
+  readonly eofObserved: boolean;
+  readonly finishReasonStopObserved: boolean;
+  readonly sseDoneObserved: boolean | null;
+}
 export interface LlmFailureAudit {
   readonly schemaVersion: 1;
   readonly requestCount: 1 | 2 | 3 | 4;
@@ -367,6 +382,8 @@ export interface LlmFailureAudit {
   readonly usageComplete: boolean;
   readonly completedResponses:
     readonly (LlmTransportReceipt | LlmSalvageTransportReceipt)[];
+  /** 仅 event_shape 重发路径写入；不包含正文、键值或响应标识。 */
+  readonly transportAttempts?: readonly LlmTransportAttemptReceipt[];
   readonly terminal: {
     readonly status: number | null;
     readonly responseMode: LlmResponseMode | null;
@@ -1038,6 +1055,10 @@ export async function chatCompleteWithReceipt(
   const result = spec.thinking
     ? extracted
     : { content: extracted.content, reasoning: null };
+  const transportAttempts =
+    requestAudit.transportAttemptReceipts.length === 0
+      ? undefined
+      : Object.freeze([...requestAudit.transportAttemptReceipts]);
   const receipt: LlmTransportReceipt = Object.freeze({
     schemaVersion: 2,
     transportAttemptCount: response.attemptCount,
@@ -1045,7 +1066,8 @@ export async function chatCompleteWithReceipt(
     responseMode: response.responseMode,
     finishReasonStopVerified: true,
     acceptedEventShapes: acceptedShapeAudit(requestAudit),
-    sseDoneObserved: response.sseDoneObserved
+    sseDoneObserved: response.sseDoneObserved,
+    ...(transportAttempts === undefined ? {} : { transportAttempts })
   });
   rememberLlmTransportAudit(receipt, mutableLlmTransportAudit(requestAudit));
   return {
@@ -1130,6 +1152,10 @@ export async function chatCompleteSalvageableWithReceipt(
   }
   if (response.salvaged) {
     const segment = extractLengthLimitedSegment(response.raw);
+    const transportAttempts =
+      requestAudit.transportAttemptReceipts.length === 0
+        ? undefined
+        : Object.freeze([...requestAudit.transportAttemptReceipts]);
     const firstReceipt: LlmSalvageTransportReceipt = Object.freeze({
       schemaVersion: 2,
       transportAttemptCount: response.attemptCount,
@@ -1139,7 +1165,8 @@ export async function chatCompleteSalvageableWithReceipt(
       finishReasonLengthSalvaged: true,
       salvagedReasoningLength: segment.reasoning.length,
       acceptedEventShapes: acceptedShapeAudit(requestAudit),
-      sseDoneObserved: response.sseDoneObserved
+      sseDoneObserved: response.sseDoneObserved,
+      ...(transportAttempts === undefined ? {} : { transportAttempts })
     });
     rememberLlmTransportAudit(firstReceipt, mutableLlmTransportAudit(requestAudit));
     if (
@@ -1241,6 +1268,10 @@ export async function chatCompleteSalvageableWithReceipt(
       throw error;
     }
     const continued = extractChatCompletion(continuation.raw);
+    const continuationAttempts =
+      continuationAudit.transportAttemptReceipts.length === 0
+        ? undefined
+        : Object.freeze([...continuationAudit.transportAttemptReceipts]);
     const continuationReceipt: LlmTransportReceipt = Object.freeze({
       schemaVersion: 2,
       transportAttemptCount: continuation.attemptCount,
@@ -1248,8 +1279,15 @@ export async function chatCompleteSalvageableWithReceipt(
       responseMode: continuation.responseMode,
       finishReasonStopVerified: true,
       acceptedEventShapes: acceptedShapeAudit(continuationAudit),
-      sseDoneObserved: continuation.sseDoneObserved
+      sseDoneObserved: continuation.sseDoneObserved,
+      ...(continuationAttempts === undefined
+        ? {}
+        : { transportAttempts: continuationAttempts })
     });
+    const combinedAttempts = [
+      ...(binding.precedingReceipt.transportAttempts ?? []),
+      ...(continuationReceipt.transportAttempts ?? [])
+    ];
     const receipt: LlmTransportReceipt = Object.freeze({
       ...continuationReceipt,
       transportAttemptCount:
@@ -1258,7 +1296,10 @@ export async function chatCompleteSalvageableWithReceipt(
       acceptedEventShapes: Object.freeze([
         ...binding.precedingReceipt.acceptedEventShapes,
         ...continuationReceipt.acceptedEventShapes
-      ])
+      ]),
+      ...(combinedAttempts.length === 0
+        ? {}
+        : { transportAttempts: Object.freeze(combinedAttempts) })
     });
     rememberLlmTransportAudit(receipt, combineContinuationAudits(
       mutableLlmTransportAudit(requestAudit),
@@ -1286,6 +1327,10 @@ export async function chatCompleteSalvageableWithReceipt(
   const result = spec.thinking
     ? extracted
     : { content: extracted.content, reasoning: null };
+  const transportAttempts =
+    requestAudit.transportAttemptReceipts.length === 0
+      ? undefined
+      : Object.freeze([...requestAudit.transportAttemptReceipts]);
   const receipt: LlmTransportReceipt = Object.freeze({
     schemaVersion: 2,
     transportAttemptCount: response.attemptCount,
@@ -1293,7 +1338,8 @@ export async function chatCompleteSalvageableWithReceipt(
     responseMode: response.responseMode,
     finishReasonStopVerified: true,
     acceptedEventShapes: acceptedShapeAudit(requestAudit),
-    sseDoneObserved: response.sseDoneObserved
+    sseDoneObserved: response.sseDoneObserved,
+    ...(transportAttempts === undefined ? {} : { transportAttempts })
   });
   rememberLlmTransportAudit(receipt, mutableLlmTransportAudit(requestAudit));
   return {
@@ -2390,6 +2436,7 @@ interface MutableLlmRequestAudit {
   usageTotalTokens: number | null;
   firstRejectedEvent: LlmSseRejectedEventAudit | null;
   maxOutputTokens: number | null;
+  transportAttemptReceipts: LlmTransportAttemptReceipt[];
 }
 
 function createMutableLlmRequestAudit(
@@ -2410,6 +2457,7 @@ function createMutableLlmRequestAudit(
     usageEventCount: 0,
     usageTotalTokens: null,
     firstRejectedEvent: null,
+    transportAttemptReceipts: [],
     maxOutputTokens
   };
 }
@@ -2430,6 +2478,41 @@ function resetMutableLlmRequestAuditForAttempt(
   audit.usageEventCount = 0;
   audit.usageTotalTokens = null;
   audit.firstRejectedEvent = null;
+}
+
+function recordFailedTransportAttempt(
+  audit: MutableLlmRequestAudit,
+  error: unknown
+): void {
+  const formatError = error instanceof LlmResponseFormatError;
+  audit.transportAttemptReceipts.push(Object.freeze({
+    attempt: audit.attemptCount,
+    outcome: "failure",
+    responseMode: audit.responseMode,
+    eofVerified: audit.eofObserved,
+    finishReasonStopVerified: audit.finishReasonStopObserved,
+    sseDoneObserved: audit.sseDoneObserved,
+    failureCode: formatError
+      ? "LLM_RESPONSE_FORMAT_INVALID"
+      : "LLM_REQUEST_FAILED",
+    failureStage: formatError ? error.formatFailureStage : null
+  }));
+}
+
+function recordSuccessfulTransportAttempt(
+  audit: MutableLlmRequestAudit,
+  response: Pick<LlmRequestResult, "responseMode" | "finishReasonStopVerified" | "sseDoneObserved">
+): void {
+  audit.transportAttemptReceipts.push(Object.freeze({
+    attempt: audit.attemptCount,
+    outcome: "success",
+    responseMode: response.responseMode,
+    eofVerified: true,
+    finishReasonStopVerified: response.finishReasonStopVerified,
+    sseDoneObserved: response.sseDoneObserved,
+    failureCode: null,
+    failureStage: null
+  }));
 }
 
 function mutableLlmTransportAudit(
@@ -2504,6 +2587,10 @@ function rememberLlmFailureAudit(
   const safeSchemaDiagnostic = input.schemaDiagnostic === undefined
     ? undefined
     : Object.freeze({ ...input.schemaDiagnostic });
+  const transportAttempts =
+    input.requestAudit.transportAttemptReceipts.length === 0
+      ? undefined
+      : Object.freeze([...input.requestAudit.transportAttemptReceipts]);
   const transportAttemptCount =
     (input.priorTransportAttemptCount ?? 0) + input.requestAudit.attemptCount;
   llmFailureAudits.set(error, Object.freeze({
@@ -2531,6 +2618,7 @@ function rememberLlmFailureAudit(
       aggregateAudits.length === input.requestCount &&
       aggregateAudits.every((audit) => audit.usageComplete),
     completedResponses: Object.freeze(completedResponses),
+    ...(transportAttempts === undefined ? {} : { transportAttempts }),
     terminal,
     stream,
     jsonSchemaValidated: input.jsonSchemaValidated,
@@ -2570,6 +2658,7 @@ function mutableAuditFromReceipt(
     usageEventCount: transportAudit?.usageComplete ? 1 : 0,
     usageTotalTokens: transportAudit?.usageTotalTokens ?? null,
     firstRejectedEvent: null,
+    transportAttemptReceipts: [...(receipt.transportAttempts ?? [])],
     maxOutputTokens: transportAudit?.maxOutputTokens ?? maxOutputTokens
   };
 }
@@ -2629,6 +2718,7 @@ function promoteJsonFailureAudit(
       usageEventCount: existing.stream.usageEventCount,
       usageTotalTokens: existing.stream.usageTotalTokens,
       firstRejectedEvent: existing.stream.firstRejectedEvent,
+      transportAttemptReceipts: [...(existing.transportAttempts ?? [])],
       maxOutputTokens: existing.maxOutputTokens
     },
     completedResponses: effectiveCompletedResponses,
@@ -2717,6 +2807,12 @@ async function requestWithRetry(
             throw timeoutError;
           }
           if (response.status !== 429 || attempt >= runtime.maxAttempts) {
+            if (
+              eventShapeRetryUsed &&
+              audit.transportAttemptReceipts.length === 1
+            ) {
+              recordFailedTransportAttempt(audit, undefined);
+            }
             return {
               ok: false,
               status: response.status,
@@ -2763,6 +2859,13 @@ async function requestWithRetry(
         if (timeoutError !== undefined) {
           throw timeoutError;
         }
+        if (eventShapeRetryUsed) {
+          recordSuccessfulTransportAttempt(audit, {
+            responseMode: parsed.responseMode,
+            finishReasonStopVerified: !parsed.salvaged,
+            sseDoneObserved: parsed.sseDoneObserved
+          });
+        }
         return {
           ok: true,
           status: response.status,
@@ -2787,11 +2890,16 @@ async function requestWithRetry(
             watchdog.formatFailureSubstage()
           );
         }
-        if (
+        const eventShapeFailure =
           error instanceof LlmResponseFormatError &&
-          error.formatFailureStage === "event_shape" &&
-          !eventShapeRetryUsed
+          error.formatFailureStage === "event_shape";
+        if (
+          eventShapeFailure ||
+          (eventShapeRetryUsed && audit.transportAttemptReceipts.length === 1)
         ) {
+          recordFailedTransportAttempt(audit, error);
+        }
+        if (eventShapeFailure && !eventShapeRetryUsed) {
           // event_shape is the sole bounded role-request replay exception.
           // Keep every other protocol/schema/content/error category fail closed.
           eventShapeRetryUsed = true;

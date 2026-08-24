@@ -994,6 +994,27 @@ describe("历史人工标准驱动的多角色提示词", () => {
         role === "solver" ? 3 : role === "tags" || role === "contest_fit" || role === "originality" ? 2 : 1;
       const eventShapeRetry = eventShapeRetryRole[role] === true;
       const expectedFetches = expectedRequests + (eventShapeRetry ? 1 : 0);
+      const transportAttempts = eventShapeRetry
+        ? [{
+            attempt: 1,
+            outcome: "failure" as const,
+            responseMode: "sse" as const,
+            eofVerified: true,
+            finishReasonStopVerified: false,
+            sseDoneObserved: false,
+            failureCode: "LLM_RESPONSE_FORMAT_INVALID" as const,
+            failureStage: "event_shape" as const
+          }, {
+            attempt: 2,
+            outcome: "success" as const,
+            responseMode: "json" as const,
+            eofVerified: true,
+            finishReasonStopVerified: true,
+            sseDoneObserved: null,
+            failureCode: null,
+            failureStage: null
+          }]
+        : undefined;
       const result = trustedRoleExecutionResultSchema.parse(await invocations[role]());
       expect(observedRequests).toHaveLength(requestIndex + expectedFetches);
       for (let i = 0; i < expectedFetches; i++) {
@@ -1013,7 +1034,8 @@ describe("历史人工标准驱动的多角色提示词", () => {
             responseMode: "json",
             finishReasonStopVerified: true,
             acceptedEventShapes: [],
-            sseDoneObserved: null
+            sseDoneObserved: null,
+            ...(transportAttempts === undefined ? {} : { transportAttempts })
           }, {
             schemaVersion: 2,
             transportAttemptCount: 1,
@@ -1072,7 +1094,8 @@ describe("历史人工标准驱动的多角色提示词", () => {
             responseMode: "json",
             finishReasonStopVerified: true,
             acceptedEventShapes: [],
-            sseDoneObserved: null
+            sseDoneObserved: null,
+            ...(transportAttempts === undefined ? {} : { transportAttempts })
           }]
         });
       }

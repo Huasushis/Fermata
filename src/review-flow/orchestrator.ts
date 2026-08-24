@@ -11,7 +11,8 @@ import {
   type LlmRequestStartGate,
   type LlmResponseFormatFailureStage,
   type LlmResponseFormatFailureSubstage,
-  type LlmSseFinishReasonClass
+  type LlmSseFinishReasonClass,
+  type LlmTransportAttemptReceipt
 } from "../llm";
 import {
   codeforcesDifficultySchema,
@@ -43,6 +44,7 @@ import {
   reviewFlowAssignmentContextSchema,
   reviewFlowExecutionContextSchema,
   roleAcceptedEventShapeSchema,
+  roleTransportAttemptSchema,
   roleIdentitySchema,
   solutionAnalystPayloadSchema,
   solverPayloadSchema,
@@ -60,6 +62,7 @@ import {
   type OriginalityPayload,
   type ReviewFlowRole,
   type RoleCompletionReceipt,
+  type RoleTransportAttemptReceipt,
   type RoleIdentity,
   type ReviewFlowExecutionContext,
   type SolutionAnalystPayload,
@@ -411,6 +414,7 @@ export interface ReviewFlowRoleCompletionSummary {
     readonly finishReasonStopVerified: true;
     readonly acceptedEventShapes: RoleCompletionReceipt["responses"][number]["acceptedEventShapes"];
     readonly sseDoneObserved: true | null;
+    readonly transportAttempts?: readonly LlmTransportAttemptReceipt[];
   }[];
 }
 
@@ -425,8 +429,8 @@ export interface ReviewFlowRoleFailureSummary {
   readonly terminalEofObserved: boolean;
   readonly terminalFinishReasonStopObserved: boolean;
   readonly terminalSseDoneObserved: boolean | null;
+  readonly transportAttempts?: readonly LlmTransportAttemptReceipt[];
 }
-
 export interface ReviewFlowIncompleteFailure {
   readonly schemaVersion: 1;
   readonly failureId: string;
@@ -466,9 +470,9 @@ const reviewFlowCalibrationReceiptResponseSchema = z
     eofVerified: z.literal(true),
     finishReasonStopVerified: z.literal(true),
     acceptedEventShapes: z.array(roleAcceptedEventShapeSchema).max(64).readonly(),
-    sseDoneObserved: z.union([z.literal(true), z.null()])
+    sseDoneObserved: z.union([z.literal(true), z.null()]),
+    transportAttempts: z.array(roleTransportAttemptSchema).max(4).readonly().optional()
   })
-  .strict()
   .superRefine((response, context) => {
     if (
       (response.responseMode === "sse" && response.sseDoneObserved !== true) ||
@@ -605,7 +609,10 @@ export const reviewFlowCalibrationProjectionSchema = z
               responseMode: response.responseMode,
               finishReasonStopVerified: response.finishReasonStopVerified,
               acceptedEventShapes: response.acceptedEventShapes,
-              sseDoneObserved: response.sseDoneObserved
+              sseDoneObserved: response.sseDoneObserved,
+              ...(response.transportAttempts === undefined
+                ? {}
+                : { transportAttempts: response.transportAttempts })
             }))
           })
       ) ||
@@ -644,7 +651,8 @@ export const reviewFlowRoleCompletionSummarySchema = z
             eofVerified: z.literal(true),
             finishReasonStopVerified: z.literal(true),
             acceptedEventShapes: z.array(roleAcceptedEventShapeSchema).max(64).readonly(),
-            sseDoneObserved: z.union([z.literal(true), z.null()])
+            sseDoneObserved: z.union([z.literal(true), z.null()]),
+            transportAttempts: z.array(roleTransportAttemptSchema).max(4).readonly().optional()
           })
           .strict()
       )
@@ -667,7 +675,8 @@ export const reviewFlowRoleFailureSummarySchema = z
     terminalResponseMode: z.union([z.enum(["sse", "json"]), z.null()]),
     terminalEofObserved: z.boolean(),
     terminalFinishReasonStopObserved: z.boolean(),
-    terminalSseDoneObserved: z.union([z.boolean(), z.null()])
+    terminalSseDoneObserved: z.union([z.boolean(), z.null()]),
+    transportAttempts: z.array(roleTransportAttemptSchema).max(4).readonly().optional()
   })
   .strict();
 
@@ -1609,7 +1618,10 @@ async function runAndSeal<TPayload>(input: {
         acceptedEventShapes: response.acceptedEventShapes,
         // roleCompletionReceiptSchema 已在进入此分支前验证 SSE=true/JSON=null；
         // 这里收窄为标定投影允许的安全字面量。
-        sseDoneObserved: response.responseMode === "sse" ? true : null
+        sseDoneObserved: response.responseMode === "sse" ? true : null,
+        ...(response.transportAttempts === undefined
+          ? {}
+          : { transportAttempts: response.transportAttempts })
       })) ?? []
     }));
     input.tracker.roleAttempts.set(
@@ -2098,7 +2110,10 @@ function summarizeCompletedReceiptFailure(
     terminalResponseMode: terminal?.responseMode ?? null,
     terminalEofObserved: terminal?.eofVerified ?? false,
     terminalFinishReasonStopObserved: terminal?.finishReasonStopVerified ?? false,
-    terminalSseDoneObserved: terminal?.sseDoneObserved ?? null
+    terminalSseDoneObserved: terminal?.sseDoneObserved ?? null,
+    ...(terminal?.transportAttempts === undefined
+      ? {}
+      : { transportAttempts: terminal.transportAttempts })
   });
 }
 
@@ -2118,7 +2133,10 @@ function summarizeRoleFailure(
     terminalEofObserved: audit?.terminal.eofObserved ?? false,
     terminalFinishReasonStopObserved:
       audit?.terminal.finishReasonStopObserved ?? false,
-    terminalSseDoneObserved: audit?.terminal.sseDoneObserved ?? null
+    terminalSseDoneObserved: audit?.terminal.sseDoneObserved ?? null,
+    ...(audit?.transportAttempts === undefined
+      ? {}
+      : { transportAttempts: audit.transportAttempts })
   });
 }
 

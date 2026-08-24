@@ -70,6 +70,35 @@ export const roleAcceptedEventShapeSchema = z.object({
   count: z.number().int().positive()
 }).strict();
 
+export const roleTransportAttemptSchema = z
+  .object({
+    attempt: z.number().int().positive().max(2_000),
+    outcome: z.enum(["success", "failure"]),
+    responseMode: z.enum(["sse", "json"]).nullable(),
+    eofVerified: z.boolean(),
+    finishReasonStopVerified: z.boolean(),
+    sseDoneObserved: z.boolean().nullable(),
+    failureCode: z.enum([
+      "LLM_RESPONSE_FORMAT_INVALID",
+      "LLM_REQUEST_FAILED"
+    ]).nullable(),
+    failureStage: z.enum([
+      "missing_body",
+      "content_type",
+      "json_utf8",
+      "json_parse",
+      "response_shape",
+      "sse_utf8",
+      "event_json",
+      "event_shape",
+      "delta_shape",
+      "finish_shape",
+      "trailing_data"
+    ]).nullable()
+  })
+  .strict();
+export type RoleTransportAttemptReceipt = z.infer<typeof roleTransportAttemptSchema>;
+
 const roleTransportReceiptSchema = z
   .object({
     schemaVersion: z.literal(2),
@@ -78,7 +107,8 @@ const roleTransportReceiptSchema = z
     responseMode: z.enum(["sse", "json"]),
     finishReasonStopVerified: z.literal(true),
     acceptedEventShapes: z.array(roleAcceptedEventShapeSchema).max(64).readonly(),
-    sseDoneObserved: z.boolean().nullable()
+    sseDoneObserved: z.boolean().nullable(),
+    transportAttempts: z.array(roleTransportAttemptSchema).max(4).readonly().optional()
   })
   .strict()
   .superRefine((receipt, context) => {

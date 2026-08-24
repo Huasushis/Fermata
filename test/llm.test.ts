@@ -2023,6 +2023,26 @@ describe("chatComplete：正常路径", () => {
     expect(result.content).toBe("合成完整答案");
     expect(result.receipt.transportAttemptCount).toBe(2);
     expect(result.receipt.eofVerified).toBe(true);
+    expect(result.receipt.transportAttempts).toEqual([
+      expect.objectContaining({
+        attempt: 1,
+        outcome: "failure",
+        responseMode: "sse",
+        eofVerified: true,
+        finishReasonStopVerified: false,
+        failureCode: "LLM_RESPONSE_FORMAT_INVALID",
+        failureStage: "event_shape"
+      }),
+      expect.objectContaining({
+        attempt: 2,
+        outcome: "success",
+        responseMode: "sse",
+        eofVerified: true,
+        finishReasonStopVerified: true,
+        failureCode: null,
+        failureStage: null
+      })
+    ]);
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(bodies[0]).toBe(bodies[1]);
   });
@@ -2049,6 +2069,20 @@ describe("chatComplete：正常路径", () => {
       retryCount: 1,
       completedResponses: []
     });
+    expect(getLlmFailureAudit(error)?.transportAttempts).toEqual([
+      expect.objectContaining({
+        attempt: 1,
+        outcome: "failure",
+        failureCode: "LLM_RESPONSE_FORMAT_INVALID",
+        failureStage: "event_shape"
+      }),
+      expect.objectContaining({
+        attempt: 2,
+        outcome: "failure",
+        failureCode: "LLM_RESPONSE_FORMAT_INVALID",
+        failureStage: "event_shape"
+      })
+    ]);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
@@ -2098,6 +2132,7 @@ describe("chatComplete：正常路径", () => {
         code: "LLM_RESPONSE_FORMAT_INVALID",
         formatFailureStage: stage
       });
+      expect(getLlmFailureAudit(error)?.transportAttempts).toBeUndefined();
       expect(fetchMock).toHaveBeenCalledTimes(1);
     }
   );
