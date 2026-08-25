@@ -1,5 +1,10 @@
 import { z } from "zod";
 import {
+  classifyStageRequestError,
+  FairLlmRequestScheduler,
+  LlmStageRequestError
+} from "../llm-scheduler";
+import {
   getLlmCompletionAudit,
   getLlmFailureAudit,
   isLlmRequestStartGate,
@@ -996,6 +1001,7 @@ export type ReviewFlowInput =
       readonly trustedRunner: unknown;
       readonly executionContext: unknown;
       readonly requestStartGate?: unknown;
+      readonly scheduler?: FairLlmRequestScheduler;
       readonly onTerminalRoleFailure?: (
         role: ReviewFlowRole,
         failureKind: ReviewFlowFailureKind,
@@ -1013,14 +1019,21 @@ export async function runReviewEvidenceFlow(
 }
 
 export async function runReviewEvidenceFlowOutcome(
-  input: ReviewFlowInput
+  input: ReviewFlowInput & {
+    readonly scheduler?: FairLlmRequestScheduler;
+  }
 ): Promise<ReviewFlowOutcome> {
   const onTerminalRoleFailure = "onTerminalRoleFailure" in input && typeof input.onTerminalRoleFailure === "function"
     ? input.onTerminalRoleFailure
     : undefined;
   const tracker = createReviewFlowRunTracker(onTerminalRoleFailure);
   try {
-    const decision = await runReviewEvidenceFlowTracked(input, tracker);
+    const roleRetryScheduler =
+      input.scheduler instanceof FairLlmRequestScheduler ? input.scheduler : null;
+    const decision = await runReviewEvidenceFlowTracked(
+      { ...input, roleRetryScheduler },
+      tracker
+    );
     return deepFreeze({ status: "complete" as const, decision });
   } catch (error) {
     const normalizedError = normalizeReviewFlowOutcomeError(error);
@@ -1052,7 +1065,9 @@ export async function runReviewEvidenceFlowOutcome(
  * 底层 incomplete 已经是封闭安全摘要，这里保持同一对象原样返回。
  */
 export async function runReviewEvidenceFlowCalibrationOutcome(
-  input: ReviewFlowCalibrationInput
+  input: ReviewFlowCalibrationInput & {
+    readonly scheduler?: FairLlmRequestScheduler;
+  }
 ): Promise<ReviewFlowCalibrationOutcome> {
   if (
     !isBuiltReviewFlowTaskSourceResult(input.taskSource) ||
@@ -1183,7 +1198,10 @@ export async function runReviewEvidenceFlowCalibrationOutcome(
 }
 
 async function runReviewEvidenceFlowTracked(
-  input: ReviewFlowInput,
+  input: ReviewFlowInput & {
+    readonly scheduler?: FairLlmRequestScheduler;
+    readonly roleRetryScheduler?: FairLlmRequestScheduler | null;
+  },
   tracker: ReviewFlowRunTracker
 ): Promise<ReviewFlowDecision> {
   const taskSource = resolveBuiltTaskSource(input);
@@ -1213,6 +1231,10 @@ async function runReviewEvidenceFlowTracked(
   }
   const { roles, identities } = resolvedRunner;
   const requestStartGate = resolveRequestStartGate(input, resolvedRunner);
+  const roleRetryScheduler =
+    input.scheduler instanceof FairLlmRequestScheduler
+      ? input.scheduler
+      : null;
   const sourceSnapshotHash = hashCanonicalValue(taskSource ?? source);
   tracker.sourceSnapshotHash = sourceSnapshotHash;
   const executionContext = parseExecutionContext(
@@ -1259,6 +1281,7 @@ async function runReviewEvidenceFlowTracked(
     tracker,
     identities,
     requestStartGate,
+    roleRetryScheduler,
     spec: {
       role: "solver",
       schema: solverPayloadSchema,
@@ -1272,6 +1295,7 @@ async function runReviewEvidenceFlowTracked(
     tracker,
     identities,
     requestStartGate,
+    roleRetryScheduler,
     spec: {
       role: "solution_analyst",
       schema: solutionAnalystPayloadSchema,
@@ -1290,6 +1314,7 @@ async function runReviewEvidenceFlowTracked(
     tracker,
     identities,
     requestStartGate,
+    roleRetryScheduler,
     spec: {
       role: "technical_auditor",
       schema: technicalAuditPayloadSchema,
@@ -1336,6 +1361,7 @@ async function runReviewEvidenceFlowTracked(
     tracker,
     identities,
     requestStartGate,
+    roleRetryScheduler,
     specs: [
       {
         role: "difficulty",
@@ -1399,6 +1425,7 @@ async function runReviewEvidenceFlowTracked(
     tracker,
     identities,
     requestStartGate,
+    roleRetryScheduler,
     specs: [
       {
         role: "critic",
@@ -1444,6 +1471,7 @@ async function runReviewEvidenceFlowTracked(
     tracker,
     identities,
     requestStartGate,
+    roleRetryScheduler,
     spec: {
       role: "adjudicator",
       schema: adjudicatorSchema,
@@ -1555,15 +1583,46 @@ async function runAndSeal<TPayload>(input: {
   readonly tracker: ReviewFlowRunTracker;
   readonly identities: Readonly<Record<ReviewFlowRole, RoleIdentity>>;
   readonly requestStartGate: LlmRequestStartGate | null;
+  readonly roleRetryScheduler?: FairLlmRequestScheduler | null;
   readonly spec: RoleSpec<TPayload>;
 }): Promise<EvidenceArtifact<TPayload>> {
+  const executeWithRetries = input.roleRetryScheduler
+    ? () => input.roleRetryScheduler!.runLogicalRequest({
+        caseId: `${input.binding.problemContentHash.slice(0, 16)}`,
+        requestId: `role:${input.spec.role}`,
+        execute: async () => {
+          try {
+            return await input.spec.run();
+          } catch (error) {
+            // 调度器只重放已分类的阶段错误；把底层传输错误归一化，
+            // 保留原始状态码与审计（safeRequestFailure 同源字段）。
+            if (classifyStageRequestError(error) !== null) throw error;
+            throw new LlmStageRequestError(
+              error instanceof LlmRequestError && error.code === "LLM_HTTP_ERROR" &&
+                typeof error.status === "number" && error.status >= 500
+                ? "server_error"
+                : error instanceof LlmRequestError && error.code === "LLM_HTTP_ERROR"
+                  ? "permanent"
+                  : "permanent",
+              { cause: error }
+            );
+          }
+        }
+      })
+    : input.spec.run;
   let completedReceipt: RoleCompletionReceipt | null = null;
   let completionAudit: LlmCompletionAudit | null = null;
   try {
     if (input.requestStartGate !== null && !input.requestStartGate.canStartRequest()) {
       throw new LlmRequestError("LLM_REQUEST_START_BLOCKED");
     }
-    const rawResult = await input.spec.run();
+    const scheduledResult = await executeWithRetries();
+    const rawResult =
+      scheduledResult !== null &&
+      typeof scheduledResult === "object" &&
+      "value" in (scheduledResult as Record<string, unknown>)
+        ? (scheduledResult as { readonly value: unknown }).value
+        : scheduledResult;
     const rawReceipt =
       typeof rawResult === "object" &&
       rawResult !== null &&
@@ -1673,6 +1732,7 @@ async function runIndependentRoles<
   readonly tracker: ReviewFlowRunTracker;
   readonly identities: Readonly<Record<ReviewFlowRole, RoleIdentity>>;
   readonly requestStartGate: LlmRequestStartGate | null;
+  readonly roleRetryScheduler?: FairLlmRequestScheduler | null;
   readonly specs: TSpecs;
 }): Promise<{ [K in keyof TSpecs]: TSpecs[K] extends RoleSpec<infer P> ? EvidenceArtifact<P> : never }> {
   const settled = await Promise.allSettled(
@@ -1681,6 +1741,7 @@ async function runIndependentRoles<
       tracker: input.tracker,
       identities: input.identities,
       requestStartGate: input.requestStartGate,
+      roleRetryScheduler: input.roleRetryScheduler,
       spec
     }))
   );

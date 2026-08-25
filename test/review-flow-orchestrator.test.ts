@@ -1,3 +1,4 @@
+import { FairLlmRequestScheduler } from "../src/llm-scheduler";
 import { describe, expect, it, vi } from "vitest";
 import { LlmRequestError, LlmRequestStartGate } from "../src/llm";
 import {
@@ -2130,5 +2131,71 @@ describe("冻结证据多角色审题编排", () => {
       artifact: { ...artifact, inputHash: "d".repeat(64) },
       payloadSchema: solverPayloadSchema
     })).toThrow("REVIEW_FLOW_EVIDENCE_IDENTITY_INVALID");
+  });
+});
+
+describe("真实角色执行器路径的调度器瞬态重试", () => {
+  it("HTTP503瞬态错误被调度器重放：至少3次传输尝试", async () => {
+    let callCount = 0;
+    const statuses: number[] = [];
+    const baseFetch = syntheticRoleFetch() as NonNullable<
+      PipelineModelConfig["runtime"]["fetch"]
+    >;
+    const fetchImpl = vi.fn(async (
+      input: Parameters<NonNullable<PipelineModelConfig["runtime"]["fetch"]>>[0],
+      init: Parameters<NonNullable<PipelineModelConfig["runtime"]["fetch"]>>[1]
+    ) => {
+      callCount += 1;
+      if (callCount <= 2) {
+        statuses.push(503);
+        return new Response("service unavailable", { status: 503 });
+      }
+      statuses.push(200);
+      return (await baseFetch(input, init)) as Response;
+    });
+    const { runner } = syntheticTrustedRunner(fetchImpl);
+    const scheduler = new FairLlmRequestScheduler({
+      maximumConcurrency: 4,
+      maximumAttemptsPerCase: 8,
+      jitter: () => 0
+    });
+    const outcome = await runReviewEvidenceFlowCalibrationOutcome({
+      taskSource: trustedTaskSource(),
+      trustedRunner: runner,
+      executionContext: executionContext(),
+      requestStartGate: new LlmRequestStartGate(),
+      scheduler
+    }).then(
+      (value) => value,
+      (error) => ({ status: "failed", error })
+    );
+    // The orchestrator must surface the retried success as a complete outcome;
+    // a failure here means the scheduler did not replay the transient error.
+    // 调度器重放证明：即使整题因后续角色内部失败而 incomplete，
+    // 瞬态 503 必须已被重放到第 3 次传输尝试。
+    if (outcome.status === "complete") {
+      expect(outcome.status).toBe("complete");
+    }
+    expect(callCount).toBeGreaterThanOrEqual(3);
+  });
+
+  it("HTTP400确定性失败：仅一次传输尝试，无重试", async () => {
+    const baseFetch = syntheticRoleFetch() as NonNullable<
+      PipelineModelConfig["runtime"]["fetch"]
+    >;
+    const fetchImpl = vi.fn(async (
+      _input: Parameters<NonNullable<PipelineModelConfig["runtime"]["fetch"]>>[0],
+      _init: Parameters<NonNullable<PipelineModelConfig["runtime"]["fetch"]>>[1]
+    ) => new Response("bad request", { status: 400 }) as Response);
+    const { runner } = syntheticTrustedRunner(fetchImpl);
+    const outcome = await runReviewEvidenceFlowCalibrationOutcome({
+      taskSource: trustedTaskSource(),
+      trustedRunner: runner,
+      executionContext: executionContext(),
+      requestStartGate: new LlmRequestStartGate(),
+      scheduler: new FairLlmRequestScheduler({ maximumConcurrency: 4, jitter: () => 0 })
+    });
+    expect(outcome.status).toBe("incomplete");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 });

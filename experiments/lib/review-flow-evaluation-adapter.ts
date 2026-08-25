@@ -11,6 +11,7 @@ import { performance } from "node:perf_hooks";
 import runtimeManifestDocument from "../../config/review-flow-runtime.json" with { type: "json" };
 import type { ModelSpec } from "../../src/config";
 import type { LlmRequestStartGate } from "../../src/llm";
+import { FairLlmRequestScheduler } from "../../src/llm-scheduler";
 import type { PipelineModelConfig } from "../../src/pipelines/types";
 import {
   reviewFlowRoleAttemptsSchema,
@@ -246,6 +247,10 @@ export function createReviewFlowEvaluationAdapter(input: {
       if (!preparedCases.has(prepared)) {
         throw new Error("REVIEW_FLOW_EVALUATION_PREPARED_CASE_INVALID");
       }
+      const roleRetryScheduler = new FairLlmRequestScheduler({
+        maximumConcurrency: input.concurrency,
+        maximumAttemptsPerLogicalRequest: 3
+      });
       const timing: MutableCaseTiming = {
         startedAt: performance.now(),
         firstByteAt: null
@@ -260,7 +265,8 @@ export function createReviewFlowEvaluationAdapter(input: {
             assignmentId: prepared.taskSource.taskBinding.assignmentId,
             expectedRound: prepared.taskSource.taskBinding.expectedRound
           },
-          requestStartGate
+          requestStartGate,
+          scheduler: roleRetryScheduler
         });
         const timingReceipt = caseTimingReceipt(timing, performance.now());
         if (outcome.status === "complete") {
