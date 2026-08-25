@@ -2892,7 +2892,11 @@ async function requestWithRetry(
         }
         const eventShapeFailure =
           error instanceof LlmResponseFormatError &&
-          error.formatFailureStage === "event_shape";
+          (error.formatFailureStage === "event_shape" ||
+            (error.formatFailureStage === "response_shape" &&
+              audit.responseMode === "sse" &&
+              audit.finishReasonStopObserved === true &&
+              audit.firstRejectedEvent === null));
         if (
           eventShapeFailure ||
           (eventShapeRetryUsed && audit.transportAttemptReceipts.length === 1)

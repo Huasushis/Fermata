@@ -2047,6 +2047,99 @@ describe("chatComplete：正常路径", () => {
     expect(bodies[0]).toBe(bodies[1]);
   });
 
+  it("SSE response_shape 首错只重发一次且成功 receipt 记录两次传输", async () => {
+    const malformedBody = [
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      "",
+      "data: [DONE]",
+      "",
+      ""
+    ].join("\n");
+    let callCount = 0;
+    const fetchMock = vi.fn(async () => {
+      callCount += 1;
+      return new Response(callCount === 1 ? malformedBody : stoppedSsePrefix(), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      });
+    });
+
+    const result = await chatCompleteWithReceipt(provider, spec, [], {
+      ...runtime,
+      maxAttempts: 1,
+      fetch: fetchMock
+    });
+
+    expect(result.content).toBe("合成完整答案");
+    expect(result.receipt.transportAttemptCount).toBe(2);
+    expect(result.receipt.eofVerified).toBe(true);
+    expect(result.receipt.transportAttempts).toEqual([
+      expect.objectContaining({
+        attempt: 1,
+        outcome: "failure",
+        responseMode: "sse",
+        eofVerified: true,
+        finishReasonStopVerified: true,
+        sseDoneObserved: true,
+        failureCode: "LLM_RESPONSE_FORMAT_INVALID",
+        failureStage: "response_shape"
+      }),
+      expect.objectContaining({
+        attempt: 2,
+        outcome: "success",
+        failureCode: null,
+        failureStage: null
+      })
+    ]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("SSE response_shape 两次失败后保持固定拒绝并保留两次尝试计数", async () => {
+    const malformedBody = [
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      "",
+      "data: [DONE]",
+      "",
+      ""
+    ].join("\n");
+    const fetchMock = vi.fn(async () => new Response(malformedBody, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    }));
+    const error = await chatCompleteWithReceipt(provider, spec, [], {
+      ...runtime,
+      maxAttempts: 1,
+      fetch: fetchMock
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "response_shape"
+    });
+    expect(getLlmFailureAudit(error)).toMatchObject({
+      requestCount: 1,
+      transportAttemptCount: 2,
+      providerRequestCount: 2,
+      retryCount: 1,
+      completedResponses: []
+    });
+    expect(getLlmFailureAudit(error)?.transportAttempts).toEqual([
+      expect.objectContaining({
+        attempt: 1,
+        outcome: "failure",
+        failureCode: "LLM_RESPONSE_FORMAT_INVALID",
+        failureStage: "response_shape"
+      }),
+      expect.objectContaining({
+        attempt: 2,
+        outcome: "failure",
+        failureCode: "LLM_RESPONSE_FORMAT_INVALID",
+        failureStage: "response_shape"
+      })
+    ]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("SSE event_shape 两次失败后保持固定拒绝并保留两次尝试计数", async () => {
     const fetchMock = vi.fn(async () => new Response(
       'data: {"unexpected":true}\n\n',
@@ -3831,42 +3924,40 @@ describe("chatComplete：响应结构异常", () => {
   });
 
   it("reasoning-only 不会被当作最终答案", async () => {
-    const responses = [
-      new Response(JSON.stringify({
-        choices: [{
-          message: {
-            role: "assistant",
-            content: "   ",
-            reasoning_content: "已经推理但没有最终回答"
-          },
-          finish_reason: "stop"
-        }]
-      }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      }),
-      new Response([
-        'data: {"choices":[{"delta":{"reasoning_content":"只有推理"}}]}',
-        "",
-        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
-        "",
-        "data: [DONE]",
-        ""
-      ].join("\n"), {
-        status: 200,
-        headers: { "Content-Type": "text/event-stream" }
-      })
-    ];
-    for (const response of responses) {
-      const fetchMock = vi.fn(async () => response);
-      await expect(
-        chatComplete(provider, { ...spec, thinking: true }, [], {
-          ...runtime,
-          fetch: fetchMock
-        })
-      ).rejects.toBeInstanceOf(LlmResponseFormatError);
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-    }
+    const jsonCase = new Response(JSON.stringify({
+      choices: [{
+        message: {
+          role: "assistant",
+          content: "   ",
+          reasoning_content: "已经推理但没有最终回答"
+        },
+        finish_reason: "stop"
+      }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+    const fetchJson = vi.fn(async () => jsonCase);
+    await expect(
+      chatComplete(provider, spec, [], { ...runtime, fetch: fetchJson })
+    ).rejects.toBeInstanceOf(LlmResponseFormatError);
+    expect(fetchJson).toHaveBeenCalledTimes(1);
+
+    const sseBody = [
+      'data: {"choices":[{"delta":{"content":7},"finish_reason":"stop"}]}',
+      "",
+      "data: [DONE]",
+      "",
+      ""
+    ].join("\n");
+    const fetchSse = vi.fn(async () => new Response(sseBody, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    }));
+    await expect(
+      chatComplete(provider, spec, [], { ...runtime, maxAttempts: 1, fetch: fetchSse })
+    ).rejects.toBeInstanceOf(LlmResponseFormatError);
+    expect(fetchSse).toHaveBeenCalledTimes(1);
   });
 });
 
