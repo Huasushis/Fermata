@@ -32,6 +32,7 @@ import {
   type ReviewFlowStageAPayload
 } from "./four-call";
 import {
+  classifyTransportFailure,
   FairLlmRequestScheduler,
   LlmStageRequestError,
   type LlmStageFailureKind
@@ -494,32 +495,8 @@ function assertRequestMatchesConfig(
   }
 }
 
-export function classifyTransportFailure(error: unknown): LlmStageRequestError {
-  if (!(error instanceof LlmRequestError)) {
-    return new LlmStageRequestError("permanent", { cause: error });
-  }
-  if (error.code === "LLM_HTTP_ERROR") {
-    if (error.status === 429) {
-      return new LlmStageRequestError("rate_limited", {
+export { classifyTransportFailure } from "../llm-scheduler";
 
-        retryAfterMs: error.retryAfterMs,
-        cause: error
-      });
-    }
-    if (error.status !== undefined && error.status >= 500 && error.status <= 599) {
-      return new LlmStageRequestError("server_error", { cause: error });
-    }
-    return new LlmStageRequestError("permanent", { cause: error });
-  }
-  const byCode: Partial<Record<LlmRequestError["code"], ConstructorParameters<typeof LlmStageRequestError>[0]>> = {
-    LLM_NETWORK_FAILED: "connect",
-    LLM_FIRST_OUTPUT_TIMEOUT: "first_byte_timeout",
-    LLM_OUTPUT_IDLE_TIMEOUT: "no_progress_timeout",
-    LLM_STREAM_INTERRUPTED: "stream_interrupted",
-    LLM_OUTPUT_LENGTH_LIMIT: "output_limit"
-  };
-  return new LlmStageRequestError(byCode[error.code] ?? "permanent", { cause: error });
-}
 function safeRequestFailure(
   error: unknown,
   kind: LlmStageFailureKind

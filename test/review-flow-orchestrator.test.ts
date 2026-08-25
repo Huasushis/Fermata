@@ -11,6 +11,8 @@ import {
   inspectReviewFlowArtifactsForTest,
   inspectReviewFlowSubmissionForTest,
   reviewFlowCalibrationProjectionSchema,
+  reviewFlowRoleLogicalRequestAttemptLimit,
+  reviewFlowRoleRetrySchedulerCaseAttemptLimit,
   ReviewFlowError,
   runReviewEvidenceFlow,
   runReviewEvidenceFlowCalibrationOutcome,
@@ -2197,5 +2199,169 @@ describe("真实角色执行器路径的调度器瞬态重试", () => {
     });
     expect(outcome.status).toBe("incomplete");
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
+function completeSchedulerRoleFetch(): NonNullable<
+  PipelineModelConfig["runtime"]["fetch"]
+> {
+  const baseFetch = syntheticRoleFetch() as NonNullable<
+    PipelineModelConfig["runtime"]["fetch"]
+  >;
+  return vi.fn(async (input, init) => {
+    const request = JSON.parse(String(init?.body)) as {
+      readonly messages: readonly { readonly role: string; readonly content: string }[];
+    };
+    const system = request.messages
+      .filter((message) => message.role === "system")
+      .map((message) => message.content)
+      .join("\n");
+    const user = request.messages.at(-1)?.content ?? "";
+    if (
+      system.includes("格式化助手") &&
+      user.includes("以下是标签整理结果")
+    ) {
+      return new Response(JSON.stringify({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              tagIds: ["basic.simulation"],
+              rationale: "合成标签。"
+            })
+          },
+          finish_reason: "stop"
+        }]
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return baseFetch(input, init);
+  });
+}
+
+describe("调度器整题上限与耗尽会计（failed-only 修正）", () => {
+  it("单题 11 个必选角色首轮全部完成：角色 9-11 不再命中整题尝试上限", async () => {
+    const { runner } = syntheticTrustedRunner(completeSchedulerRoleFetch());
+    const scheduler = new FairLlmRequestScheduler({
+      maximumConcurrency: 4,
+      maximumAttemptsPerLogicalRequest: reviewFlowRoleLogicalRequestAttemptLimit,
+      maximumAttemptsPerCase: reviewFlowRoleRetrySchedulerCaseAttemptLimit(),
+      jitter: () => 0
+    });
+    const outcome = await runReviewEvidenceFlowCalibrationOutcome({
+      taskSource: trustedTaskSource(),
+      trustedRunner: runner,
+      executionContext: executionContext(),
+      requestStartGate: new LlmRequestStartGate(),
+      scheduler
+    });
+    if (outcome.status !== "complete") {
+      throw new Error(`expected complete: ${JSON.stringify(outcome.failure?.failedRoles ?? null)}`);
+    }
+    expect(Object.values(scheduler.snapshot().attemptsByCase)).toEqual([11]);
+  });
+
+  it("整题外层上限恰为 11×3：有界且第 34 次外层尝试被拒绝", async () => {
+    const cap = reviewFlowRoleRetrySchedulerCaseAttemptLimit();
+    expect(reviewFlowRoleLogicalRequestAttemptLimit).toBe(3);
+    expect(cap).toBe(33);
+    const scheduler = new FairLlmRequestScheduler({
+      maximumConcurrency: 4,
+      maximumAttemptsPerCase: cap,
+      jitter: () => 0,
+      sleep: async () => undefined
+    });
+    for (let index = 0; index < cap; index += 1) {
+      await scheduler.runLogicalRequest({
+        caseId: "cap-case",
+        requestId: `req${index}`,
+        execute: async () => ({ index })
+      });
+    }
+    await expect(scheduler.runLogicalRequest({
+      caseId: "cap-case",
+      requestId: "overflow",
+      execute: async () => {
+        throw new Error("must-not-run");
+      }
+    })).rejects.toThrow("LLM_CASE_ATTEMPT_LIMIT");
+    expect(scheduler.snapshot().attemptsByCase["cap-case"]).toBe(cap);
+  });
+
+  it("网络瞬态恰好 3 次耗尽后按 transport/LLM_NETWORK_FAILED 记账 3 次，而非 role_internal/0", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new TypeError("simulated network reset");
+    });
+    const { runner } = syntheticTrustedRunner(fetchImpl as NonNullable<PipelineModelConfig["runtime"]["fetch"]>);
+    const outcome = await runReviewEvidenceFlowCalibrationOutcome({
+      taskSource: trustedTaskSource(),
+      trustedRunner: runner,
+      executionContext: executionContext(),
+      requestStartGate: new LlmRequestStartGate(),
+      scheduler: new FairLlmRequestScheduler({
+        maximumConcurrency: 4,
+        maximumAttemptsPerLogicalRequest: reviewFlowRoleLogicalRequestAttemptLimit,
+        maximumAttemptsPerCase: reviewFlowRoleRetrySchedulerCaseAttemptLimit(),
+        jitter: () => 0,
+        sleep: async () => undefined
+      })
+    });
+    expect(outcome.status).toBe("incomplete");
+    if (outcome.status !== "incomplete") return;
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(outcome.failure.failedRoles[0]).toMatchObject({
+      role: "solver",
+      failureKind: "transport",
+      requestCount: 3,
+      transportAttemptCount: 3
+    });
+    const solver = outcome.failure.roleAttempts.find((entry) => entry.role === "solver");
+    expect(solver).toMatchObject({
+      outcome: "failed",
+      errorCategory: "transport",
+      errorCode: "LLM_NETWORK_FAILED",
+      logicalRequestCount: 3,
+      transportAttemptCount: 3,
+      providerRequestCount: 3,
+      retryCount: 0,
+      httpStatus: null
+    });
+  });
+
+  it("服务端瞬态恰好 3 次耗尽后按 service_http 记账并保留状态码", async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response("service unavailable", { status: 503 }) as Response
+    );
+    const { runner } = syntheticTrustedRunner(fetchImpl as NonNullable<PipelineModelConfig["runtime"]["fetch"]>);
+    const outcome = await runReviewEvidenceFlowCalibrationOutcome({
+      taskSource: trustedTaskSource(),
+      trustedRunner: runner,
+      executionContext: executionContext(),
+      requestStartGate: new LlmRequestStartGate(),
+      scheduler: new FairLlmRequestScheduler({
+        maximumConcurrency: 4,
+        maximumAttemptsPerLogicalRequest: reviewFlowRoleLogicalRequestAttemptLimit,
+        maximumAttemptsPerCase: reviewFlowRoleRetrySchedulerCaseAttemptLimit(),
+        jitter: () => 0,
+        sleep: async () => undefined
+      })
+    });
+    expect(outcome.status).toBe("incomplete");
+    if (outcome.status !== "incomplete") return;
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(outcome.failure.failedRoles[0]).toMatchObject({
+      role: "solver",
+      failureKind: "service_http",
+      requestCount: 3,
+      transportAttemptCount: 3
+    });
+    const solver = outcome.failure.roleAttempts.find((entry) => entry.role === "solver");
+    expect(solver).toMatchObject({
+      outcome: "failed",
+      errorCategory: "service_http",
+      errorCode: "LLM_HTTP_ERROR",
+      logicalRequestCount: 3,
+      transportAttemptCount: 3,
+      providerRequestCount: 3,
+      httpStatus: 503
+    });
   });
 });

@@ -1,8 +1,8 @@
 import { z } from "zod";
 import {
   classifyStageRequestError,
-  FairLlmRequestScheduler,
-  LlmStageRequestError
+  classifyTransportFailure,
+  FairLlmRequestScheduler
 } from "../llm-scheduler";
 import {
   getLlmCompletionAudit,
@@ -113,6 +113,14 @@ import {
   type TagsView,
   type TechnicalAuditorView
 } from "./views";
+
+/** 每个必选角色逻辑请求最多重放三次。 */
+export const reviewFlowRoleLogicalRequestAttemptLimit = 3 as const;
+/** 整题外层尝试上限必须覆盖所有必选角色的最坏逻辑重放次数。 */
+export function reviewFlowRoleRetrySchedulerCaseAttemptLimit(): number {
+  return reviewFlowRoleSchema.options.length *
+    reviewFlowRoleLogicalRequestAttemptLimit;
+}
 
 /** 任一视图、证据封装、裁决或传输 receipt 语义变化时都必须重新绑定。 */
 export const reviewFlowRuntimeImplementationVersion =
@@ -951,6 +959,13 @@ interface RoleSpec<TPayload> {
   readonly run: () => Promise<unknown>;
   postValidate?(artifact: EvidenceArtifact<TPayload>): void;
 }
+interface SchedulerRoleFailureAccounting {
+  readonly logicalRequestCount: 0 | 1 | 2 | 3;
+  readonly transportAttemptCount: number;
+  readonly providerRequestCount: number;
+  readonly retryCount: number;
+}
+
 interface ReviewFlowRunTracker {
   sourceSnapshotHash: string | null;
   runBinding: ReviewFlowSafeRunBinding | null;
@@ -1586,26 +1601,33 @@ async function runAndSeal<TPayload>(input: {
   readonly roleRetryScheduler?: FairLlmRequestScheduler | null;
   readonly spec: RoleSpec<TPayload>;
 }): Promise<EvidenceArtifact<TPayload>> {
+  let schedulerTerminalError: unknown = null;
+  let schedulerTerminalAudit: LlmFailureAudit | null = null;
+  let schedulerLogicalRequestCount: 0 | 1 | 2 | 3 = 0;
+  let schedulerTransportAttemptCount = 0;
+  let schedulerProviderRequestCount = 0;
+  let schedulerRetryCount = 0;
   const executeWithRetries = input.roleRetryScheduler
     ? () => input.roleRetryScheduler!.runLogicalRequest({
         caseId: `${input.binding.problemContentHash.slice(0, 16)}`,
         requestId: `role:${input.spec.role}`,
-        execute: async () => {
+        execute: async (attempt) => {
+          // FairLlmRequestScheduler 构造器已把每逻辑请求上限限定为 1-3。
+          schedulerLogicalRequestCount = attempt as 1 | 2 | 3;
           try {
             return await input.spec.run();
           } catch (error) {
-            // 调度器只重放已分类的阶段错误；把底层传输错误归一化，
-            // 保留原始状态码与审计（safeRequestFailure 同源字段）。
-            if (classifyStageRequestError(error) !== null) throw error;
-            throw new LlmStageRequestError(
-              error instanceof LlmRequestError && error.code === "LLM_HTTP_ERROR" &&
-                typeof error.status === "number" && error.status >= 500
-                ? "server_error"
-                : error instanceof LlmRequestError && error.code === "LLM_HTTP_ERROR"
-                  ? "permanent"
-                  : "permanent",
-              { cause: error }
-            );
+            const existingStageError = classifyStageRequestError(error);
+            const stageError = existingStageError ?? classifyTransportFailure(error);
+            const terminalError = existingStageError?.cause ?? error;
+            const audit = getLlmFailureAudit(terminalError) ??
+              getLlmFailureAudit(error);
+            schedulerTerminalError = terminalError;
+            schedulerTerminalAudit = audit;
+            schedulerTransportAttemptCount += audit?.transportAttemptCount ?? 0;
+            schedulerProviderRequestCount += audit?.providerRequestCount ?? 0;
+            schedulerRetryCount += audit?.retryCount ?? 0;
+            throw stageError;
           }
         }
       })
@@ -1694,15 +1716,34 @@ async function runAndSeal<TPayload>(input: {
     // 错误地归类为 cancelled 而非让已付费的请求自然收束（见 rep3-v4
     // 终态账本中 5 个 cancelled 角色）。案例终态由 runIndependentRoles
     // 抛出的第一个错误决定；这里只记录失败，不阻止其它在途请求。
-    const failureKind = classifyRoleFailure(error);
-    input.tracker.onTerminalRoleFailure?.(input.spec.role, failureKind, error);
+    const effectiveError = schedulerTerminalError ?? error;
+    const failureKind = classifyRoleFailure(effectiveError);
+    input.tracker.onTerminalRoleFailure?.(
+      input.spec.role,
+      failureKind,
+      effectiveError
+    );
     input.tracker.completions.delete(input.spec.role);
     input.tracker.roleAttempts.delete(input.spec.role);
-    const llmAudit = getLlmFailureAudit(error);
+    const llmAudit = schedulerTerminalAudit ?? getLlmFailureAudit(effectiveError);
+    const schedulerAccounting: SchedulerRoleFailureAccounting | null =
+      schedulerTerminalError === null
+        ? null
+        : {
+            logicalRequestCount: schedulerLogicalRequestCount,
+            transportAttemptCount: schedulerTransportAttemptCount,
+            providerRequestCount: schedulerProviderRequestCount,
+            retryCount: schedulerRetryCount
+          };
     input.tracker.failures.set(
       input.spec.role,
-      llmAudit !== null
-        ? summarizeRoleFailure(input.spec.role, failureKind, llmAudit)
+      llmAudit !== null || schedulerAccounting !== null
+        ? summarizeRoleFailure(
+            input.spec.role,
+            failureKind,
+            llmAudit,
+            schedulerAccounting
+          )
         : summarizeCompletedReceiptFailure(
           input.spec.role,
           failureKind,
@@ -1714,10 +1755,11 @@ async function runAndSeal<TPayload>(input: {
       failedRoleAttemptAudit(
         input.spec.role,
         failureKind,
-        error,
+        effectiveError,
         llmAudit,
         completedReceipt,
-        completionAudit
+        completionAudit,
+        schedulerAccounting
       )
     );
     if (error instanceof ReviewFlowError) throw error;
@@ -2055,14 +2097,16 @@ function failedRoleAttemptAudit(
   error: unknown,
   llmAudit: LlmFailureAudit | null,
   receipt: RoleCompletionReceipt | null,
-  completionAudit: LlmCompletionAudit | null
+  completionAudit: LlmCompletionAudit | null,
+  schedulerAccounting: SchedulerRoleFailureAccounting | null = null
 ): ReviewFlowRoleAttemptAudit {
   const location = safeFailureLocation(error);
-  const logicalRequestCount =
+  const logicalRequestCount = schedulerAccounting?.logicalRequestCount ??
     llmAudit?.requestCount ?? receipt?.requestCount ?? 0;
-  const transportAttemptCount =
+  const transportAttemptCount = schedulerAccounting?.transportAttemptCount ??
     llmAudit?.transportAttemptCount ?? receipt?.transportAttemptCount ?? 0;
-  const retryCount = llmAudit?.retryCount ?? completionAudit?.retryCount ??
+  const retryCount = schedulerAccounting?.retryCount ?? llmAudit?.retryCount ??
+    completionAudit?.retryCount ??
     receipt?.responses.reduce(
       (sum, response) => sum + Math.max(0, response.transportAttemptCount - 1),
       0
@@ -2102,6 +2146,7 @@ function failedRoleAttemptAudit(
     logicalRequestCount,
     transportAttemptCount,
     providerRequestCount:
+      schedulerAccounting?.providerRequestCount ??
       llmAudit?.providerRequestCount ??
       completionAudit?.providerRequestCount ??
       transportAttemptCount,
@@ -2181,14 +2226,19 @@ function summarizeCompletedReceiptFailure(
 function summarizeRoleFailure(
   role: ReviewFlowRole,
   failureKind: ReviewFlowFailureKind,
-  audit: LlmFailureAudit | null
+  audit: LlmFailureAudit | null,
+  schedulerAccounting: SchedulerRoleFailureAccounting | null = null
 ): ReviewFlowRoleFailureSummary {
   return deepFreeze({
     role,
     failureKind,
     httpStatus: audit?.terminal.status ?? null,
-    requestCount: audit?.requestCount ?? 0,
-    transportAttemptCount: audit?.transportAttemptCount ?? 0,
+    requestCount:
+      schedulerAccounting?.logicalRequestCount ?? audit?.requestCount ?? 0,
+    transportAttemptCount:
+      schedulerAccounting?.transportAttemptCount ??
+      audit?.transportAttemptCount ??
+      0,
     completedResponseCount: audit?.completedResponses.length ?? 0,
     terminalResponseMode: audit?.terminal.responseMode ?? null,
     terminalEofObserved: audit?.terminal.eofObserved ?? false,

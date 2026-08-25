@@ -14,6 +14,8 @@ import type { LlmRequestStartGate } from "../../src/llm";
 import { FairLlmRequestScheduler } from "../../src/llm-scheduler";
 import type { PipelineModelConfig } from "../../src/pipelines/types";
 import {
+  reviewFlowRoleLogicalRequestAttemptLimit,
+  reviewFlowRoleRetrySchedulerCaseAttemptLimit,
   reviewFlowRoleAttemptsSchema,
   runReviewEvidenceFlowCalibrationOutcome,
   type ReviewFlowCalibrationProjection,
@@ -249,7 +251,9 @@ export function createReviewFlowEvaluationAdapter(input: {
       }
       const roleRetryScheduler = new FairLlmRequestScheduler({
         maximumConcurrency: input.concurrency,
-        maximumAttemptsPerLogicalRequest: 3
+        maximumAttemptsPerLogicalRequest:
+          reviewFlowRoleLogicalRequestAttemptLimit,
+        maximumAttemptsPerCase: reviewFlowRoleRetrySchedulerCaseAttemptLimit()
       });
       const timing: MutableCaseTiming = {
         startedAt: performance.now(),
