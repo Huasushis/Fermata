@@ -18,6 +18,7 @@
     "experiments/lib/review-flow-evaluation-dataset.ts",
     "experiments/lib/review-flow-evaluation-registry.ts",
     "experiments/lib/review-flow-evaluation-report.ts",
+    "experiments/lib/review-flow-evaluation-reconcile.ts",
     "experiments/lib/review-flow-evaluation-runner.ts",
     "experiments/lib/review-flow-evaluation-state.ts",
     "experiments/lib/review-flow-runtime-attestation.ts",

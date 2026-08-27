@@ -615,6 +615,105 @@ const executionSealSchema = z
     completionFingerprint: digestSchema
   })
   .strict();
+const reconciliationPostCommitAllowedPaths = [
+  "config/review-flow-runtime.json",
+  "experiments/eval-review-flow.ts",
+  "experiments/lib/review-flow-evaluation-reconcile.ts",
+  "experiments/lib/review-flow-evaluation-state.ts",
+  "scripts/trusted-git-state.mjs",
+  "test/review-flow-evaluation-reconcile.test.ts"
+] as const;
+const reconciliationTelemetrySourceCodeVersion =
+  "3c0005a8054056748e2adf99cc3ada8aa9bca4c2";
+const reconciliationTelemetryTargetCodeVersion =
+  "fa2929af05cd7564a3bb1a98b072f639524627b0";
+const reconciliationPostCommitSourceCodeVersion =
+  reconciliationTelemetryTargetCodeVersion;
+const reconciliationCommitVersionSchema = z.string().regex(
+  /^(?!0{40}$)[0-9a-f]{40}$/u
+);
+const reconciliationPathSchema = z.string().regex(
+  /^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/u
+);
+const reconciliationPostCommitCodeDeltaSchema = z
+  .object({
+    sourceCodeVersion: z.literal(reconciliationPostCommitSourceCodeVersion),
+    targetCodeVersion: reconciliationCommitVersionSchema,
+    diffSha256: digestSchema,
+    proofSha256: digestSchema,
+    changedPaths: z
+      .array(reconciliationPathSchema)
+      .length(reconciliationPostCommitAllowedPaths.length)
+  })
+  .strict()
+  .superRefine((delta, context) => {
+    if (
+      delta.targetCodeVersion === delta.sourceCodeVersion ||
+      delta.changedPaths.some(
+        (path, index) => path !== reconciliationPostCommitAllowedPaths[index]
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["changedPaths"],
+        message: "reconciliation code delta is not the exact private proof."
+      });
+    }
+  });
+
+const reconciliationCheckpointSourceSchema = z
+  .object({
+    label: reviewFlowEvaluationLabelSchema,
+    runId: z.string().uuid(),
+    identityFingerprint: digestSchema,
+    stateFingerprint: digestSchema,
+    checkpointSha256: digestSchema,
+    expectedCaseCount: z.literal(32),
+    completedCaseCount: z.literal(23),
+    failedCaseCount: z.literal(9),
+    activeCaseCount: z.literal(0)
+  })
+  .strict();
+
+export const reviewFlowEvaluationReconciliationBindingSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    artifactKind: z.literal("review_flow_evaluation_reconciliation"),
+    authority: reconciliationCheckpointSourceSchema,
+    donor: reconciliationCheckpointSourceSchema.extend({
+      expectedCaseCount: z.literal(9),
+      completedCaseCount: z.literal(7),
+      failedCaseCount: z.literal(1),
+      activeCaseCount: z.literal(1)
+    }).strict(),
+    compatibilityProofSha256: digestSchema,
+    sourceCodeVersion: z.literal(reconciliationTelemetrySourceCodeVersion),
+    targetCodeVersion: z.literal(reconciliationTelemetryTargetCodeVersion),
+    postCommitCodeDelta: reconciliationPostCommitCodeDeltaSchema.optional(),
+    reconciledIdentityFingerprint: digestSchema,
+    absorbedCaseIds: z.array(reviewFlowEvaluationSafeIdSchema).length(7),
+    requeueCaseIds: z.array(reviewFlowEvaluationSafeIdSchema).length(2)
+  })
+  .strict()
+  .superRefine((binding, context) => {
+    const absorbed = new Set(binding.absorbedCaseIds);
+    const requeue = new Set(binding.requeueCaseIds);
+    if (
+      absorbed.size !== binding.absorbedCaseIds.length ||
+      requeue.size !== binding.requeueCaseIds.length ||
+      binding.requeueCaseIds.some((safeId) => absorbed.has(safeId))
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["requeueCaseIds"],
+        message: "reconciliation case provenance must be disjoint and unique."
+      });
+    }
+  });
+export type ReviewFlowEvaluationReconciliationBinding = z.infer<
+  typeof reviewFlowEvaluationReconciliationBindingSchema
+>;
+
 const failedOnlyContinuationSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -633,7 +732,6 @@ const failedOnlyContinuationSchema = z
 export type ReviewFlowEvaluationFailedOnlyContinuation = z.infer<
   typeof failedOnlyContinuationSchema
 >;
-
 
 export const reviewFlowEvaluationPublicationBindingSchema = z
   .object({
@@ -666,6 +764,8 @@ export const reviewFlowEvaluationCheckpointSchema = z
     globalClaimSha256: digestSchema.nullable(),
     termination: terminationSchema.nullable(),
     executionSeal: executionSealSchema.nullable(),
+    reconciliation:
+      reviewFlowEvaluationReconciliationBindingSchema.optional(),
     publication: reviewFlowEvaluationPublicationBindingSchema.nullable(),
     failedOnlyContinuation: failedOnlyContinuationSchema.optional(),
     representative3Timing:
@@ -741,6 +841,25 @@ export const reviewFlowEvaluationCheckpointSchema = z
         message: "检查点身份或样本集合不一致。"
       });
     }
+    if (state.reconciliation !== undefined) {
+      const postCommit = state.reconciliation.postCommitCodeDelta;
+      if (
+        state.reconciliation.reconciledIdentityFingerprint !==
+          state.identityFingerprint ||
+        (postCommit === undefined &&
+          state.identity.codeIdentity.codeVersion !==
+            reconciliationTelemetryTargetCodeVersion) ||
+        (postCommit !== undefined &&
+          state.identity.codeIdentity.codeVersion !==
+            postCommit.targetCodeVersion)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["reconciliation"],
+          message: "reconciliation 必须绑定当前检查点身份。"
+        });
+      }
+    }
     if (
       state.identity.caseSelection !== undefined &&
       (
@@ -794,7 +913,8 @@ export const reviewFlowEvaluationCheckpointSchema = z
       });
     }
     if (state.executionSeal !== null) {
-      const expectedFingerprint = executionCompletionFingerprint(state);
+      const expectedFingerprint =
+        reviewFlowEvaluationExecutionCompletionFingerprint(state);
       const receiptSeal = buildExecutionReceiptSeal(
         state.expectedCases,
         state.identity.caseSelection,
@@ -1014,8 +1134,86 @@ export function assertFailedOnlyContinuationIdentityCompatible(
     );
   }
 }
+function reconciledContinuationIdentityProjection(
+  identity: ReviewFlowEvaluationIdentity
+): unknown {
+  const {
+    snapshotSha256: _snapshotSha256,
+    snapshotFileCount: _snapshotFileCount,
+    ...stableRuntime
+  } = identity.runtime;
+  const {
+    runnerSha256: _runnerSha256,
+    dependencyCodeSha256: _dependencyCodeSha256,
+    dependencyFileCount: _dependencyFileCount,
+    ...stableCodeIdentity
+  } = identity.codeIdentity;
+  const { codeIdentity: _codeIdentity, ...semanticIdentity } = identity;
+  return {
+    ...semanticIdentity,
+    codeIdentity: {
+      ...stableCodeIdentity,
+      runnerSha256: null,
+      dependencyCodeSha256: null,
+      dependencyFileCount: null
+    },
+    runtime: {
+      ...stableRuntime,
+      snapshotSha256: null,
+      snapshotFileCount: null
+    }
+  };
+}
 
-
+/**
+ * 重协调检查点只能通过私有工具生成的精确提交差异绑定跨越遥测提交。
+ * 普通 failed-only continuation 继续使用上面的历史兼容规则。
+ */
+export function assertFailedOnlyReconciledContinuationIdentityCompatible(
+  source: ReviewFlowEvaluationCheckpointState,
+  continuation: ReviewFlowEvaluationIdentity
+): void {
+  let parsedContinuation: ReviewFlowEvaluationIdentity;
+  try {
+    parsedContinuation = reviewFlowEvaluationIdentitySchema.parse(continuation);
+  } catch {
+    throw new ReviewFlowEvaluationCheckpointError(
+      "REVIEW_FLOW_EVALUATION_FAILED_ONLY_IDENTITY_MISMATCH"
+    );
+  }
+  const postCommit = source.reconciliation?.postCommitCodeDelta;
+  if (postCommit === undefined) {
+    if (
+      source.identity.codeIdentity.codeVersion !==
+        reconciliationTelemetryTargetCodeVersion ||
+      parsedContinuation.codeIdentity.codeVersion !==
+        reconciliationTelemetryTargetCodeVersion
+    ) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_EVALUATION_FAILED_ONLY_IDENTITY_MISMATCH"
+      );
+    }
+    assertFailedOnlyContinuationIdentityCompatible(
+      source.identity,
+      parsedContinuation
+    );
+    return;
+  }
+  if (
+    source.identity.codeIdentity.codeVersion !== postCommit.targetCodeVersion ||
+    parsedContinuation.codeIdentity.codeVersion !== postCommit.targetCodeVersion ||
+    hashCanonicalValue(
+      reconciledContinuationIdentityProjection(source.identity)
+    ) !==
+      hashCanonicalValue(
+        reconciledContinuationIdentityProjection(parsedContinuation)
+      )
+  ) {
+    throw new ReviewFlowEvaluationCheckpointError(
+      "REVIEW_FLOW_EVALUATION_FAILED_ONLY_IDENTITY_MISMATCH"
+    );
+  }
+}
 export class ReviewFlowEvaluationCheckpointError extends Error {
   public readonly code: string;
 
@@ -1065,10 +1263,17 @@ function buildFailedOnlyContinuationState(input: {
       "REVIEW_FLOW_EVALUATION_FAILED_ONLY_IDENTITY_MISMATCH"
     );
   }
-  assertFailedOnlyContinuationIdentityCompatible(
-    source.identity,
-    input.identity
-  );
+  if (source.reconciliation !== undefined) {
+    assertFailedOnlyReconciledContinuationIdentityCompatible(
+      source,
+      input.identity
+    );
+  } else {
+    assertFailedOnlyContinuationIdentityCompatible(
+      source.identity,
+      input.identity
+    );
+  }
   const sourceFailedCaseIds = source.entries.flatMap((entry) =>
     entry.status === "failed" ? [entry.safeId] : []
   );
@@ -1114,6 +1319,13 @@ function buildFailedOnlyContinuationState(input: {
     );
   }
   const identityFingerprint = hashCanonicalValue(input.identity);
+  const reconciliation =
+    source.reconciliation === undefined
+      ? undefined
+      : {
+          ...source.reconciliation,
+          reconciledIdentityFingerprint: identityFingerprint
+        };
   return reviewFlowEvaluationCheckpointSchema.parse({
     schemaVersion: 2,
     label: input.label,
@@ -1125,6 +1337,7 @@ function buildFailedOnlyContinuationState(input: {
     identityFingerprint,
     holdoutIdentity: input.holdoutIdentity,
     thresholdPolicySha256: input.thresholdPolicySha256,
+    ...(reconciliation === undefined ? {} : { reconciliation }),
     expectedCases: input.expectedCases,
     entries: continuationEntries,
     auditLedger: source.auditLedger,
@@ -1749,7 +1962,8 @@ export class ReviewFlowEvaluationCheckpoint {
       executionSeal: {
         sealedAt,
         complete,
-        completionFingerprint: executionCompletionFingerprint(this.#state)
+        completionFingerprint:
+          reviewFlowEvaluationExecutionCompletionFingerprint(this.#state)
       },
       revision: this.#state.revision + 1,
       updatedAt: sealedAt
@@ -2227,7 +2441,7 @@ function legacyFailedCaseAttempt(
   });
 }
 
-function executionCompletionFingerprint(
+export function reviewFlowEvaluationExecutionCompletionFingerprint(
   state: Pick<
     ReviewFlowEvaluationCheckpointState,
     | "runId"
@@ -2239,6 +2453,7 @@ function executionCompletionFingerprint(
     | "globalClaimSha256"
     | "termination"
     | "representative3Timing"
+    | "reconciliation"
   >
 ): string {
   const receiptSeal = buildExecutionReceiptSeal(
@@ -2247,7 +2462,10 @@ function executionCompletionFingerprint(
     state.entries
   );
   return hashCanonicalValue({
-    protocol: "review-flow-evaluation-execution-completion-v4",
+    protocol:
+      state.reconciliation === undefined
+        ? "review-flow-evaluation-execution-completion-v4"
+        : "review-flow-evaluation-execution-completion-v5",
     runId: state.runId,
     identityFingerprint: state.identityFingerprint,
     expectedCases: state.expectedCases,
@@ -2258,7 +2476,10 @@ function executionCompletionFingerprint(
     termination: state.termination,
     ...(state.representative3Timing === undefined
       ? {}
-      : { representative3Timing: state.representative3Timing })
+      : { representative3Timing: state.representative3Timing }),
+    ...(state.reconciliation === undefined
+      ? {}
+      : { reconciliation: state.reconciliation })
   });
 }
 

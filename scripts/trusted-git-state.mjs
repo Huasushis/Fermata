@@ -925,6 +925,30 @@ export function buildTrustedGitEnvironment() {
 }
 
 function isAllowedReadOnlyGitCommand(commandArguments) {
+  if (
+    commandArguments.length === 6 &&
+    commandArguments[0] === "diff" &&
+    commandArguments[1] === "--binary" &&
+    commandArguments[2] === "--no-ext-diff" &&
+    commandArguments[3] === "--no-renames" &&
+    commitPattern.test(commandArguments[4] ?? "") &&
+    commitPattern.test(commandArguments[5] ?? "") &&
+    commandArguments[4] !== commandArguments[5]
+  ) {
+    return true;
+  }
+  if (
+    commandArguments.length === 6 &&
+    commandArguments[0] === "diff" &&
+    commandArguments[1] === "--name-only" &&
+    commandArguments[2] === "--no-ext-diff" &&
+    commandArguments[3] === "--no-renames" &&
+    commitPattern.test(commandArguments[4] ?? "") &&
+    commitPattern.test(commandArguments[5] ?? "") &&
+    commandArguments[4] !== commandArguments[5]
+  ) {
+    return true;
+  }
   const serialized = JSON.stringify(commandArguments);
   if (
     serialized === JSON.stringify(["rev-parse", "HEAD"]) ||

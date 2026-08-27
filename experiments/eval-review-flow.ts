@@ -72,6 +72,10 @@ import {
   type ReviewFlowSafeStreamCheckpoint
 } from "./lib/review-flow-evaluation-state";
 import {
+  runReviewFlowEvaluationReconciliationCli,
+  type ReviewFlowEvaluationReconciliationCliOptions
+} from "./lib/review-flow-evaluation-reconcile";
+import {
   loadReviewFlowRuntimeAttestation,
   reviewFlowRuntimeIdentitySchema,
   type ReviewFlowRuntimeAttestation
@@ -107,10 +111,14 @@ export interface ReviewFlowEvaluationRunCliOptions {
   readonly failedOnlyCaseIds: readonly string[] | null;
   readonly caseSelector: ReviewFlowEvaluationCaseSelector | null;
   readonly caseSelectorFilePath: string | null;
+
   readonly maxCaseAttempts: number;
   readonly maxEventShapeRetries: number | null;
   readonly streamCheckpoints: boolean;
 }
+export type ReviewFlowEvaluationReconcileCliOptions =
+  ReviewFlowEvaluationReconciliationCliOptions;
+
 
 export interface ReviewFlowEvaluationRevealCliOptions {
   readonly action: "reveal";
@@ -124,7 +132,8 @@ export interface ReviewFlowEvaluationRevealCliOptions {
 
 export type ReviewFlowEvaluationCliOptions =
   | ReviewFlowEvaluationRunCliOptions
-  | ReviewFlowEvaluationRevealCliOptions;
+  | ReviewFlowEvaluationRevealCliOptions
+  | ReviewFlowEvaluationReconcileCliOptions;
 
 export function resolveReviewFlowEvaluationCliOptions(
   argv: readonly string[]
@@ -133,11 +142,13 @@ export function resolveReviewFlowEvaluationCliOptions(
   let resume = false;
   let failedOnly = false;
   let streamCheckpoints = false;
+  let dryRun = false;
   for (const argument of argv) {
     if (
       argument === "--resume" ||
       argument === "--failed-only" ||
-      argument === "--stream-checkpoints"
+      argument === "--stream-checkpoints" ||
+      argument === "--dry-run"
     ) {
       if (argument === "--resume") {
         if (resume) throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
@@ -145,11 +156,14 @@ export function resolveReviewFlowEvaluationCliOptions(
       } else if (argument === "--failed-only") {
         if (failedOnly) throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
         failedOnly = true;
-      } else {
+      } else if (argument === "--stream-checkpoints") {
         if (streamCheckpoints) {
           throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
         }
         streamCheckpoints = true;
+      } else {
+        if (dryRun) throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+        dryRun = true;
       }
       continue;
     }
@@ -160,8 +174,68 @@ export function resolveReviewFlowEvaluationCliOptions(
     values.set(match[1]!, match[2]!);
   }
   const action = values.get("action") ?? "run";
+  if (action === "reconcile") {
+    if (resume || failedOnly || streamCheckpoints) {
+      throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+    }
+    const allowed = new Set([
+      "action",
+      "authoritative-checkpoint",
+      "donor-checkpoint",
+      "compatibility-proof",
+      "reconciliation-proof",
+      "output"
+    ]);
+    if ([...values.keys()].some((key) => !allowed.has(key))) {
+      throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+    }
+    const authoritativeCheckpointPath = values.get(
+      "authoritative-checkpoint"
+    );
+    const donorCheckpointPath = values.get("donor-checkpoint");
+    const compatibilityProofPath = values.get("compatibility-proof");
+    const reconciliationProofPath = values.get("reconciliation-proof") ?? null;
+    const outputPath = values.get("output");
+    const reconcilePaths = [
+      authoritativeCheckpointPath,
+      donorCheckpointPath,
+      compatibilityProofPath,
+      reconciliationProofPath,
+      outputPath
+    ];
+    if (
+      authoritativeCheckpointPath === undefined ||
+      !isAbsolute(authoritativeCheckpointPath) ||
+      donorCheckpointPath === undefined ||
+      !isAbsolute(donorCheckpointPath) ||
+      compatibilityProofPath === undefined ||
+      !isAbsolute(compatibilityProofPath) ||
+      (reconciliationProofPath !== null &&
+        !isAbsolute(reconciliationProofPath)) ||
+      outputPath === undefined ||
+      !isAbsolute(outputPath) ||
+      new Set(
+        reconcilePaths
+          .filter((path): path is string => path !== null && path !== undefined)
+          .map((path) => resolve(path))
+      ).size !== reconcilePaths.filter(
+        (path): path is string => path !== null && path !== undefined
+      ).length
+    ) {
+      throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+    }
+    return {
+      action: "reconcile",
+      authoritativeCheckpointPath,
+      donorCheckpointPath,
+      compatibilityProofPath,
+      reconciliationProofPath,
+      outputPath,
+      dryRun
+    };
+  }
   if (action === "reveal") {
-    if (failedOnly || streamCheckpoints) {
+    if (failedOnly || streamCheckpoints || dryRun) {
       throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
     }
     const allowed = new Set([
@@ -202,6 +276,9 @@ export function resolveReviewFlowEvaluationCliOptions(
     };
   }
   if (action !== "run") {
+    throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+  }
+  if (dryRun) {
     throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
   }
   const allowed = new Set([
@@ -406,6 +483,21 @@ export async function runReviewFlowEvaluationCli(input: {
   const argv = directScoring
     ? input.argv.filter((argument) => argument !== "--direct-scoring")
     : input.argv;
+  if (argv.some((argument) => argument === "--action=reconcile")) {
+    const options = resolveReviewFlowEvaluationCliOptions(argv);
+    if (directScoring || options.action !== "reconcile") {
+      throw new Error(
+        directScoring
+          ? "REVIEW_FLOW_EVALUATION_DIRECT_SCORING_SCOPE_INVALID"
+          : "REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID"
+      );
+    }
+    await runReviewFlowEvaluationReconciliationCli({
+      options,
+      repositoryDirectory
+    });
+    return;
+  }
   if (directScoring) {
     assertDirectScoringEnvironment(input.env);
   } else {
@@ -438,6 +530,9 @@ export async function runReviewFlowEvaluationCli(input: {
       runtimeAttestation
     });
     return;
+  }
+  if (options.action !== "run") {
+    throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
   }
   await (
     input.dependencies?.runPredictionOrDevelopment ??
