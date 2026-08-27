@@ -43,7 +43,10 @@ import {
   upstreamVerifierRunnerPath
 } from "../experiments/lib/review-flow-bridge-repositories";
 import { reviewFlowEvaluationCodePaths } from "../experiments/lib/review-flow-bridge-repositories";
-import { loadReviewFlowEvaluationConfig } from "../experiments/lib/review-flow-evaluation-config";
+import {
+  loadReviewFlowEvaluationConfig,
+  type ReviewFlowEvaluationConfig
+} from "../experiments/lib/review-flow-evaluation-config";
 import {
   loadReviewFlowEvaluationDataset,
   reviewFlowEvaluationBridgeCompletionFileName,
@@ -3600,6 +3603,101 @@ describe("adapter、CLI 与窄环境", () => {
       }
     })).rejects.toThrow();
   });
+  it("CLI max-event-shape-retries 进入 run 选项，默认 null 且 0..4 闭集拒绝非法值", () => {
+    const holdoutBaselineArgs = [
+      "--action=run",
+      "--manifest=/private/manifest.json",
+      "--dataset-private-root=/private",
+      "--private-dir=/private/runs",
+      "--partition=holdout",
+      "--label=before-a",
+      "--variant=baseline",
+      "--development-baseline-label=dev-before-a",
+      "--development-candidate-label=dev-after-a"
+    ] as const;
+    for (const retries of ["0", "2", "4"]) {
+      expect(resolveReviewFlowEvaluationCliOptions([
+        ...holdoutBaselineArgs,
+        `--max-event-shape-retries=${retries}`
+      ])).toMatchObject({
+        action: "run",
+        maxEventShapeRetries: Number(retries),
+        maxCaseAttempts: 3,
+        resume: false
+      });
+    }
+    expect(resolveReviewFlowEvaluationCliOptions(
+      holdoutBaselineArgs
+    )).toMatchObject({
+      action: "run",
+      maxEventShapeRetries: null,
+      maxCaseAttempts: 3,
+      resume: false
+    });
+    for (const invalidRaw of ["5", "-1", "1.5", "abc", ""]) {
+      expect(() => resolveReviewFlowEvaluationCliOptions([
+        ...holdoutBaselineArgs,
+        `--max-event-shape-retries=${invalidRaw}`
+      ])).toThrow("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+    }
+    expect(() => resolveReviewFlowEvaluationCliOptions([
+      ...holdoutBaselineArgs,
+      "--max-event-shape-retries=2",
+      "--max-event-shape-retries=3"
+    ])).toThrow("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+    expect(() => resolveReviewFlowEvaluationCliOptions([
+      ...holdoutBaselineArgs,
+      "--max-event-shape-retries=@//private"
+    ])).toThrow("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+  });
+
+  it("adapter 把 max-event-shape-retries 写进配置摘要并改变身份指纹", () => {
+    const fixture = createDatasetFixture();
+    const dataset = loadDataset(fixture, "development_scored");
+    const baseOverrides = {
+      config: undefined as unknown as ReviewFlowEvaluationConfig,
+      codeIdentity: codeIdentityFixture(),
+      runtimeIdentity: runtimeIdentityFixture(),
+      difficultyAnchors: {
+        anchors: [],
+        provisional: true,
+        fingerprint: "4".repeat(64)
+      },
+      datasetFingerprint: dataset.datasetFingerprint,
+      manifestSha256: dataset.manifestSha256,
+      anklangInputPolicy: dataset.anklangInputPolicy,
+      placeholderTagIds: dataset.placeholderTagIds,
+      purpose: dataset.purpose,
+      concurrency: 2,
+      maxCaseAttempts: 2,
+      proxyEnvironment: { HTTP_PROXY: "http://127.0.0.1:10808" }
+    };
+    const defaultConfig = loadReviewFlowEvaluationConfig({
+      env: narrowEnvironment()
+    });
+    const optionConfig = loadReviewFlowEvaluationConfig({
+      env: narrowEnvironment(),
+      maxEventShapeRetries: 4
+    });
+    expect(defaultConfig.models.retry.maxEventShapeRetries).toBeNull();
+    expect(optionConfig.models.retry.maxEventShapeRetries).toBe(4);
+    const defaultAdapter = createReviewFlowEvaluationAdapter({
+      ...baseOverrides,
+      config: defaultConfig
+    });
+    const optionAdapter = createReviewFlowEvaluationAdapter({
+      ...baseOverrides,
+      config: optionConfig
+    });
+    expect(defaultAdapter.identity.configurationSummary.maxEventShapeRetries)
+      .toBeNull();
+    expect(optionAdapter.identity.configurationSummary.maxEventShapeRetries)
+      .toBe(4);
+    expect(optionAdapter.identity.configurationFingerprint).not.toBe(
+      defaultAdapter.identity.configurationFingerprint
+    );
+  });
+
   it("direct-scoring 显式绕过 attestation，默认仍关闭且不触发 provider", async () => {
     expect(classifyDirectScoringStartupError(
       new Error("REVIEW_FLOW_EVALUATION_CHECKPOINT_INVALID")

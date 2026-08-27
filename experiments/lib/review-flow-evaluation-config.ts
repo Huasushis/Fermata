@@ -92,6 +92,7 @@ export interface ReviewFlowEvaluationConfig {
     readonly retry: {
       readonly maxAttempts: number;
       readonly baseDelayMs: number;
+      readonly maxEventShapeRetries: number | null;
     };
     readonly timeouts: {
       readonly llmFirstOutputMs: number;
@@ -111,6 +112,12 @@ export interface LoadReviewFlowEvaluationConfigOptions {
   readonly modelsYamlSource?: string;
   /** 留空时使用 models.yaml 的 defaults.modelProfileName。 */
   readonly profileName?: string;
+  /**
+   * 标定专用的 event_shape 重发上限（0..4 闭集）。缺省与 null 保持现有默认：
+   * 恰好一次重发。CLI 在进入配置前已做严格校验；这里再验证一次，非法值
+   * fail-closed，不发起任何请求。
+   */
+  readonly maxEventShapeRetries?: number;
 }
 
 export function loadReviewFlowEvaluationConfig(
@@ -140,6 +147,17 @@ export function loadReviewFlowEvaluationConfig(
   if (profile === undefined) {
     throw new ConfigError("review-flow 实验指定的模型档位不存在。");
   }
+  const maxEventShapeRetries = options.maxEventShapeRetries ?? null;
+  if (
+    maxEventShapeRetries !== null &&
+    (!Number.isSafeInteger(maxEventShapeRetries) ||
+      maxEventShapeRetries < 0 ||
+      maxEventShapeRetries > 4)
+  ) {
+    throw new ConfigError(
+      "review-flow 实验的 max-event-shape-retries 必须是不超过 4 的非负整数。"
+    );
+  }
 
   const usedProviders = new Set<ProviderName>(
     reviewFlowModelRoleNames.map((role) => profile.reviewFlow[role].provider)
@@ -158,7 +176,10 @@ export function loadReviewFlowEvaluationConfig(
     providers: Object.freeze(providers),
     models: Object.freeze({
       experimentVersion: parsed.experimentVersion,
-      retry: Object.freeze({ ...parsed.retry }),
+      retry: Object.freeze({
+        ...parsed.retry,
+        maxEventShapeRetries
+      }),
       timeouts: Object.freeze({
         llmFirstOutputMs: parsed.timeouts.llmFirstOutputMs,
         llmOutputIdleMs: parsed.timeouts.llmOutputIdleMs,

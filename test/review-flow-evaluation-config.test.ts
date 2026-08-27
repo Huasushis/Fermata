@@ -114,6 +114,40 @@ describe("review-flow 评估专用配置", () => {
       })
     ).toThrow(ConfigError);
   });
+  it("默认缺省 max-event-shape-retries 时配置保持恰好一次 event_shape 重发", () => {
+    const config = loadReviewFlowEvaluationConfig({
+      env: aetherEnvironment,
+      modelsYamlSource
+    });
+    expect(config.models.retry.maxEventShapeRetries).toBeNull();
+    expect(config.models.retry).toMatchObject({
+      maxAttempts: expect.any(Number),
+      baseDelayMs: expect.any(Number),
+      maxEventShapeRetries: null
+    });
+  });
+
+  it("显式 max-event-shape-retries 通过配置进入不可变 retry 字段", () => {
+    const config = loadReviewFlowEvaluationConfig({
+      env: aetherEnvironment,
+      modelsYamlSource,
+      maxEventShapeRetries: 3
+    });
+    expect(Object.isFrozen(config.models.retry)).toBe(true);
+    expect(config.models.retry.maxEventShapeRetries).toBe(3);
+  });
+
+  it("拒绝越界或非整数的 max-event-shape-retries", () => {
+    for (const invalid of [5, -1, 1.5, NaN, 4.5]) {
+      expect(() =>
+        loadReviewFlowEvaluationConfig({
+          env: aetherEnvironment,
+          modelsYamlSource,
+          maxEventShapeRetries: invalid
+        })
+      ).toThrow(ConfigError);
+    }
+  });
 
   it("失败信息不回显凭据值", () => {
     const marker = "secret-must-not-appear";

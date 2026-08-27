@@ -106,6 +106,7 @@ export interface ReviewFlowEvaluationRunCliOptions {
   readonly caseSelector: ReviewFlowEvaluationCaseSelector | null;
   readonly caseSelectorFilePath: string | null;
   readonly maxCaseAttempts: number;
+  readonly maxEventShapeRetries: number | null;
 }
 
 export interface ReviewFlowEvaluationRevealCliOptions {
@@ -205,6 +206,7 @@ export function resolveReviewFlowEvaluationCliOptions(
     "case-selector",
     "case-selector-file",
     "max-case-attempts",
+    "max-event-shape-retries",
     "failed-only-source",
     "failed-only-case-ids"
   ]);
@@ -244,6 +246,14 @@ export function resolveReviewFlowEvaluationCliOptions(
   const maxCaseAttempts = maxCaseAttemptsRaw === undefined
     ? 3
     : Number(maxCaseAttemptsRaw);
+  let maxEventShapeRetries: number | null = null;
+  const maxEventShapeRetriesRaw = values.get("max-event-shape-retries");
+  if (maxEventShapeRetriesRaw !== undefined) {
+    if (maxEventShapeRetriesRaw.length === 0) {
+      throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+    }
+    maxEventShapeRetries = Number(maxEventShapeRetriesRaw);
+  }
   const caseSelectorRaw = values.get("case-selector");
   const caseSelector = caseSelectorRaw === undefined
     ? null
@@ -288,6 +298,14 @@ export function resolveReviewFlowEvaluationCliOptions(
     !Number.isSafeInteger(maxCaseAttempts) ||
     maxCaseAttempts < 1 ||
     maxCaseAttempts > maxReviewFlowEvaluationCaseAttempts
+  ) {
+    throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+  }
+  if (
+    maxEventShapeRetries !== null &&
+    (!Number.isSafeInteger(maxEventShapeRetries) ||
+      maxEventShapeRetries < 0 ||
+      maxEventShapeRetries > 4)
   ) {
     throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
   }
@@ -349,6 +367,7 @@ export function resolveReviewFlowEvaluationCliOptions(
     failedOnlySourcePath,
     failedOnlyCaseIds,
     maxCaseAttempts,
+    maxEventShapeRetries,
     caseSelector: caseSelector === null ? null : caseSelector.data,
     caseSelectorFilePath
   };
@@ -560,7 +579,10 @@ async function runPredictionOrDevelopment(input: {
           developmentBaselineLabel: options.developmentBaselineLabel!,
           developmentCandidateLabel: options.developmentCandidateLabel!
         });
-    const config = loadReviewFlowEvaluationConfig({ env: input.env });
+    const config = loadReviewFlowEvaluationConfig({
+      env: input.env,
+      maxEventShapeRetries: options.maxEventShapeRetries ?? undefined
+    });
     const difficultyAnchors = loadDifficultyAnchorsStrict(anchorsFile);
     const adapter = createReviewFlowEvaluationAdapter({
       config,

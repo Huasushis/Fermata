@@ -182,6 +182,7 @@ export function createReviewFlowEvaluationAdapter(input: {
     llmMaximumDurationMs: input.config.models.timeouts.llmMaximumDurationMs,
     maxAttempts: input.config.models.retry.maxAttempts,
     baseDelayMs: input.config.models.retry.baseDelayMs,
+    maxEventShapeRetries: input.config.models.retry.maxEventShapeRetries,
     concurrency: input.concurrency,
     caseAttempts: input.maxCaseAttempts,
     proxyEnvironmentFingerprint: proxyEnvironmentSummary.fingerprint,
@@ -333,6 +334,9 @@ function modelConfig(
       maximumDurationMs: config.models.timeouts.llmMaximumDurationMs,
       maxAttempts: config.models.retry.maxAttempts,
       baseDelayMs: config.models.retry.baseDelayMs,
+      ...(config.models.retry.maxEventShapeRetries === null
+        ? {}
+        : { maxEventShapeRetries: config.models.retry.maxEventShapeRetries }),
       onResponseBodyByte: observeResponseBodyByte
     }
   };
