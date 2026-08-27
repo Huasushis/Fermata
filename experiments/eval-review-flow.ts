@@ -65,9 +65,11 @@ import {
 import {
   loadReviewFlowEvaluationCheckpointForReveal,
   loadReviewFlowEvaluationCheckpointStateFromPath,
+  openReviewFlowSafeStreamCheckpoint,
   ReviewFlowEvaluationCheckpoint,
   reviewFlowEvaluationBaselineBindingSchema,
-  type ReviewFlowEvaluationBaselineBinding
+  type ReviewFlowEvaluationBaselineBinding,
+  type ReviewFlowSafeStreamCheckpoint
 } from "./lib/review-flow-evaluation-state";
 import {
   loadReviewFlowRuntimeAttestation,
@@ -107,6 +109,7 @@ export interface ReviewFlowEvaluationRunCliOptions {
   readonly caseSelectorFilePath: string | null;
   readonly maxCaseAttempts: number;
   readonly maxEventShapeRetries: number | null;
+  readonly streamCheckpoints: boolean;
 }
 
 export interface ReviewFlowEvaluationRevealCliOptions {
@@ -129,14 +132,24 @@ export function resolveReviewFlowEvaluationCliOptions(
   const values = new Map<string, string>();
   let resume = false;
   let failedOnly = false;
+  let streamCheckpoints = false;
   for (const argument of argv) {
-    if (argument === "--resume" || argument === "--failed-only") {
+    if (
+      argument === "--resume" ||
+      argument === "--failed-only" ||
+      argument === "--stream-checkpoints"
+    ) {
       if (argument === "--resume") {
         if (resume) throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
         resume = true;
-      } else {
+      } else if (argument === "--failed-only") {
         if (failedOnly) throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
         failedOnly = true;
+      } else {
+        if (streamCheckpoints) {
+          throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
+        }
+        streamCheckpoints = true;
       }
       continue;
     }
@@ -148,7 +161,7 @@ export function resolveReviewFlowEvaluationCliOptions(
   }
   const action = values.get("action") ?? "run";
   if (action === "reveal") {
-    if (failedOnly) {
+    if (failedOnly || streamCheckpoints) {
       throw new Error("REVIEW_FLOW_EVALUATION_ARGUMENT_INVALID");
     }
     const allowed = new Set([
@@ -368,6 +381,7 @@ export function resolveReviewFlowEvaluationCliOptions(
     failedOnlyCaseIds,
     maxCaseAttempts,
     maxEventShapeRetries,
+    streamCheckpoints,
     caseSelector: caseSelector === null ? null : caseSelector.data,
     caseSelectorFilePath
   };
@@ -540,6 +554,7 @@ async function runPredictionOrDevelopment(input: {
   });
   let checkpoint: ReviewFlowEvaluationCheckpoint | undefined;
   let removeSignalHandlers: (() => void) | undefined;
+  let streamCheckpoint: ReviewFlowSafeStreamCheckpoint | undefined;
   let terminalReceiptWritten = false;
   try {
     const dataset = options.purpose === "development"
@@ -584,6 +599,12 @@ async function runPredictionOrDevelopment(input: {
       maxEventShapeRetries: options.maxEventShapeRetries ?? undefined
     });
     const difficultyAnchors = loadDifficultyAnchorsStrict(anchorsFile);
+    streamCheckpoint = openReviewFlowSafeStreamCheckpoint({
+      enabled: options.streamCheckpoints,
+      privateDirectory: options.privateDirectory,
+      privateRoot: input.runtimeAttestation.originPrivateRoot,
+      containingWorkspace: input.runtimeAttestation.originWorkspaceRoot
+    });
     const adapter = createReviewFlowEvaluationAdapter({
       config,
       codeIdentity: input.codeIdentity,
@@ -596,7 +617,13 @@ async function runPredictionOrDevelopment(input: {
       purpose: dataset.purpose,
       concurrency,
       maxCaseAttempts: options.maxCaseAttempts,
-      proxyEnvironment: input.env
+      proxyEnvironment: input.env,
+      safeStreamTelemetry:
+        streamCheckpoint === undefined
+          ? undefined
+          : (event) => {
+              streamCheckpoint!.append(event);
+            }
     });
     const caseSelection = dataset.caseSelection;
     const checkpointIdentity = caseSelection === undefined
@@ -767,6 +794,7 @@ async function runPredictionOrDevelopment(input: {
     if (checkpoint === undefined || terminalReceiptWritten) {
       checkpoint?.close();
     }
+    streamCheckpoint?.close();
     registry.close();
     if (terminalReceiptFailure !== undefined) {
       throw terminalReceiptFailure;

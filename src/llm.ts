@@ -520,6 +520,173 @@ export interface ModelCallSpec {
 
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
+export type LlmSafeStreamRole =
+  | "solver"
+  | "solution_analyst"
+  | "technical_auditor"
+  | "difficulty"
+  | "editorial_judge"
+  | "contest_fit"
+  | "originality"
+  | "tags"
+  | "critic"
+  | "adversary"
+  | "adjudicator";
+
+export type LlmSafeStreamStage =
+  | "headers"
+  | "first_chunk"
+  | "progress"
+  | "pending"
+  | "done"
+  | "eof"
+  | "reader_error"
+  | "abort";
+
+export interface LlmSafeStreamTelemetryEvent {
+  readonly schemaVersion: 1;
+  readonly role: LlmSafeStreamRole;
+  readonly stage: LlmSafeStreamStage;
+  readonly statusClass: "1xx" | "2xx" | "3xx" | "4xx" | "5xx" | null;
+  readonly elapsedMs: number;
+  readonly bytes: number;
+  readonly lastDataMs: number | null;
+  readonly done: boolean;
+  readonly eof: boolean;
+  readonly readerPending: boolean;
+  readonly abort: boolean;
+}
+
+export interface LlmSafeStreamTelemetryConfig {
+  readonly role: LlmSafeStreamRole;
+  readonly onEvent: (event: LlmSafeStreamTelemetryEvent) => void;
+}
+
+const safeStreamCheckpointIntervalMs = 5_000;
+
+class LlmSafeStreamTelemetryAttempt {
+  readonly #config: LlmSafeStreamTelemetryConfig;
+  readonly #startedAt = performance.now();
+  #statusClass: LlmSafeStreamTelemetryEvent["statusClass"] = null;
+  #bytes = 0;
+  #lastDataMs: number | null = null;
+  #lastProgressMs: number | null = null;
+  #sawFirstChunk = false;
+  #done = false;
+  #eof = false;
+  #readerPending = false;
+  #aborted = false;
+  #closed = false;
+  #pendingTimer: ReturnType<typeof setInterval> | undefined;
+
+  public constructor(config: LlmSafeStreamTelemetryConfig) {
+    this.#config = config;
+  }
+
+  public headers(status: number): void {
+    this.#statusClass = safeHttpStatusClass(status);
+    this.emit("headers");
+  }
+
+  public beginRead(): void {
+    if (this.#closed) return;
+    this.endRead();
+    this.#readerPending = true;
+    this.#pendingTimer = setInterval(() => {
+      if (this.#readerPending && !this.#closed) this.emit("pending");
+    }, safeStreamCheckpointIntervalMs);
+    this.#pendingTimer.unref?.();
+  }
+
+  public endRead(): void {
+    if (this.#pendingTimer !== undefined) {
+      clearInterval(this.#pendingTimer);
+      this.#pendingTimer = undefined;
+    }
+    this.#readerPending = false;
+  }
+
+  public chunk(byteLength: number): void {
+    if (this.#closed || byteLength <= 0) return;
+    this.#bytes = Math.min(Number.MAX_SAFE_INTEGER, this.#bytes + byteLength);
+    const elapsedMs = this.elapsedMs();
+    this.#lastDataMs = elapsedMs;
+    if (!this.#sawFirstChunk) {
+      this.#sawFirstChunk = true;
+      this.#lastProgressMs = elapsedMs;
+      this.emit("first_chunk");
+      return;
+    }
+    if (
+      this.#lastProgressMs === null ||
+      elapsedMs - this.#lastProgressMs >= safeStreamCheckpointIntervalMs
+    ) {
+      this.#lastProgressMs = elapsedMs;
+      this.emit("progress");
+    }
+  }
+
+  public observedDone(): void {
+    if (this.#closed || this.#done) return;
+    this.#done = true;
+    this.emit("done");
+  }
+
+  public observedEof(): void {
+    if (this.#closed || this.#eof) return;
+    this.#eof = true;
+    this.emit("eof");
+  }
+
+  public readerError(): void {
+    if (!this.#closed) this.emit("reader_error");
+  }
+
+  public aborted(): void {
+    if (this.#closed || this.#aborted) return;
+    this.#aborted = true;
+    this.emit("abort");
+  }
+
+  public close(): void {
+    this.endRead();
+    this.#closed = true;
+  }
+
+  private elapsedMs(): number {
+    return Math.min(
+      Number.MAX_SAFE_INTEGER,
+      Math.max(0, Math.ceil(performance.now() - this.#startedAt))
+    );
+  }
+
+  private emit(stage: LlmSafeStreamStage): void {
+    this.#config.onEvent(Object.freeze({
+      schemaVersion: 1,
+      role: this.#config.role,
+      stage,
+      statusClass: this.#statusClass,
+      elapsedMs: this.elapsedMs(),
+      bytes: this.#bytes,
+      lastDataMs: this.#lastDataMs,
+      done: this.#done,
+      eof: this.#eof,
+      readerPending: this.#readerPending,
+      abort: this.#aborted
+    }));
+  }
+}
+
+function safeHttpStatusClass(
+  status: number
+): LlmSafeStreamTelemetryEvent["statusClass"] {
+  const hundred = Math.trunc(status / 100);
+  return hundred >= 1 && hundred <= 5
+    ? `${hundred}xx` as LlmSafeStreamTelemetryEvent["statusClass"]
+    : null;
+}
+
+
 export interface LlmRuntimeOptions {
   /** 收到首个有效模型事件后，连续多久没有新有效事件才认为连接停住。 */
   readonly outputIdleTimeoutMs: number;
@@ -538,6 +705,11 @@ export interface LlmRuntimeOptions {
    * 和所有其它错误都不重发。
    */
   readonly maxEventShapeRetries?: number;
+  /**
+   * 标定 runner 显式开启时才提供。事件是固定安全字段；未提供时不创建计时器、
+   * 回调或文件，不改变生产请求行为。
+   */
+  readonly safeStreamTelemetry?: LlmSafeStreamTelemetryConfig;
   /**
    * 标定专用的直接结构化模式。默认关闭时保留语义轮+格式化轮；开启后，两轮
    * JSON 角色在一个请求中完成判断和严格 JSON，staged solver 保留探索轮并把
@@ -2796,6 +2968,13 @@ async function requestWithRetry(
       }
       const controller = new AbortController();
       const watchdog = new LlmRequestWatchdog(controller, durations);
+      const telemetry = runtime.safeStreamTelemetry === undefined
+        ? null
+        : new LlmSafeStreamTelemetryAttempt(runtime.safeStreamTelemetry);
+      const recordAbort = (): void => {
+        telemetry?.aborted();
+      };
+      controller.signal.addEventListener("abort", recordAbort, { once: true });
       const cancelForTaskState = (): void => {
         controller.abort();
       };
@@ -2826,6 +3005,7 @@ async function requestWithRetry(
         );
         responseReceived = true;
         audit.status = response.status;
+        telemetry?.headers(response.status);
         retryAfterMs = parseRetryAfterMilliseconds(
           response.headers.get("retry-after"),
           Date.now()
@@ -2880,7 +3060,8 @@ async function requestWithRetry(
             },
             onInvalidResponseDrainActivity: () => {
               watchdog.receivedInvalidResponseDrainActivity();
-            }
+            },
+            telemetry
           },
           audit,
           salvageOnLengthLimit
@@ -2974,6 +3155,8 @@ async function requestWithRetry(
         }
         return null;
       } finally {
+        controller.signal.removeEventListener("abort", recordAbort);
+        telemetry?.close();
         runtime.signal?.removeEventListener("abort", cancelForTaskState);
         watchdog.close();
       }
@@ -3232,6 +3415,7 @@ interface ResponseBodyActivityObserver {
     formatFailureSubstage?: LlmResponseFormatFailureSubstage
   ) => void;
   readonly onInvalidResponseDrainActivity: () => void;
+  readonly telemetry: LlmSafeStreamTelemetryAttempt | null;
 }
 
 interface ParsedResponseBody {
@@ -3333,14 +3517,19 @@ async function readResponseTextWithLimit(
   try {
     for (;;) {
       let chunk: Awaited<ReturnType<typeof reader.read>>;
+      observer.telemetry?.beginRead();
       try {
         chunk = await waitForOrAbort(reader.read(), requestController.signal);
       } catch (error) {
         readerErrored = !requestController.signal.aborted;
+        if (readerErrored) observer.telemetry?.readerError();
         throw error;
+      } finally {
+        observer.telemetry?.endRead();
       }
       if (chunk.done) {
         readerFinished = true;
+        observer.telemetry?.observedEof();
         if (firstProtocolError !== undefined) throw firstProtocolError;
         try {
           text += decoder.decode();
@@ -3357,6 +3546,7 @@ async function readResponseTextWithLimit(
         );
         audit.streamChunkCount += 1;
         observer.onResponseByte();
+        observer.telemetry?.chunk(chunk.value.byteLength);
       }
       if (firstProtocolError !== undefined) {
         if (chunk.value.byteLength > 0) {
@@ -3408,14 +3598,19 @@ async function drainResponseAfterProtocolError(
   try {
     for (;;) {
       let chunk: Awaited<ReturnType<typeof reader.read>>;
+      observer.telemetry?.beginRead();
       try {
         chunk = await waitForOrAbort(reader.read(), requestController.signal);
       } catch (error) {
         readerErrored = !requestController.signal.aborted;
+        if (readerErrored) observer.telemetry?.readerError();
         throw error;
+      } finally {
+        observer.telemetry?.endRead();
       }
       if (chunk.done) {
         readerFinished = true;
+        observer.telemetry?.observedEof();
         audit.eofObserved = true;
         throw firstProtocolError;
       }
@@ -3426,6 +3621,7 @@ async function drainResponseAfterProtocolError(
         );
         audit.streamChunkCount += 1;
         observer.onResponseByte();
+        observer.telemetry?.chunk(chunk.value.byteLength);
       }
       // 排空阶段不解码、不拼接、不解析，也不保留任何响应字节。
       if (chunk.value.byteLength > 0) {
@@ -3856,6 +4052,7 @@ async function readChatCompletionEventStream(
         if (data === "[DONE]") {
           state.sawDone = true;
           audit.sseDoneObserved = true;
+          observer.telemetry?.observedDone();
         }
       }
       return;
@@ -3874,6 +4071,7 @@ async function readChatCompletionEventStream(
       audit.finishReasonStopObserved = state.sawStop;
       resetPostDonePendingDataScan(postDonePendingDataScan, state);
       if (hasValidOutput) observer.onValidOutput();
+      if (state.sawDone) observer.telemetry?.observedDone();
     } catch (error) {
       audit.firstRejectedEvent ??= describeRejectedSseEvent(
         event,
@@ -3912,17 +4110,22 @@ async function readChatCompletionEventStream(
   try {
     for (;;) {
       let chunk: Awaited<ReturnType<typeof reader.read>>;
+      observer.telemetry?.beginRead();
       try {
         chunk = await waitForOrAbort(reader.read(), requestController.signal);
       } catch (error) {
         readerErrored = !requestController.signal.aborted;
+        if (readerErrored) observer.telemetry?.readerError();
         if (state.sawDone && state.postDoneTailHasUnresolvedData) {
           publishUnresolvedPostDoneData(state, observer);
         }
         throw error;
+      } finally {
+        observer.telemetry?.endRead();
       }
       if (chunk.done) {
         readerFinished = true;
+        observer.telemetry?.observedEof();
         audit.eofObserved = true;
         audit.sseDoneObserved = state.sawDone;
         audit.finishReasonStopObserved = state.sawStop;
@@ -3999,6 +4202,7 @@ async function readChatCompletionEventStream(
       totalBytes = addResponseChunkSize(totalBytes, chunk.value.byteLength);
       if (chunk.value.byteLength > 0) observer.onResponseByte();
       audit.streamUtf8Bytes = totalBytes;
+      observer.telemetry?.chunk(chunk.value.byteLength);
       if (chunk.value.byteLength > 0) {
         responseChunkCount += 1;
         audit.streamChunkCount = responseChunkCount;

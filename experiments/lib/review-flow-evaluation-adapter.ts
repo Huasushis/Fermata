@@ -10,7 +10,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { performance } from "node:perf_hooks";
 import runtimeManifestDocument from "../../config/review-flow-runtime.json" with { type: "json" };
 import type { ModelSpec } from "../../src/config";
-import type { LlmRequestStartGate } from "../../src/llm";
+import type {
+  LlmRequestStartGate,
+  LlmSafeStreamRole,
+  LlmSafeStreamTelemetryEvent
+} from "../../src/llm";
 import { FairLlmRequestScheduler } from "../../src/llm-scheduler";
 import type { PipelineModelConfig } from "../../src/pipelines/types";
 import {
@@ -122,6 +126,7 @@ export function createReviewFlowEvaluationAdapter(input: {
   readonly concurrency: number;
   readonly maxCaseAttempts: number;
   readonly proxyEnvironment: NodeJS.ProcessEnv;
+  readonly safeStreamTelemetry?: (event: LlmSafeStreamTelemetryEvent) => void;
 }): ReviewFlowEvaluationAdapter {
   if (!Number.isSafeInteger(input.concurrency) || input.concurrency < 1 || input.concurrency > 20) {
     throw new Error("REVIEW_FLOW_EVALUATION_CONCURRENCY_INVALID");
@@ -134,7 +139,7 @@ export function createReviewFlowEvaluationAdapter(input: {
       input.placeholderTagIds
     )
   ]);
-  const models = resolveModels(input.config);
+  const models = resolveModels(input.config, input.safeStreamTelemetry);
   const engineBuildFingerprint =
     input.codeIdentity.productionDependencyCodeSha256;
   const bundle = createReviewFlowLlmBundle({
@@ -296,27 +301,72 @@ export function createReviewFlowEvaluationAdapter(input: {
 }
 
 function resolveModels(
-  config: ReviewFlowEvaluationConfig
+  config: ReviewFlowEvaluationConfig,
+  safeStreamTelemetry: ((event: LlmSafeStreamTelemetryEvent) => void) | undefined
 ): ReviewFlowModelConfigs {
   const specs = config.profile.reviewFlow;
   return {
-    solver: modelConfig(config, specs.solver),
-    solution_analyst: modelConfig(config, specs.solutionAnalyst),
-    technical_auditor: modelConfig(config, specs.technicalAuditor),
-    difficulty: modelConfig(config, specs.difficulty),
-    editorial_judge: modelConfig(config, specs.editorialJudge),
-    contest_fit: modelConfig(config, specs.contestFit),
-    originality: modelConfig(config, specs.originality),
-    tags: modelConfig(config, specs.tags),
-    critic: modelConfig(config, specs.critic),
-    adversary: modelConfig(config, specs.adversary),
-    adjudicator: modelConfig(config, specs.adjudicator)
+    solver: modelConfig(config, specs.solver, "solver", safeStreamTelemetry),
+    solution_analyst: modelConfig(
+      config,
+      specs.solutionAnalyst,
+      "solution_analyst",
+      safeStreamTelemetry
+    ),
+    technical_auditor: modelConfig(
+      config,
+      specs.technicalAuditor,
+      "technical_auditor",
+      safeStreamTelemetry
+    ),
+    difficulty: modelConfig(
+      config,
+      specs.difficulty,
+      "difficulty",
+      safeStreamTelemetry
+    ),
+    editorial_judge: modelConfig(
+      config,
+      specs.editorialJudge,
+      "editorial_judge",
+      safeStreamTelemetry
+    ),
+    contest_fit: modelConfig(
+      config,
+      specs.contestFit,
+      "contest_fit",
+      safeStreamTelemetry
+    ),
+    originality: modelConfig(
+      config,
+      specs.originality,
+      "originality",
+      safeStreamTelemetry
+    ),
+    tags: modelConfig(config, specs.tags, "tags", safeStreamTelemetry),
+    critic: modelConfig(config, specs.critic, "critic", safeStreamTelemetry),
+    adversary: modelConfig(
+      config,
+      specs.adversary,
+      "adversary",
+      safeStreamTelemetry
+    ),
+    adjudicator: modelConfig(
+      config,
+      specs.adjudicator,
+      "adjudicator",
+      safeStreamTelemetry
+    )
   };
 }
 
 function modelConfig(
   config: ReviewFlowEvaluationConfig,
-  spec: ModelSpec
+  spec: ModelSpec,
+  role: LlmSafeStreamRole,
+  safeStreamTelemetry:
+    | ((event: LlmSafeStreamTelemetryEvent) => void)
+    | undefined
 ): PipelineModelConfig {
   const credentials = getReviewFlowEvaluationProviderCredentials(
     config,
@@ -337,7 +387,15 @@ function modelConfig(
       ...(config.models.retry.maxEventShapeRetries === null
         ? {}
         : { maxEventShapeRetries: config.models.retry.maxEventShapeRetries }),
-      onResponseBodyByte: observeResponseBodyByte
+      onResponseBodyByte: observeResponseBodyByte,
+      ...(safeStreamTelemetry === undefined
+        ? {}
+        : {
+            safeStreamTelemetry: {
+              role,
+              onEvent: safeStreamTelemetry
+            }
+          })
     }
   };
 }

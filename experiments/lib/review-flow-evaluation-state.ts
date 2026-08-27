@@ -42,6 +42,7 @@ import {
 } from "../../src/review-flow/orchestrator";
 import { deepFreeze, hashCanonicalValue } from "../../src/review-flow/evidence";
 import { reviewFlowRoleSchema } from "../../src/review-flow/schemas";
+import type { LlmSafeStreamTelemetryEvent } from "../../src/llm";
 import {
   readPrivateArtifactBytes
 } from "./private-artifact-io";
@@ -68,6 +69,35 @@ const roleProviderSummarySchema = z
     model: z.string().trim().min(1).max(200)
   })
   .strict();
+
+export const reviewFlowSafeStreamCheckpointRecordSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    role: reviewFlowRoleSchema,
+    stage: z.enum([
+      "headers",
+      "first_chunk",
+      "progress",
+      "pending",
+      "done",
+      "eof",
+      "reader_error",
+      "abort"
+    ]),
+    statusClass: z.enum(["1xx", "2xx", "3xx", "4xx", "5xx"]).nullable(),
+    elapsedMs: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    bytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    lastDataMs: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+    done: z.boolean(),
+    eof: z.boolean(),
+    readerPending: z.boolean(),
+    abort: z.boolean()
+  })
+  .strict();
+
+export type ReviewFlowSafeStreamCheckpointRecord = z.infer<
+  typeof reviewFlowSafeStreamCheckpointRecordSchema
+>;
 
 export const reviewFlowEvaluationBaselineBindingSchema = z
   .object({
@@ -1122,6 +1152,99 @@ function buildFailedOnlyContinuationState(input: {
   });
 }
 
+
+export class ReviewFlowSafeStreamCheckpoint {
+  readonly #directory: PrivateDirectoryHandle;
+  readonly #descriptor: number;
+  #closed = false;
+
+  public constructor(options: {
+    readonly privateDirectory: string;
+    readonly privateRoot?: string;
+    readonly containingWorkspace?: string;
+  }) {
+    if (!isAbsolute(options.privateDirectory)) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_STREAM_CHECKPOINT_DIRECTORY_INVALID"
+      );
+    }
+    this.#directory = preparePrivateDirectory(options.privateDirectory, {
+      privateRoot: options.privateRoot ?? projectPrivateRoot,
+      containingWorkspace: options.containingWorkspace ?? workspaceRoot
+    });
+    let descriptor: number | undefined;
+    try {
+      const target = anchoredPrivatePath(
+        this.#directory,
+        "review-flow-stream.checkpoint.private.jsonl"
+      );
+      descriptor = openSync(
+        target,
+        constants.O_APPEND |
+          constants.O_CREAT |
+          constants.O_WRONLY |
+          (constants.O_NOFOLLOW ?? 0),
+        0o600
+      );
+      const before = fstatSync(descriptor, { bigint: true });
+      const currentUid = typeof process.getuid === "function"
+        ? BigInt(process.getuid())
+        : before.uid;
+      if (
+        !before.isFile() ||
+        before.nlink !== 1n ||
+        before.uid !== currentUid
+      ) {
+        throw new ReviewFlowEvaluationCheckpointError(
+          "REVIEW_FLOW_STREAM_CHECKPOINT_FILE_INVALID"
+        );
+      }
+      fchmodSync(descriptor, 0o600);
+      const after = fstatSync(descriptor, { bigint: true });
+      if ((after.mode & 0o777n) !== 0o600n) {
+        throw new ReviewFlowEvaluationCheckpointError(
+          "REVIEW_FLOW_STREAM_CHECKPOINT_MODE_INVALID"
+        );
+      }
+      fsyncSync(this.#directory.descriptor);
+      this.#descriptor = descriptor;
+      descriptor = undefined;
+    } catch (error) {
+      if (descriptor !== undefined) closeQuietly(descriptor);
+      closePrivateDirectory(this.#directory);
+      throw error;
+    }
+  }
+
+  public append(event: LlmSafeStreamTelemetryEvent): void {
+    if (this.#closed) {
+      throw new ReviewFlowEvaluationCheckpointError(
+        "REVIEW_FLOW_STREAM_CHECKPOINT_CLOSED"
+      );
+    }
+    const record = reviewFlowSafeStreamCheckpointRecordSchema.parse(event);
+    const line = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
+    writeAll(this.#descriptor, line);
+    fsyncSync(this.#descriptor);
+  }
+
+  public close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    closeQuietly(this.#descriptor);
+    closePrivateDirectory(this.#directory);
+  }
+}
+
+export function openReviewFlowSafeStreamCheckpoint(options: {
+  readonly enabled: boolean;
+  readonly privateDirectory: string;
+  readonly privateRoot?: string;
+  readonly containingWorkspace?: string;
+}): ReviewFlowSafeStreamCheckpoint | undefined {
+  if (!options.enabled) return undefined;
+  return new ReviewFlowSafeStreamCheckpoint(options);
+}
 
 export class ReviewFlowEvaluationCheckpoint {
   readonly #directory: PrivateDirectoryHandle;
