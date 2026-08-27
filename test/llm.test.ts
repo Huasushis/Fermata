@@ -7,6 +7,7 @@ import {
   chatCompleteJsonWithReceipt,
   chatCompleteTwoRoundJsonWithReceipt,
   getLlmFailureAudit,
+  getLlmTransportAudit,
   LlmRequestStartGate,
   LlmJsonOutputError,
   LlmRequestError,
@@ -4550,5 +4551,280 @@ describe("两轮 JSON：phase2 结构化轮不继承 phase1 的 max thinking", (
         json_schema: { strict: true }
       }
     });
+  });
+});
+
+describe("calibration-selectable event_shape retransmission option", () => {
+  const eventShapeFailureBody = 'data: {"unexpected":true}\n\n';
+
+  function eventShapeResponse(): Response {
+    return new Response(eventShapeFailureBody, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    });
+  }
+
+  it("默认未显式配置时保持恰好一次 event_shape 重发", async () => {
+    const fetchMock = vi.fn(async () => eventShapeResponse());
+    const error = await chatCompleteWithReceipt(provider, spec, [], {
+      ...runtime,
+      maxAttempts: 1,
+      fetch: fetchMock
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "event_shape"
+    });
+    expect(getLlmFailureAudit(error)).toMatchObject({
+      requestCount: 1,
+      transportAttemptCount: 2,
+      providerRequestCount: 2,
+      retryCount: 1,
+      completedResponses: []
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("显式 maxEventShapeRetries:3 时 event_shape 失败三次后第四次成功", async () => {
+    const bodies: string[] = [];
+    let callCount = 0;
+    const fetchMock = vi.fn(async (
+      _url: string | URL | Request,
+      init?: RequestInit
+    ) => {
+      bodies.push(String(init?.body));
+      callCount += 1;
+      return callCount <= 3
+        ? eventShapeResponse()
+        : new Response(stoppedSsePrefix(), {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" }
+          });
+    });
+
+    const result = await chatCompleteWithReceipt(provider, spec, [], {
+      ...runtime,
+      maxAttempts: 1,
+      maxEventShapeRetries: 3,
+      fetch: fetchMock
+    });
+
+    expect(result.content).toBe("合成完整答案");
+    expect(result.receipt.transportAttemptCount).toBe(4);
+    expect(getLlmTransportAudit(result.receipt)?.retryCount).toBe(3);
+    expect(result.receipt.transportAttempts).toEqual([
+      expect.objectContaining({ attempt: 1, outcome: "failure", failureStage: "event_shape" }),
+      expect.objectContaining({ attempt: 2, outcome: "failure", failureStage: "event_shape" }),
+      expect.objectContaining({ attempt: 3, outcome: "failure", failureStage: "event_shape" }),
+      expect.objectContaining({ attempt: 4, outcome: "success", failureStage: null })
+    ]);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(bodies).toHaveLength(4);
+    expect(bodies.every((body) => body === bodies[0])).toBe(true);
+  });
+
+  it("显式 maxEventShapeRetries:3 全部耗尽后保持失败并保留四次尝试", async () => {
+    const fetchMock = vi.fn(async () => eventShapeResponse());
+    const error = await chatCompleteWithReceipt(provider, spec, [], {
+      ...runtime,
+      maxAttempts: 1,
+      maxEventShapeRetries: 3,
+      fetch: fetchMock
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "event_shape"
+    });
+    expect(getLlmFailureAudit(error)).toMatchObject({
+      requestCount: 1,
+      transportAttemptCount: 4,
+      providerRequestCount: 4,
+      retryCount: 3,
+      completedResponses: []
+    });
+    expect(getLlmFailureAudit(error)?.transportAttempts).toEqual([
+      expect.objectContaining({ attempt: 1, outcome: "failure", failureStage: "event_shape" }),
+      expect.objectContaining({ attempt: 2, outcome: "failure", failureStage: "event_shape" }),
+      expect.objectContaining({ attempt: 3, outcome: "failure", failureStage: "event_shape" }),
+      expect.objectContaining({ attempt: 4, outcome: "failure", failureStage: "event_shape" })
+    ]);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("显式 maxEventShapeRetries:0 完全关闭 event_shape 重发", async () => {
+    const fetchMock = vi.fn(async () => eventShapeResponse());
+    const error = await chatCompleteWithReceipt(provider, spec, [], {
+      ...runtime,
+      maxAttempts: 1,
+      maxEventShapeRetries: 0,
+      fetch: fetchMock
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      code: "LLM_RESPONSE_FORMAT_INVALID",
+      formatFailureStage: "event_shape"
+    });
+    expect(getLlmFailureAudit(error)?.transportAttempts).toBeUndefined();
+    expect(getLlmFailureAudit(error)?.retryCount).toBe(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("超出边界的 maxEventShapeRetries 值 fail-closed 且不发起请求", async () => {
+    const fetchMock = vi.fn(async () => eventShapeResponse());
+    const error = await chatCompleteWithReceipt(provider, spec, [], {
+      ...runtime,
+      maxEventShapeRetries: 7,
+      fetch: fetchMock
+    }).catch((caught: unknown) => caught);
+
+    expect((error as Error).message).toBe("LLM_EVENT_SHAPE_RETRIES_OUT_OF_RANGE");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("显式校准上限下取消/中止绝不触发重发", async () => {
+    // Real-stream abort integration: fake timers cannot drive a live
+    // ReadableStream read; wait on the fetch call condition instead of a duration.
+    const controller = new AbortController();
+    const encoder = new TextEncoder();
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(sink) {
+        streamController = sink;
+      }
+    });
+    const fetchMock = vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    }));
+    let settled = false;
+    const promise = chatCompleteWithReceipt(provider, spec, [], {
+      ...runtime,
+      maxEventShapeRetries: 3,
+      fetch: fetchMock,
+      signal: controller.signal
+    });
+    void promise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      }
+    );
+
+    while (fetchMock.mock.calls.length === 0) {
+      await Promise.resolve();
+    }
+    streamController.enqueue(encoder.encode(eventShapeFailureBody));
+    for (let i = 0; i < 40; i += 1) {
+      await Promise.resolve();
+    }
+    expect(settled).toBe(false);
+    controller.abort();
+    await expect(promise).rejects.toMatchObject({ code: "LLM_CANCELLED" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    {
+      name: "event_json",
+      body: "data: {not-json}\n\n",
+      stage: "event_json",
+      code: "LLM_RESPONSE_FORMAT_INVALID"
+    },
+    {
+      name: "delta_shape",
+      body: 'data: {"choices":[{"delta":{"content":7},"finish_reason":"stop"}]}\n\n',
+      stage: "delta_shape",
+      code: "LLM_RESPONSE_FORMAT_INVALID"
+    },
+    {
+      name: "finish_shape",
+      body: 'data: {"choices":[{"delta":{},"finish_reason":17}]}\n\n',
+      stage: "finish_shape",
+      code: "LLM_RESPONSE_FORMAT_INVALID"
+    },
+    {
+      name: "finish_length",
+      body: 'data: {"choices":[{"delta":{"content":"合成内容"},"finish_reason":"length"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}\n\n',
+      stage: "response_shape",
+      code: "LLM_OUTPUT_LENGTH_LIMIT"
+    }
+  ] as const)(
+    "显式校准上限 $name 也不触发 event_shape 专用重发且成功传输只算一次",
+    async ({ body, stage, code }) => {
+      const fetchMock = vi.fn(async () => new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      }));
+      const error = await chatCompleteWithReceipt(provider, spec, [], {
+        ...runtime,
+        maxAttempts: 1,
+        maxEventShapeRetries: 3,
+        fetch: fetchMock
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({ code });
+      expect(getLlmFailureAudit(error)?.transportAttempts).toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it("显式校准上限下 4xx 错误绝不重发", async () => {
+    const fetchMock = vi.fn(async () => new Response("bad request", {
+      status: 400
+    }));
+    const error = await chatCompleteWithReceipt(provider, spec, [], {
+      ...runtime,
+      maxEventShapeRetries: 3,
+      fetch: fetchMock
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({ code: "LLM_HTTP_ERROR" });
+    expect(getLlmFailureAudit(error)?.transportAttempts).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("显式校准上限成功重发后仍只持久化一次成功结果并保持隐私", async () => {
+    const privateSentinel = "SYNTHETIC_PRIVATE_RETRY_VALUE";
+    let callCount = 0;
+    const fetchMock = vi.fn(async () => {
+      callCount += 1;
+      return callCount === 1
+        ? eventShapeResponse()
+        : new Response(
+            [
+              `data: ${JSON.stringify({ choices: [{ delta: { content: privateSentinel } }] })}`,
+              "",
+              `data: ${JSON.stringify({ choices: [{ delta: { content: "第二段" } }] })}`,
+              "",
+              `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}`,
+              "",
+              "data: [DONE]",
+              "",
+              ""
+            ].join("\n"),
+            { status: 200, headers: { "Content-Type": "text/event-stream" } }
+          );
+    });
+
+    const result = await chatCompleteWithReceipt(provider, spec, [], {
+      ...runtime,
+      maxEventShapeRetries: 1,
+      fetch: fetchMock
+    });
+
+    expect(result.content).toBe(`${privateSentinel}第二段`);
+    expect(result.receipt.transportAttemptCount).toBe(2);
+    expect(JSON.stringify(result.receipt)).not.toContain(privateSentinel);
+    expect(JSON.stringify(getLlmTransportAudit(result.receipt))).not.toContain(
+      privateSentinel
+    );
+    for (const shape of result.receipt.acceptedEventShapes) {
+      expect(shape.shapeFingerprint).toMatch(/^[a-f0-9]{64}$/u);
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

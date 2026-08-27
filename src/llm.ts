@@ -531,6 +531,14 @@ export interface LlmRuntimeOptions {
   readonly maxAttempts: number;
   readonly baseDelayMs: number;
   /**
+   * 标定专用的 event_shape 重发上限。不提供时保持现有默认：恰好一次重发
+   * （transportAttemptCount=2、retryCount=1）。显式提供时允许把该上限提高到闭集
+   * 边界内的更大值（0 表示完全关闭 event_shape 重发）。不改变任何其它重试
+   * 类别：有效判断、终止的 schema/语义失败、显式取消/中止、4xx、持久化失败
+   * 和所有其它错误都不重发。
+   */
+  readonly maxEventShapeRetries?: number;
+  /**
    * 标定专用的直接结构化模式。默认关闭时保留语义轮+格式化轮；开启后，两轮
    * JSON 角色在一个请求中完成判断和严格 JSON，staged solver 保留探索轮并把
    * 综合轮直接结构化。JSON 修复仍可按原协议追加一次请求。
@@ -2740,6 +2748,27 @@ interface LlmRequestResult {
   readonly salvaged: boolean;
 }
 
+/**
+ * event_shape 专用重发的硬上限。校准只能在不改变其它重试类别的前提下把
+ * 默认的恰好一次重发提高到这个闭集边界内（含 0 = 完全关闭）。
+ */
+const maximumEventShapeTransmissionReplays = 4;
+
+function resolveEventShapeRetransmissionLimit(
+  runtime: LlmRuntimeOptions
+): number {
+  const raw = runtime.maxEventShapeRetries;
+  if (raw === undefined) return 1;
+  if (
+    !Number.isSafeInteger(raw) ||
+    raw < 0 ||
+    raw > maximumEventShapeTransmissionReplays
+  ) {
+    throw new TypeError("LLM_EVENT_SHAPE_RETRIES_OUT_OF_RANGE");
+  }
+  return raw;
+}
+
 async function requestWithRetry(
   fetchImpl: FetchLike,
   url: URL,
@@ -2749,9 +2778,10 @@ async function requestWithRetry(
   salvageOnLengthLimit = false
 ): Promise<LlmRequestResult> {
   const durations = resolveLlmRequestDurations(runtime);
+  const maxEventShapeRetries = resolveEventShapeRetransmissionLimit(runtime);
   let attempt = 1;
   let retryAfterMs: number | null = null;
-  let eventShapeRetryUsed = false;
+  let eventShapeReplaysUsed = 0;
   for (;;) {
     resetMutableLlmRequestAuditForAttempt(audit);
     assertLlmRequestMayStart();
@@ -2808,7 +2838,7 @@ async function requestWithRetry(
           }
           if (response.status !== 429 || attempt >= runtime.maxAttempts) {
             if (
-              eventShapeRetryUsed &&
+              eventShapeReplaysUsed > 0 &&
               audit.transportAttemptReceipts.length === 1
             ) {
               recordFailedTransportAttempt(audit, undefined);
@@ -2859,7 +2889,7 @@ async function requestWithRetry(
         if (timeoutError !== undefined) {
           throw timeoutError;
         }
-        if (eventShapeRetryUsed) {
+        if (eventShapeReplaysUsed > 0) {
           recordSuccessfulTransportAttempt(audit, {
             responseMode: parsed.responseMode,
             finishReasonStopVerified: !parsed.salvaged,
@@ -2897,16 +2927,20 @@ async function requestWithRetry(
               audit.responseMode === "sse" &&
               audit.finishReasonStopObserved === true &&
               audit.firstRejectedEvent === null));
+        const eventShapeFailureInReplayZone =
+          eventShapeFailure &&
+          (eventShapeReplaysUsed > 0 ||
+            eventShapeReplaysUsed < maxEventShapeRetries);
         if (
-          eventShapeFailure ||
-          (eventShapeRetryUsed && audit.transportAttemptReceipts.length === 1)
+          eventShapeFailureInReplayZone ||
+          (eventShapeReplaysUsed > 0 && audit.transportAttemptReceipts.length === 1)
         ) {
           recordFailedTransportAttempt(audit, error);
         }
-        if (eventShapeFailure && !eventShapeRetryUsed) {
+        if (eventShapeFailure && eventShapeReplaysUsed < maxEventShapeRetries) {
           // event_shape is the sole bounded role-request replay exception.
           // Keep every other protocol/schema/content/error category fail closed.
-          eventShapeRetryUsed = true;
+          eventShapeReplaysUsed += 1;
           return null;
         }
         if (
