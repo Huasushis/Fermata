@@ -55,6 +55,7 @@ import {
   reviewFlowEvaluationReconciliationAuthorityCodeVersion,
   reviewFlowEvaluationReconciliationAuthorityDiffSha256,
   reviewFlowEvaluationReconciliationAuthoritySolVerdict,
+  reviewFlowEvaluationReconciliationIdentitySolVerdict,
   reviewFlowEvaluationReconciliationDiffSha256,
   reviewFlowEvaluationReconciliationPostCommitAllowedPaths,
   reviewFlowEvaluationReconciliationPostCommitProofSchema,
@@ -547,6 +548,7 @@ function makeFixture(): ReconciliationFixture {
     authorityCheckpointCodeVersion:
       reviewFlowEvaluationReconciliationAuthorityCodeVersion,
     authorityCheckpointSha256: digest(readFileSync(authorityPath)),
+    authorityIdentityFingerprint: authority.identityFingerprint,
     authorityDiffSha256:
       reviewFlowEvaluationReconciliationAuthorityDiffSha256,
     authorityChangedPaths: [
@@ -554,6 +556,12 @@ function makeFixture(): ReconciliationFixture {
     ],
     authoritySolVerdict:
       reviewFlowEvaluationReconciliationAuthoritySolVerdict,
+    donorCheckpointCodeVersion:
+      reviewFlowEvaluationReconciliationTargetCodeVersion,
+    donorCheckpointSha256: digest(readFileSync(donorPath)),
+    donorIdentityFingerprint: donor.identityFingerprint,
+    identitySolVerdict:
+      reviewFlowEvaluationReconciliationIdentitySolVerdict,
     sourceCodeVersion: reviewFlowEvaluationReconciliationSourceCodeVersion,
     targetCodeVersion: reviewFlowEvaluationReconciliationTargetCodeVersion,
     diffSha256: reviewFlowEvaluationReconciliationDiffSha256,
@@ -571,6 +579,18 @@ function makeFixture(): ReconciliationFixture {
   execFileSync(
     "/usr/bin/git",
     ["clone", "--no-local", "--quiet", repositoryRoot, repositoryDirectory],
+    { env: trustedGitEnvironment }
+  );
+  execFileSync(
+    "/usr/bin/git",
+    [
+      "-C",
+      repositoryDirectory,
+      "checkout",
+      "--detach",
+      "--quiet",
+      reviewFlowEvaluationReconciliationTargetCodeVersion
+    ],
     { env: trustedGitEnvironment }
   );
   return {
@@ -702,6 +722,7 @@ describe("review-flow checkpoint reconciliation", () => {
       authorityCheckpointCodeVersion:
         reviewFlowEvaluationReconciliationAuthorityCodeVersion,
       authorityCheckpointSha256: digest("authority-checkpoint"),
+      authorityIdentityFingerprint: digest("authority-identity"),
       authorityDiffSha256:
         reviewFlowEvaluationReconciliationAuthorityDiffSha256,
       authorityChangedPaths: [
@@ -709,6 +730,12 @@ describe("review-flow checkpoint reconciliation", () => {
       ],
       authoritySolVerdict:
         reviewFlowEvaluationReconciliationAuthoritySolVerdict,
+      donorCheckpointCodeVersion:
+        reviewFlowEvaluationReconciliationTargetCodeVersion,
+      donorCheckpointSha256: digest("donor-checkpoint"),
+      donorIdentityFingerprint: digest("donor-identity"),
+      identitySolVerdict:
+        reviewFlowEvaluationReconciliationIdentitySolVerdict,
       sourceCodeVersion: reviewFlowEvaluationReconciliationSourceCodeVersion,
       targetCodeVersion: reviewFlowEvaluationReconciliationTargetCodeVersion,
       diffSha256: reviewFlowEvaluationReconciliationDiffSha256,
@@ -1012,6 +1039,7 @@ describe("review-flow checkpoint reconciliation", () => {
         authorityCheckpointCodeVersion:
           reviewFlowEvaluationReconciliationAuthorityCodeVersion,
         authorityCheckpointSha256: digest(readFileSync(fixture.authorityPath)),
+        authorityIdentityFingerprint: fixture.authority.identityFingerprint,
         authorityDiffSha256:
           reviewFlowEvaluationReconciliationAuthorityDiffSha256,
         authorityChangedPaths: [
@@ -1019,6 +1047,12 @@ describe("review-flow checkpoint reconciliation", () => {
         ],
         authoritySolVerdict:
           reviewFlowEvaluationReconciliationAuthoritySolVerdict,
+        donorCheckpointCodeVersion:
+          reviewFlowEvaluationReconciliationTargetCodeVersion,
+        donorCheckpointSha256: digest(readFileSync(fixture.donorPath)),
+        donorIdentityFingerprint: fixture.donor.identityFingerprint,
+        identitySolVerdict:
+          reviewFlowEvaluationReconciliationIdentitySolVerdict,
         sourceCodeVersion: reviewFlowEvaluationReconciliationSourceCodeVersion,
         targetCodeVersion: reviewFlowEvaluationReconciliationTargetCodeVersion,
         diffSha256: reviewFlowEvaluationReconciliationDiffSha256,

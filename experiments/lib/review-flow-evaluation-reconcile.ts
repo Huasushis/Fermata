@@ -47,6 +47,8 @@ export const reviewFlowEvaluationReconciliationAuthorityDiffSha256 =
   "ae8b3d06a2a95b9c2a0e2a2fb6eaa5ff1c3d07188b2045c2d1e704f2bc69692c" as const;
 export const reviewFlowEvaluationReconciliationAuthoritySolVerdict =
   "bounded_event_shape_retry_only" as const;
+export const reviewFlowEvaluationReconciliationIdentitySolVerdict =
+  "exact_identity_bound_operational_retry_delta" as const;
 
 export const reviewFlowEvaluationReconciliationSourceCodeVersion =
   "3c0005a8054056748e2adf99cc3ada8aa9bca4c2" as const;
@@ -109,6 +111,7 @@ export const reviewFlowEvaluationCompatibilityProofSchema = z
       reviewFlowEvaluationReconciliationAuthorityCodeVersion
     ),
     authorityCheckpointSha256: digestSchema,
+    authorityIdentityFingerprint: digestSchema,
     authorityDiffSha256: z.literal(
       reviewFlowEvaluationReconciliationAuthorityDiffSha256
     ),
@@ -119,6 +122,14 @@ export const reviewFlowEvaluationCompatibilityProofSchema = z
       ),
     authoritySolVerdict: z.literal(
       reviewFlowEvaluationReconciliationAuthoritySolVerdict
+    ),
+    donorCheckpointCodeVersion: z.literal(
+      reviewFlowEvaluationReconciliationTargetCodeVersion
+    ),
+    donorCheckpointSha256: digestSchema,
+    donorIdentityFingerprint: digestSchema,
+    identitySolVerdict: z.literal(
+      reviewFlowEvaluationReconciliationIdentitySolVerdict
     ),
     sourceCodeVersion: z.literal(
       reviewFlowEvaluationReconciliationSourceCodeVersion
@@ -816,8 +827,16 @@ function reconciliationIdentityProjection(
     codeIdentity: _codeIdentity,
     caseSelection: _caseSelection,
     runtime,
+    configurationFingerprint: _configurationFingerprint,
+    configurationSummary,
+    runnerIdentity: _runnerIdentity,
     ...semanticIdentity
   } = identity;
+  const {
+    concurrency: _concurrency,
+    maxEventShapeRetries: _maxEventShapeRetries,
+    ...stableConfigurationSummary
+  } = configurationSummary;
   const {
     snapshotSha256: _snapshotSha256,
     snapshotFileCount: _snapshotFileCount,
@@ -825,6 +844,13 @@ function reconciliationIdentityProjection(
   } = runtime;
   return {
     ...semanticIdentity,
+    configurationFingerprint: null,
+    configurationSummary: {
+      ...stableConfigurationSummary,
+      concurrency: null,
+      maxEventShapeRetries: null
+    },
+    runnerIdentity: null,
     runtime: {
       ...stableRuntime,
       snapshotSha256: null,
@@ -836,13 +862,16 @@ function reconciliationIdentityProjection(
 function assertDonorIdentity(
   authority: ReviewFlowEvaluationCheckpointState,
   donor: ReviewFlowEvaluationCheckpointState,
-  currentCodeVersion: string
+  currentCodeVersion: string,
+  proof: ReviewFlowEvaluationCompatibilityProof
 ): ReviewFlowEvaluationCheckpointState["identity"] {
   if (
+    authority.identityFingerprint !== proof.authorityIdentityFingerprint ||
+    donor.identityFingerprint !== proof.donorIdentityFingerprint ||
     authority.identity.codeIdentity.codeVersion !==
-      reviewFlowEvaluationReconciliationAuthorityCodeVersion ||
+      proof.authorityCheckpointCodeVersion ||
     donor.identity.codeIdentity.codeVersion !==
-      reviewFlowEvaluationReconciliationTargetCodeVersion
+      proof.donorCheckpointCodeVersion
   ) {
     throw new ReviewFlowEvaluationReconciliationError(
       "REVIEW_FLOW_EVALUATION_RECONCILIATION_IDENTITY_MISMATCH"
@@ -1181,8 +1210,14 @@ export function reconcileReviewFlowEvaluationCheckpoints(
   const targetIdentity = assertDonorIdentity(
     authorityFile.value,
     donorFile.value,
-    verifiedCodeBinding.currentCodeVersion
+    verifiedCodeBinding.currentCodeVersion,
+    proofFile.value
   );
+  if (sha256(donorFile.bytes) !== proofFile.value.donorCheckpointSha256) {
+    throw new ReviewFlowEvaluationReconciliationError(
+      "REVIEW_FLOW_EVALUATION_RECONCILIATION_PROOF_INVALID"
+    );
+  }
 
   const authorityFailedIds = new Set(
     authorityFile.value.entries
