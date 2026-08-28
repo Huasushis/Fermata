@@ -2913,6 +2913,25 @@ describe("严格私有报告、恢复与计分", () => {
     const state = chain.checkpoint.sealExecution();
     const report = buildReviewFlowEvaluationReport({ dataset, checkpoint: state });
     expect(report.summary.complete).toBe(true);
+    expect(report.summary.accounting.syntheticReconciliationInterruptions).toEqual({
+      count: 0,
+      excludedFromActualAttemptAccounting: true
+    });
+    const serializedReport = JSON.parse(report.json) as {
+      readonly accounting: {
+        readonly syntheticReconciliationInterruptions: {
+          readonly count: number;
+          readonly excludedFromActualAttemptAccounting: true;
+        };
+      };
+    };
+    expect(serializedReport.accounting.syntheticReconciliationInterruptions).toEqual({
+      count: 0,
+      excludedFromActualAttemptAccounting: true
+    });
+    expect(report.markdown).toContain(
+      "合成重协调中断：0 次；排除出实际案例尝试账本：是。"
+    );
     expect(report.summary.eligible).toBe(false);
     expect(report.summary.scoring.historicalOutcomeBinary).toMatchObject({
       scoredCaseCount: 32,
@@ -2985,19 +3004,16 @@ describe("严格私有报告、恢复与计分", () => {
       }
     );
     chain.checkpoint.bindGlobalClaim("b".repeat(64));
-    for (const safeId of dataset.cases.map((entry) => entry.safeId)) {
-      chain.checkpoint.markActive(safeId);
-      chain.checkpoint.markCompleted(
-        safeId,
+    completeAll(
+      chain.checkpoint,
+      dataset.cases.map((entry) => entry.safeId),
+      (safeId) =>
         safeId === "case-0001"
           ? projection("approve")
           : safeId === "case-0002"
             ? projection("reject")
-            : projection("reject"),
-        undefined,
-        { schemaVersion: 1, firstByteMs: 1, endToEndMs: 2 }
-      );
-    }
+            : projection("reject")
+    );
     const state = chain.checkpoint.sealExecution();
     const report = buildReviewFlowEvaluationReport({ dataset, checkpoint: state });
     expect(report.summary.scoring.historicalOutcomeBinary).toMatchObject({
@@ -3055,6 +3071,151 @@ describe("严格私有报告、恢复与计分", () => {
         code: "REVIEW_FLOW_EVALUATION_NOT_STARTED_AFTER_FAILURE"
       })
     ]));
+    chain.checkpoint.close();
+  });
+  it("cancelled actual attempts remain incomplete and unscorable", () => {
+    const fixture = createDatasetFixture("cancelled-accounting");
+    const dataset = loadDataset(fixture, "development_scored");
+    const chain = createDatasetCheckpoint(
+      fixture,
+      dataset,
+      "baseline",
+      "dev-cancelled",
+      null,
+      "dev-cancelled"
+    );
+    chain.checkpoint.bindGlobalClaim("b".repeat(64));
+    chain.checkpoint.markActive("case-0001");
+    chain.checkpoint.markFailed("case-0001", {
+      ...fixedFailure("REVIEW_FLOW_CANCELLED", null),
+      failureKind: "cancelled" as const
+    });
+    const state = chain.checkpoint.sealExecution();
+    const report = buildReviewFlowEvaluationReport({ dataset, checkpoint: state });
+    expect(report.summary).toMatchObject({
+      complete: false,
+      eligible: false,
+      accounting: {
+        exact: false,
+        caseAttempts: 1,
+        syntheticReconciliationInterruptions: {
+          count: 0,
+          excludedFromActualAttemptAccounting: true
+        }
+      }
+    });
+    expect(report.summary.scoring.valid).toBe(false);
+    expect(report.summary.scoring.historicalOutcomeBinary.accuracy).toBeNull();
+    chain.checkpoint.close();
+  });
+
+  it("missing/unresolved cases fail closed without inventing attempts", () => {
+    const fixture = createDatasetFixture("unresolved-accounting");
+    const dataset = loadDataset(fixture, "development_scored");
+    const chain = createDatasetCheckpoint(
+      fixture,
+      dataset,
+      "baseline",
+      "dev-unresolved",
+      null,
+      "dev-unresolved"
+    );
+    chain.checkpoint.bindGlobalClaim("b".repeat(64));
+    chain.checkpoint.markTerminationRequested("SIGINT");
+    const state = chain.checkpoint.sealExecution();
+    const report = buildReviewFlowEvaluationReport({ dataset, checkpoint: state });
+    expect(report.summary).toMatchObject({
+      complete: false,
+      eligible: false,
+      caseCounts: {
+        notStarted: 32,
+        skipped: 0,
+        unaccounted: 0
+      },
+      accounting: {
+        exact: false,
+        caseAttempts: 0
+      }
+    });
+    const completeChain = createDatasetCheckpoint(
+      fixture,
+      dataset,
+      "baseline",
+      "dev-missing-ledger",
+      null,
+      "dev-missing-ledger"
+    );
+    completeChain.checkpoint.bindGlobalClaim("c".repeat(64));
+    completeAll(
+      completeChain.checkpoint,
+      dataset.cases.map((entry) => entry.safeId)
+    );
+    const completeState = completeChain.checkpoint.sealExecution();
+    const missingAuditState = {
+      ...completeState,
+      auditLedger: {
+        ...completeState.auditLedger!,
+        cases: completeState.auditLedger!.cases.slice(0, -1)
+      }
+    };
+    const missingAuditReport = buildReviewFlowEvaluationReport({
+      dataset,
+      checkpoint: missingAuditState
+    });
+    expect(missingAuditReport.summary).toMatchObject({
+      complete: false,
+      eligible: false
+    });
+    expect(missingAuditReport.summary.scoring.valid).toBe(false);
+    completeChain.checkpoint.close();
+    chain.checkpoint.close();
+  });
+  it("actual attempt 的未知 usage/response 使报告保持不可计分", async () => {
+    const fixture = createDatasetFixture("unknown-accounting");
+    const dataset = loadDataset(fixture, "development_scored");
+    const chain = createDatasetCheckpoint(
+      fixture,
+      dataset,
+      "baseline",
+      "dev-unknown-accounting",
+      null,
+      "dev-unknown-accounting"
+    );
+    chain.checkpoint.bindGlobalClaim("b".repeat(64));
+    const roleAttempts = auditRoleAttempts().map((role, index) =>
+      index === 0
+        ? { ...role, responseByteCount: null, eofObserved: null }
+        : role
+    );
+    const state = await runReviewFlowEvaluationCases({
+      checkpoint: chain.checkpoint,
+      cases: dataset.cases.map((entry) => ({
+        safeId: entry.safeId,
+        prepared: entry.safeId
+      })),
+      executor: {
+        execute: async () => ({
+          status: "complete" as const,
+          projection: projection("approve"),
+          roleAttempts
+        })
+      },
+      concurrency: 1,
+      maxCaseAttempts: 1
+    });
+    const report = buildReviewFlowEvaluationReport({ dataset, checkpoint: state });
+    expect(report.summary).toMatchObject({
+      complete: false,
+      eligible: false,
+      accounting: {
+        exact: false,
+        caseAttempts: 32,
+        unknownUsageRoleCount: 352,
+        unknownResponseByteRoleCount: 32
+      }
+    });
+    expect(report.summary.scoring.valid).toBe(false);
+    expect(report.summary.scoring.historicalOutcomeBinary.accuracy).toBeNull();
     chain.checkpoint.close();
   });
 
@@ -3163,9 +3324,15 @@ describe("严格私有报告、恢复与计分", () => {
     expect(statSync(markerPath).nlink).toBe(1);
     expect(() => parseReviewFlowEvaluationReportSummary(
       Buffer.from(`${JSON.stringify({
-        schemaVersion: 2,
+        schemaVersion: 3,
         protocolVersion: "review-flow-evaluation-v2",
         label: "strict-baseline"
+      })}\n`)
+    )).toThrow("REVIEW_FLOW_EVALUATION_REPORT_SUMMARY_INVALID");
+    expect(() => parseReviewFlowEvaluationReportSummary(
+      Buffer.from(`${JSON.stringify({
+        ...report.summary,
+        schemaVersion: 2
       })}\n`)
     )).toThrow("REVIEW_FLOW_EVALUATION_REPORT_SUMMARY_INVALID");
     expect(() => parseReviewFlowEvaluationReportSummary(
@@ -4835,7 +5002,27 @@ function completeAll(
 ): void {
   for (const safeId of safeIds) {
     checkpoint.markActive(safeId);
-    checkpoint.markCompleted(safeId, makeProjection(safeId));
+    checkpoint.recordCaseAttempt(safeId, {
+      schemaVersion: 1,
+      attempt: checkpoint.existingCaseAttemptCount(safeId) + 1,
+      outcome: "completed",
+      accountingComplete: true,
+      errorCategory: null,
+      errorCode: null,
+      roleAttempts: auditRoleAttempts(undefined, true)
+    });
+    const selection = checkpoint.snapshot().identity.caseSelection;
+    const representative3 =
+      selection?.selector === "representative3-v1" ||
+      selection?.selector === "representative3-v2";
+    checkpoint.markCompleted(
+      safeId,
+      makeProjection(safeId),
+      undefined,
+      representative3
+        ? { schemaVersion: 1, firstByteMs: 1, endToEndMs: 2 }
+        : undefined
+    );
   }
 }
 
@@ -4850,7 +5037,9 @@ function fixedFailure(code: string, httpStatus: number | null) {
     caseAttempts: 1
   };
 }
-function auditRoleStage(role: string) {
+function auditRoleStage(
+  role: string
+): "foundation" | "independent" | "critique" | "adjudication" {
   if (["solver", "solution_analyst", "technical_auditor"].includes(role)) {
     return "foundation";
   }
@@ -4861,7 +5050,10 @@ function auditRoleStage(role: string) {
   return "adjudication";
 }
 
-function auditRoleAttempts(failedRole?: string) {
+function auditRoleAttempts(
+  failedRole?: string,
+  knownAccounting = false
+) {
   return reviewFlowRoleSchema.options.map((role) => {
     const failed = role === failedRole;
     const blocked = failedRole !== undefined && !failed;
@@ -4879,8 +5071,8 @@ function auditRoleAttempts(failedRole?: string) {
       httpStatus: failed ? 200 : null,
       finishReason: failed ? "length" as const : blocked ? null : "stop" as const,
       maxTokens: null,
-      usageTotalTokens: failed ? 7 : null,
-      usageComplete: failed,
+      usageTotalTokens: failed ? 7 : knownAccounting && !blocked ? 1 : null,
+      usageComplete: failed || knownAccounting && !blocked,
       responseByteCount: failed ? 13 : blocked ? 0 : 5,
       eofObserved: blocked ? null : true,
       stopObserved: blocked ? null : !failed,
@@ -5497,7 +5689,7 @@ describe("audit-chain RED terminal persistence", () => {
     }).writeTerminalReceipt();
     expect(receipt).toMatchObject({
       schemaVersion: 1,
-      status: "complete",
+      status: "incomplete",
       caseCount: 32
     });
     const receiptPath = join(chain.outputDirectory, "terminal-receipt.private.json");
@@ -5518,7 +5710,7 @@ describe("audit-chain RED terminal persistence", () => {
 
     const report = buildReviewFlowEvaluationReport({ dataset, checkpoint: state });
     expect(report.summary.accounting).toMatchObject({
-      exact: true,
+      exact: false,
       caseAttempts: 33,
       logicalRequests: 353,
       transportAttempts: 354,
@@ -5530,6 +5722,8 @@ describe("audit-chain RED terminal persistence", () => {
       unknownResponseByteRoleCount: 0,
       dependencyBlockedRoleCount: 10
     });
+    expect(report.summary.scoring.valid).toBe(false);
+    expect(report.summary.scoring.historicalOutcomeBinary.accuracy).toBeNull();
     chain.checkpoint.close();
   });
 
@@ -5585,6 +5779,10 @@ describe("T0145-RED 终端摘要账本完整性", () => {
         schemaErrors: number;
         formatterCorrections: number;
         repairCount: number;
+        syntheticReconciliationInterruptions: {
+          count: number;
+          excludedFromActualAttemptAccounting: true;
+        }
       };
       complete: boolean;
       failures: Array<{ code: string; count: number }>;
@@ -5598,18 +5796,19 @@ describe("T0145-RED 终端摘要账本完整性", () => {
     expect(summary.caseCounts.http499).toBe(0);
     expect(summary.caseCounts.unaccounted).toBe(0);
     // 逐角色/逐尝试账本：一次部分角色失败精确暴露 2 次逻辑请求 / 2 次传输 / 1 次收到字节响应 / 重试 / schema / formatter / repair
-    expect(summary.accounting).toEqual({
+    expect(summary.accounting).toMatchObject({
       logicalRequests: 2,
       transportAttempts: 2,
       receivedByteResponses: 1,
       retries: 0,
       schemaErrors: 0,
       formatterCorrections: 0,
-      repairCount: 0
+      repairCount: 0,
+      syntheticReconciliationInterruptions: {
+        count: 0,
+        excludedFromActualAttemptAccounting: true
+      }
     });
-    // 任一账本字段缺失 => completeness=false，且 failures 必须逐项列出
-    expect(summary.complete).toBe(false);
-    expect(summary.failures.some((row) => row.code === "REVIEW_FLOW_ROLE_FAILED")).toBe(true);
     expect(summary.failures.some((row) => row.code === "REVIEW_FLOW_EVALUATION_NOT_STARTED_AFTER_FAILURE")).toBe(true);
     chain.checkpoint.close();
   });

@@ -488,31 +488,40 @@ export async function runReviewFlowEvaluationCases<TPrepared>(input: {
   };
 
   const pending = input.checkpoint.pendingSafeIds();
-  if (selection !== undefined) {
-    // 有选择的案例按建模并发度直接执行；只有 representative3 保留 pilot
-    // 时延收据，其它私有子集不改变请求或模型语义。
-    const stage2StartedAt = representative3Selection
-      ? monotonicNow()
-      : null;
-    await runBatch(pending, input.concurrency, representative3Selection);
-    const stage2EndedAt = monotonicNow();
+  if (
+    selection !== undefined &&
+    representative3Selection &&
+    selection.selector !== "representative3-v3"
+  ) {
+    const pilotSafeId = pending[0];
+    if (pilotSafeId === undefined) {
+      throw new Error("REVIEW_FLOW_EVALUATION_REPRESENTATIVE3_RUN_INVALID");
+    }
+    await runBatch([pilotSafeId], 1, true);
+    const pilotState = input.checkpoint.snapshot();
+    const pilotEntry = pilotState.entries[0];
+    const remainingCasesAdmitted =
+      pilotEntry?.status === "completed" &&
+      pilotEntry.pilotTiming?.remainingCasesAdmitted === true;
+    let stage2StartedAt: number | null = null;
+    let stage2EndedAt: number | null = null;
+    if (remainingCasesAdmitted) {
+      stage2StartedAt = monotonicNow();
+      await runBatch(pending.slice(1), input.concurrency, false);
+      stage2EndedAt = monotonicNow();
+    }
     const completed = input.checkpoint.snapshot();
-    const completedPilot = representative3Selection
-      ? completed.entries.find(
-          (entry) =>
-            entry.status === "completed" && entry.caseTiming !== undefined
-        )
-      : undefined;
+    const completedPilot = completed.entries[0];
     const pilotCaseTiming =
       completedPilot?.status === "completed"
         ? completedPilot.caseTiming
         : undefined;
     if (
-      representative3Selection &&
       completed.entries.every((entry) => entry.status === "completed") &&
       pilotCaseTiming !== undefined &&
       representative3StartedAt !== null &&
-      stage2StartedAt !== null
+      stage2StartedAt !== null &&
+      stage2EndedAt !== null
     ) {
       input.checkpoint.bindRepresentative3Timing({
         schemaVersion: 1,

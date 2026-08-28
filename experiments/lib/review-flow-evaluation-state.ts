@@ -312,9 +312,30 @@ const failureSchema = z
     failedRoleCount: z.number().int().min(0).max(11),
     failedRoles: z.array(roleFailureSchema),
     roleAttempts: reviewFlowRoleAttemptsSchema.optional(),
-    caseAttempts: z.number().int().min(1).max(8).default(1)
+    caseAttempts: z.number().int().min(0).max(8).default(1)
   })
-  .strict();
+  .strict()
+  .superRefine((failure, context) => {
+    const requeueable =
+      failure.code === "REVIEW_FLOW_RECONCILIATION_REQUEUEABLE";
+    const validRequeueable =
+      failure.failureKind === null &&
+      failure.completedRoleCount === 0 &&
+      failure.failedRoleCount === 0 &&
+      failure.failedRoles.length === 0 &&
+      failure.roleAttempts === undefined &&
+      failure.caseAttempts === 0;
+    if (
+      (failure.caseAttempts === 0 && !requeueable) ||
+      (requeueable && !validRequeueable)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["caseAttempts"],
+        message: "只有重协调占位失败条目可以声明零次实际案例尝试。"
+      });
+    }
+  });
 export type ReviewFlowEvaluationFailure = z.infer<typeof failureSchema>;
 export const reviewFlowEvaluationCaseErrorCodeSchema = z.enum([
   ...reviewFlowAuditErrorCodeSchema.options,
@@ -427,14 +448,41 @@ export function summarizeReviewFlowEvaluationAuditLedger(
   const attempts = ledger.cases.flatMap((entry) => entry.attempts);
   const roles = attempts.flatMap((attempt) => attempt.roleAttempts);
   const countedRoles = roles.filter((role) => !role.dependencyBlocked);
+  const everyCaseHasAttempt = ledger.cases.every(
+    (entry, index) =>
+      entry.caseOrdinal === index + 1 &&
+      entry.attempts.length > 0
+  );
   const usageValues = countedRoles.flatMap((role) =>
-    role.usageTotalTokens === null ? [] : [role.usageTotalTokens]
+    role.usageComplete && role.usageTotalTokens !== null
+      ? [role.usageTotalTokens]
+      : []
   );
   const byteValues = countedRoles.flatMap((role) =>
-    role.responseByteCount === null ? [] : [role.responseByteCount]
+    role.eofObserved === true && role.responseByteCount !== null
+      ? [role.responseByteCount]
+      : []
+  );
+  // 重协调 provenance 不在实际尝试账本中；实际尝试必须有完整收据，取消/499 永不计分。
+  const exactAttempts = attempts.every((attempt) =>
+    attempt.accountingComplete &&
+    attempt.errorCategory !== "cancelled" &&
+    attempt.errorCode !== "LLM_CANCELLED" &&
+    attempt.roleAttempts.every((role) =>
+      role.dependencyBlocked ||
+      (
+        role.errorCategory !== "cancelled" &&
+        role.errorCode !== "LLM_CANCELLED" &&
+        role.httpStatus !== 499 &&
+        role.usageComplete &&
+        role.usageTotalTokens !== null &&
+        role.responseByteCount !== null &&
+        role.eofObserved === true
+      )
+    )
   );
   return reviewFlowEvaluationAuditAccountingSchema.parse({
-    exact: attempts.every((attempt) => attempt.accountingComplete),
+    exact: everyCaseHasAttempt && exactAttempts,
     caseAttempts: attempts.length,
     logicalRequests: roles.reduce(
       (sum, role) => sum + role.logicalRequestCount,
@@ -453,13 +501,13 @@ export function summarizeReviewFlowEvaluationAuditLedger(
       ? null
       : usageValues.reduce((sum, value) => sum + value, 0),
     unknownUsageRoleCount: countedRoles.filter(
-      (role) => role.usageTotalTokens === null
+      (role) => !role.usageComplete || role.usageTotalTokens === null
     ).length,
     responseBytes: byteValues.length === 0
       ? null
       : byteValues.reduce((sum, value) => sum + value, 0),
     unknownResponseByteRoleCount: countedRoles.filter(
-      (role) => role.responseByteCount === null
+      (role) => role.eofObserved !== true || role.responseByteCount === null
     ).length,
     dependencyBlockedRoleCount: roles.filter(
       (role) => role.dependencyBlocked
@@ -619,9 +667,12 @@ const reconciliationPostCommitAllowedPaths = [
   "config/review-flow-runtime.json",
   "experiments/eval-review-flow.ts",
   "experiments/lib/review-flow-evaluation-reconcile.ts",
+  "experiments/lib/review-flow-evaluation-report.ts",
+  "experiments/lib/review-flow-evaluation-runner.ts",
   "experiments/lib/review-flow-evaluation-state.ts",
   "scripts/trusted-git-state.mjs",
-  "test/review-flow-evaluation-reconcile.test.ts"
+  "test/review-flow-evaluation-reconcile.test.ts",
+  "test/review-flow-evaluation.test.ts"
 ] as const;
 const reconciliationTelemetrySourceCodeVersion =
   "3c0005a8054056748e2adf99cc3ada8aa9bca4c2";
@@ -675,12 +726,52 @@ const reconciliationCheckpointSourceSchema = z
   })
   .strict();
 
-export const reviewFlowEvaluationReconciliationBindingSchema = z
+const reconciliationInterruptionProvenanceRecordSchema = z
   .object({
     schemaVersion: z.literal(1),
+    artifactKind: z.literal(
+      "review_flow_evaluation_reconciliation_interruption"
+    ),
+    donorActiveEntrySafeId: reviewFlowEvaluationSafeIdSchema,
+    donorActiveEntryFingerprint: digestSchema,
+    donorCaseLedgerFingerprint: digestSchema,
+    donorIdentityFingerprint: digestSchema,
+    donorStateFingerprint: digestSchema,
+    donorCheckpointSha256: digestSchema,
+    donorActiveEntryInterrupted: z.literal(true),
+    donorCaseAttemptCount: z.literal(0),
+    caseBoundProviderReceiptCount: z.literal(0),
+    caseBoundUsageReceiptCount: z.literal(0),
+    caseBoundResponseReceiptCount: z.literal(0),
+    runWideTelemetryBinding: z.literal("unbound"),
+    accountingTreatment: z.literal("provenance_only_not_actual_attempt"),
+    isActualAttempt: z.literal(false)
+  })
+  .strict();
+
+const reconciliationProvenanceSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    appendOnly: z.literal(true),
+    interruptionCount: z.literal(1),
+    interruptions: z
+      .array(reconciliationInterruptionProvenanceRecordSchema)
+      .length(1)
+  })
+  .strict();
+
+export type ReviewFlowEvaluationReconciliationProvenance = z.infer<
+  typeof reconciliationProvenanceSchema
+>;
+export const reviewFlowEvaluationReconciliationBindingSchema = z
+  .object({
+    schemaVersion: z.literal(2),
     artifactKind: z.literal("review_flow_evaluation_reconciliation"),
     authority: reconciliationCheckpointSourceSchema,
     donor: reconciliationCheckpointSourceSchema.extend({
+      activeCaseId: reviewFlowEvaluationSafeIdSchema,
+      activeEntryFingerprint: digestSchema,
+      activeCaseLedgerFingerprint: digestSchema,
       expectedCaseCount: z.literal(9),
       completedCaseCount: z.literal(7),
       failedCaseCount: z.literal(1),
@@ -690,6 +781,8 @@ export const reviewFlowEvaluationReconciliationBindingSchema = z
     sourceCodeVersion: z.literal(reconciliationTelemetrySourceCodeVersion),
     targetCodeVersion: z.literal(reconciliationTelemetryTargetCodeVersion),
     postCommitCodeDelta: reconciliationPostCommitCodeDeltaSchema.optional(),
+    reconciliationProvenance: reconciliationProvenanceSchema,
+    reconciliationProvenanceSha256: digestSchema,
     reconciledIdentityFingerprint: digestSchema,
     absorbedCaseIds: z.array(reviewFlowEvaluationSafeIdSchema).length(7),
     requeueCaseIds: z.array(reviewFlowEvaluationSafeIdSchema).length(2)
@@ -698,15 +791,36 @@ export const reviewFlowEvaluationReconciliationBindingSchema = z
   .superRefine((binding, context) => {
     const absorbed = new Set(binding.absorbedCaseIds);
     const requeue = new Set(binding.requeueCaseIds);
+    const interruption = binding.reconciliationProvenance.interruptions[0];
+    const provenanceBound =
+      interruption !== undefined &&
+      binding.reconciliationProvenanceSha256 ===
+        hashCanonicalValue(binding.reconciliationProvenance) &&
+      interruption.donorActiveEntrySafeId === binding.donor.activeCaseId &&
+      interruption.donorActiveEntryFingerprint ===
+        binding.donor.activeEntryFingerprint &&
+      interruption.donorCaseLedgerFingerprint ===
+        binding.donor.activeCaseLedgerFingerprint &&
+      interruption.donorIdentityFingerprint ===
+        binding.donor.identityFingerprint &&
+      interruption.donorStateFingerprint === binding.donor.stateFingerprint &&
+      interruption.donorCheckpointSha256 === binding.donor.checkpointSha256 &&
+      requeue.has(interruption.donorActiveEntrySafeId) &&
+      !absorbed.has(interruption.donorActiveEntrySafeId);
     if (
       absorbed.size !== binding.absorbedCaseIds.length ||
       requeue.size !== binding.requeueCaseIds.length ||
-      binding.requeueCaseIds.some((safeId) => absorbed.has(safeId))
+      binding.requeueCaseIds.some((safeId) => absorbed.has(safeId)) ||
+      !provenanceBound
     ) {
       context.addIssue({
         code: "custom",
-        path: ["requeueCaseIds"],
-        message: "reconciliation case provenance must be disjoint and unique."
+        path: !provenanceBound
+          ? ["reconciliationProvenance"]
+          : ["requeueCaseIds"],
+        message: !provenanceBound
+          ? "reconciliation interruption provenance is not bound to the donor."
+          : "reconciliation case provenance must be disjoint and unique."
       });
     }
   });
@@ -1989,7 +2103,9 @@ export class ReviewFlowEvaluationCheckpoint {
       terminalCases !== null &&
       terminalCases.length === this.#state.expectedCases.length &&
       terminalCases.every(
-        (entry) => entry.attempts.at(-1)?.outcome === "completed"
+        (entry, index) =>
+          entry.caseOrdinal === index + 1 &&
+          entry.attempts.at(-1)?.outcome === "completed"
       );
     const receipt = reviewFlowEvaluationTerminalReceiptSchema.parse({
       schemaVersion: 1,
@@ -2465,7 +2581,7 @@ export function reviewFlowEvaluationExecutionCompletionFingerprint(
     protocol:
       state.reconciliation === undefined
         ? "review-flow-evaluation-execution-completion-v4"
-        : "review-flow-evaluation-execution-completion-v5",
+        : "review-flow-evaluation-execution-completion-v6",
     runId: state.runId,
     identityFingerprint: state.identityFingerprint,
     expectedCases: state.expectedCases,

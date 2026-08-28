@@ -17,12 +17,7 @@ import {
 import { withTrustedGitSnapshot } from "../../scripts/trusted-git-state.mjs";
 import { hashCanonicalValue } from "../../src/review-flow/evidence";
 import {
-  reviewFlowRoleStage,
-  reviewFlowRoleAttemptAuditSchema
-} from "../../src/review-flow/orchestrator";
-import {
-  reviewFlowRoleSchema,
-  type ReviewFlowRole
+  reviewFlowRoleSchema
 } from "../../src/review-flow/schemas";
 import {
   reviewFlowEvaluationCheckpointSchema,
@@ -86,9 +81,12 @@ export const reviewFlowEvaluationReconciliationPostCommitAllowedPaths =
     "config/review-flow-runtime.json",
     "experiments/eval-review-flow.ts",
     "experiments/lib/review-flow-evaluation-reconcile.ts",
+    "experiments/lib/review-flow-evaluation-report.ts",
+    "experiments/lib/review-flow-evaluation-runner.ts",
     "experiments/lib/review-flow-evaluation-state.ts",
     "scripts/trusted-git-state.mjs",
-    "test/review-flow-evaluation-reconcile.test.ts"
+    "test/review-flow-evaluation-reconcile.test.ts",
+    "test/review-flow-evaluation.test.ts"
   ] as const);
 export const reviewFlowEvaluationReconciliationPostCommitSolVerdict =
   "reconciliation_projection_only" as const;
@@ -175,7 +173,7 @@ export type ReviewFlowEvaluationCompatibilityProof = z.infer<
 >;
 export const reviewFlowEvaluationReconciliationPostCommitProofSchema = z
   .object({
-    schemaVersion: z.literal(1),
+    schemaVersion: z.literal(2),
     artifactKind: z.literal(
       "review_flow_evaluation_reconciliation_post_commit_proof"
     ),
@@ -764,7 +762,10 @@ function assertDonorCheckpoint(
         "REVIEW_FLOW_EVALUATION_RECONCILIATION_LEDGER_INVALID"
       );
     }
-    if (entry.status !== "active" && caseLedger.attempts.length === 0) {
+    if (
+      (entry.status === "active" && caseLedger.attempts.length !== 0) ||
+      (entry.status !== "active" && caseLedger.attempts.length === 0)
+    ) {
       throw new ReviewFlowEvaluationReconciliationError(
         "REVIEW_FLOW_EVALUATION_RECONCILIATION_LEDGER_INVALID"
       );
@@ -895,60 +896,29 @@ function assertDonorIdentity(
   }
   return targetIdentity;
 }
-function unknownCancelledRoleAttemptAudit(role: ReviewFlowRole) {
-  return reviewFlowRoleAttemptAuditSchema.parse({
-    schemaVersion: 1,
-    role,
-    roleStage: reviewFlowRoleStage(role),
-    outcome: "failed",
-    errorCategory: "cancelled",
-    errorCode: "LLM_CANCELLED",
-    failureStage: null,
-    failureSubstage: null,
-    httpStatus: null,
-    finishReason: "unknown",
-    maxTokens: null,
-    usageTotalTokens: null,
-    usageComplete: false,
-    responseByteCount: null,
-    eofObserved: null,
-    stopObserved: null,
-    doneObserved: null,
-    logicalRequestCount: 0,
-    transportAttemptCount: 0,
-    providerRequestCount: 0,
-    retryCount: 0,
-    dependencyBlocked: false
-  });
-}
 
 function requeueActiveEntry(
   entry: Extract<ReviewFlowEvaluationEntry, { readonly status: "active" }>,
   ledger: ReviewFlowEvaluationAuditCase,
   failedAt: string
 ): Extract<ReviewFlowEvaluationEntry, { readonly status: "failed" }> {
-  const nextAttempt = ledger.attempts.length + 1;
-  if (nextAttempt > 8) {
+  if (ledger.attempts.length !== 0) {
     throw new ReviewFlowEvaluationReconciliationError(
       "REVIEW_FLOW_EVALUATION_RECONCILIATION_LEDGER_INVALID"
     );
   }
-  const roleAttempts = reviewFlowRoleSchema.options.map((role) =>
-    unknownCancelledRoleAttemptAudit(role)
-  );
   return {
     safeId: entry.safeId,
     status: "failed",
     failedAt,
     failure: {
       code: "REVIEW_FLOW_RECONCILIATION_REQUEUEABLE",
-      failureKind: "cancelled",
+      failureKind: null,
       httpStatus: null,
       completedRoleCount: 0,
       failedRoleCount: 0,
       failedRoles: [],
-      roleAttempts,
-      caseAttempts: nextAttempt
+      caseAttempts: 0
     }
   };
 }
@@ -974,6 +944,25 @@ function mergeState(
   const requeueIds: string[] = [];
   const mergedEntries: ReviewFlowEvaluationEntry[] = [];
   const mergedAuditCases: ReviewFlowEvaluationAuditCases = [];
+  const donorActiveEntry = donor.entries.find(
+    (
+      entry
+    ): entry is Extract<ReviewFlowEvaluationEntry, { readonly status: "active" }> =>
+      entry.status === "active"
+  );
+  const donorActiveCaseLedger =
+    donorActiveEntry === undefined
+      ? undefined
+      : donorLedger.get(donorActiveEntry.safeId);
+  if (
+    donorActiveEntry === undefined ||
+    donorActiveCaseLedger === undefined ||
+    donorActiveCaseLedger.attempts.length !== 0
+  ) {
+    throw new ReviewFlowEvaluationReconciliationError(
+      "REVIEW_FLOW_EVALUATION_RECONCILIATION_LEDGER_INVALID"
+    );
+  }
   for (let index = 0; index < authority.expectedCases.length; index += 1) {
     const expected = authority.expectedCases[index]!;
     const authorityEntry = authorityEntries.get(expected.safeId)!;
@@ -1025,18 +1014,7 @@ function mergeState(
     mergedEntries.push(requeuedEntry);
     mergedAuditCases.push({
       caseOrdinal: index + 1,
-      attempts: [
-        ...donorCaseLedger.attempts,
-        {
-          schemaVersion: 1,
-          attempt: donorCaseLedger.attempts.length + 1,
-          outcome: "failed",
-          accountingComplete: false,
-          errorCategory: "cancelled",
-          errorCode: "LLM_CANCELLED",
-          roleAttempts: requeuedEntry.failure.roleAttempts!
-        }
-      ]
+      attempts: donorCaseLedger.attempts
     });
   }
 
@@ -1047,14 +1025,44 @@ function mergeState(
   }
 
   const identityFingerprint = hashCanonicalValue(targetIdentity);
-  const reconciliationWithoutFingerprint = {
+  const authorityStateFingerprint = hashCanonicalValue(authority);
+  const donorStateFingerprint = hashCanonicalValue(donor);
+  const reconciliationProvenance = {
     schemaVersion: 1 as const,
+    appendOnly: true as const,
+    interruptionCount: 1 as const,
+    interruptions: [{
+      schemaVersion: 1 as const,
+      artifactKind:
+        "review_flow_evaluation_reconciliation_interruption" as const,
+      donorActiveEntrySafeId: donorActiveEntry.safeId,
+      donorActiveEntryFingerprint: hashCanonicalValue(donorActiveEntry),
+      donorCaseLedgerFingerprint: hashCanonicalValue(donorActiveCaseLedger),
+      donorIdentityFingerprint: donor.identityFingerprint,
+      donorStateFingerprint,
+      donorCheckpointSha256,
+      donorActiveEntryInterrupted: true as const,
+      donorCaseAttemptCount: 0 as const,
+      caseBoundProviderReceiptCount: 0 as const,
+      caseBoundUsageReceiptCount: 0 as const,
+      caseBoundResponseReceiptCount: 0 as const,
+      runWideTelemetryBinding: "unbound" as const,
+      accountingTreatment:
+        "provenance_only_not_actual_attempt" as const,
+      isActualAttempt: false as const
+    }]
+  };
+  const reconciliationProvenanceSha256 = hashCanonicalValue(
+    reconciliationProvenance
+  );
+  const reconciliationWithoutFingerprint = {
+    schemaVersion: 2 as const,
     artifactKind: "review_flow_evaluation_reconciliation" as const,
     authority: {
       label: authority.label,
       runId: authority.runId,
       identityFingerprint: authority.identityFingerprint,
-      stateFingerprint: hashCanonicalValue(authority),
+      stateFingerprint: authorityStateFingerprint,
       checkpointSha256: authorityCheckpointSha256,
       expectedCaseCount: 32 as const,
       completedCaseCount: 23,
@@ -1065,8 +1073,11 @@ function mergeState(
       label: donor.label,
       runId: donor.runId,
       identityFingerprint: donor.identityFingerprint,
-      stateFingerprint: hashCanonicalValue(donor),
+      stateFingerprint: donorStateFingerprint,
       checkpointSha256: donorCheckpointSha256,
+      activeCaseId: donorActiveEntry.safeId,
+      activeEntryFingerprint: hashCanonicalValue(donorActiveEntry),
+      activeCaseLedgerFingerprint: hashCanonicalValue(donorActiveCaseLedger),
       expectedCaseCount: 9 as const,
       completedCaseCount: 7 as const,
       failedCaseCount: 1 as const,
@@ -1076,6 +1087,8 @@ function mergeState(
     sourceCodeVersion: reviewFlowEvaluationReconciliationSourceCodeVersion,
     targetCodeVersion: reviewFlowEvaluationReconciliationTargetCodeVersion,
     ...(postCommitCodeDelta === undefined ? {} : { postCommitCodeDelta }),
+    reconciliationProvenance,
+    reconciliationProvenanceSha256,
     reconciledIdentityFingerprint: identityFingerprint,
     absorbedCaseIds: donorCompletedIds,
     requeueCaseIds: requeueIds
@@ -1085,10 +1098,11 @@ function mergeState(
       reconciliationWithoutFingerprint
     );
   const runBinding = hashCanonicalValue({
-    protocol: "review-flow-evaluation-reconciliation-run-v2",
+    protocol: "review-flow-evaluation-reconciliation-run-v3",
     authorityStateFingerprint: reconciliation.authority.stateFingerprint,
     donorStateFingerprint: reconciliation.donor.stateFingerprint,
     compatibilityProofSha256,
+    reconciliationProvenanceSha256,
     ...(postCommitCodeDelta === undefined ? {} : { postCommitCodeDelta }),
     targetIdentityFingerprint: identityFingerprint
   });

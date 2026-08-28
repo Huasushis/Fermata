@@ -231,7 +231,13 @@ const accountingSchema = z
     dependencyBlockedRoleCount: z.number().int().nonnegative().nullable(),
     schemaErrors: z.number().int().nonnegative(),
     formatterCorrections: z.number().int().nonnegative(),
-    repairCount: z.number().int().nonnegative()
+    repairCount: z.number().int().nonnegative(),
+    syntheticReconciliationInterruptions: z
+      .object({
+        count: z.number().int().nonnegative(),
+        excludedFromActualAttemptAccounting: z.literal(true)
+      })
+      .strict()
   })
   .strict();
 
@@ -263,7 +269,7 @@ const caseResultSchema = z
 
 export const reviewFlowEvaluationReportSummarySchema = z
   .object({
-    schemaVersion: z.literal(2),
+    schemaVersion: z.literal(3),
     protocolVersion: z.literal("review-flow-evaluation-v2"),
     label: reviewFlowEvaluationLabelSchema,
     variant: z.enum(["baseline", "candidate"]),
@@ -336,16 +342,19 @@ export const reviewFlowEvaluationReportSummarySchema = z
           summary.accounting.logicalRequests === null ||
           summary.accounting.transportAttempts === null ||
           summary.accounting.providerRequests === null)) ||
-      (summary.accounting.logicalRequests !== null &&
-        summary.accounting.logicalRequests <
-          summary.accounting.receivedByteResponses) ||
-      (summary.accounting.transportAttempts !== null &&
-        summary.accounting.transportAttempts <
-          summary.accounting.receivedByteResponses) ||
-      (summary.accounting.transportAttempts !== null &&
-        summary.accounting.providerRequests !== null &&
-        summary.accounting.transportAttempts !==
-          summary.accounting.providerRequests) ||
+      (summary.accounting.exact &&
+        (
+          (summary.accounting.logicalRequests !== null &&
+            summary.accounting.logicalRequests <
+              summary.accounting.receivedByteResponses) ||
+          (summary.accounting.transportAttempts !== null &&
+            summary.accounting.transportAttempts <
+              summary.accounting.receivedByteResponses) ||
+          (summary.accounting.transportAttempts !== null &&
+            summary.accounting.providerRequests !== null &&
+            summary.accounting.transportAttempts !==
+              summary.accounting.providerRequests)
+        )) ||
       (summary.dataset.purpose === "development" &&
         summary.dataset.holdoutIdentity !== null) ||
       (summary.dataset.purpose === "holdout" &&
@@ -528,18 +537,33 @@ export function buildReviewFlowEvaluationReport(input: {
   const auditAccounting = summarizeReviewFlowEvaluationAuditLedger(
     input.checkpoint.auditLedger
   );
+  const auditCaseCoverageExact =
+    input.checkpoint.auditLedger !== null &&
+    input.checkpoint.auditLedger.cases.length ===
+      input.checkpoint.entries.length &&
+    input.checkpoint.auditLedger.cases.every(
+      (entry, index) => entry.caseOrdinal === index + 1
+    );
   const accounting = {
     ...auditAccounting,
+    exact: auditAccounting.exact && auditCaseCoverageExact,
     receivedByteResponses: legacyAccounting.receivedByteResponses,
     schemaErrors: legacyAccounting.schemaErrors,
     formatterCorrections: legacyAccounting.formatterCorrections,
-    repairCount: legacyAccounting.repairCount
+    repairCount: legacyAccounting.repairCount,
+    syntheticReconciliationInterruptions: {
+      count:
+        input.checkpoint.reconciliation?.reconciliationProvenance
+          .interruptionCount ?? 0,
+      excludedFromActualAttemptAccounting: true as const
+    }
   };
   const complete =
-    input.checkpoint.executionSeal!.complete && auditAccounting.exact;
+    input.checkpoint.executionSeal!.complete &&
+    accounting.exact;
   const completed = completedProjectionMap(input.checkpoint.entries);
   const summary = reviewFlowEvaluationReportSummarySchema.parse({
-    schemaVersion: 2,
+    schemaVersion: 3,
     protocolVersion: "review-flow-evaluation-v2",
     label: input.checkpoint.label,
     variant: input.checkpoint.variant,
@@ -640,7 +664,7 @@ export function parseReviewFlowEvaluationReportSummary(
     return parseVersionedStrictArtifact({
       value: parsePhysicalBlindJson(bytes.toString("utf8")),
       schema: reviewFlowEvaluationReportSummarySchema,
-      supportedVersions: [2]
+      supportedVersions: [3]
     });
   } catch {
     throw new Error("REVIEW_FLOW_EVALUATION_REPORT_SUMMARY_INVALID");
@@ -1369,6 +1393,7 @@ function buildMarkdown(summary: ReviewFlowEvaluationReportSummary): string {
     "## 样本完整性",
     "",
     `预期 ${summary.caseCounts.expected}，完成 ${summary.caseCounts.completed}，失败 ${summary.caseCounts.failed}，中断 ${summary.caseCounts.active}，未启动 ${summary.caseCounts.pending}。`,
+    `- 合成重协调中断：${summary.accounting.syntheticReconciliationInterruptions.count} 次；排除出实际案例尝试账本：是。`,
     "",
     "## 计分摘要",
     "",

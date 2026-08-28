@@ -46,6 +46,7 @@ import {
   type ReviewFlowEvaluationCheckpointState,
   type ReviewFlowEvaluationEntry
 } from "../experiments/lib/review-flow-evaluation-state";
+import { runReviewFlowEvaluationCases } from "../experiments/lib/review-flow-evaluation-runner";
 import {
   formatReviewFlowEvaluationReconciliationSummary,
   reconcileReviewFlowEvaluationCheckpoints,
@@ -667,7 +668,7 @@ function makePostCommitProof(fixture: ReconciliationFixture): {
     { env: trustedGitEnvironment }
   );
   const proof = reviewFlowEvaluationReconciliationPostCommitProofSchema.parse({
-    schemaVersion: 1,
+    schemaVersion: 2,
     artifactKind: "review_flow_evaluation_reconciliation_post_commit_proof",
     sourceCodeVersion:
       reviewFlowEvaluationReconciliationTargetCodeVersion,
@@ -788,6 +789,7 @@ describe("review-flow checkpoint reconciliation", () => {
       privateRoot: fixture.privateRoot,
       containingWorkspace: fixture.workspace
     };
+    const donorBytes = readFileSync(fixture.donorPath);
     const dryRun = reconcileReviewFlowEvaluationCheckpoints({
       ...input,
       dryRun: true
@@ -832,20 +834,88 @@ describe("review-flow checkpoint reconciliation", () => {
     expect(parsed.termination).toBeNull();
     expect(parsed.publication).toBeNull();
     expect(parsed.reconciliation).toMatchObject({
+      schemaVersion: 2,
       sourceCodeVersion: reviewFlowEvaluationReconciliationSourceCodeVersion,
       targetCodeVersion: reviewFlowEvaluationReconciliationTargetCodeVersion,
-      compatibilityProofSha256: digest(readFileSync(fixture.proofPath))
+      compatibilityProofSha256: digest(readFileSync(fixture.proofPath)),
+      reconciliationProvenance: {
+        schemaVersion: 1,
+        appendOnly: true,
+        interruptionCount: 1,
+        interruptions: [{
+          donorActiveEntrySafeId: "case-0032",
+          donorActiveEntryInterrupted: true,
+          donorCaseAttemptCount: 0,
+          caseBoundProviderReceiptCount: 0,
+          caseBoundUsageReceiptCount: 0,
+          caseBoundResponseReceiptCount: 0,
+          runWideTelemetryBinding: "unbound",
+          accountingTreatment: "provenance_only_not_actual_attempt",
+          isActualAttempt: false,
+          donorIdentityFingerprint: fixture.donor.identityFingerprint,
+          donorActiveEntryFingerprint: hashCanonicalValue(
+            fixture.donor.entries[8]!
+          ),
+          donorCaseLedgerFingerprint: hashCanonicalValue(
+            fixture.donor.auditLedger!.cases[8]!
+          ),
+          donorStateFingerprint: hashCanonicalValue(fixture.donor),
+          donorCheckpointSha256: digest(donorBytes)
+        }]
+      },
+      reconciliationProvenanceSha256: hashCanonicalValue(
+        parsed.reconciliation!.reconciliationProvenance
+      )
     });
     const requeued = parsed.entries.find((entry) => entry.safeId === "case-0032");
     expect(requeued).toMatchObject({
       status: "failed",
-      failure: { code: "REVIEW_FLOW_RECONCILIATION_REQUEUEABLE" }
+      failure: {
+        code: "REVIEW_FLOW_RECONCILIATION_REQUEUEABLE",
+        failureKind: null,
+        caseAttempts: 0
+      }
     });
+    if (requeued?.status !== "failed") throw new Error("TEST_REQUEUE_STATE");
+    expect(requeued.failure.roleAttempts).toBeUndefined();
+    const activeAudit = parsed.auditLedger!.cases.find(
+      (entry) => entry.caseOrdinal === 32
+    )!;
+    expect(activeAudit.attempts).toHaveLength(0);
+    expect(readFileSync(fixture.donorPath)).toEqual(donorBytes);
     expect(() => reviewFlowEvaluationCheckpointSchema.parse({
       ...parsed,
       reconciliation: {
         ...parsed.reconciliation!,
         requeueCaseIds: [...parsed.reconciliation!.requeueCaseIds].reverse()
+      }
+    })).toThrow();
+    expect(() => reviewFlowEvaluationCheckpointSchema.parse({
+      ...parsed,
+      reconciliation: {
+        ...parsed.reconciliation!,
+        reconciliationProvenanceSha256: digest("tampered-provenance")
+      }
+    })).toThrow();
+    expect(() => reviewFlowEvaluationCheckpointSchema.parse({
+      ...parsed,
+      reconciliation: {
+        ...parsed.reconciliation!,
+        reconciliationProvenance: {
+          ...parsed.reconciliation!.reconciliationProvenance,
+          interruptions: parsed.reconciliation!.reconciliationProvenance
+            .interruptions.map((interruption) => ({
+              ...interruption,
+              donorIdentityFingerprint: digest("tampered-identity")
+            }))
+        }
+      }
+    })).toThrow();
+    expect(() => reviewFlowEvaluationCheckpointSchema.parse({
+      ...parsed,
+      reconciliation: {
+        ...parsed.reconciliation!,
+        schemaVersion: 1
       }
     })).toThrow();
     expect(formatReviewFlowEvaluationReconciliationSummary(output, false)).not.toContain("case-");
@@ -889,6 +959,44 @@ describe("review-flow checkpoint reconciliation", () => {
       ]);
       expect(continuationState.failedOnlyContinuation!.selectedFailedCaseIds)
         .toEqual(["case-0031", "case-0032"]);
+      continuation.bindGlobalClaim("d".repeat(64));
+      const completed = await runReviewFlowEvaluationCases({
+        checkpoint: continuation,
+        cases: parsed.expectedCases.map((entry) => ({
+          safeId: entry.safeId,
+          prepared: entry.safeId
+        })),
+        executor: {
+          execute: async () => ({
+            status: "complete" as const,
+            projection: projection(),
+            roleAttempts: completedRoleAudits()
+          })
+        },
+        concurrency: 1,
+        maxCaseAttempts: 1,
+        failedOnly: true
+      });
+      expect(completed.auditLedger!.cases[31]!.attempts).toMatchObject([{
+        attempt: 1,
+        outcome: "completed",
+        accountingComplete: true
+      }]);
+      expect(
+        summarizeReviewFlowEvaluationAuditLedger(completed.auditLedger)
+          .caseAttempts
+      ).toBe(33);
+      expect(completed.reconciliation?.reconciliationProvenance).toEqual(
+        parsed.reconciliation?.reconciliationProvenance
+      );
+      expect(completed.reconciliation?.reconciledIdentityFingerprint).toBe(
+        completed.identityFingerprint
+      );
+      expect(completed.failedOnlyContinuation).toMatchObject({
+        sourceStateFingerprint: hashCanonicalValue(parsed),
+        sourceExecutionCompletionFingerprint:
+          parsed.executionSeal!.completionFingerprint
+      });
     } finally {
       continuation.close();
     }
@@ -907,6 +1015,7 @@ describe("review-flow checkpoint reconciliation", () => {
       containingWorkspace: fixture.workspace,
       dryRun: true
     };
+    const donorBytes = readFileSync(fixture.donorPath);
     expect(() => reconcileReviewFlowEvaluationCheckpoints(postCommitInput)).toThrow(
       "REVIEW_FLOW_EVALUATION_RECONCILIATION_REPOSITORY_INVALID"
     );
@@ -929,27 +1038,43 @@ describe("review-flow checkpoint reconciliation", () => {
     const activeAudit = reconciled.state.auditLedger!.cases.find(
       (entry) => entry.caseOrdinal === 32
     )!;
-    const unknownCancelledAttempt = activeAudit.attempts[0]!;
-    expect(unknownCancelledAttempt).toMatchObject({
-      outcome: "failed",
-      accountingComplete: false,
-      errorCategory: "cancelled",
-      errorCode: "LLM_CANCELLED"
+    expect(activeAudit.attempts).toHaveLength(0);
+    expect(reconciled.state.reconciliation?.reconciliationProvenance).toMatchObject({
+      schemaVersion: 1,
+      appendOnly: true,
+      interruptionCount: 1,
+      interruptions: [{
+        donorActiveEntrySafeId: "case-0032",
+        donorActiveEntryInterrupted: true,
+        donorCaseAttemptCount: 0,
+        caseBoundProviderReceiptCount: 0,
+        caseBoundUsageReceiptCount: 0,
+        caseBoundResponseReceiptCount: 0,
+        runWideTelemetryBinding: "unbound",
+        accountingTreatment: "provenance_only_not_actual_attempt",
+        isActualAttempt: false,
+        donorActiveEntryFingerprint: hashCanonicalValue(
+          fixture.donor.entries[8]!
+        ),
+        donorCaseLedgerFingerprint: hashCanonicalValue(
+          fixture.donor.auditLedger!.cases[8]!
+        ),
+        donorIdentityFingerprint: fixture.donor.identityFingerprint,
+        donorStateFingerprint: hashCanonicalValue(fixture.donor),
+        donorCheckpointSha256: digest(donorBytes)
+      }]
     });
-    expect(unknownCancelledAttempt.roleAttempts[0]).toMatchObject({
-      outcome: "failed",
-      dependencyBlocked: false,
-      usageTotalTokens: null,
-      responseByteCount: null
-    });
+    expect(readFileSync(fixture.donorPath)).toEqual(donorBytes);
     expect(
       summarizeReviewFlowEvaluationAuditLedger(reconciled.state.auditLedger)
     ).toMatchObject({
       exact: false,
+      caseAttempts: 31,
       usageTotalTokens: 341,
-      unknownUsageRoleCount: 11,
+      unknownUsageRoleCount: 0,
       responseBytes: 341,
-      unknownResponseByteRoleCount: 11
+      unknownResponseByteRoleCount: 0,
+      dependencyBlockedRoleCount: 0
     });
 
     const futureIdentity = reviewFlowEvaluationIdentitySchema.parse({
