@@ -292,6 +292,10 @@ Content-Type: application/json
 | `POST /api/v1/robot/review-tasks/{assignmentId}/renew` | `requestId` 为 UUID、`expectedLeaseExpiresAt` 为日期时间、`leaseSeconds` 为 30–1800。 | `assignmentId` 和新的 `leaseExpiresAt`。 |
 | `POST /api/v1/robot/review-tasks/{assignmentId}/complete` | 带请求标识、租约/题目/tag catalog（标签目录）版本、实验版本、模型档位和 `review`。 | `accepted: true` 以及 `problemStatus`。 |
 
+`claim` 省略字段时，服务端镜像会补默认值 `maximumTasks: 1`、`leaseSeconds: 300`；`supportedProblemTypes` 的值只能是 `traditional`、`interactive` 或 `submit_answer`。`complete` 成功响应的 `problemStatus` 只能是 `pending_review`、`approved` 或 `rejected`。
+
+`complete` 的 `review` 必须通过 Urmotiv 审核输入 Schema：`verdict` 为 `approve`、`request_changes` 或 `reject`；`codeforcesDifficulty` 为 800–3500 的整百；`qualityLevel`、`thinkingLevel`、`codingLevel` 为 1–5；`originalityLevel` 可省略或为 null/1–5；`tagIds` 为 1–30 个非空字符串；`improvements` 为 1–20,000 字符的非空文本；`publicComment` 和 `privateNote` 最多 20,000 字符；`expectedRound` 为正整数。不要把题面、题解或模型原文写进运维文档。
+
 Fermata 在本地先按严格镜像校验请求和响应；具体字段以 [`src/urmotiv-schemas.ts`](../src/urmotiv-schemas.ts) 的 `robotReviewTaskSchema`、`completeRobotReviewTaskInputSchema` 等定义为准。任务处理失败不会让 Fermata 伪造完成结果，也不会改变 Urmotiv 的人工流程。
 
 续租和完成请求在满足租约安全预算时只对网络错误、429 和 5xx 做有界重试，并复用同一个请求标识和请求体；确定性的 4xx 或响应契约错误不会自动重试。详见 [`src/urmotiv-client.ts`](../src/urmotiv-client.ts)。
