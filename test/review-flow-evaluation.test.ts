@@ -3170,7 +3170,7 @@ describe("严格私有报告、恢复与计分", () => {
     completeChain.checkpoint.close();
     chain.checkpoint.close();
   });
-  it("actual attempt 的未知 usage/response 使报告保持不可计分", async () => {
+  it("actual attempt 的未知 usage/response 保持披露且不伪造计数", async () => {
     const fixture = createDatasetFixture("unknown-accounting");
     const dataset = loadDataset(fixture, "development_scored");
     const chain = createDatasetCheckpoint(
@@ -3205,17 +3205,17 @@ describe("严格私有报告、恢复与计分", () => {
     });
     const report = buildReviewFlowEvaluationReport({ dataset, checkpoint: state });
     expect(report.summary).toMatchObject({
-      complete: false,
+      complete: true,
       eligible: false,
       accounting: {
-        exact: false,
+        exact: true,
         caseAttempts: 32,
         unknownUsageRoleCount: 352,
         unknownResponseByteRoleCount: 32
       }
     });
-    expect(report.summary.scoring.valid).toBe(false);
-    expect(report.summary.scoring.historicalOutcomeBinary.accuracy).toBeNull();
+    expect(report.summary.scoring.valid).toBe(true);
+    expect(report.summary.scoring.historicalOutcomeBinary.accuracy).not.toBeNull();
     chain.checkpoint.close();
   });
 
@@ -5689,7 +5689,7 @@ describe("audit-chain RED terminal persistence", () => {
     }).writeTerminalReceipt();
     expect(receipt).toMatchObject({
       schemaVersion: 1,
-      status: "incomplete",
+      status: "complete",
       caseCount: 32
     });
     const receiptPath = join(chain.outputDirectory, "terminal-receipt.private.json");
@@ -5710,7 +5710,7 @@ describe("audit-chain RED terminal persistence", () => {
 
     const report = buildReviewFlowEvaluationReport({ dataset, checkpoint: state });
     expect(report.summary.accounting).toMatchObject({
-      exact: false,
+      exact: true,
       caseAttempts: 33,
       logicalRequests: 353,
       transportAttempts: 354,
@@ -5722,8 +5722,8 @@ describe("audit-chain RED terminal persistence", () => {
       unknownResponseByteRoleCount: 0,
       dependencyBlockedRoleCount: 10
     });
-    expect(report.summary.scoring.valid).toBe(false);
-    expect(report.summary.scoring.historicalOutcomeBinary.accuracy).toBeNull();
+    expect(report.summary.scoring.valid).toBe(true);
+    expect(report.summary.scoring.historicalOutcomeBinary.accuracy).not.toBeNull();
     chain.checkpoint.close();
   });
 

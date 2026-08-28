@@ -463,22 +463,16 @@ export function summarizeReviewFlowEvaluationAuditLedger(
       ? [role.responseByteCount]
       : []
   );
-  // 重协调 provenance 不在实际尝试账本中；实际尝试必须有完整收据，取消/499 永不计分。
+  // 重协调 provenance 不在实际尝试账本中；持久化完整的实际尝试可保留未知子字段，但取消/499 永不计分。
   const exactAttempts = attempts.every((attempt) =>
     attempt.accountingComplete &&
     attempt.errorCategory !== "cancelled" &&
     attempt.errorCode !== "LLM_CANCELLED" &&
-    attempt.roleAttempts.every((role) =>
-      role.dependencyBlocked ||
-      (
+    attempt.roleAttempts.every(
+      (role) =>
         role.errorCategory !== "cancelled" &&
         role.errorCode !== "LLM_CANCELLED" &&
-        role.httpStatus !== 499 &&
-        role.usageComplete &&
-        role.usageTotalTokens !== null &&
-        role.responseByteCount !== null &&
-        role.eofObserved === true
-      )
+        role.httpStatus !== 499
     )
   );
   return reviewFlowEvaluationAuditAccountingSchema.parse({
