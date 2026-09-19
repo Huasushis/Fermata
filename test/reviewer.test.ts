@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ReviewerWorker } from "../src/reviewer";
 import { scoreReviewTask } from "../src/scorer";
 import { UrmotivApiError, UrmotivNetworkError } from "../src/urmotiv-client";
-import type { ClaimRobotReviewTasksResponse } from "../src/urmotiv-schemas";
+import type { ClaimRobotReviewTasksResponse, FermataPublicSettings } from "../src/urmotiv-schemas";
 import { appConfig, review, settings, task } from "./helpers/scorer-fixture";
 
 vi.mock("../src/scorer", () => ({ scoreReviewTask: vi.fn() }));
@@ -13,8 +13,8 @@ function deferred<T>() {
   const promise = new Promise<T>((done) => { resolve = done; });
   return { promise, resolve };
 }
-function setup(change = {}) {
-  const current = { ...settings, ...change };
+function setup(change: Partial<FermataPublicSettings> = {}) {
+  const current: FermataPublicSettings = { ...settings, ...change };
   const client = {
     requestTimeoutMs: 30000,
     claim: vi.fn(async (): Promise<ClaimRobotReviewTasksResponse> => ({ items: [] })),
@@ -32,6 +32,50 @@ beforeEach(() => {
 afterEach(async () => { await worker?.stop(); worker = undefined; vi.useRealTimers(); });
 
 describe("机器人任务运行和交付", () => {
+  it("明确清除模型密钥后不回退到环境密钥领取任务", async () => {
+    const { client } = setup();
+    worker = new ReviewerWorker({ urmotivClient: client,
+      settingsStore: { get: () => ({ settings, revision: 1 }), getSecrets: () => ({ modelApiKey: null }), update: () => { throw Error("unused"); } },
+      appConfig, anchors: [] });
+    worker.start(); await vi.advanceTimersByTimeAsync(0);
+    expect(client.claim).not.toHaveBeenCalled();
+    expect(score).not.toHaveBeenCalled();
+  });
+
+  it("网页修改模型和机器人连接只影响新任务，在途任务保留原配置", async () => {
+    const first = setup();
+    const second = setup();
+    const current: FermataPublicSettings = { ...settings, model: { baseUrl: "https://model-a.example.test/v1", model: "model-a", temperature: 0.2, thinking: true } };
+    const secrets = { modelApiKey: "runtime-key-a" };
+    let connection = first.client;
+    const pending = deferred<typeof review>();
+    score.mockReturnValueOnce(pending.promise);
+    first.client.claim.mockResolvedValueOnce({ items: [task()] });
+    second.client.claim.mockResolvedValueOnce({ items: [task("22222222-2222-4222-8222-222222222222")] });
+    worker = new ReviewerWorker({ urmotivClient: () => connection,
+      settingsStore: { get: () => ({ settings: current, revision: 1 }), getSecrets: () => secrets, update: () => { throw Error("unused"); } },
+      appConfig, anchors: [] });
+    try {
+      worker.start(); await vi.advanceTimersByTimeAsync(0);
+      const firstModel = score.mock.calls[0]![1];
+      expect(firstModel.credentials).toEqual({ baseUrl: "https://model-a.example.test/v1", apiKey: "runtime-key-a" });
+      current.model = { baseUrl: "https://model-b.example.test/v1", model: "deepseek-v4-flash", temperature: 0.1, thinking: true };
+      secrets.modelApiKey = "runtime-key-b";
+      connection = second.client;
+      worker.wake(); await vi.advanceTimersByTimeAsync(0);
+      expect(score.mock.calls[1]![1].credentials.apiKey).toBe("runtime-key-b");
+      expect(score.mock.calls[1]![1].spec).toMatchObject({ model: "deepseek-v4-flash", thinkingRequest: "enabled", reasoningEffort: "max" });
+      expect(firstModel.credentials.apiKey).toBe("runtime-key-a");
+      expect(firstModel.spec.model).toBe("model-a");
+      await vi.advanceTimersByTimeAsync(100000);
+      expect(first.client.renew).toHaveBeenCalledOnce();
+      expect(second.client.renew).not.toHaveBeenCalled();
+      pending.resolve(review); await vi.advanceTimersByTimeAsync(0);
+      expect(first.client.complete).toHaveBeenCalledOnce();
+      expect(second.client.complete).toHaveBeenCalledOnce();
+    } finally { pending.resolve(review); await vi.advanceTimersByTimeAsync(0); }
+  });
+
   it("没有查重条目也能领取并提交，绑定当前修订、目录及轮次", async () => {
     const { client, worker } = setup();
     const input = task();

@@ -15,7 +15,7 @@ import {
   getProviderCredentials,
   type AppConfig,
   type ModelSpec,
-  type ProfileConfig
+  type ProviderCredentials
 } from "./config";
 import type { FetchLike } from "./llm";
 import { logError, logInfo, logWarn } from "./logger";
@@ -24,6 +24,7 @@ import type { PipelineModelConfig } from "./pipelines/types";
 import type { SettingsStoreLike } from "./settings-store";
 import { resolveReviewerActivation } from "./reviewer-activation";
 import { scoreReviewTask } from "./scorer";
+import { resolveRuntimeModel } from "./runtime-settings";
 import {
   isAuthenticationError,
   isForbiddenError,
@@ -46,7 +47,7 @@ export interface ReviewerStatus {
 }
 
 export interface ReviewerWorkerOptions {
-  readonly urmotivClient: UrmotivClientLike;
+  readonly urmotivClient: UrmotivClientLike | (() => UrmotivClientLike | undefined);
   readonly settingsStore: SettingsStoreLike;
   readonly appConfig: AppConfig;
   readonly anchors: readonly DifficultyAnchor[];
@@ -57,6 +58,7 @@ export interface ReviewerWorkerOptions {
 }
 
 interface InFlightTask {
+  readonly client: UrmotivClientLike;
   readonly assignmentId: string;
   readonly abortController: AbortController;
   leaseExpiresAt: string;
@@ -73,7 +75,7 @@ interface InFlightTask {
 }
 
 export class ReviewerWorker {
-  readonly #urmotivClient: UrmotivClientLike;
+  readonly #urmotivClient: UrmotivClientLike | (() => UrmotivClientLike | undefined);
   readonly #settingsStore: SettingsStoreLike;
   readonly #appConfig: AppConfig;
   readonly #anchors: readonly DifficultyAnchor[];
@@ -197,15 +199,20 @@ export class ReviewerWorker {
       return;
     }
 
-    const profile = activation.profile;
-    if (getProviderCredentials(this.#appConfig, profile.reviewFlow.adjudicator.provider) === undefined) {
+    const model = resolveRuntimeModel(this.#appConfig, settings, this.#settingsStore.getSecrets?.());
+    if (model === undefined) {
       logWarn("当前审题模型缺少服务商密钥，跳过这一轮轮询");
+      return;
+    }
+    const client = typeof this.#urmotivClient === "function" ? this.#urmotivClient() : this.#urmotivClient;
+    if (client === undefined) {
+      logWarn("机器人凭据尚未配置，跳过这一轮轮询");
       return;
     }
 
     let claimed: ClaimRobotReviewTasksResponse;
     try {
-      claimed = await this.#urmotivClient.claim({
+      claimed = await client.claim({
         maximumTasks: Math.min(availableSlots, 10),
         leaseSeconds: this.#leaseSeconds
       });
@@ -244,7 +251,8 @@ export class ReviewerWorker {
         task,
         settings.modelProfileName,
         settings.experimentVersion,
-        profile
+        model,
+        client
       ).finally(
         () => {
           // 只清理自己登记的 promise；即使以后启动策略变化，也不能让旧任务的
@@ -262,9 +270,11 @@ export class ReviewerWorker {
     task: RobotReviewTask,
     modelProfileName: string,
     experimentVersion: string,
-    profile: ProfileConfig
+    model: NonNullable<ReturnType<typeof resolveRuntimeModel>>,
+    client: UrmotivClientLike
   ): Promise<void> {
     const inFlight: InFlightTask = {
+      client,
       assignmentId: task.assignmentId,
       abortController: new AbortController(),
       leaseExpiresAt: task.leaseExpiresAt,
@@ -280,7 +290,7 @@ export class ReviewerWorker {
       logInfo("开始处理审题任务", { problemId: task.problem.id, revision: task.problem.revision });
       const review = await scoreReviewTask(
         task,
-        this.resolveModelConfig(profile.reviewFlow.adjudicator, inFlight.abortController.signal),
+        this.resolveModelConfig(model.spec, inFlight.abortController.signal, model.credentials),
         this.#anchors
       );
 
@@ -297,7 +307,7 @@ export class ReviewerWorker {
         return;
       }
 
-      const completion = await this.#urmotivClient.complete(task.assignmentId, {
+      const completion = await inFlight.client.complete(task.assignmentId, {
         requestId: randomUUID(),
         expectedLeaseExpiresAt: inFlight.leaseExpiresAt,
         expectedProblemRevision: task.problem.revision,
@@ -355,9 +365,10 @@ export class ReviewerWorker {
 
   private resolveModelConfig(
     spec: ModelSpec,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    configuredCredentials?: ProviderCredentials
   ): PipelineModelConfig {
-    const credentials = getProviderCredentials(this.#appConfig, spec.provider);
+    const credentials = configuredCredentials ?? getProviderCredentials(this.#appConfig, spec.provider);
     if (credentials === undefined) {
       // pollOnce 已经用 missingProvidersForProfile 提前检查过，正常不会走到这里；
       // 保留这个检查是为了在契约/配置被意外改动时给出清楚的错误而不是空指针异常。
@@ -394,7 +405,7 @@ export class ReviewerWorker {
     );
     const leaseExpiresAtMs = Date.parse(inFlight.leaseExpiresAt);
     const remainingLeaseMs = leaseExpiresAtMs - Date.now();
-    const requestTimeoutMs = this.#urmotivClient.requestTimeoutMs;
+    const requestTimeoutMs = inFlight.client.requestTimeoutMs;
     if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs < 1_000) {
       return false;
     }
@@ -418,7 +429,7 @@ export class ReviewerWorker {
     if (operation === null) {
       return true;
     }
-    const requestTimeoutMs = this.#urmotivClient.requestTimeoutMs;
+    const requestTimeoutMs = inFlight.client.requestTimeoutMs;
     const leaseExpiresAtMs = Date.parse(operation.expectedLeaseExpiresAt);
     return Number.isFinite(requestTimeoutMs)
       && requestTimeoutMs >= 1_000
@@ -486,7 +497,7 @@ export class ReviewerWorker {
     };
     inFlight.renewalOperation = operation;
     try {
-      const result = await this.#urmotivClient.renew(inFlight.assignmentId, operation);
+      const result = await inFlight.client.renew(inFlight.assignmentId, operation);
       inFlight.renewalOperation = null;
       inFlight.leaseExpiresAt = result.leaseExpiresAt;
       // processTask 可能在这次 await 期间已经完成并把任务从 #inFlight 里删掉了

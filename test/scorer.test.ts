@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { scoreReviewTask } from "../src/scorer";
 import type { PipelineModelConfig } from "../src/pipelines/types";
-import { review, task } from "./helpers/scorer-fixture";
+import { appConfig, review, settings, task } from "./helpers/scorer-fixture";
+import { resolveRuntimeModel } from "../src/runtime-settings";
 
 function response(content: string, finish = "stop") {
   return new Response(JSON.stringify({ choices: [{ message: { content }, finish_reason: finish }] }), { headers: { "content-type": "application/json" } });
@@ -19,6 +20,25 @@ function setup(output: unknown) {
 const { expectedRound: _round, ...modelReview } = review;
 
 describe("正式评分器", () => {
+  it("网页模型配置实际进入两轮 HTTP 请求，DeepSeek 使用 enabled/max", async () => {
+    const { fetch, model } = setup(modelReview);
+    const resolved = resolveRuntimeModel(appConfig, { ...settings, model: {
+      baseUrl: "https://configured.example.test/v1", model: "deepseek-v4-flash", temperature: 0.3, thinking: true
+    } }, { modelApiKey: "configured-synthetic-key" });
+    expect(resolved).toBeDefined();
+    await scoreReviewTask(task(), { ...model, ...resolved! }, []);
+    for (const [url, init] of fetch.mock.calls) {
+      expect(String(url)).toBe("https://configured.example.test/v1/chat/completions");
+      expect(new Headers(init.headers).get("Authorization")).toBe("Bearer configured-synthetic-key");
+      expect(JSON.parse(init.body).model).toBe("deepseek-v4-flash");
+    }
+    const semantic = JSON.parse(fetch.mock.calls[0]![1].body);
+    expect(semantic.temperature).toBe(0.3);
+    expect(semantic.thinking).toEqual({ type: "enabled" });
+    expect(semantic.reasoning_effort).toBe("max");
+    expect(JSON.parse(fetch.mock.calls[1]![1].body).thinking).toEqual({ type: "disabled" });
+  });
+
   it("两轮处理：深度思考 max 审题，再使用 JSON Schema 格式化；不需要查重资料", async () => {
     const { model, fetch } = setup(modelReview);
     const result = await scoreReviewTask(task(), model, []);

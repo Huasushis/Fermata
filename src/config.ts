@@ -4,8 +4,8 @@
  * 不可变的 AppConfig。校验失败（必需项缺失或格式不对）会抛出 ConfigError，
  * 让进程在处理任何任务之前就崩溃退出，而不是带着一个残缺的配置继续跑。
  *
- * 密钥（机器人令牌、管理令牌、模型 API Key、CF key/secret）只存在于这个
- * 模块产出的内存对象里，不写文件、不进日志。
+ * 本模块只在内存中读取环境密钥，不写文件、不进日志。
+ * 网页配置的模型密钥和机器人令牌由 SettingsStore 单独加密持久化。
  */
 import { readFileSync } from "node:fs";
 import { z } from "zod";
@@ -44,8 +44,8 @@ const httpUrlSchema = z
 
 const envSchema = z
   .object({
-    URMOTIV_BASE_URL: httpUrlSchema,
-    URMOTIV_ROBOT_TOKEN: z.string().trim().min(8).max(4_096),
+    URMOTIV_BASE_URL: httpUrlSchema.default("http://127.0.0.1:3000"),
+    URMOTIV_ROBOT_TOKEN: z.string().trim().min(8).max(4_096).optional(),
     FERMATA_PORT: z.coerce.number().int().min(1).max(65_535).default(8720),
     FERMATA_HOST: z.string().trim().min(1).max(253).default("0.0.0.0"),
     // 和 plugins/fermata-control/src/index.ts 里 FermataControlClient 对管理令牌
@@ -328,7 +328,7 @@ export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
       : null;
 
   const config: AppConfig = {
-    urmotiv: { baseUrl: env.URMOTIV_BASE_URL, robotToken: env.URMOTIV_ROBOT_TOKEN },
+    urmotiv: { baseUrl: env.URMOTIV_BASE_URL, robotToken: env.URMOTIV_ROBOT_TOKEN ?? "" },
     server: {
       port: env.FERMATA_PORT,
       host: env.FERMATA_HOST,
@@ -348,13 +348,7 @@ export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
   if (defaultProfile === undefined) {
     throw new ConfigError("内部错误：默认模型档位不存在。");
   }
-  const missing = missingProvidersForProfile(config, defaultProfile);
-  if (missing.length > 0) {
-    throw new ConfigError(
-      `默认模型档位 "${models.defaults.modelProfileName}" 需要以下服务商的密钥，但环境变量里没有配置：` +
-        `${missing.join("、")}。请检查 .env 中对应的 *_BASE_URL / *_API_KEY，或修改 config/models.yaml 使用已配置的服务商。`
-    );
-  }
+  // 凭据允许在管理网页中补齐；worker 在领取任务前检查，不阻塞管理端口启动。
 
   return config;
 }

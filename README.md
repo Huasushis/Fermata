@@ -85,7 +85,7 @@ npm run typecheck
 docker build -t fermata:local .
 ```
 
-镜像只复制运行服务需要的 `config/`、`src/` 和 TypeScript 配置，不复制 `private/`、`.env`、`experiments/` 或 `test/`。运行期设置应通过卷保存，密钥应由容器平台注入。
+镜像只复制运行服务需要的 `config/`、`src/` 和 TypeScript 配置，不复制 `private/`、`.env`、`experiments/` 或 `test/`。运行期设置应通过卷保存。管理令牌由容器平台注入；模型密钥和机器人令牌可以注入环境，也可以通过管理页面加密保存。备份运行设置时须同时保留相邻的 `.key` 文件。
 
 <a id="start"></a>
 ## 5. Start（启动）
@@ -116,7 +116,7 @@ node scripts/run-with-env.mjs "$PWD/private/fermata.env" npm start
 node scripts/run-with-env.mjs "$PWD/private/fermata.env" npm run dev
 ```
 
-启动时会校验必填环境变量、URL 形状、成对的 provider 凭据和默认模型档位。缺少配置时直接退出；`enabled: false` 也不会绕过启动配置检查。
+启动时校验管理令牌、URL 形状、环境中的成对 provider 凭据和默认模型档位。模型密钥或机器人令牌尚未提供时，管理页面仍可使用，服务不会领取任务；可在网页中补齐配置。
 
 ### 使用 Docker
 
@@ -245,17 +245,23 @@ Content-Type: application/json
 
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
-| `URMOTIV_BASE_URL` | 无 | Urmotiv 服务基础 URL。 |
-| `URMOTIV_ROBOT_TOKEN` | 无 | Fermata 出站机器人 Bearer 令牌，长度 8–4096。 |
+| `URMOTIV_BASE_URL` | `http://127.0.0.1:3000` | Urmotiv 服务基础 URL，也可在网页覆盖。 |
+| `URMOTIV_ROBOT_TOKEN` | 无 | 可选的机器人令牌，长度 8–4096；可改在网页配置。 |
 | `FERMATA_PORT` | `8720` | 管理 HTTP 端口。 |
 | `FERMATA_HOST` | `0.0.0.0` | 监听地址；直接运行或 host 网络使用 `127.0.0.1`。 |
 | `FERMATA_MANAGEMENT_TOKEN` | 无 | 管理 API Bearer 令牌，长度 16–4096。 |
-| `FERMATA_SETTINGS_PATH` | `./data/settings.json` | 公开运行设置文件路径。 |
+| `FERMATA_SETTINGS_PATH` | `./data/settings.json` | 运行设置与加密凭据文件路径，配套 `.key` 文件必须一同备份。 |
 | `AETHER_BASE_URL` + `AETHER_API_KEY` | 无 | 项目自身模型服务的地址与密钥；历史变量名，与 OMP 无关。 |
 | `DASHSCOPE_BASE_URL` + `DASHSCOPE_API_KEY` | 无 | DashScope 模型服务商凭据，按当前档位决定是否必需。 |
 | `CODEFORCES_KEY` + `CODEFORCES_SECRET` | 无 | 仅供离线 Codeforces 工具使用的可选凭据，必须成对设置。 |
 
-模型 key 不写入 `settings.json`、健康响应或公开设置响应。模型档位和 `experimentVersion` 来自 `config/models.yaml`，设置中的版本必须与文件一致。
+在 Urmotiv 的「管理 → 插件 → Fermata → 打开管理页面」中，可以设置模型接口基础地址（OpenAI 兼容）、模型 ID、温度、题库地址、模型 API 密钥、机器人令牌、开关和并发。不必为这些设置修改 YAML 或重启；新任务使用新配置，在途任务保持领取时的模型与连接。
+
+模型密钥由模型服务商提供；机器人令牌在 Urmotiv「服务账号」中生成，需授予登录、读取题目、审题及需要时读取测试资料的权限。轮换机器人令牌后，应把新值保存到 Fermata 管理页。插件连接 Fermata 所用的管理令牌仍由部署环境配置。
+
+密钥输入留空保持原值；明确清除后停止使用该密钥，不自动回退到环境中的旧值。网页配置优先于环境。密钥不在响应中回显，持久化时使用 AES-GCM 加密，配套的 `settings.json.key` 自动生成、权限 0600。备份或迁移时同时保存设置文件与 `.key`；遗失加密密钥会导致已有凭据无法恢复。历史未配置网页密钥的部署继续使用环境中的值。
+
+模型档位与 `experimentVersion` 仍标识部署中的评分流程；网页不要求使用者编辑这些内部标记。修改提示词或难度规则的实验约束不变。
 
 正式服务使用所选档位的 `reviewFlow.adjudicator`，当前为 `deepseek-v4-flash`，不使用 pro。第一轮使用 `thinking: enabled` 与 `reasoning_effort: max`；第二轮及唯一一次格式修复轮明确使用 `thinking: disabled`。省略 thinking 参数会沿用提供商默认值，不能当作关闭思考。
 

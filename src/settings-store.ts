@@ -18,7 +18,8 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { z } from "zod";
-import { fermataPublicSettingsSchema, type FermataPublicSettings } from "./urmotiv-schemas";
+import { fermataPublicSettingsSchema, fermataSecretUpdateSchema, type FermataSecretUpdate, type FermataPublicSettings } from "./urmotiv-schemas";
+import { openSettingsSecrets, sealSettingsSecrets, updateRuntimeSecrets, type RuntimeSecrets } from "./settings-secrets";
 
 export class SettingsConflictError extends Error {
   public readonly expectedRevision: number;
@@ -58,7 +59,8 @@ export interface SettingsSnapshot {
  */
 export interface SettingsStoreLike {
   get(): SettingsSnapshot;
-  update(expectedRevision: number, settings: FermataPublicSettings): SettingsSnapshot;
+  update(expectedRevision: number, settings: FermataPublicSettings, secrets?: FermataSecretUpdate): SettingsSnapshot;
+  getSecrets?(): RuntimeSecrets;
 }
 
 export interface SettingsStoreOptions {
@@ -69,7 +71,8 @@ export interface SettingsStoreOptions {
 const storedSettingsFileSchema = z
   .object({
     revision: z.number().int().positive(),
-    settings: fermataPublicSettingsSchema
+    settings: fermataPublicSettingsSchema,
+    encryptedSecrets: z.string().max(24_000).optional()
   })
   .strict();
 
@@ -77,6 +80,7 @@ export class SettingsStore implements SettingsStoreLike {
   readonly #filePath: string;
   #revision: number;
   #settings: FermataPublicSettings;
+  #secrets: RuntimeSecrets = {};
 
   public constructor(options: SettingsStoreOptions) {
     this.#filePath = options.filePath;
@@ -88,25 +92,31 @@ export class SettingsStore implements SettingsStoreLike {
     } else {
       this.#revision = loaded.revision;
       this.#settings = loaded.settings;
+      if (loaded.encryptedSecrets !== undefined) this.#secrets = openSettingsSecrets(loaded.encryptedSecrets, this.#filePath + ".key");
     }
   }
 
   public get(): SettingsSnapshot {
-    return { settings: this.#settings, revision: this.#revision };
+    return { settings: structuredClone(this.#settings), revision: this.#revision };
   }
 
+  public getSecrets(): RuntimeSecrets { return { ...this.#secrets }; }
+
   /** expectedRevision 和当前 revision 不一致时抛出 SettingsConflictError，不做任何修改。 */
-  public update(expectedRevision: number, settings: FermataPublicSettings): SettingsSnapshot {
+  public update(expectedRevision: number, settings: FermataPublicSettings, secrets: FermataSecretUpdate = {}): SettingsSnapshot {
     if (expectedRevision !== this.#revision) {
       throw new SettingsConflictError(expectedRevision, this.#revision);
     }
-    this.#settings = fermataPublicSettingsSchema.parse(settings);
+    const next = fermataPublicSettingsSchema.parse(settings);
+    const nextSecrets = updateRuntimeSecrets(this.#secrets, fermataSecretUpdateSchema.parse(secrets));
+    this.persist(next, this.#revision + 1, nextSecrets);
+    this.#settings = next;
+    this.#secrets = nextSecrets;
     this.#revision += 1;
-    this.persist();
     return this.get();
   }
 
-  private loadFromDisk(): { revision: number; settings: FermataPublicSettings } | null {
+  private loadFromDisk(): z.infer<typeof storedSettingsFileSchema> | null {
     if (!existsSync(this.#filePath)) {
       return null;
     }
@@ -123,15 +133,17 @@ export class SettingsStore implements SettingsStoreLike {
     return parsed.data;
   }
 
-  private persist(): void {
+  private persist(settings = this.#settings, revision = this.#revision, secrets = this.#secrets): void {
     const dir = dirname(this.#filePath);
     if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
-    const payload = JSON.stringify({ revision: this.#revision, settings: this.#settings }, null, 2);
+    const payload = JSON.stringify({ revision, settings,
+      ...(Object.keys(secrets).length ? { encryptedSecrets: sealSettingsSecrets(secrets, this.#filePath + ".key") } : {})
+    }, null, 2);
     const tmpPath = `${this.#filePath}.tmp-${process.pid}`;
     // 先写临时文件再原子改名，避免进程在写盘过程中被杀掉时留下半截的 JSON。
-    writeFileSync(tmpPath, payload, "utf8");
+    writeFileSync(tmpPath, payload, { encoding: "utf8", mode: 0o600 });
     renameSync(tmpPath, this.#filePath);
   }
 }

@@ -206,9 +206,9 @@ describe("loadConfig：正常路径", () => {
 });
 
 describe("loadConfig：必需项缺失或格式错误时快速失败", () => {
-  it("缺少 URMOTIV_BASE_URL 时抛出 ConfigError", () => {
+  it("题库地址缺失时使用回环默认值，允许稍后通过管理页设置", () => {
     const { URMOTIV_BASE_URL, ...rest } = validEnv;
-    expect(() => loadConfig({ env: rest, modelsYamlSource: validYaml })).toThrow(ConfigError);
+    expect(loadConfig({ env: rest, modelsYamlSource: validYaml }).urmotiv.baseUrl).toBe("http://127.0.0.1:3000");
   });
 
   it("URMOTIV_BASE_URL 带账号密码时抛出 ConfigError", () => {
@@ -240,14 +240,13 @@ describe("loadConfig：必需项缺失或格式错误时快速失败", () => {
     expect(() => loadConfig({ env: rest, modelsYamlSource: validYaml })).toThrow(ConfigError);
   });
 
-  it("只有 reviewFlow 槽引用的 provider 缺少密钥时也抛出 ConfigError", () => {
+  it("缺少模型密钥时保留管理配置能力，由 worker 阻止领取", () => {
     const { DASHSCOPE_BASE_URL, DASHSCOPE_API_KEY, ...rest } = validEnv;
     const roleOnlyDashscope = yamlWithOnlyReviewFlowRoleUsingDashscope(
       "adjudicator"
     );
-    expect(() => loadConfig({ env: rest, modelsYamlSource: roleOnlyDashscope })).toThrow(
-      ConfigError
-    );
+    const config = loadConfig({ env: rest, modelsYamlSource: roleOnlyDashscope });
+    expect(config.providers.dashscope).toBeUndefined();
   });
 
   it("YAML 结构不合法（缺字段）时抛出 ConfigError", () => {

@@ -69,6 +69,29 @@ afterEach(async () => {
 });
 
 describe("管理端口：鉴权", () => {
+  it("模型设置和密钥写入要求管理令牌，密钥不会回显", async () => {
+    const original = createFakeSettingsStore(defaultSettings());
+    const update = vi.fn(original.update);
+    testServer = startTestServer({ settingsStore: { ...original, update } });
+    const settings = { ...defaultSettings(), model: { baseUrl: "https://models.example.test/v1", model: "deepseek-v4-flash", temperature: 0.2, thinking: true }, urmotivBaseUrl: "https://urmotiv.example.test" };
+    const secrets = { modelApiKey: "synthetic-model-secret", robotToken: "urv_synthetic_robot" };
+    const url = `${testServer.baseUrl}/api/v1/settings/public`;
+    const body = JSON.stringify({ expectedRevision: 4, settings, secrets });
+    const denied = await fetch(url, { method: "PUT", headers: { "Content-Type": "application/json" }, body });
+    expect(denied.status).toBe(401);
+    expect(update).not.toHaveBeenCalled();
+    const saved = await fetch(url, { method: "PUT", headers: { Authorization: `Bearer ${managementToken}`, "Content-Type": "application/json" }, body });
+    expect(saved.status).toBe(200);
+    expect(update).toHaveBeenCalledWith(4, settings, secrets);
+    const result = await saved.text();
+    expect(result).toContain("deepseek-v4-flash");
+    expect(result).not.toContain(secrets.modelApiKey);
+    expect(result).not.toContain(secrets.robotToken);
+    const invalid = await fetch(url, { method: "PUT", headers: { Authorization: `Bearer ${managementToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision: 5, settings, secrets: { modelApiKey: "bad\nsecret" } }) });
+    expect(invalid.status).toBe(400);
+    expect(update).toHaveBeenCalledTimes(1);
+  });
   it("没有 Authorization 头时返回 401", async () => {
     testServer = startTestServer();
     const response = await fetch(`${testServer.baseUrl}/api/v1/health`);

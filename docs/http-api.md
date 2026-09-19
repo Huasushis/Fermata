@@ -71,7 +71,7 @@ curl --fail-with-body --silent --show-error \
 
 字段含义：
 
-- `status`：`ok` 或 `degraded`。当前实现只在“设置要求启用但 worker 未运行”或“当前设置选择的模型档位缺 provider 凭据”时标记 `degraded`。
+- `status`：`ok` 或 `degraded`。设置要求启用但 worker 未运行、模型凭据缺失或机器人令牌未配置时标记 `degraded`。
 - `service`：固定为 `fermata`。
 - `apiVersion`：固定为字符串 `"1"`。
 - `workerRunning`：调度循环已启动且当前启用条件满足；禁用设置、版本不符或档位不可用时为 `false`。
@@ -108,9 +108,14 @@ curl --fail-with-body --silent --show-error \
 
 - `settings` 只包含公开运行设置，不包含任何令牌、API key、URL 凭据或数据库信息。
 - `revision` 是正整数。每次成功更新后加 1。
-- `secretsConfigured` 只表示当前档位正式评分模型所需的凭据是否已在进程环境中成对配置；`true` 不表示模型响应正确或准确性达标。
+- `secretsConfigured` 表示当前正式评分模型所需凭据是否已配置（网页保存优先，否则使用环境）。`true` 不保证服务商接受凭据，也不表示评分准确。
+- `settings.model` 可包含 `baseUrl`（OpenAI 兼容基础地址）、`model`（模型 ID）、`temperature`（0–2）和 `thinking`（是否保留思考输出）；DeepSeek V4 请求固定启用思考及 max 强度。
+- `settings.urmotivBaseUrl` 是 Fermata 可以访问的题库基础地址。地址不可包含用户密码、查询参数或片段。
+- `credentialStatus` 分别返回 `modelApiKey`、`robotToken` 是否配置的布尔值，绝不包含完整值。
 
 ## `PUT /api/v1/settings/public`
+
+请求可以另带 `secrets` 对象，支持 `modelApiKey`、`robotToken`、`clearModelApiKey`、`clearRobotToken`。密钥只写不读，空字符串保持原值；清除为 true 时不允许同时填写非空新值。设置与密钥按同一修订号保存，版本冲突或写盘失败不改变运行配置。路径中的 public 指返回字段不含秘密，所有请求仍需管理令牌。
 
 使用最新的 `revision` 进行条件写入：
 

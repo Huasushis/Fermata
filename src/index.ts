@@ -2,7 +2,7 @@
  * 入口：读取配置、装配 SettingsStore/UrmotivClient/ReviewerWorker/管理端口，
  * 启动，注册信号处理，实现优雅停机。
  */
-import { ConfigError, getProviderCredentials, loadConfig, type ProfileConfig } from "./config";
+import { ConfigError, loadConfig } from "./config";
 import { logError, logInfo, logWarn } from "./logger";
 import { loadDifficultyAnchors } from "./pipelines/difficulty";
 import { ReviewerWorker } from "./reviewer";
@@ -10,6 +10,7 @@ import { createDefaultReviewerSettings, resolveReviewerActivation } from "./revi
 import { createManagementServer } from "./server";
 import { SettingsStore } from "./settings-store";
 import { UrmotivClient } from "./urmotiv-client";
+import { resolveRuntimeModel, resolveRuntimeRobot, runtimeSettingsDefaults } from "./runtime-settings";
 
 function main(): void {
   try {
@@ -42,10 +43,10 @@ function run(): void {
     defaultSettings: createDefaultReviewerSettings(config.models)
   });
 
-  const urmotivClient = new UrmotivClient({
-    baseUrl: config.urmotiv.baseUrl,
-    robotToken: config.urmotiv.robotToken
-  });
+  const urmotivClient = () => {
+    const connection = resolveRuntimeRobot(config, settingsStore.get().settings, settingsStore.getSecrets());
+    return connection === undefined ? undefined : new UrmotivClient(connection);
+  };
 
   const reviewer = new ReviewerWorker({
     urmotivClient,
@@ -56,15 +57,15 @@ function run(): void {
 
   const secretsConfigured = (): boolean => {
     const { settings } = settingsStore.get();
-    const profiles: Record<string, ProfileConfig | undefined> = config.models.profiles;
-    const profile = profiles[settings.modelProfileName];
-    return profile !== undefined && getProviderCredentials(config, profile.reviewFlow.adjudicator.provider) !== undefined;
+    return resolveRuntimeModel(config, settings, settingsStore.getSecrets()) !== undefined;
   };
 
   const server = createManagementServer({
     managementToken: config.server.managementToken,
     settingsStore,
     secretsConfigured,
+    publicSettings: () => runtimeSettingsDefaults(config, settingsStore.get().settings),
+    credentialStatus: () => ({ modelApiKey: secretsConfigured(), robotToken: resolveRuntimeRobot(config, settingsStore.get().settings, settingsStore.getSecrets()) !== undefined }),
     getWorkerStatus: () => {
       const status = reviewer.getStatus();
       return {

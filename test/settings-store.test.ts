@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -78,6 +78,42 @@ describe("SettingsStore：初始化", () => {
 });
 
 describe("SettingsStore：update 的乐观锁", () => {
+  it("密钥加密持久化、重启可用且不出现在公开快照", () => {
+    const first = new SettingsStore({ filePath, defaultSettings });
+    const keys = { modelApiKey: "synthetic-model-key", robotToken: "urv_synthetic_robot_key" };
+    first.update(1, defaultSettings, keys);
+    expect(JSON.stringify(first.get())).not.toContain(keys.modelApiKey);
+    expect(readFileSync(filePath, "utf8")).not.toContain(keys.robotToken);
+    expect(readFileSync(filePath, "utf8")).not.toContain(keys.modelApiKey);
+    expect(statSync(filePath + ".key").mode & 0o777).toBe(0o600);
+    const second = new SettingsStore({ filePath, defaultSettings });
+    expect(second.getSecrets()).toEqual(keys);
+    second.update(2, defaultSettings, { modelApiKey: "", robotToken: "" });
+    expect(second.getSecrets()).toEqual(keys);
+    second.update(3, defaultSettings, { clearModelApiKey: true });
+    expect(second.getSecrets()).toEqual({ modelApiKey: null, robotToken: keys.robotToken });
+  });
+
+  it("加密文件被篡改或密钥不匹配时拒绝恢复，不回退到环境值", () => {
+    const store = new SettingsStore({ filePath, defaultSettings });
+    store.update(1, defaultSettings, { modelApiKey: "synthetic-secret" });
+    const saved = readFileSync(filePath, "utf8");
+    writeFileSync(filePath + ".key", Buffer.alloc(32));
+    expect(() => new SettingsStore({ filePath, defaultSettings })).toThrow("无法解密");
+    expect(readFileSync(filePath, "utf8")).toBe(saved);
+  });
+
+  it("版本冲突或写盘失败不会改变内存设置和密钥", () => {
+    const store = new SettingsStore({ filePath, defaultSettings });
+    store.update(1, defaultSettings, { modelApiKey: "before" });
+    const snapshot = store.get();
+    expect(() => store.update(1, defaultSettings, { modelApiKey: "stale" })).toThrow(SettingsConflictError);
+    mkdirSync(filePath + ".tmp-" + process.pid);
+    expect(() => store.update(2, { ...defaultSettings, enabled: false }, { modelApiKey: "after" })).toThrow();
+    expect(store.get()).toEqual(snapshot);
+    expect(store.getSecrets()).toEqual({ modelApiKey: "before" });
+  });
+
   it("expectedRevision 正确时更新成功，revision 自增并持久化到文件", () => {
     const store = new SettingsStore({ filePath, defaultSettings });
     const changed: FermataPublicSettings = { ...defaultSettings, maximumConcurrentTasks: 5 };

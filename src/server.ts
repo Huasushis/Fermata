@@ -21,6 +21,7 @@ import { SettingsConflictError, type SettingsStoreLike } from "./settings-store"
 import {
   fermataHealthSchema,
   fermataPublicSettingsResponseSchema,
+  type FermataPublicSettings,
   updateFermataPublicSettingsInputSchema
 } from "./urmotiv-schemas";
 
@@ -41,6 +42,8 @@ export interface ManagementServerDeps {
   readonly settingsStore: SettingsStoreLike;
   /** 当前生效的模型档位是否已经配置好所需的 provider 密钥，实时计算，不缓存。 */
   readonly secretsConfigured: () => boolean;
+  readonly credentialStatus?: () => { modelApiKey: boolean; robotToken: boolean };
+  readonly publicSettings?: () => FermataPublicSettings;
   readonly getWorkerStatus: () => WorkerStatus;
   readonly wake: () => void;
   readonly now?: () => Date;
@@ -114,7 +117,7 @@ function sendHealth(res: ServerResponse, deps: ManagementServerDeps, now: () => 
   const settings = deps.settingsStore.get().settings;
   // "降级"目前只覆盖两种能明确判断的情况：设置里希望它在跑但实际主循环没在跑，
   // 或者当前生效档位缺密钥导致就算跑着也做不了任何事。
-  const isDegraded = (settings.enabled && !workerStatus.workerRunning) || !deps.secretsConfigured();
+  const isDegraded = (settings.enabled && !workerStatus.workerRunning) || !deps.secretsConfigured() || deps.credentialStatus?.().robotToken === false;
   const health = fermataHealthSchema.parse({
     status: isDegraded ? "degraded" : "ok",
     service: "fermata",
@@ -129,9 +132,10 @@ function sendHealth(res: ServerResponse, deps: ManagementServerDeps, now: () => 
 function sendSettings(res: ServerResponse, deps: ManagementServerDeps, status: number): void {
   const snapshot = deps.settingsStore.get();
   const response = fermataPublicSettingsResponseSchema.parse({
-    settings: snapshot.settings,
+    settings: deps.publicSettings?.() ?? snapshot.settings,
     revision: snapshot.revision,
-    secretsConfigured: deps.secretsConfigured()
+    secretsConfigured: deps.secretsConfigured(),
+    ...(deps.credentialStatus === undefined ? {} : { credentialStatus: deps.credentialStatus() })
   });
   sendJson(res, status, response);
 }
@@ -151,7 +155,7 @@ async function handlePutSettings(req: IncomingMessage, res: ServerResponse, deps
   }
 
   try {
-    deps.settingsStore.update(parsed.data.expectedRevision, parsed.data.settings);
+    deps.settingsStore.update(parsed.data.expectedRevision, parsed.data.settings, parsed.data.secrets);
   } catch (error) {
     if (error instanceof SettingsConflictError) {
       sendJson(res, 409, { error: { code: "CONFLICT", message: error.message } });
