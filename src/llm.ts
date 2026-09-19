@@ -805,6 +805,11 @@ export interface ChatCompletionJsonOptions {
   readonly safeSchemaDiagnostic?: "originality";
 }
 
+export interface TwoRoundJsonOptions extends ChatCompletionJsonOptions {
+  /** 部分兼容服务不接受完整 json_schema 参数；仍使用完整提示词 Schema 和本地校验。 */
+  readonly formatResponseType?: "json_schema" | "json_object";
+}
+
 /**
  * 修改 EOF/终止状态机或 receipt 语义时必须显式递增并重新标定。
  *
@@ -1864,7 +1869,7 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
   formatterMessages: (semanticOutput: string, semanticReasoning: string | null) => ChatMessage[],
   schema: z.ZodType<T>,
   runtime: LlmRuntimeOptions,
-  options: ChatCompletionJsonOptions = {},
+  options: TwoRoundJsonOptions = {},
   roundAudit?: TwoRoundJsonRoundAudit
 ): Promise<{ data: T; reasoning: string | null; receipt: LlmJsonCompletionReceipt }> {
   let semantic: ChatCompletionSalvageableResult;
@@ -1889,16 +1894,18 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
   const formatMessages = formatterMessages(semantic.content, semantic.reasoning);
   const jsonInstruction: ChatMessage = {
     role: "system",
-    content: "只输出一个满足要求的 JSON 对象本身，不要输出任何解释、前后缀文字，也不要用 Markdown 代码块包裹。"
+    content: "只输出一个满足要求的 JSON 对象本身，不要输出任何解释、前后缀文字，也不要用 Markdown 代码块包裹。" +
+      (options.formatResponseType === "json_object" ? "\n完整 JSON Schema：\n" + serializeTargetJsonSchema(schema) : "")
   };
   const firstFormatMessages: ChatMessage[] = [jsonInstruction, ...formatMessages];
   let firstFormat: ChatCompletionWithReceipt;
   roundAudit?.onRoundStart("format");
   const extractionSpec = derivedStructuredExtractionSpec(spec);
+  const formatOutput = options.formatResponseType === "json_object"
+    ? { requestJson: true }
+    : strictSchemaOutputOption(schema);
   try {
-    firstFormat = await chatCompleteWithReceipt(provider, extractionSpec, firstFormatMessages, runtime, {
-      ...strictSchemaOutputOption(schema),
-    });
+    firstFormat = await chatCompleteWithReceipt(provider, extractionSpec, firstFormatMessages, runtime, formatOutput);
     assertStructuredCompletionTransport(firstFormat.receipt);
   } catch (error) {
     promoteJsonFailureAudit(error, 2, [semantic.receipt], semantic.receipt.transportAttemptCount);
@@ -1933,9 +1940,7 @@ export async function chatCompleteTwoRoundJsonWithReceipt<T>(
   let secondFormat: ChatCompletionWithReceipt;
   roundAudit?.onRoundStart("format_repair");
   try {
-    secondFormat = await chatCompleteWithReceipt(provider, extractionSpec, repairMessages, runtime, {
-      ...strictSchemaOutputOption(schema),
-    });
+    secondFormat = await chatCompleteWithReceipt(provider, extractionSpec, repairMessages, runtime, formatOutput);
     assertStructuredCompletionTransport(secondFormat.receipt);
   } catch (error) {
     promoteJsonFailureAudit(

@@ -32,8 +32,9 @@ describe("正式评分器", () => {
     expect(semantic.response_format).toBeUndefined();
     expect(format.thinking).toEqual({ type: "disabled" });
     expect(format.reasoning_effort).toBeUndefined();
-    expect(format.response_format.type).toBe("json_schema");
-    expect(format.response_format.json_schema.schema.properties.tagIds.items.enum).toEqual(["math"]);
+    expect(format.response_format).toEqual({ type: "json_object" });
+    const target = JSON.parse(format.messages[0].content.split("完整 JSON Schema：\n")[1]);
+    expect(target.properties.tagIds.items.enum).toEqual(["math"]);
     expect(JSON.stringify(semantic)).toContain("难度不能决定通过与否");
     expect(format.messages.at(-1).content).toBe("合成审核结论，不代表准确性标定。");
   });
@@ -52,6 +53,9 @@ describe("正式评分器", () => {
       .mockResolvedValueOnce(response(JSON.stringify(modelReview)));
     expect(await scoreReviewTask(task(), model, [])).toEqual(review);
     expect(fetch).toHaveBeenCalledTimes(3);
+    const repair = JSON.parse(fetch.mock.calls[2]![1].body);
+    expect(repair.response_format).toEqual({ type: "json_object" });
+    expect(repair.thinking).toEqual({ type: "disabled" });
   });
   it("服务失败或生成被截断时不把残缺结果当成意见", async () => {
     const { model, fetch } = setup(modelReview);

@@ -77,7 +77,9 @@ npm test            # vitest run
 审题请求必须同时使用 `thinkingRequest: enabled` 和 `reasoningEffort: max`。配置层会在网络请求前拒绝
 缺字段、关闭思考或非 `max` 的 V4 槽位。正式服务使用所选档位的 `reviewFlow.adjudicator`
 模型：第一轮深度思考审题，第二轮明确发送 `thinking: {type: disabled}`，使用完整 JSON Schema
-转换格式（必要时仅修复一次格式）。省略 thinking 参数会沿用提供商默认值，不能当作关闭思考。
+转换格式（必要时仅修复一次格式）。格式请求使用 `response_format: {type: json_object}`，
+完整 Schema 写入提示词，收到结果后再次严格校验；不依赖兼容服务支持 `json_schema` 参数。
+省略 thinking 参数会沿用提供商默认值，不能当作关闭思考。
 两轮都复用现有流式传输，不设置固定总生成时限；不同题目按 `maximumConcurrentTasks` 并行。
 模型地址与密钥来自本项目私有环境文件的 `AETHER_BASE_URL`/`AETHER_API_KEY`，该变量名是
 历史命名，与 OMP 的模型配置无关。生产使用 `deepseek-v4-flash`，不使用 pro。

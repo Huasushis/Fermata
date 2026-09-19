@@ -42,7 +42,9 @@ export async function scoreReviewTask(
       { role: "user", content: output }
     ],
     schema,
-    model.runtime
+    model.runtime,
+    // DeepSeek 兼容接口使用 JSON 输出模式；完整 Schema 留在提示词并严格本地校验。
+    { formatResponseType: "json_object" }
   );
   if (new Set(data.tagIds).size !== data.tagIds.length) {
     throw new Error("SCORER_DUPLICATE_TAGS");
