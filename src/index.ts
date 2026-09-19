@@ -2,12 +2,11 @@
  * 入口：读取配置、装配 SettingsStore/UrmotivClient/ReviewerWorker/管理端口，
  * 启动，注册信号处理，实现优雅停机。
  */
-import { ConfigError, loadConfig, missingProvidersForProfile, type ProfileConfig } from "./config";
+import { ConfigError, getProviderCredentials, loadConfig, type ProfileConfig } from "./config";
 import { logError, logInfo, logWarn } from "./logger";
 import { loadDifficultyAnchors } from "./pipelines/difficulty";
 import { ReviewerWorker } from "./reviewer";
-import { createDefaultReviewerSettings } from "./reviewer-activation";
-import { createProductionEligibilityVerifier } from "./production-eligibility";
+import { createDefaultReviewerSettings, resolveReviewerActivation } from "./reviewer-activation";
 import { createManagementServer } from "./server";
 import { SettingsStore } from "./settings-store";
 import { UrmotivClient } from "./urmotiv-client";
@@ -48,28 +47,31 @@ function run(): void {
     robotToken: config.urmotiv.robotToken
   });
 
-  const productionEligibility = createProductionEligibilityVerifier(config);
-
   const reviewer = new ReviewerWorker({
     urmotivClient,
     settingsStore,
     appConfig: config,
-    anchors,
-    productionEligibility: (profileName) => productionEligibility.verify(profileName)
+    anchors
   });
 
   const secretsConfigured = (): boolean => {
     const { settings } = settingsStore.get();
     const profiles: Record<string, ProfileConfig | undefined> = config.models.profiles;
     const profile = profiles[settings.modelProfileName];
-    return profile !== undefined && missingProvidersForProfile(config, profile).length === 0;
+    return profile !== undefined && getProviderCredentials(config, profile.reviewFlow.adjudicator.provider) !== undefined;
   };
 
   const server = createManagementServer({
     managementToken: config.server.managementToken,
     settingsStore,
     secretsConfigured,
-    getWorkerStatus: () => reviewer.getStatus(),
+    getWorkerStatus: () => {
+      const status = reviewer.getStatus();
+      return {
+        ...status,
+        workerRunning: status.workerRunning && resolveReviewerActivation(settingsStore.get().settings, config.models).active
+      };
+    },
     wake: () => {
       reviewer.wake();
     }

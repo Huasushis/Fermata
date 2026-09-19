@@ -1,6 +1,5 @@
 /**
- * 主循环：定时轮询 claim -> 严格构造完整题目快照 -> 跑 11 个相互隔离并带
- * EOF receipt 的审题角色 -> 只有完整且绑定生产准确性证据时才 complete。每个任务
+ * 主循环：定时轮询 claim -> 审题并转换为严格 JSON -> complete。每个任务
  * 独立续租；单个任务失败不影响其它任务和下一轮轮询；wake() 可以跳过当前等待
  * 立即触发一轮轮询；stop() 优雅停机。
  *
@@ -9,13 +8,11 @@
  * 固定下来——这样通过管理端口改了设置之后，下一轮轮询（或者调用 wake() 之后）
  * 马上生效，不需要重启进程。
  *
- * 历史的难度/思维/代码/verdict 路径不再由 worker 引用；离线实验可独立使用
- * 旧模块，但生产构建没有切回旧审题流程的开关。
+ * 历史多角色证据流仅供离线实验，不再作为正式服务领取任务的前置条件。
  */
 import { randomUUID } from "node:crypto";
 import {
   getProviderCredentials,
-  missingProvidersForProfile,
   type AppConfig,
   type ModelSpec,
   type ProfileConfig
@@ -26,12 +23,7 @@ import type { DifficultyAnchor } from "./pipelines/difficulty";
 import type { PipelineModelConfig } from "./pipelines/types";
 import type { SettingsStoreLike } from "./settings-store";
 import { resolveReviewerActivation } from "./reviewer-activation";
-import {
-  productionEligibilityBlocked,
-  type ProductionEligibilityDecision,
-  type ProductionReviewGrant,
-  type ProductionReviewGrantClaims
-} from "./production-eligibility";
+import { scoreReviewTask } from "./scorer";
 import {
   isAuthenticationError,
   isForbiddenError,
@@ -47,16 +39,6 @@ import type {
   ClaimRobotReviewTasksResponse,
   RobotReviewTask
 } from "./urmotiv-schemas";
-import {
-  consumeReviewFlowSubmission,
-  runReviewEvidenceFlowOutcome
-} from "./review-flow/orchestrator";
-import {
-  createReviewFlowLlmBundle,
-  preflightReviewFlowProductionGrant,
-  type ReviewFlowModelConfigs
-} from "./review-flow/llm-roles";
-import { buildReviewFlowTaskSource } from "./review-flow/task-source";
 
 export interface ReviewerStatus {
   readonly workerRunning: boolean;
@@ -72,8 +54,6 @@ export interface ReviewerWorkerOptions {
   readonly leaseSeconds?: number;
   /** 传给所有流水线的 LLM 请求用的 fetch，默认全局 fetch；测试用来注入假实现。 */
   readonly fetch?: FetchLike;
-  /** 服务端生产资格证据门；未注入时固定拒绝，不能因测试/装配遗漏而放行。 */
-  readonly productionEligibility?: (profileName: string) => ProductionEligibilityDecision;
 }
 
 interface InFlightTask {
@@ -99,7 +79,6 @@ export class ReviewerWorker {
   readonly #anchors: readonly DifficultyAnchor[];
   readonly #leaseSeconds: number;
   readonly #fetch: FetchLike | undefined;
-  readonly #productionEligibility: (profileName: string) => ProductionEligibilityDecision;
 
   #running = false;
   #stopping = false;
@@ -115,7 +94,6 @@ export class ReviewerWorker {
     this.#anchors = options.anchors;
     this.#leaseSeconds = options.leaseSeconds ?? 300;
     this.#fetch = options.fetch;
-    this.#productionEligibility = options.productionEligibility ?? productionEligibilityBlocked;
   }
 
   public start(): void {
@@ -199,15 +177,9 @@ export class ReviewerWorker {
 
   private async pollOnce(): Promise<void> {
     const { settings } = this.#settingsStore.get();
-    let productionDecision: ProductionEligibilityDecision | undefined;
-    const readProductionEligibility = (): ProductionEligibilityDecision => {
-      productionDecision ??= this.#productionEligibility(settings.modelProfileName);
-      return productionDecision;
-    };
     const activation = resolveReviewerActivation(
       settings,
-      this.#appConfig.models,
-      readProductionEligibility
+      this.#appConfig.models
     );
     if (!activation.active) {
       if (activation.reason === "experiment_version_mismatch") {
@@ -215,11 +187,6 @@ export class ReviewerWorker {
       } else if (activation.reason === "profile_missing") {
         logWarn("当前设置的 modelProfileName 在 config/models.yaml 里不存在，跳过这一轮轮询", {
           modelProfileName: settings.modelProfileName
-        });
-      } else if (activation.reason === "production_evidence_rejected") {
-        const decision = readProductionEligibility();
-        logWarn("生产资格证据未通过，拒绝领取任务", {
-          reason: decision.eligible ? "evidence_invalid" : decision.reason
         });
       }
       return;
@@ -231,32 +198,8 @@ export class ReviewerWorker {
     }
 
     const profile = activation.profile;
-    const missing = missingProvidersForProfile(this.#appConfig, profile);
-    if (missing.length > 0) {
-      logWarn("当前模型档位缺少 provider 密钥，跳过这一轮轮询", { missing: missing.join(",") });
-      return;
-    }
-
-    // activation 只证明 grant 属于当前 profile/version；在真正领取私有任务前，
-    // 还必须用本进程实际装配的 11 个模型槽位、凭据、anchors、传输模式和构建
-    // 摘要重算 runner 身份并完整验真。预检不创建角色，也不会发出模型请求。
-    let productionClaims: ProductionReviewGrantClaims | null = null;
-    try {
-      productionClaims = preflightReviewFlowProductionGrant({
-        models: this.resolveReviewFlowModelConfigs(profile),
-        difficultyAnchors: this.#anchors,
-        profileName: settings.modelProfileName,
-        experimentVersion: settings.experimentVersion,
-        engineBuildFingerprint: activation.productionClaims.engineBuildFingerprint,
-        productionGrant: activation.productionGrant
-      });
-    } catch {
-      // 配置或构建摘要不满足 runner 身份契约时同样 fail-closed；错误细节可能
-      // 含 provider 配置，不能写进日志。
-      productionClaims = null;
-    }
-    if (productionClaims === null) {
-      logWarn("生产资格证据与当前审题 runner 不匹配，拒绝领取任务");
+    if (getProviderCredentials(this.#appConfig, profile.reviewFlow.adjudicator.provider) === undefined) {
+      logWarn("当前审题模型缺少服务商密钥，跳过这一轮轮询");
       return;
     }
 
@@ -301,9 +244,7 @@ export class ReviewerWorker {
         task,
         settings.modelProfileName,
         settings.experimentVersion,
-        profile,
-        activation.productionGrant,
-        productionClaims
+        profile
       ).finally(
         () => {
           // 只清理自己登记的 promise；即使以后启动策略变化，也不能让旧任务的
@@ -321,9 +262,7 @@ export class ReviewerWorker {
     task: RobotReviewTask,
     modelProfileName: string,
     experimentVersion: string,
-    profile: ProfileConfig,
-    productionGrant: ProductionReviewGrant,
-    productionClaims: ProductionReviewGrantClaims
+    profile: ProfileConfig
   ): Promise<void> {
     const inFlight: InFlightTask = {
       assignmentId: task.assignmentId,
@@ -339,58 +278,11 @@ export class ReviewerWorker {
 
     try {
       logInfo("开始处理审题任务", { problemId: task.problem.id, revision: task.problem.revision });
-      const taskSource = buildReviewFlowTaskSource(task, {
-        duplicateSimilarityRejectThreshold:
-          this.#appConfig.models.thresholds.duplicateSimilarityReject
-      });
-      const trustedRunner = createReviewFlowLlmBundle({
-        models: this.resolveReviewFlowModelConfigs(
-          profile,
-          inFlight.abortController.signal
-        ),
-        difficultyAnchors: this.#anchors,
-        profileName: modelProfileName,
-        experimentVersion,
-        engineBuildFingerprint: productionClaims.engineBuildFingerprint,
-        productionGrant
-      });
-      const outcome = await runReviewEvidenceFlowOutcome({
-        taskSource,
-        trustedRunner,
-        executionContext: {
-          schemaVersion: 1,
-          runId: randomUUID(),
-          assignmentId: task.assignmentId,
-          expectedRound: task.problem.reviewRound
-        }
-      });
-      if (outcome.status === "incomplete") {
-        logWarn("审题证据工作流不完整，不提交审核意见", {
-          problemId: task.problem.id,
-          failureId: outcome.failure.failureId,
-          failureKind: outcome.failure.failureKind,
-          failedRoles: outcome.failure.failedRoles
-            .map((failure) => failure.role)
-            .join(","),
-          transportAttemptCount: outcome.failure.failedRoles.reduce(
-            (sum, failure) => sum + failure.transportAttemptCount,
-            0
-          )
-        });
-        return;
-      }
-      if (!outcome.decision.executionEligible) {
-        logWarn("审题结果没有同时绑定生产传输与准确性证据，不提交审核意见", {
-          problemId: task.problem.id,
-          decisionId: outcome.decision.decisionId
-        });
-        return;
-      }
-      const completionLog: Readonly<Record<string, string | number | boolean>> = {
-        decisionId: outcome.decision.decisionId,
-        policyHash: outcome.decision.policyHash,
-        evidenceCount: outcome.decision.evidenceIds.length
-      };
+      const review = await scoreReviewTask(
+        task,
+        this.resolveModelConfig(profile.reviewFlow.adjudicator, inFlight.abortController.signal),
+        this.#anchors
+      );
 
       if (inFlight.abandoned) {
         logWarn("综合流水线跑完时任务已经被判定放弃，不再提交", { problemId: task.problem.id });
@@ -405,16 +297,6 @@ export class ReviewerWorker {
         return;
       }
 
-      const review = consumeReviewFlowSubmission(outcome.decision, {
-        taskSource,
-        assignmentId: task.assignmentId,
-        problemContentHash: task.problem.contentHash,
-        problemRevision: task.problem.revision,
-        expectedRound: task.problem.reviewRound,
-        tagCatalogVersion: task.tagCatalog.version,
-        accuracyEvidenceFingerprint: productionClaims.evidenceFingerprint
-      });
-
       const completion = await this.#urmotivClient.complete(task.assignmentId, {
         requestId: randomUUID(),
         expectedLeaseExpiresAt: inFlight.leaseExpiresAt,
@@ -427,8 +309,7 @@ export class ReviewerWorker {
 
       logInfo("完成审题任务", {
         problemId: task.problem.id,
-        problemStatus: completion.problemStatus,
-        ...completionLog
+        problemStatus: completion.problemStatus
       });
     } catch (error) {
       if (!inFlight.abandoned) {
@@ -442,26 +323,6 @@ export class ReviewerWorker {
         this.#inFlight.delete(task.assignmentId);
       }
     }
-  }
-
-  private resolveReviewFlowModelConfigs(
-    profile: ProfileConfig,
-    signal?: AbortSignal
-  ): ReviewFlowModelConfigs {
-    const specs = profile.reviewFlow;
-    return {
-      solver: this.resolveModelConfig(specs.solver, signal),
-      solution_analyst: this.resolveModelConfig(specs.solutionAnalyst, signal),
-      technical_auditor: this.resolveModelConfig(specs.technicalAuditor, signal),
-      difficulty: this.resolveModelConfig(specs.difficulty, signal),
-      editorial_judge: this.resolveModelConfig(specs.editorialJudge, signal),
-      contest_fit: this.resolveModelConfig(specs.contestFit, signal),
-      originality: this.resolveModelConfig(specs.originality, signal),
-      tags: this.resolveModelConfig(specs.tags, signal),
-      critic: this.resolveModelConfig(specs.critic, signal),
-      adversary: this.resolveModelConfig(specs.adversary, signal),
-      adjudicator: this.resolveModelConfig(specs.adjudicator, signal)
-    };
   }
 
   private logTaskFailure(task: RobotReviewTask, error: unknown): void {
