@@ -47,6 +47,7 @@ const envSchema = z
     URMOTIV_BASE_URL: httpUrlSchema,
     URMOTIV_ROBOT_TOKEN: z.string().trim().min(8).max(4_096),
     FERMATA_PORT: z.coerce.number().int().min(1).max(65_535).default(8720),
+    FERMATA_HOST: z.string().trim().min(1).max(253).default("0.0.0.0"),
     // 和 plugins/fermata-control/src/index.ts 里 FermataControlClient 对管理令牌
     // 的校验（min(16).max(4_096)）保持一致，否则两边会互相拒绝对方发来的令牌。
     FERMATA_MANAGEMENT_TOKEN: z.string().trim().min(16).max(4_096),
@@ -273,6 +274,7 @@ export interface AppConfig {
   };
   readonly server: {
     readonly port: number;
+    readonly host?: string;
     readonly managementToken: string;
     readonly settingsPath: string;
   };
@@ -329,6 +331,7 @@ export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
     urmotiv: { baseUrl: env.URMOTIV_BASE_URL, robotToken: env.URMOTIV_ROBOT_TOKEN },
     server: {
       port: env.FERMATA_PORT,
+      host: env.FERMATA_HOST,
       managementToken: env.FERMATA_MANAGEMENT_TOKEN,
       settingsPath: env.FERMATA_SETTINGS_PATH
     },

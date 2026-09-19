@@ -89,7 +89,7 @@ function run(): void {
   });
 
   reviewer.start();
-  server.listen(config.server.port, () => {
+  server.listen(config.server.port, config.server.host ?? "0.0.0.0", () => {
     logInfo("Fermata 启动完成", { port: config.server.port, secretsConfigured: secretsConfigured() });
   });
 
