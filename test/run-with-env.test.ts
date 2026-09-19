@@ -38,6 +38,19 @@ async function loadRunWithEnv(): Promise<RunWithEnv> {
 }
 
 describe("run-with-env：命令行边界", () => {
+  it("普通服务启动转发显式回环监听地址", async () => {
+    const runWithEnv = await loadRunWithEnv();
+    let childEnvironment: NodeJS.ProcessEnv | undefined;
+    runWithEnv(["/safe/private/fermata.env", process.execPath, "--version"], {
+      parentEnvironment: {},
+      readEnvFile: () => "FERMATA_HOST=127.0.0.1\n",
+      spawnProcess: (_command, _arguments, options) => {
+        childEnvironment = options.env;
+        return {};
+      }
+    });
+    expect(childEnvironment?.FERMATA_HOST).toBe("127.0.0.1");
+  });
   it("缺少参数时只输出固定用法，不读取文件或启动命令", () => {
     const result = spawnSync(process.execPath, [runnerPath], {
       encoding: "utf8"
