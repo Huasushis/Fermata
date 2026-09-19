@@ -8,7 +8,7 @@
  *   - 读取思考模型的 reasoning_content（如果响应里有的话）；
  *   - 结构化 JSON 输出：用提示词要求只输出 JSON；解析或校验失败时重新带着
  *     固定校验说明请求一次（这会产生第二次模型调用，和 429 重试是两回事）；
- *   - 只对服务端明确返回的 429 做退避重试；连接中断和超时不自动重发，
+ *   - 对服务端明确返回的 429、502、503、504 做有界退避重试；输出中断和超时不自动重发，
  *     避免同一道题在模型已经开始生成后被重复计费。
  *
  * 使用流式响应持续接收推理与最终答案。这里的流式不是为了边生成边展示，
@@ -3016,7 +3016,7 @@ async function requestWithRetry(
           if (timeoutError !== undefined) {
             throw timeoutError;
           }
-          if (response.status !== 429 || attempt >= runtime.maxAttempts) {
+          if (![429, 502, 503, 504].includes(response.status) || attempt >= runtime.maxAttempts) {
             if (
               eventShapeReplaysUsed > 0 &&
               audit.transportAttemptReceipts.length === 1

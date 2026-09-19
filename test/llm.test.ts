@@ -79,6 +79,14 @@ function strictUsageMetadataEvent(): Record<string, unknown> {
 }
 
 describe("chatComplete：正常路径", () => {
+  it.each([502, 503, 504])("模型网关临时不可用 %s 后有界重试", async (status) => {
+    const fetch = vi.fn().mockResolvedValueOnce(new Response(null, { status })).mockResolvedValueOnce(completionResponse("恢复后的完整结果"));
+    await expect(chatComplete(provider, spec, [], { ...runtime, fetch })).resolves.toEqual({ content: "恢复后的完整结果", reasoning: null });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const failed = vi.fn(async () => new Response(null, { status }));
+    await expect(chatComplete(provider, spec, [], { ...runtime, maxAttempts: 2, fetch: failed })).rejects.toMatchObject({ code: "LLM_HTTP_ERROR", status });
+    expect(failed).toHaveBeenCalledTimes(2);
+  });
   it("共享停发闸门关闭后仍等待已发请求真实 EOF", async () => {
     let streamController!: ReadableStreamDefaultController<Uint8Array>;
     const body = new ReadableStream<Uint8Array>({
@@ -3572,7 +3580,7 @@ describe("chatComplete：只在服务端明确拒绝接单时重试", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
-  it("5xx 不自动重发，避免模型已经开始生成时重复计费", async () => {
+  it("临时 503 达到重试上限后返回状态，不读取错误正文", async () => {
     const fetchMock = vi.fn(async () => new Response("server error", { status: 503 }));
     await expect(chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock })).rejects.toSatisfy(
       (error: unknown) => {
@@ -3581,10 +3589,10 @@ describe("chatComplete：只在服务端明确拒绝接单时重试", () => {
         return true;
       }
     );
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
-  it("5xx 响应正文即使不结束也立即按状态失败，并取消正文", async () => {
+  it("503 错误正文即使不结束也取消正文并按上限重试", async () => {
     let cancelled = false;
     const fetchMock = vi.fn(
       async () =>
@@ -3601,7 +3609,7 @@ describe("chatComplete：只在服务端明确拒绝接单时重试", () => {
       chatComplete(provider, spec, [], { ...runtime, fetch: fetchMock })
     ).rejects.toMatchObject({ code: "LLM_HTTP_ERROR", status: 503 });
     expect(cancelled).toBe(true);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it("其它错误状态码（比如 400）不重试，直接失败", async () => {
