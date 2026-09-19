@@ -508,8 +508,8 @@ describe("chatComplete：正常路径", () => {
       { ...spec, provider: "aether", model: "deepseek-v4-flash", thinkingRequest: "enabled" }
     ],
     [
-      "V4 flash 使用 disabled",
-      { ...spec, provider: "aether", model: "deepseek-v4-flash", thinkingRequest: "disabled" }
+      "V4 flash 审题使用 disabled",
+      { ...spec, provider: "aether", model: "deepseek-v4-flash", thinking: true, thinkingRequest: "disabled" }
     ],
     [
       "V4 flash enabled 但使用已废弃的 low effort",
@@ -524,8 +524,8 @@ describe("chatComplete：正常路径", () => {
       { ...spec, provider: "aether", model: "deepseek-v4-pro", thinkingRequest: "enabled" }
     ],
     [
-      "V4 pro 使用 disabled",
-      { ...spec, provider: "aether", model: "deepseek-v4-pro", thinkingRequest: "disabled" }
+      "V4 pro 审题使用 disabled",
+      { ...spec, provider: "aether", model: "deepseek-v4-pro", thinking: true, thinkingRequest: "disabled" }
     ],
     [
       "V4 pro enabled 但使用已废弃的 low effort",
@@ -4421,7 +4421,7 @@ describe("chatComplete：统一机器 JSON Schema transport", () => {
 });
 
 describe("两轮 JSON：phase2 结构化轮不继承 phase1 的 max thinking", () => {
-  it("phase1 语义轮保持 max thinking，phase2 格式/修复轮不再发送 thinking 与 reasoning_effort", async () => {
+  it("语义轮保持 max，格式及修复轮明确关闭思考而非沿用提供商默认值", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     let calls = 0;
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
@@ -4457,11 +4457,9 @@ describe("两轮 JSON：phase2 结构化轮不继承 phase1 的 max thinking", (
       thinking: { type: "enabled" },
       reasoning_effort: "max"
     });
-    // phase2 格式轮与修复轮必须是兼容的结构化提取规格，不得携带 max thinking。
-    // 当前实现把这个 spec 原样传给两轮，导致这里失败（RED）。
-    expect(bodies[1].thinking).toBeUndefined();
+    expect(bodies[1].thinking).toEqual({ type: "disabled" });
     expect(bodies[1].reasoning_effort).toBeUndefined();
-    expect(bodies[2].thinking).toBeUndefined();
+    expect(bodies[2].thinking).toEqual({ type: "disabled" });
     expect(bodies[2].reasoning_effort).toBeUndefined();
     for (const body of bodies.slice(1)) {
       expect(body).toMatchObject({

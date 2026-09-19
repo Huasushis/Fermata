@@ -30,6 +30,8 @@ describe("正式评分器", () => {
     expect(semantic.thinking).toEqual({ type: "enabled" });
     expect(semantic.reasoning_effort).toBe("max");
     expect(semantic.response_format).toBeUndefined();
+    expect(format.thinking).toEqual({ type: "disabled" });
+    expect(format.reasoning_effort).toBeUndefined();
     expect(format.response_format.type).toBe("json_schema");
     expect(format.response_format.json_schema.schema.properties.tagIds.items.enum).toEqual(["math"]);
     expect(JSON.stringify(semantic)).toContain("难度不能决定通过与否");

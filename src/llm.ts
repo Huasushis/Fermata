@@ -511,7 +511,8 @@ export interface ModelCallSpec {
   readonly thinking: boolean;
   /**
    * 显式发送经配置层限定的深度思考请求。Aether deepseek-v4-flash 和
-   * deepseek-v4-pro 必须配置 enabled + max；其它模型/网关不允许配置。
+   * deepseek-v4-pro 审题必须配置 enabled + max；派生的格式提取轮明确 disabled。
+   * 其它模型/网关不允许配置。
    * 未配置时不发送 `thinking` 请求字段，保持原有请求行为。
    */
   readonly thinkingRequest?: "enabled" | "disabled";
@@ -1620,6 +1621,11 @@ function validateThinkingRequest(spec: ModelCallSpec): void {
     spec.provider === "aether" &&
     (spec.model === "deepseek-v4-flash" || spec.model === "deepseek-v4-pro");
   if (isAetherV4) {
+    // 配置层仍要求审题 enabled + max。格式轮不判断题目，也不保留推理；
+    // 必须明确关闭，否则提供商的默认思考模式仍会生效。
+    if (spec.thinkingRequest === "disabled" && spec.thinking === false && spec.reasoningEffort === undefined) {
+      return;
+    }
     if (spec.thinkingRequest !== "enabled") {
       throw new TypeError("Aether deepseek-v4-flash/pro 必须配置 thinkingRequest: enabled。");
     }
@@ -1807,17 +1813,17 @@ function directStructuredMessages<T>(
 }
 
 /**
- * 为 phase2 结构化提取/修复轮派生专用规格：清除 max-thinking 请求字段，
- * 让格式轮以兼容模式输出满足 schema 的 JSON，避免推理链与强制 JSON 争用
- * 同一调用的输出预算。provider 凭据经由独立的 provider 参数传入，因此清空
- * spec.provider 只改变请求校验分支，不改变传输目标。
+ * 结构化提取/修复轮只转换格式。DeepSeek 默认开启思考，省略字段不代表
+ * 关闭；这里明确发送 disabled，并清除只在审题轮使用的 max 强度。
  */
 function derivedStructuredExtractionSpec(spec: ModelCallSpec): ModelCallSpec {
+  const deepseek = spec.provider === "aether" &&
+    (spec.model === "deepseek-v4-flash" || spec.model === "deepseek-v4-pro");
   return {
     ...spec,
-    provider: undefined,
+    provider: deepseek ? spec.provider : undefined,
     thinking: false,
-    thinkingRequest: undefined,
+    thinkingRequest: deepseek ? "disabled" : undefined,
     reasoningEffort: undefined
   };
 }
@@ -1848,8 +1854,8 @@ export interface TwoRoundJsonRoundAudit {
 /**
  * 两轮 JSON 设计：第一轮让模型用自然语言完成语义判断（不强制 JSON），
  * 第二轮只做格式化——把第一轮的文本转换为满足 schema 的 JSON，不重新判断。
- * 两轮都使用相同的模型配置（含 thinking/reasoning_effort）。
- * 适用于 thinking=max 时模型推理 token 量大、与 JSON 输出争用 max_tokens 的情况。
+ * 两轮使用同一模型和凭据：审题保留原思考配置，格式轮显式关闭 DeepSeek
+ * 思考，只把已经形成的结论转换为满足 JSON Schema 的对象。
  */
 export async function chatCompleteTwoRoundJsonWithReceipt<T>(
   provider: ProviderCredentialsLike,
