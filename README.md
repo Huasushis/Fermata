@@ -1,215 +1,322 @@
 # Fermata
 
-USTC 算法竞赛协会的独立 AI 审题服务：用机器人令牌轮询 Urmotiv 题库里的待审
-题目，使用模型审题并提交结构化审核意见，并对 Urmotiv 的
-`fermata-control` 管理插件暴露自己的健康状态和可公开设置。
+Fermata 是独立部署的 AI 审题服务，向 Urmotiv 提交结构化审核意见。
 
-## 架构
+<a id="toc"></a>
+## Table of Contents（目录）
 
-```
-                         ┌───────────────────────────────┐
-                         │            Urmotiv             │
-                         │   （题库、账号、审核规则等）      │
-                         └───────────────┬─────────────────┘
-                                          │
-               机器人 API（claim/renew/complete）
-                   Authorization: Bearer <机器人令牌>
-                                          │
-                                          ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                              Fermata                              │
-│                                                                    │
-│  src/reviewer.ts  主循环                                           │
-│    轮询 claim → 审题 → JSON Schema 格式化与校验                    │
-│      → 输出难度、通过/修改/拒绝、知识点与具体意见                    │
-│           ↓                                                        │
-│    complete 提交回 Urmotiv；同时给每个任务挂续租定时器                │
-│                                                                    │
-│  src/server.ts  管理端口（node:http，Bearer 管理令牌鉴权）            │
-│    GET  /api/v1/health           worker 是否在跑、活跃任务数         │
-│    GET  /api/v1/settings/public  当前设置 + 乐观锁 revision          │
-│    PUT  /api/v1/settings/public  改设置（enabled/并发上限/轮询间隔等）│
-│    POST /api/v1/actions/wake     跳过等待，立即触发一轮轮询           │
-│                                                                    │
-│  src/llm.ts  用显式可控 HTTP 客户端调 OpenAI 兼容接口            │
-│  src/codeforces.ts  CF API 客户端 + 题面抓取（签名、限速、HTML 解析）  │
-│  src/settings-store.ts  内存 + settings.json 持久化，乐观锁           │
-└──────────────────────────────────────┬─────────────────────────────┘
-                                        │
-                          Authorization: Bearer <管理令牌>
-                                        │
-                                        ▼
-                         ┌───────────────────────────────┐
-                         │  Urmotiv 的 fermata-control 插件  │
-                         │  （设置页面、健康状态展示、唤醒按钮） │
-                         └───────────────────────────────┘
-```
+- [1. Background（背景）](#background)
+- [2. Status（状态边界）](#status)
+- [3. Prerequisites（前提）](#prerequisites)
+- [4. Install（安装）](#install)
+- [5. Start（启动）](#start)
+- [6. Health（健康检查）](#health)
+- [7. Usage（使用）](#usage)
+- [8. API（接口）](#api)
+- [9. Configuration（配置）](#configuration)
+- [10. Operations and Security（运维与安全）](#operations-and-security)
+- [11. Testing（测试）](#testing)
+- [12. Support（支持）](#support)
+- [13. Contributing（贡献）](#contributing)
+- [14. Maintainers（维护者）](#maintainers)
+- [15. License（许可）](#license)
 
-Fermata 不是 Urmotiv 里的一个插件、不共享数据库、不共享代码依赖——两边只通过
-上面这两组 HTTP 接口交互，Fermata 崩溃或者被关掉，Urmotiv 本身（人工审题、
-其它插件）不受影响，只是少了机器人这一路审核意见。
+<a id="background"></a>
+## 1. Background（背景）
 
-## 快速开始
+Fermata 是 USTC 算法竞赛协会的独立 AI 审题服务。它作为 Urmotiv 机器人客户端领取待审题目，运行分阶段的模型审核流程，再提交结构化意见；同时作为 HTTP 服务端向运维人员和 Urmotiv 的 `fermata-control` 插件提供管理接口。
+
+Fermata 与 Urmotiv 分开部署、分开安装、分开保存凭据，不共享数据库或代码依赖：
+
+- Fermata 只通过 Urmotiv 明确版本化的机器人 API 调用 `claim`、`renew` 和 `complete`。
+- Urmotiv 的管理插件只访问 Fermata 的健康、公开设置和唤醒接口；这些接口不是普通用户 API，也不是模型推理 API。
+- Fermata 不连接 Urmotiv 的 PostgreSQL、Redis 或对象存储，不执行选手代码，不提供普通用户登录。
+- Anklang 的相似题信息若参与审核，只能作为 Urmotiv 任务快照中的受信任输入；Fermata 不读取 Anklang 数据库，也不与 Anklang 运行时互调。
+
+管理接口契约见 [`docs/http-api.md`](docs/http-api.md)。Urmotiv 侧契约在本仓库以严格镜像的 [`src/urmotiv-schemas.ts`](src/urmotiv-schemas.ts) 为准。
+
+<a id="status"></a>
+## 2. Status（状态边界）
+
+必须把接口运行性和审题准确性分开理解：
+
+| 证据类别 | 能证明什么 | 不能证明什么 |
+| --- | --- | --- |
+| 接口、JSON Schema 和启动检查 | 进程按约定启动，管理路由、设置和机器人数据通过格式校验。 | 不能证明模型判断符合人工标准。 |
+| `/healthz`、`/api/v1/health` 成功 | HTTP 进程或 worker 的当前运行状态。 | 不能证明任务已领取、审核已提交或评分准确。 |
+| 单元测试、类型检查和容器构建 | 当前工程契约在所运行的测试环境中成立。 | 不能替代人工标定。 |
+
+启用服务且模型档位、版本和凭据有效后，Fermata 会通过机器人 API 领取任务。正式评分分两轮：先深度思考审题，再把结论转换成符合 JSON Schema 的意见；领取、续租和提交仍由 Urmotiv 检查权限及题目版本。离线准确性标定不再阻止正式服务运行，运行成功也不代表判断准确。
+
+本仓库不宣称 CF 难度、思维难度、代码难度、标签、质量、原创性或通过/修改/拒绝结论达到任何准确率。难度与通过结论分别判断；缺少查重资料不会阻止审题，也不代表原创。旧多角色实验及历史报告说明保留在 [校准记录](docs/calibration.md)，不作为正式运行的前置条件。私有材料和模型原始输出不进入镜像或 Git。
+
+<a id="prerequisites"></a>
+## 3. Prerequisites（前提）
+
+- Node.js 24 或更高版本（`package.json` 的 engines 约束）。
+- npm，以及可写的运行期设置目录。
+- 一个可访问的 Urmotiv 服务和由 Urmotiv 授权的机器人令牌。
+- `config/models.yaml` 当前默认档位所需的模型服务商凭据；当前支持 `aether` 和 `dashscope`。
+- 至少 16 个字符的 Fermata 管理令牌。管理令牌与 Urmotiv 机器人令牌不是同一凭据。
+- Docker 部署还需要 Docker Engine；若要运行镜像，反向代理或 Urmotiv 插件只能访问管理端口。
+
+配置模板是 [`.env.example`](.env.example)，只包含变量名和说明。不要把真实令牌、API key、题面、题解或模型输出写入仓库。
+
+<a id="install"></a>
+## 4. Install（安装）
+
+从仓库根目录安装锁定依赖：
 
 ```bash
-npm install
-
-# 参照 .env.example，在被 Git 整体忽略的 Fermata/private/ 中创建 fermata.env。
-# USTC 服务器约定使用下面这个位置；不要把真实密钥文件放进跟踪文件。
-node scripts/run-with-env.mjs /home/ubuntu/codex-urmotiv/Fermata/private/fermata.env npm run dev
-# 上一行是 tsx watch 模式；或者单次启动：
-node scripts/run-with-env.mjs /home/ubuntu/codex-urmotiv/Fermata/private/fermata.env npm start
-# 或者
-npm run typecheck   # tsc --noEmit
-npm test            # vitest run
+npm ci
 ```
 
-启动会先校验环境变量和 `config/models.yaml`；任何必填项缺失、格式不对，或者
-默认模型档位缺少对应服务商的密钥，都会在启动时直接报错退出，不会带着残缺配置
-跑起来。首次创建 `settings.json` 时 `enabled` 固定为 `false`，不会因为 YAML 里
-存在默认档位就自动领取题目。已有设置不会被新部署自动改写；只有操作员明确保存
-`enabled=true`，且其中的 `experimentVersion` 与本次 `models.yaml` 精确一致、所选
-档位仍然存在且模型凭据齐全时，worker 才会调用 claim。旧版本原样保留等待人工核对，
-缺字段或损坏文件则拒绝启动。运行不再依赖旧实验的“生产资格证书”；准确性未标定，
-意见默认供人工参考，是否参与状态汇总由 Urmotiv 的审核规则决定。
+本仓库生产依赖保持精简；开发工具由 `package-lock.json` 固定。安装后可以先运行类型检查而不启动服务：
 
-模型配置中的 `thinking` 只决定是否保留响应里的推理过程；正式 Aether DeepSeek V4
-审题请求必须同时使用 `thinkingRequest: enabled` 和 `reasoningEffort: max`。配置层会在网络请求前拒绝
-缺字段、关闭思考或非 `max` 的 V4 槽位。正式服务使用所选档位的 `reviewFlow.adjudicator`
-模型：第一轮深度思考审题，第二轮明确发送 `thinking: {type: disabled}`，使用完整 JSON Schema
-转换格式（必要时仅修复一次格式）。格式请求使用 `response_format: {type: json_object}`，
-完整 Schema 写入提示词，收到结果后再次严格校验；不依赖兼容服务支持 `json_schema` 参数。
-省略 thinking 参数会沿用提供商默认值，不能当作关闭思考。
-两轮都复用现有流式传输，不设置固定总生成时限；不同题目按 `maximumConcurrentTasks` 并行。
-模型地址与密钥来自本项目私有环境文件的 `AETHER_BASE_URL`/`AETHER_API_KEY`，该变量名是
-历史命名，与 OMP 的模型配置无关。生产使用 `deepseek-v4-flash`，不使用 pro。
-直接在主机运行或使用 Docker host 网络时，设置 `FERMATA_HOST=127.0.0.1`，
-让管理端口仅供同机访问；默认桥接容器使用 `0.0.0.0` 并只向主机回环地址发布端口。
-难度和是否通过分别判断，不能按难度直接通过或否决；缺少查重资料仍能审题，但不声称已查重。
-旧 11 角色和四语义请求工作流仅保留作离线实验，不是正式服务的请求路径。
+```bash
+npm run typecheck
+```
 
-Fermata 本身不解析 `.env` 文件，只读取进程已经收到的环境变量。上面的
-`run-with-env.mjs` 只接受 `Fermata/private/` 内的绝对路径，并沿已经打开的目录描述符
-读取文件；路径中的符号链接、权限过宽的目录、非普通文件、读取中变化、超限内容或非法
-UTF-8 都会失败关闭。它只向子进程传递明确登记的 Fermata、实验、基本运行时和代理变量，
-不会让 shell 解释密钥中的特殊字符，也不会在出错时打印密钥内容。env 文件里的 Fermata
-和实验变量明确覆盖父进程中的同名值；代理、`PATH` 和临时目录只从父进程继承，不能写进
-env 文件。未知键、重复键、危险 Node/OpenSSL 设置或关闭 TLS 校验的设置都会在启动前被
-拒绝。需要改变一次实验参数时，应使用内容已登记的专用私有 env 文件，不能依赖命令前的
-同名临时变量覆盖它。
-不要用 shell 的 `source` 或 `.` 加载密钥文件，
-因为特殊字符可能导致命令失败并把密钥回显到终端。生产环境也可以由部署平台直接把变量
-传给进程，不需要改 Fermata 的代码。
+### Docker 镜像
 
-## 和 Urmotiv / fermata-control 的关系
+仓库提供 [`Dockerfile`](Dockerfile)，不提供独立 Compose 文件：
 
-- **谁发起连接**：Fermata 主动调用 Urmotiv 的机器人 API（claim/renew/
-  complete），是"客户端"；Urmotiv 的 `fermata-control` 插件主动调用 Fermata
-  的管理端口，这时候 Fermata 是"服务端"。两个方向的鉴权是两套完全独立的
-  令牌（`URMOTIV_ROBOT_TOKEN` 和 `FERMATA_MANAGEMENT_TOKEN`），互不影响。
-- **谁定义契约**：所有数据结构都由 Urmotiv 的 `packages/contracts` 定义，
-  Fermata 只是手工镜像了用得到的子集到 `src/urmotiv-schemas.ts`，并注明了
-  对齐时间和来源——这不是 Fermata 自己发明的格式。契约变了需要回来同步，
-  见 AGENTS.md 第 2 节。
-- **失败边界**：Fermata 的任何故障（进程崩溃、模型服务不可用、单个任务处理
-  失败）都不会影响 Urmotiv 本身或者人工审题流程；反过来，Urmotiv 侧的普通
-  故障也不会导致 Fermata 崩溃——领取任务失败只是跳过这一轮轮询，下一轮再试。
-- **权限边界**：Fermata 拿到的机器人令牌只能做机器人 API 明确允许的事（领取
-  自己有权限看的待审题目、提交审核意见），不能读写普通用户能读写的其它内容，
-  更不是什么"远程执行任意代码"的后门。
+```bash
+docker build -t fermata:local .
+```
 
-续租和完成请求由 worker 为每个逻辑操作生成一个 UUID 请求标识。HTTP 客户端只对
-没有收到响应、429 限流和 5xx 服务端故障做有界重试，并在这一条交付链中逐字复用
-同一请求体和标识；401/403/404/409、其它确定的 4xx 和响应契约错误不会自动重试。
-续租的暂时故障可以在租约安全预算内跨短间隔继续复用原标识，成功后的下一轮正常
-续租才生成新标识。完成交付的结果如果仍不确定，当前任务路径不会换一个标识重复
-提交。请求标识和请求体都不写入日志。
+镜像只复制运行服务需要的 `config/`、`src/` 和 TypeScript 配置，不复制 `private/`、`.env`、`experiments/` 或 `test/`。运行期设置应通过卷保存，密钥应由容器平台注入。
 
-## 准确性实验与历史记录
+<a id="start"></a>
+## 5. Start（启动）
 
-正式部署不需要先运行准确性实验。实验命令、历史记录和研究约束见[准确性实验文档](docs/calibration.md)；它们不能代替当前服务的运行验收。
+### 使用进程环境
 
-## 当前校准状态
+`npm start` 只读取已经注入进程的环境变量，不会自动解析仓库根目录的 `.env` 文件：
 
-迁移前的 7 次逻辑实验已经登记在
-`experiments/results/legacy-report-registry.json`。登记表只保存实验类型、标签、时间、
-样本计数、完整性三态和安全汇总产物的 SHA-256 校验值；旧产物仍原样保留在只读档案，
-没有复制 raw 区内容。运行 `npm run experiment:verify-legacy-reports` 可以逐字节核对
-13 份唯一脱敏汇总及其重复快照，输出只含数量，不显示档案文件名或内容。
+```bash
+npm start
+```
 
-这些旧实验中有的明确缺样本或缺分段，其余旧格式没有 expected、失败和跳过计数，
-都不能作为当前代码的合格基线。修改前的完整方案与候选方案必须使用各自唯一标签，保留
-两份报告；任何失败、取消、缺失或跳过都会使该次报告不完整。
+### 使用安全启动器
 
-| 流水线 | 状态 | 说明 |
+如需使用环境文件，文件必须位于 Fermata `private/` 下、是当前用户拥有的普通文件，目录权限为 `0700`、文件权限为 `0600`。使用仓库提供的启动器，不要使用 `source` 或 `.`：
+
+```bash
+mkdir -p private data
+chmod 700 private data
+# 由密钥管理器创建 private/fermata.env；不要把真实值粘贴到 shell 历史
+chmod 600 private/fermata.env
+node scripts/run-with-env.mjs "$PWD/private/fermata.env" npm start
+```
+
+开发热加载入口：
+
+```bash
+node scripts/run-with-env.mjs "$PWD/private/fermata.env" npm run dev
+```
+
+启动时会校验必填环境变量、URL 形状、成对的 provider 凭据和默认模型档位。缺少配置时直接退出；`enabled: false` 也不会绕过启动配置检查。
+
+### 使用 Docker
+
+```bash
+mkdir -p data
+docker run --name fermata \
+  --restart unless-stopped \
+  --env-file "$PWD/private/fermata.env" \
+  -p 127.0.0.1:8720:8720 \
+  -v "$PWD/data:/app/data" \
+  fermata:local
+```
+
+默认管理端口为 `8720`，设置文件为 `./data/settings.json`。修改 `FERMATA_PORT` 时同步修改端口映射。直接在主机运行或使用 Docker host 网络时，设置 `FERMATA_HOST=127.0.0.1`；默认桥接容器使用 `0.0.0.0` 并仅向主机回环地址发布端口。
+
+<a id="health"></a>
+## 6. Health（健康检查）
+
+`/healthz` 是不需要令牌的容器 liveness（存活）探针；它只证明 HTTP 进程可达：
+
+```bash
+curl --fail --silent --show-error http://127.0.0.1:8720/healthz
+```
+
+成功响应固定为：
+
+```json
+{"ok":true}
+```
+
+管理健康路由需要 `FERMATA_MANAGEMENT_TOKEN`：
+
+```bash
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer ${FERMATA_MANAGEMENT_TOKEN}" \
+  http://127.0.0.1:8720/api/v1/health
+```
+
+它返回 `workerRunning`、`activeTasks` 和 `status`。`workerRunning` 表示调度循环已启动且当前启用条件满足；`status: "ok"` 不证明模型判断准确或已有任务完成。
+
+<a id="usage"></a>
+## 7. Usage（使用）
+
+首次启动且没有设置文件时，公开设置固定为 `enabled: false`、`revision: 1`。禁用设置不会领取任务，健康接口的 `workerRunning` 为 false。
+
+管理设置使用乐观锁：先读取 `revision`，再在 PUT 中带上同一个 `expectedRevision`。下面只使用合成值：
+
+```bash
+curl --fail --silent --show-error \
+  -X PUT \
+  -H "Authorization: Bearer ${FERMATA_MANAGEMENT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data @- \
+  http://127.0.0.1:8720/api/v1/settings/public <<'JSON'
+{
+  "expectedRevision": 1,
+  "settings": {
+    "enabled": false,
+    "pollingIntervalSeconds": 60,
+    "maximumConcurrentTasks": 2,
+    "modelProfileName": "review-balanced",
+    "experimentVersion": "example-experiment-version"
+  }
+}
+JSON
+```
+
+`POST /api/v1/actions/wake` 只请求调度器尽快轮询一次，不修改 `enabled`，不绕过版本、模型凭据或 Urmotiv 权限检查：
+
+```bash
+curl --fail --silent --show-error \
+  -X POST \
+  -H "Authorization: Bearer ${FERMATA_MANAGEMENT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data '{}' \
+  http://127.0.0.1:8720/api/v1/actions/wake
+```
+
+没有领到任务时，检查机器人账号及令牌权限、是否有可领取的待审核题目，以及题目的外部验题开关。历史题可关闭外部验题以避免重复审核；领取 0 条不等于已处理全部题目。
+
+<a id="api"></a>
+## 8. API（接口）
+
+### Fermata 管理接口
+
+管理 API 的版本写在 `/api/v1` 路径中。除 `GET /healthz` 外，所有路径先检查：
+
+```http
+Authorization: Bearer $FERMATA_MANAGEMENT_TOKEN
+```
+
+| 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| CF 难度（旧 difficulty.ts） | **Candidate C 完整但未达标；旧 provider-v1 探针已冻结** | 旧 83/83 结果只作历史证据；不得据此声明当前四调用准确。 |
-| 思维/代码难度（旧流水线） | **旧实验均不可作基线** | 旧结果不完整或缺分层，保持原字节只读。 |
-| 查重判断（旧 verdict.ts） | **旧设计不可作准确性基线** | 不能替代独立 human truth 的 verdict 轴。 |
-| 四语义请求 reviewFlow（离线实验） | **准确性未实跑，不是正式服务路径** | 旧实验终态仍为 0 completed / 20 failed / 72 pending / 4 orphaned，accuracy=`INCOMPLETE`。 |
-| 正式两轮评分器 | **接口与格式验证；准确性尚未标定** | 明确启用后通过机器人 API 领取任务；独立判断难度和通过/修改/拒绝，不以实验资格阻止运行。 |
+| `GET` | `/healthz` | 无令牌 liveness；只表示 HTTP 进程可达。 |
+| `GET` | `/api/v1/health` | worker 状态和已知降级条件。 |
+| `GET` | `/api/v1/settings/public` | 公开设置、revision 和 `secretsConfigured`。 |
+| `PUT` | `/api/v1/settings/public` | 按 `expectedRevision` 条件更新设置。 |
+| `POST` | `/api/v1/actions/wake` | 尽快触发一次轮询。 |
 
+公开设置是严格 JSON 对象，只允许 `enabled`、`pollingIntervalSeconds`、`maximumConcurrentTasks`、`modelProfileName` 和 `experimentVersion`。响应不会包含令牌、API key、数据库连接或其它内部字段。过期的 `expectedRevision` 返回 `409 CONFLICT`；未知字段不会被静默保存。
 
-旧离线实验的付费诊断必须由仓库 owner 直接使用绝对 Node 路径调用
-`scripts/development-diagnostic-bootstrap.mjs`。先用 `--print-contract --state-dir <绝对状态目录>`
-取得只含摘要的启动契约，再以同一入口和 `--approve-contract <摘要>` 明确批准；之后才可传入
-私有 env 文件和诊断参数。bootstrap 会在读取 env、加载仓库 helper、tsx 或诊断 CLI 之前，从已验证
-descriptor 把批准的完整生产源码、入口、配置、已安装递归运行时依赖及二进制复制到 owner-only、
-不可复用的 content-addressed staging 闭包；动态 import、loader、tsconfig、cwd 与 child source
-随后全部来自该闭包，结束后按 identity 安全清理。仓库 owner 直接调用该 bootstrap 是信任根；边界
-防御未确认的依赖漂移、并发替换和非 owner/组/其他用户可写路径，不声称防御 owner 恶意自替换
-bootstrap。`npm run diagnostic:development` 只是便捷入口，不是正式付费授权边界；正式运行不得
-从 npm script 开始。
-这张表应该随每一次真正跑过评测脚本之后更新。只有当前代码生成、对应脱敏汇总与完成证据存在，
-并且报告明确 `eligible=true` 时，才能把结果写成合格候选；仅有完整性为真不代表准确性达标。
+错误响应使用固定错误码，如 `INVALID_JSON`、`INVALID_BODY`、`UNAUTHENTICATED`、`NOT_FOUND`、`CONFLICT` 和 `PAYLOAD_TOO_LARGE`，不回显题面、密钥或外部服务原文。完整字段约束和 JSON 示例见 [`docs/http-api.md`](docs/http-api.md)。
 
-## 已对齐的跨仓库契约
+### Fermata 调用的 Urmotiv 接口
 
-- 机器人任务已经携带严格的 Anklang v2 条目来源、插件编号、可见级别、有效期与内容哈希；
-  Fermata 不再兼容猜测形状，也不会把未认证建议升级为确定性重复题证据。
-- `reviewInputSchema` 已包含 `publicComment`；Fermata 镜像实际 Urmotiv 契约并在提交前再次严格校验。
-- 机器人任务已经携带版本化的活动标签目录。每题可选择多个目录内标签，`tags` 角色只能返回当前
-  活动编号；目录外、停用或重复编号不能提交。
+这些是 Fermata 的**出站**请求，不是 Fermata 管理端口上的路由。Fermata 使用另一套 Urmotiv 机器人凭据：
 
-## 项目结构
-
+```http
+Authorization: Bearer $URMOTIV_ROBOT_TOKEN
+X-Urmotiv-API-Version: 1
+Content-Type: application/json
 ```
-config/
-  models.yaml              模型档位、深度思考与首输出/停顿超时配置
-  anchors/difficulty.json  CF 难度评估的参照题（当前为 7 条 Candidate C 临时数据，见"当前校准状态"）
-scripts/
-  env-file.mjs             run-with-env 和后台启动器共用的简单 env 解析规则
-  private-runtime.mjs      从 Fermata/private/ 的目录描述符安全读取或创建私有运行文件
-  run-with-env.mjs         从 Git 忽略的私有目录安全读取 env 文件，不经 shell 运行参数数组
-  detached-calibration-worker.mjs
-                           等 PID 元数据写盘后，在同一进程载入标定入口
-  start-detached-calibration.mjs
-                           脱离 SSH 启动长期标定，日志和启动记录只写服务器私有目录
-src/
-  config.ts                读 env + models.yaml，启动即校验
-  yaml-lite.ts             一个只支持很小子集的 YAML 解析器（避免引入额外依赖）
-  logger.ts                日志 + 常量时间比较，硬性规则见 AGENTS.md 第 3 节
-  urmotiv-schemas.ts       从 Urmotiv contracts 镜像的 zod schema
-  urmotiv-client.ts        机器人 API 客户端（claim/renew/complete）
-  llm.ts                   OpenAI 兼容 chat 客户端（重试、JSON 结构化输出）
-  codeforces.ts            CF API 客户端 + 题面抓取
-  settings-store.ts        运行期设置，内存 + 文件持久化，乐观锁
-  scorer.ts                正式两轮评分：审题、JSON Schema 格式化、目录校验
-  production-eligibility.ts
-                           旧离线实验资格逻辑；正式服务不使用
-  review-flow/
-    task-source.ts         严格绑定 Urmotiv 任务、Anklang 来源和标签目录
-    four-call.ts           A/B/C/D DAG、统一 schema、预算与内容绑定 receipt
-    four-call-runtime.ts   共享全局 scheduler 的生产 transport 适配
-    llm-roles.ts           旧 11 角色历史兼容适配
-    orchestrator.ts        旧证据流冻结、失败收束与一次性提交载荷
-    schemas.ts / views.ts  旧 11 角色输入、输出与最小可见视图
-  reviewer.ts              主循环：轮询、并发、续租、优雅停机
-  server.ts                管理端口
-  index.ts                 入口
-  pipelines/
-    difficulty.ts / thinking.ts / coding.ts / verdict.ts
-experiments/               离线调优脚本，见 docs/calibration.md
-test/                      vitest，覆盖签名算法、HTML 解析、数值映射、
-                           settings 乐观锁、verdict 阈值、client 错误分类等
+
+| 方法和路径 | 用途 |
+| --- | --- |
+| `POST /api/v1/robot/review-tasks/claim` | 领取待审任务。 |
+| `POST /api/v1/robot/review-tasks/{assignmentId}/renew` | 续租任务。 |
+| `POST /api/v1/robot/review-tasks/{assignmentId}/complete` | 提交通过严格 Schema 校验的结构化审核意见。 |
+
+任务、续租和完成请求的完整字段以 [`src/urmotiv-schemas.ts`](src/urmotiv-schemas.ts) 与 [`docs/http-api.md`](docs/http-api.md) 为准。任务失败不会伪造完成结果，也不会改变 Urmotiv 的人工流程。
+
+<a id="configuration"></a>
+## 9. Configuration（配置）
+
+所有 URL 必须是没有账号、密码、查询参数或片段的 `http://` 或 `https://` 地址。provider 的 BASE_URL 与 API key 必须同时设置或同时留空。
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `URMOTIV_BASE_URL` | 无 | Urmotiv 服务基础 URL。 |
+| `URMOTIV_ROBOT_TOKEN` | 无 | Fermata 出站机器人 Bearer 令牌，长度 8–4096。 |
+| `FERMATA_PORT` | `8720` | 管理 HTTP 端口。 |
+| `FERMATA_HOST` | `0.0.0.0` | 监听地址；直接运行或 host 网络使用 `127.0.0.1`。 |
+| `FERMATA_MANAGEMENT_TOKEN` | 无 | 管理 API Bearer 令牌，长度 16–4096。 |
+| `FERMATA_SETTINGS_PATH` | `./data/settings.json` | 公开运行设置文件路径。 |
+| `AETHER_BASE_URL` + `AETHER_API_KEY` | 无 | 项目自身模型服务的地址与密钥；历史变量名，与 OMP 无关。 |
+| `DASHSCOPE_BASE_URL` + `DASHSCOPE_API_KEY` | 无 | DashScope 模型服务商凭据，按当前档位决定是否必需。 |
+| `CODEFORCES_KEY` + `CODEFORCES_SECRET` | 无 | 仅供离线 Codeforces 工具使用的可选凭据，必须成对设置。 |
+
+模型 key 不写入 `settings.json`、健康响应或公开设置响应。模型档位和 `experimentVersion` 来自 `config/models.yaml`，设置中的版本必须与文件一致。
+
+正式服务使用所选档位的 `reviewFlow.adjudicator`，当前为 `deepseek-v4-flash`，不使用 pro。第一轮使用 `thinking: enabled` 与 `reasoning_effort: max`；第二轮及唯一一次格式修复轮明确使用 `thinking: disabled`。省略 thinking 参数会沿用提供商默认值，不能当作关闭思考。
+
+格式轮使用 `response_format: {type: json_object}`，提示词提供完整 JSON Schema，收到结果后严格校验字段、范围及活动知识点。这样不依赖兼容服务支持 `json_schema` 请求参数。两轮持续读取流式输出，不因正常慢速生成而反复重发；明确的 429/502/503/504 按配置有界退避重试。不同题目按 `maximumConcurrentTasks` 并行。
+
+<a id="operations-and-security"></a>
+## 10. Operations and Security（运维与安全）
+
+### 运维
+
+- 将 `/healthz` 配置为容器 liveness；用受保护的 `/api/v1/health` 观察 worker 和活动任务数。
+- 通过 `docker logs --tail=100 fermata` 或受控日志系统检查固定错误码；不要把环境变量、请求头、题面、题解或模型原文写入日志。
+- 将 `FERMATA_SETTINGS_PATH` 所在目录持久化，并限制 `settings.json` 访问权限；设置文件损坏时应停止并从受控备份恢复，不要自动删除重建。
+- 管理设置 PUT 使用最新 `revision`，收到 `409 CONFLICT` 时重新 GET，不要覆盖其他操作员的更新。
+- 机器人令牌丢失、租约过期、服务端拒绝或模型 provider 不可用时，先检查对应固定错误类别；不要把 Urmotiv 权限错误当成模型错误。
+- 准确性尚未标定，审核意见应由人工复核；是否参与状态汇总由 Urmotiv 的审核规则决定。不要把接口通过改写成准确性结论。
+
+### 安全
+
+- Fermata 使用四类相互独立的凭据边界：调用 Urmotiv 的机器人令牌、访问 Fermata 管理端口的管理令牌、模型 provider key，以及仅供离线工具的可选 Codeforces 凭据。不要混用或互相转发。
+- 管理接口使用常量时间 Bearer 比较；公开设置 Schema 严格拒绝未知字段，响应不返回任何 secret。
+- `run-with-env.mjs` 不经过 shell 解释环境文件；目录和文件权限、路径身份、大小、UTF-8 和允许的变量都会检查。不要用 `source` 或 `.`。
+- 仅在授权的 Urmotiv 机器人范围内领取、续租和提交；Fermata 不执行选手代码，不访问 Urmotiv 内部数据库。
+- 离线实验使用的题面、题解、人工 gold、模型原始输出、私有清单和环境文件不进入 Git、镜像、日志或本文档。文档示例只用合成数据。
+
+<a id="testing"></a>
+## 11. Testing（测试）
+
+测试使用注入的 HTTP、时间和模型依赖，不发起真实外部模型请求。受影响工作区从仓库根目录运行：
+
+```bash
+npm run typecheck
+npm test
+npm run test:durable
+docker build -t fermata:verify .
 ```
+
+这些命令只能证明类型、工程契约和镜像构建在当前环境成立；它们不证明审题准确性。不要为 README 或工程验证启动外部模型校准，也不要运行会读取私有题面或模型密钥的实验命令。
+
+<a id="support"></a>
+## 12. Support（支持）
+
+请在 [GitHub Issues](https://github.com/Huasushis/Fermata/issues) 报告可复现问题。附上版本、运行模式、固定错误码和不含敏感内容的健康状态；不要提交题面、题解、模型原文、环境文件、令牌或请求头。
+
+<a id="contributing"></a>
+## 13. Contributing（贡献）
+
+1. 从 `main` 创建主题分支，每个提交只覆盖一个可审阅的行为变化。
+2. 修改 Urmotiv 契约、管理路由、鉴权、任务租约或失败边界时，同时更新对应镜像、文档和失败路径测试。
+3. 保持机器人权限、租约和版本检查，不以接口成功或少量实验结果推断准确性。
+4. 运行 [Testing（测试）](#testing) 中的命令；确认 staged 文件没有私有材料、密钥、题面或模型原始输出。
+5. Pull request 应写明行为、验证命令和未解决限制，不提交真实校准数据。
+
+<a id="maintainers"></a>
+## 14. Maintainers（维护者）
+
+- [Huasushis](https://github.com/Huasushis)
+
+<a id="license"></a>
+## 15. License（许可）
+
+本项目采用 MIT License，完整文本见 [`LICENSE`](LICENSE)。
+
+SPDX-License-Identifier: MIT
