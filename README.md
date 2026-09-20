@@ -1,28 +1,41 @@
+![Fermata：停下来，把题目想清楚](docs/assets/cover.svg)
+
 # Fermata
 
-Fermata 是独立部署的 AI 审题服务，向 Urmotiv 提交结构化审核意见。
+独立部署的 AI 审题服务。先深入分析题意与解法，再整理成可供命题团队复核的结构化意见。
+
+[启动服务](#start) · [配置模型](#configuration) · [HTTP API](docs/http-api.md) · [校准边界](docs/calibration.md) · [报告问题](https://github.com/Huasushis/Fermata/issues)
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-087e94.svg)](LICENSE)
+[![Node.js](https://img.shields.io/badge/Node.js-24+-447c43.svg)](package.json)
+
+- **先思考，再整理**：分开进行深度审阅和 JSON 格式化，结构化结果经过严格校验。
+- **可独立运维**：模型、并发、题库连接和凭据可通过管理接口配置，并与题库分开部署。
+- **尊重命题流程**：使用授权机器人领取、续租和提交意见；结论是否影响题目状态由题库规则决定。
+
+Fermata（延长记号）意为在此稍作停留。它与 [Urmotiv 命题工作台](https://github.com/Huasushis/Urmotiv) 配合使用，读取题库提供的原题检索资料；不会直接调用 [Anklang](https://github.com/Huasushis/Anklang) 或共享它们的数据库。当前不宣称审题准确率，模型意见仍需人工复核。
 
 <a id="toc"></a>
-## Table of Contents（目录）
+## 目录
 
-- [1. Background（背景）](#background)
-- [2. Status（状态边界）](#status)
-- [3. Prerequisites（前提）](#prerequisites)
-- [4. Install（安装）](#install)
-- [5. Start（启动）](#start)
-- [6. Health（健康检查）](#health)
-- [7. Usage（使用）](#usage)
-- [8. API（接口）](#api)
-- [9. Configuration（配置）](#configuration)
-- [10. Operations and Security（运维与安全）](#operations-and-security)
-- [11. Testing（测试）](#testing)
-- [12. Support（支持）](#support)
-- [13. Contributing（贡献）](#contributing)
-- [14. Maintainers（维护者）](#maintainers)
-- [15. License（许可）](#license)
+- [背景](#background)
+- [状态边界](#status)
+- [前置条件](#prerequisites)
+- [安装](#install)
+- [启动](#start)
+- [健康检查](#health)
+- [使用](#usage)
+- [接口](#api)
+- [配置](#configuration)
+- [运维与安全](#operations-and-security)
+- [测试](#testing)
+- [支持](#support)
+- [参与贡献](#contributing)
+- [维护者](#maintainers)
+- [许可证](#license)
 
 <a id="background"></a>
-## 1. Background（背景）
+## 背景
 
 Fermata 是 USTC 算法竞赛协会的独立 AI 审题服务。它作为 Urmotiv 机器人客户端领取待审题目，运行分阶段的模型审核流程，再提交结构化意见；同时作为 HTTP 服务端向运维人员和 Urmotiv 的 `fermata-control` 插件提供管理接口。
 
@@ -36,7 +49,7 @@ Fermata 与 Urmotiv 分开部署、分开安装、分开保存凭据，不共享
 管理接口契约见 [`docs/http-api.md`](docs/http-api.md)。Urmotiv 侧契约在本仓库以严格镜像的 [`src/urmotiv-schemas.ts`](src/urmotiv-schemas.ts) 为准。
 
 <a id="status"></a>
-## 2. Status（状态边界）
+## 状态边界
 
 必须把接口运行性和审题准确性分开理解：
 
@@ -51,7 +64,7 @@ Fermata 与 Urmotiv 分开部署、分开安装、分开保存凭据，不共享
 本仓库不宣称 CF 难度、思维难度、代码难度、标签、质量、原创性或通过/修改/拒绝结论达到任何准确率。难度与通过结论分别判断；缺少查重资料不会阻止审题，也不代表原创。旧多角色实验及历史报告说明保留在 [校准记录](docs/calibration.md)，不作为正式运行的前置条件。私有材料和模型原始输出不进入镜像或 Git。
 
 <a id="prerequisites"></a>
-## 3. Prerequisites（前提）
+## 前置条件
 
 - Node.js 24 或更高版本（`package.json` 的 engines 约束）。
 - npm，以及可写的运行期设置目录。
@@ -63,7 +76,7 @@ Fermata 与 Urmotiv 分开部署、分开安装、分开保存凭据，不共享
 配置模板是 [`.env.example`](.env.example)，只包含变量名和说明。不要把真实令牌、API key、题面、题解或模型输出写入仓库。
 
 <a id="install"></a>
-## 4. Install（安装）
+## 安装
 
 从仓库根目录安装锁定依赖：
 
@@ -88,7 +101,7 @@ docker build -t fermata:local .
 镜像只复制运行服务需要的 `config/`、`src/` 和 TypeScript 配置，不复制 `private/`、`.env`、`experiments/` 或 `test/`。运行期设置应通过卷保存。管理令牌由容器平台注入；模型密钥和机器人令牌可以注入环境，也可以通过管理页面加密保存。备份运行设置时须同时保留相邻的 `.key` 文件。
 
 <a id="start"></a>
-## 5. Start（启动）
+## 启动
 
 ### 使用进程环境
 
@@ -133,7 +146,7 @@ docker run --name fermata \
 默认管理端口为 `8720`，设置文件为 `./data/settings.json`。修改 `FERMATA_PORT` 时同步修改端口映射。直接在主机运行或使用 Docker host 网络时，设置 `FERMATA_HOST=127.0.0.1`；默认桥接容器使用 `0.0.0.0` 并仅向主机回环地址发布端口。
 
 <a id="health"></a>
-## 6. Health（健康检查）
+## 健康检查
 
 `/healthz` 是不需要令牌的容器 liveness（存活）探针；它只证明 HTTP 进程可达：
 
@@ -158,7 +171,7 @@ curl --fail --silent --show-error \
 它返回 `workerRunning`、`activeTasks` 和 `status`。`workerRunning` 表示调度循环已启动且当前启用条件满足；`status: "ok"` 不证明模型判断准确或已有任务完成。
 
 <a id="usage"></a>
-## 7. Usage（使用）
+## 使用
 
 首次启动且没有设置文件时，公开设置固定为 `enabled: false`、`revision: 1`。禁用设置不会领取任务，健康接口的 `workerRunning` 为 false。
 
@@ -198,7 +211,7 @@ curl --fail --silent --show-error \
 没有领到任务时，检查机器人账号及令牌权限、是否有可领取的待审核题目，以及题目的外部验题开关。历史题可关闭外部验题以避免重复审核；领取 0 条不等于已处理全部题目。
 
 <a id="api"></a>
-## 8. API（接口）
+## 接口
 
 ### Fermata 管理接口
 
@@ -216,7 +229,7 @@ Authorization: Bearer $FERMATA_MANAGEMENT_TOKEN
 | `PUT` | `/api/v1/settings/public` | 按 `expectedRevision` 条件更新设置。 |
 | `POST` | `/api/v1/actions/wake` | 尽快触发一次轮询。 |
 
-公开设置是严格 JSON 对象，只允许 `enabled`、`pollingIntervalSeconds`、`maximumConcurrentTasks`、`modelProfileName` 和 `experimentVersion`。响应不会包含令牌、API key、数据库连接或其它内部字段。过期的 `expectedRevision` 返回 `409 CONFLICT`；未知字段不会被静默保存。
+公开设置使用严格 JSON 校验，包含启用状态、轮询间隔、并发，以及模型和题库连接的非敏感配置；密钥采用独立的只写字段，读取只返回是否已配置。字段约束以 [HTTP API](docs/http-api.md) 为准。响应不会包含令牌、API key、数据库连接或其它内部字段。过期的 `expectedRevision` 返回 `409 CONFLICT`；未知字段不会被静默保存。
 
 错误响应使用固定错误码，如 `INVALID_JSON`、`INVALID_BODY`、`UNAUTHENTICATED`、`NOT_FOUND`、`CONFLICT` 和 `PAYLOAD_TOO_LARGE`，不回显题面、密钥或外部服务原文。完整字段约束和 JSON 示例见 [`docs/http-api.md`](docs/http-api.md)。
 
@@ -239,7 +252,7 @@ Content-Type: application/json
 任务、续租和完成请求的完整字段以 [`src/urmotiv-schemas.ts`](src/urmotiv-schemas.ts) 与 [`docs/http-api.md`](docs/http-api.md) 为准。任务失败不会伪造完成结果，也不会改变 Urmotiv 的人工流程。
 
 <a id="configuration"></a>
-## 9. Configuration（配置）
+## 配置
 
 所有 URL 必须是没有账号、密码、查询参数或片段的 `http://` 或 `https://` 地址。provider 的 BASE_URL 与 API key 必须同时设置或同时留空。
 
@@ -268,7 +281,7 @@ Content-Type: application/json
 格式轮使用 `response_format: {type: json_object}`，提示词提供完整 JSON Schema，收到结果后严格校验字段、范围及活动知识点。这样不依赖兼容服务支持 `json_schema` 请求参数。两轮持续读取流式输出，不因正常慢速生成而反复重发；明确的 429/502/503/504 按配置有界退避重试。不同题目按 `maximumConcurrentTasks` 并行。
 
 <a id="operations-and-security"></a>
-## 10. Operations and Security（运维与安全）
+## 运维与安全
 
 ### 运维
 
@@ -288,7 +301,7 @@ Content-Type: application/json
 - 离线实验使用的题面、题解、人工 gold、模型原始输出、私有清单和环境文件不进入 Git、镜像、日志或本文档。文档示例只用合成数据。
 
 <a id="testing"></a>
-## 11. Testing（测试）
+## 测试
 
 测试使用注入的 HTTP、时间和模型依赖，不发起真实外部模型请求。受影响工作区从仓库根目录运行：
 
@@ -302,12 +315,12 @@ docker build -t fermata:verify .
 这些命令只能证明类型、工程契约和镜像构建在当前环境成立；它们不证明审题准确性。不要为 README 或工程验证启动外部模型校准，也不要运行会读取私有题面或模型密钥的实验命令。
 
 <a id="support"></a>
-## 12. Support（支持）
+## 支持
 
 请在 [GitHub Issues](https://github.com/Huasushis/Fermata/issues) 报告可复现问题。附上版本、运行模式、固定错误码和不含敏感内容的健康状态；不要提交题面、题解、模型原文、环境文件、令牌或请求头。
 
 <a id="contributing"></a>
-## 13. Contributing（贡献）
+## 参与贡献
 
 1. 从 `main` 创建主题分支，每个提交只覆盖一个可审阅的行为变化。
 2. 修改 Urmotiv 契约、管理路由、鉴权、任务租约或失败边界时，同时更新对应镜像、文档和失败路径测试。
@@ -316,12 +329,12 @@ docker build -t fermata:verify .
 5. Pull request 应写明行为、验证命令和未解决限制，不提交真实校准数据。
 
 <a id="maintainers"></a>
-## 14. Maintainers（维护者）
+## 维护者
 
 - [Huasushis](https://github.com/Huasushis)
 
 <a id="license"></a>
-## 15. License（许可）
+## 许可证
 
 本项目采用 MIT License，完整文本见 [`LICENSE`](LICENSE)。
 
