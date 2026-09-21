@@ -341,3 +341,4 @@ docker build -t fermata:verify .
 本项目采用 MIT License，完整文本见 [`LICENSE`](LICENSE)。
 
 SPDX-License-Identifier: MIT
+本轮针对“基础题面/题解被按比赛定稿审查”修正了评分提示词，并加入合成尺度案例。7 个固定样本前后完整对照见 [基础投稿审核尺度说明](docs/basic-proposal-review-20260921.md)，不将小样本结果宣称为总体准确率。

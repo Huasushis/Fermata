@@ -56,6 +56,9 @@ describe("正式评分器", () => {
     const target = JSON.parse(format.messages[0].content.split("完整 JSON Schema：\n")[1]);
     expect(target.properties.tagIds.items.enum).toEqual(["math"]);
     expect(JSON.stringify(semantic)).toContain("难度不能决定通过与否");
+    expect(JSON.stringify(semantic)).toContain('基础构思审查');
+    expect(JSON.stringify(semantic)).toContain('不能要求重复录入后才通过');
+    expect(JSON.stringify(semantic)).toContain('阻塞问题');
     expect(format.messages.at(-1).content).toBe("合成审核结论，不代表准确性标定。");
   });
   it.each([
