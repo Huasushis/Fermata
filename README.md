@@ -225,6 +225,7 @@ Authorization: Bearer $FERMATA_MANAGEMENT_TOKEN
 | --- | --- | --- |
 | `GET` | `/healthz` | 无令牌 liveness；只表示 HTTP 进程可达。 |
 | `GET` | `/api/v1/health` | worker 状态和已知降级条件。 |
+| `GET` | `/api/v1/logs?level=all&limit=100` | 最近安全运行事件；按 INFO/WARN/ERROR 筛选，最多 200 条。 |
 | `GET` | `/api/v1/settings/public` | 公开设置、revision 和 `secretsConfigured`。 |
 | `PUT` | `/api/v1/settings/public` | 按 `expectedRevision` 条件更新设置。 |
 | `POST` | `/api/v1/actions/wake` | 尽快触发一次轮询。 |
@@ -287,6 +288,7 @@ Content-Type: application/json
 
 - 将 `/healthz` 配置为容器 liveness；用受保护的 `/api/v1/health` 观察 worker 和活动任务数。
 - 通过 `docker logs --tail=100 fermata` 或受控日志系统检查固定错误码；不要把环境变量、请求头、题面、题解或模型原文写入日志。
+- Urmotiv 插件管理页提供「运行日志」，可手动刷新或每 10 秒自动刷新。服务内保留最近 1000 条事件，重启后清空；显示处理阶段、耗时、HTTP 状态和错误码，不返回题目身份、正文、模型原文或密钥。未知消息替换为固定提示，未知错误码归为 `UNEXPECTED_ERROR`。
 - 将 `FERMATA_SETTINGS_PATH` 所在目录持久化，并限制 `settings.json` 访问权限；设置文件损坏时应停止并从受控备份恢复，不要自动删除重建。
 - 管理设置 PUT 使用最新 `revision`，收到 `409 CONFLICT` 时重新 GET，不要覆盖其他操作员的更新。
 - 机器人令牌丢失、租约过期、服务端拒绝或模型 provider 不可用时，先检查对应固定错误类别；不要把 Urmotiv 权限错误当成模型错误。

@@ -8,6 +8,7 @@
  * 打印敏感字段。
  */
 import { timingSafeEqual as nodeTimingSafeEqual } from "node:crypto";
+import {recordRuntimeLog} from './runtime-logs';
 
 export type LogFields = Readonly<Record<string, string | number | boolean | null | undefined>>;
 
@@ -86,6 +87,7 @@ const allowedErrorCodes = new Set([
 ]);
 
 function write(stream: NodeJS.WriteStream, level: string, message: string, fields?: LogFields): void {
+  recordRuntimeLog(level,message,fields);
   const timestamp = new Date().toISOString();
   const suffix = fields === undefined ? "" : " " + formatFields(fields);
   stream.write(`${timestamp} [${level}] ${message}${suffix}\n`);
@@ -107,8 +109,9 @@ export function logWarn(message: string, fields?: LogFields): void {
 }
 
 export function logError(message: string, error?: unknown, fields?: LogFields): void {
+  const status=typeof error==='object'&&error!==null&&'status' in error ? error.status : undefined;
   const errorFields: LogFields =
-    error === undefined ? {} : { errorCode: describeError(error) };
+    error === undefined ? {} : { errorCode: describeError(error),...(typeof status==='number'&&Number.isInteger(status)&&status>=100&&status<=599?{statusCode:status}:{}) };
   write(process.stderr, "ERROR", message, { ...fields, ...errorFields });
 }
 

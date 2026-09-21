@@ -1,4 +1,5 @@
 import { z } from "zod";
+import {logInfo} from './logger';
 import { chatCompleteTwoRoundJsonWithReceipt, serializeTargetJsonSchema } from "./llm";
 import type { DifficultyAnchor } from "./pipelines/difficulty";
 import type { PipelineModelConfig } from "./pipelines/types";
@@ -30,6 +31,8 @@ export async function scoreReviewTask(
     "先独立核验后给出所有字段的明确结论，下一轮仅转换格式。目标 JSON Schema：",
     jsonSchema
   ].join("\n");
+  logInfo('模型深度审阅开始');
+  const started=Date.now();
   const { data } = await chatCompleteTwoRoundJsonWithReceipt(
     model.credentials,
     model.spec,
@@ -37,15 +40,16 @@ export async function scoreReviewTask(
       { role: "system", content: instructions },
       { role: "user", content: JSON.stringify({ problem: task.problem, tagCatalog: task.tagCatalog, reviewItems, difficultyReferences: anchors }) }
     ],
-    (output) => [
+    (output) => {logInfo('模型深度审阅完成',{elapsedMs:Date.now()-started});logInfo('结构化意见整理开始');return [
       { role: "system", content: "把审核结论转换成满足下列 JSON Schema 的对象。只调整格式，不重新审题、不编造缺失结论。\n" + jsonSchema },
       { role: "user", content: output }
-    ],
+    ];},
     schema,
     model.runtime,
     // DeepSeek 兼容接口使用 JSON 输出模式；完整 Schema 留在提示词并严格本地校验。
     { formatResponseType: "json_object" }
   );
+  logInfo('结构化意见整理完成',{elapsedMs:Date.now()-started});
   if (new Set(data.tagIds).size !== data.tagIds.length) {
     throw new Error("SCORER_DUPLICATE_TAGS");
   }

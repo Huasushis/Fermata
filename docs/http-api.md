@@ -311,6 +311,12 @@ Fermata 在本地先按严格镜像校验请求和响应；具体字段以 [`src
 - Anklang 只作为 Urmotiv 任务中经过认证的相似题检索证据出现；Fermata 不把 Anklang 当作工作流或审核状态权威，不直接调用其数据库。相似度证据不能单独推出 Fermata 的评分准确性。
 - 管理 API 的 `secretsConfigured` 只是布尔状态；它不返回 provider 地址中的凭据、不返回 API key，也不表示模型服务可用或判断结果正确。
 
+### 安全运行日志
+
+`GET /api/v1/logs` 与其他管理接口使用同一个管理令牌，返回 `Cache-Control: no-store`。查询参数 `level` 为 `all`（默认）、`INFO`、`WARN`、`ERROR`；`limit` 为 1–200（默认 100）。未知参数或超限返回 400，未授权返回 401。
+
+响应包含 `startedAt` 和倒序 `items`。每条包含递增 `id`、`time`、`level`、固定白名单 `message`、安全 `errorCode`（可为 null）和仅数字/布尔白名单字段 `details`。只保留最近 1000 条，不是持久化审计；重启后清空。不提供文件路径选择、任意日志下载或模型回答。Urmotiv 侧还需要真人同时拥有 `plugin.manage` 与 `system.manage`。
+
 ## 相关文件
 
 - 启动和环境变量：[`README.md`](../README.md)、[`.env.example`](../.env.example)

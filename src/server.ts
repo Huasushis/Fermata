@@ -17,6 +17,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { z } from "zod";
 import { logError, timingSafeEqual } from "./logger";
+import {runtimeLogs} from './runtime-logs';
 import { SettingsConflictError, type SettingsStoreLike } from "./settings-store";
 import {
   fermataHealthSchema,
@@ -86,6 +87,12 @@ async function handleRequest(
   if (method === "GET" && path === "/api/v1/health") {
     sendHealth(res, deps, now);
     return;
+  }
+  if(method==='GET'&&path==='/api/v1/logs'){
+    const query=Object.fromEntries(new URL(req.url!,'http://localhost').searchParams);
+    const parsed=z.object({level:z.enum(['all','INFO','WARN','ERROR']).default('all'),limit:z.coerce.number().int().min(1).max(200).default(100)}).strict().safeParse(query);
+    if(!parsed.success){sendJson(res,400,{error:{code:'INVALID_QUERY',message:'日志筛选参数无效。'}});return;}
+    sendJson(res,200,runtimeLogs(parsed.data.level,parsed.data.limit));return;
   }
   if (method === "GET" && path === "/api/v1/settings/public") {
     sendSettings(res, deps, 200);
@@ -240,6 +247,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
     return;
   }
   res.writeHead(status, {
+    "Cache-Control":"no-store",
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": String(payload.length)
   });

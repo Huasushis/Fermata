@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createManagementServer, type ManagementServerDeps, type SettingsStoreLike } from "../src/server";
 import { SettingsConflictError } from "../src/settings-store";
 import type { FermataPublicSettings } from "../src/urmotiv-schemas";
+import {recordRuntimeLog,fermataLogsSchema} from '../src/runtime-logs';
 
 const managementToken = "test-management-token-1234567890";
 
@@ -69,6 +70,20 @@ afterEach(async () => {
 });
 
 describe("管理端口：鉴权", () => {
+  it('运行日志需要鉴权，限制大小并过滤未经允许的原文、字段与错误码',async()=>{
+    testServer=startTestServer();
+    recordRuntimeLog('ERROR','synthetic-private-payload',{apiKey:'secret',problemId:'private-id',errorCode:'UNTRUSTED_SECRET',statusCode:503});
+    const url=testServer.baseUrl+'/api/v1/logs?level=ERROR&limit=1';
+    expect((await fetch(url)).status).toBe(401);
+    const response=await fetch(url,{headers:{authorization:'Bearer '+managementToken}});
+    expect(response.status).toBe(200);expect(response.headers.get('cache-control')).toBe('no-store');
+    const body=fermataLogsSchema.parse(await response.json());expect(body.items).toHaveLength(1);
+    expect(body.items[0]).toMatchObject({message:'服务运行事件',errorCode:'UNEXPECTED_ERROR',details:{statusCode:503}});
+    const serialized=JSON.stringify(body);for(const marker of ['synthetic-private-payload','secret','private-id','UNTRUSTED_SECRET'])expect(serialized).not.toContain(marker);
+    expect((await fetch(testServer.baseUrl+'/api/v1/logs?limit=201',{headers:{authorization:'Bearer '+managementToken}})).status).toBe(400);
+    for(let i=0;i<1100;i++)recordRuntimeLog('INFO','Fermata 启动完成');
+    expect(fermataLogsSchema.parse(await fetch(testServer.baseUrl+'/api/v1/logs?limit=200',{headers:{authorization:'Bearer '+managementToken}}).then(r=>r.json())).items).toHaveLength(200);
+  });
   it("模型设置和密钥写入要求管理令牌，密钥不会回显", async () => {
     const original = createFakeSettingsStore(defaultSettings());
     const update = vi.fn(original.update);
