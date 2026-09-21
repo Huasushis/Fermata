@@ -100,7 +100,7 @@ export const modelSpecSchema = z
     thinking: z.boolean(),
     // thinking 只决定是否保留响应中的 reasoning_content；thinkingRequest
     // 才是显式发给经过配置层限定的模型/网关的推理请求配置。Aether
-    // deepseek-v4-flash 和 deepseek-v4-pro 必须配置 thinkingRequest: enabled
+    // deepseek-v4-flash/pro 及学校接口别名 deepseek-flash 必须配置 thinkingRequest: enabled
     // 与 reasoningEffort: max，缺失或 disabled/low 均拒绝；其它模型/网关
     // 不允许配置 thinkingRequest 或 reasoningEffort。
     thinkingRequest: z.enum(["enabled", "disabled"]).optional(),
@@ -110,7 +110,7 @@ export const modelSpecSchema = z
   .superRefine((spec, context) => {
     const isAetherV4 =
       spec.provider === "aether" &&
-      (spec.model === "deepseek-v4-flash" || spec.model === "deepseek-v4-pro");
+      (spec.model === "deepseek-v4-flash" || spec.model === "deepseek-v4-pro" || spec.model === "deepseek-flash");
     if (isAetherV4) {
       if (spec.thinkingRequest !== "enabled") {
         context.addIssue({

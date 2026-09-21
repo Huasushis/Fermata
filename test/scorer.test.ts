@@ -20,6 +20,14 @@ function setup(output: unknown) {
 const { expectedRound: _round, ...modelReview } = review;
 
 describe("正式评分器", () => {
+  it('学校接口 deepseek-flash 别名也发送 enabled/max，整理轮关闭思考',async()=>{
+    const {fetch,model}=setup(modelReview);
+    const configured=resolveRuntimeModel(appConfig,{...settings,model:{baseUrl:'https://school.example.test/v1',model:'deepseek-flash',temperature:.1,thinking:true}},{modelApiKey:'synthetic'})!;
+    await scoreReviewTask(task(),{...model,...configured},[]);
+    expect(JSON.parse(fetch.mock.calls[0]![1].body)).toMatchObject({model:'deepseek-flash',thinking:{type:'enabled'},reasoning_effort:'max'});
+    expect(JSON.parse(fetch.mock.calls[1]![1].body).thinking).toEqual({type:'disabled'});
+    expect(JSON.parse(fetch.mock.calls[1]![1].body).reasoning_effort).toBeUndefined();
+  });
   it("网页模型配置实际进入两轮 HTTP 请求，DeepSeek 使用 enabled/max", async () => {
     const { fetch, model } = setup(modelReview);
     const resolved = resolveRuntimeModel(appConfig, { ...settings, model: {

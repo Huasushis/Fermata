@@ -1624,7 +1624,7 @@ function combineContinuationAudits(
 function validateThinkingRequest(spec: ModelCallSpec): void {
   const isAetherV4 =
     spec.provider === "aether" &&
-    (spec.model === "deepseek-v4-flash" || spec.model === "deepseek-v4-pro");
+    (spec.model === "deepseek-v4-flash" || spec.model === "deepseek-v4-pro" || spec.model === "deepseek-flash");
   if (isAetherV4) {
     // 配置层仍要求审题 enabled + max。格式轮不判断题目，也不保留推理；
     // 必须明确关闭，否则提供商的默认思考模式仍会生效。
@@ -1823,7 +1823,7 @@ function directStructuredMessages<T>(
  */
 function derivedStructuredExtractionSpec(spec: ModelCallSpec): ModelCallSpec {
   const deepseek = spec.provider === "aether" &&
-    (spec.model === "deepseek-v4-flash" || spec.model === "deepseek-v4-pro");
+    (spec.model === "deepseek-v4-flash" || spec.model === "deepseek-v4-pro" || spec.model === "deepseek-flash");
   return {
     ...spec,
     provider: deepseek ? spec.provider : undefined,

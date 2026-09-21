@@ -13,7 +13,7 @@ export function resolveRuntimeModel(config: AppConfig, settings: FermataPublicSe
   const baseUrl = settings.model?.baseUrl ?? fallback?.baseUrl;
   if (!apiKey || !baseUrl) return undefined;
   const model = settings.model;
-  const deepseek = model?.model === "deepseek-v4-flash" || model?.model === "deepseek-v4-pro";
+  const deepseek = model?.model === "deepseek-v4-flash" || model?.model === "deepseek-v4-pro" || model?.model === "deepseek-flash";
   const spec = model === undefined ? original : modelSpecSchema.parse({
     provider: "aether",
     model: model.model,
